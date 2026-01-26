@@ -1,0 +1,12 @@
+{
+  "name": "mobisecuscan",
+  "version": "1.0.0",
+  "description": "Secure photo sharing between devices using WebRTC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

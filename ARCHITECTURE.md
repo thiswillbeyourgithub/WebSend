@@ -1,0 +1,149 @@
+# Architecture
+
+> Written with the help of [Claude Code](https://claude.ai/claude-code).
+
+## Overview
+
+ImageSecureSend is a webapp for securely transferring photos from a phone (sender) to a
+computer (receiver). It uses WebRTC for peer-to-peer data transfer and ECDH + AES-GCM
+for end-to-end encryption. The server's only role is signaling (SDP relay) and serving
+static files — it never sees photo data or encryption keys.
+
+## Directory Structure
+
+```
+ImageSecureSend/
+├── server.js               # Express server: signaling API, ICE config, static serving
+├── Dockerfile              # Node 20 Alpine image, non-root user, production build
+├── docker-compose.yml      # Service definition with security hardening (read-only FS,
+│                           #   dropped capabilities, resource limits, health check)
+│                           #   Also contains commented-out coturn TURN relay service
+├── package.json            # Dependencies (express only)
+├── env                     # Active environment config (gitignored)
+├── env.example             # Documented env vars: DOMAIN, ICE servers, TURN credentials
+├── CLAUDE.md               # Project spec and instructions for AI-assisted development
+├── TODO.md                 # Task tracking
+├── README.md               # User-facing docs: features, security, deployment
+│
+└── public/                 # Static frontend (vanilla HTML/CSS/JS, no build step)
+    ├── index.html          # Landing page: "Receive" and "Send" buttons, About modal
+    ├── receive.html        # Receiver flow: key generation, room creation, QR display,
+    │                       #   WebRTC answer polling, decryption, image display,
+    │                       #   perspective crop tool, PDF generation
+    ├── send.html           # Sender flow: QR scanning (jsQR), room joining, key exchange,
+    │                       #   camera capture or file picker, encryption, chunked sending
+    ├── manifest.json       # PWA manifest (installable as app on mobile)
+    ├── service-worker.js   # PWA service worker: caches static assets for fast reload
+    │                       #   (stale-while-revalidate strategy; API calls bypass cache)
+    │
+    ├── css/
+    │   └── style.css       # All styles: dark theme, large touch targets for accessibility,
+    │                       #   responsive layout, crop modal, logs panel
+    │
+    ├── js/
+    │   ├── crypto.js       # ECDH key exchange (P-256) + AES-GCM-256 encryption via
+    │   │                   #   Web Crypto API. Includes HKDF key derivation, key
+    │   │                   #   fingerprinting for MITM detection, size-bucket padding
+    │   │                   #   to hide exact file sizes, and metadata bundling (filename,
+    │   │                   #   MIME type encrypted inside the payload)
+    │   ├── webrtc.js       # WebRTC peer connection management: room creation/joining,
+    │   │                   #   SDP offer/answer exchange via server API, trickle ICE
+    │   │                   #   candidate relay, data channel setup, chunked file transfer,
+    │   │                   #   connection type detection (direct vs TURN relay)
+    │   ├── logger.js       # In-memory log buffer with UI panel (slide-up overlay).
+    │   │                   #   Supports info/success/warn/error/debug levels.
+    │   │                   #   DEV mode (toggled via server config) enables verbose output
+    │   ├── i18n.js         # Internationalization: English + French. Detects browser locale,
+    │   │                   #   applies translations via data-i18n attributes on DOM elements
+    │   ├── sdp-compress.js # SDP compression utilities (extracts essential SDP fields,
+    │   │                   #   compresses with deflate, reconstructs minimal valid SDP).
+    │   │                   #   Used to keep QR codes small
+    │   ├── qrcode.min.js   # QR code generator library (vendored, used by receiver)
+    │   └── jsqr.min.js     # QR code scanner library (vendored, used by sender)
+    │
+    └── icons/
+        ├── icon-192.png    # PWA icon (192x192)
+        └── icon-512.png    # PWA icon (512x512)
+```
+
+## Data Flow
+
+```
+  Receiver (computer)                    Server                     Sender (phone)
+  ─────────────────                    ────────                   ───────────────
+  1. Generate ECDH key pair
+  2. POST /api/rooms ───────────────▶ Create room ◀─────────────── (scans QR later)
+     ◀── roomId + secret ───────────
+  3. Create WebRTC offer
+  4. POST /api/rooms/:id/offer ─────▶ Store SDP offer
+  5. Display QR code
+     (URL with roomId + secret in
+      hash fragment)
+                                                                  6. Scan QR code
+                                                                  7. GET /api/rooms/:id/offer
+                                                                     ◀── SDP offer ──────────
+                                                                  8. Create WebRTC answer
+                                                                  9. POST /api/rooms/:id/answer
+  10. GET /api/rooms/:id/answer ────▶ Relay SDP answer ──────────
+      (long-polling)
+      ◀── SDP answer ──────────────
+                                      ICE candidates also relayed
+                                      via /api/rooms/:id/ice/*
+
+  ════════════ WebRTC P2P data channel established ════════════
+
+  11. Send ECDH public key ─────────────────────────────────────▶ 12. Derive shared AES key
+  ◀────────────────────────────────────────────── Send ECDH public key back
+  13. Derive same shared AES key
+  14. Show fingerprint verification modal ◀─────────────────────▶ Show fingerprint modal
+  15. Both confirm match
+
+  ◀──────────────────────────────────── Encrypt photo (AES-GCM, padded)
+                                        Send via data channel chunks
+  16. Decrypt, display, offer download
+```
+
+## Server API Endpoints
+
+| Method | Path                         | Purpose                              | Auth        | Rate Limit      |
+|--------|------------------------------|--------------------------------------|-------------|-----------------|
+| GET    | `/api/config`                | ICE server list + DEV flag           | None        | None            |
+| POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None        | 5/min per IP    |
+| GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 30/min per IP   |
+| POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Room secret | 100/min per IP  |
+| GET    | `/api/rooms/:id/offer`       | Retrieve SDP offer                   | Room secret | 30/min per IP   |
+| POST   | `/api/rooms/:id/answer`      | Store SDP answer                     | Room secret | 100/min per IP  |
+| GET    | `/api/rooms/:id/answer`      | Retrieve SDP answer (long-poll)      | Room secret | None            |
+| POST   | `/api/rooms/:id/ice/offer`   | Add receiver ICE candidate           | Room secret | 100/min per IP  |
+| GET    | `/api/rooms/:id/ice/offer`   | Get receiver ICE candidates          | Room secret | None            |
+| POST   | `/api/rooms/:id/ice/answer`  | Add sender ICE candidate             | Room secret | 100/min per IP  |
+| GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | None            |
+
+All `/api/*` endpoints validate the `Origin` header against `ALLOWED_ORIGINS`.
+Room endpoints require an `X-Room-Secret` header (constant-time comparison).
+
+## Security Layers
+
+1. **End-to-end encryption**: ECDH P-256 key exchange + HKDF + AES-GCM-256. Server never
+   sees keys or plaintext.
+2. **Room secrets**: 16-byte random token required for any room access. Passed in URL hash
+   fragment (never sent to server in HTTP requests). Prevents room enumeration.
+3. **Fingerprint verification**: Both parties see short hex fingerprints of each other's
+   public keys and must manually confirm they match, defeating MITM attacks.
+4. **Size obfuscation**: Photos are padded to power-of-2 bucket sizes before encryption,
+   hiding exact file sizes from network observers.
+5. **Metadata encryption**: Filename, MIME type, and original size are encrypted inside the
+   payload, not sent in plaintext over the data channel.
+6. **Rate limiting**: Per-IP sliding window limits on room creation (5/min), room lookup
+   (30/min), and general API (100/min).
+7. **Origin validation**: API rejects requests from unauthorized origins (CSRF protection).
+8. **Proxy trust**: Express trusts `X-Forwarded-For` only from loopback (Caddy).
+9. **Docker hardening**: Read-only filesystem, no-new-privileges, all capabilities dropped,
+   non-root user, memory/CPU limits.
+10. **SRI**: Script and stylesheet tags use `integrity` attributes (Subresource Integrity).
+
+## Deployment
+
+Expected to run behind **Caddy** reverse proxy which handles HTTPS termination.
+Docker Compose exposes port 7395 mapped to internal 8080. Configure via `env` file
+(copy from `env.example`).

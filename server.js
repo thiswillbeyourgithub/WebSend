@@ -1,0 +1,592 @@
+/**
+ * Express server for ImageSecureSend
+ * Serves static files, provides ICE configuration, and acts as a signaling server
+ * for WebRTC SDP offer/answer exchange.
+ */
+
+const express = require('express');
+const crypto = require('crypto');
+const path = require('path');
+
+const app = express();
+const PORT = 8080;
+const DOMAIN = process.env.DOMAIN || 'localhost';
+// DEV mode: when 1, enables verbose debug logging for handshake/connection troubleshooting
+const DEV = process.env.DEV === '1';
+
+// ============ ICE Server Configuration ============
+// STUN_SERVER: optional self-hosted STUN server (host:port)
+const STUN_SERVER = process.env.STUN_SERVER || '';
+// STUN_GOOGLE_FALLBACK: whether to include Google's public STUN as fallback (default: true)
+const STUN_GOOGLE_FALLBACK = process.env.STUN_GOOGLE_FALLBACK !== 'false';
+// TURN_SERVER: optional TURN relay server (host:port)
+const TURN_SERVER = process.env.TURN_SERVER || '';
+// TURN_SECRET: shared secret for time-based TURN credentials
+const TURN_SECRET = process.env.TURN_SECRET || '';
+// TURN_CREDENTIAL_TTL: how long TURN credentials are valid (default: 24 hours)
+const TURN_CREDENTIAL_TTL = parseInt(process.env.TURN_CREDENTIAL_TTL, 10) || 86400;
+
+/**
+ * Debug logging helper - only logs when DEV=1
+ * @param {string} context - Log context (e.g., 'ROOM', 'ICE', 'SIGNALING')
+ * @param {string} message - Log message
+ * @param {Object} [data] - Optional data to log
+ */
+function debugLog(context, message, data = null) {
+    if (!DEV) return;
+    const timestamp = new Date().toISOString();
+    const dataStr = data ? ` | ${JSON.stringify(data)}` : '';
+    console.log(`[${timestamp}] [DEBUG:${context}] ${message}${dataStr}`);
+}
+
+// ALLOWED_ORIGINS: comma-separated list of allowed origins for Origin header validation.
+// If not set, defaults to https://{DOMAIN} and http://{DOMAIN} (for local dev).
+// Example: ALLOWED_ORIGINS=https://share.example.com,https://backup.example.com
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : [`https://${DOMAIN}`, `http://${DOMAIN}`];
+
+// Trust proxy headers only from loopback (Caddy runs on same host).
+// This ensures X-Forwarded-For cannot be spoofed by external clients.
+app.set('trust proxy', 'loopback');
+
+// Parse JSON bodies
+app.use(express.json({ limit: '50kb' }));
+
+// In-memory room storage (in production, use Redis or similar)
+const rooms = new Map();
+const ROOM_TTL = 10 * 60 * 1000; // 10 minutes TTL
+
+// ============ Rate Limiting ============
+// Simple sliding window rate limiter to prevent DoS and room enumeration attacks.
+// Uses in-memory storage; in production, use Redis for distributed rate limiting.
+
+const rateLimiters = new Map(); // IP -> { timestamps: [], blockedUntil: null }
+
+const RATE_LIMIT_CONFIG = {
+    // Room creation: 5 rooms per minute per IP (prevents room flooding)
+    roomCreation: { windowMs: 60 * 1000, maxRequests: 5 },
+    // Room lookup: 30 requests per minute per IP (prevents enumeration)
+    roomLookup: { windowMs: 60 * 1000, maxRequests: 30 },
+    // General API: 100 requests per minute per IP
+    general: { windowMs: 60 * 1000, maxRequests: 100 }
+};
+
+/**
+ * Get client IP from Express request.
+ * Uses req.ip which respects the 'trust proxy' setting - it will use
+ * X-Forwarded-For only when the request comes from a trusted proxy (loopback).
+ * @param {Request} req - Express request
+ * @returns {string} Client IP address
+ */
+function getClientIp(req) {
+    return req.ip || 'unknown';
+}
+
+/**
+ * Check and update rate limit for a given IP and limit type
+ * @param {string} ip - Client IP
+ * @param {string} limitType - One of: 'roomCreation', 'roomLookup', 'general'
+ * @returns {object} { allowed: boolean, retryAfter: number (seconds) }
+ */
+function checkRateLimit(ip, limitType) {
+    const config = RATE_LIMIT_CONFIG[limitType];
+    const now = Date.now();
+    const key = `${ip}:${limitType}`;
+
+    if (!rateLimiters.has(key)) {
+        rateLimiters.set(key, { timestamps: [], blockedUntil: null });
+    }
+
+    const limiter = rateLimiters.get(key);
+
+    // Check if currently blocked
+    if (limiter.blockedUntil && now < limiter.blockedUntil) {
+        const retryAfter = Math.ceil((limiter.blockedUntil - now) / 1000);
+        return { allowed: false, retryAfter };
+    }
+
+    // Clear block if expired
+    if (limiter.blockedUntil && now >= limiter.blockedUntil) {
+        limiter.blockedUntil = null;
+        limiter.timestamps = [];
+    }
+
+    // Remove timestamps outside the window
+    const windowStart = now - config.windowMs;
+    limiter.timestamps = limiter.timestamps.filter(ts => ts > windowStart);
+
+    // Check if limit exceeded
+    if (limiter.timestamps.length >= config.maxRequests) {
+        // Block for the remainder of the window
+        limiter.blockedUntil = now + config.windowMs;
+        const retryAfter = Math.ceil(config.windowMs / 1000);
+        return { allowed: false, retryAfter };
+    }
+
+    // Allow request and record timestamp
+    limiter.timestamps.push(now);
+    return { allowed: true, retryAfter: 0 };
+}
+
+/**
+ * Express middleware factory for rate limiting
+ * @param {string} limitType - Rate limit type to apply
+ * @returns {Function} Express middleware
+ */
+function rateLimitMiddleware(limitType) {
+    return (req, res, next) => {
+        const ip = getClientIp(req);
+        const result = checkRateLimit(ip, limitType);
+
+        if (!result.allowed) {
+            res.set('Retry-After', result.retryAfter);
+            return res.status(429).json({
+                error: 'Too many requests',
+                retryAfter: result.retryAfter
+            });
+        }
+
+        next();
+    };
+}
+
+/**
+ * Clean up old rate limiter entries periodically
+ */
+function cleanupRateLimiters() {
+    const now = Date.now();
+    const maxAge = 5 * 60 * 1000; // Remove entries older than 5 minutes
+
+    for (const [key, limiter] of rateLimiters.entries()) {
+        // Remove if no recent timestamps and not blocked
+        const hasRecentActivity = limiter.timestamps.some(ts => now - ts < maxAge);
+        const isBlocked = limiter.blockedUntil && now < limiter.blockedUntil;
+
+        if (!hasRecentActivity && !isBlocked) {
+            rateLimiters.delete(key);
+        }
+    }
+}
+
+// Clean up rate limiters every 2 minutes
+setInterval(cleanupRateLimiters, 2 * 60 * 1000);
+
+// ============ Origin Validation ============
+// Validates that requests come from expected origins to prevent malicious sites
+// from connecting to the signaling server (CSRF-like protection for APIs).
+
+/**
+ * Middleware to validate Origin header against allowed origins.
+ * Blocks requests from unexpected origins with 403 Forbidden.
+ * Allows requests without Origin header (e.g., direct curl/Postman calls)
+ * since those can't abuse browser credentials anyway.
+ * @param {Request} req - Express request
+ * @param {Response} res - Express response
+ * @param {Function} next - Next middleware
+ */
+function validateOrigin(req, res, next) {
+    const origin = req.headers.origin;
+
+    // No Origin header = not a browser cross-origin request (e.g., curl, direct navigation)
+    // These are safe since they can't access browser cookies/state
+    if (!origin) {
+        return next();
+    }
+
+    // Check if origin is in allowed list
+    if (ALLOWED_ORIGINS.includes(origin)) {
+        return next();
+    }
+
+    // Origin present but not allowed - reject
+    console.warn(`Blocked request from unauthorized origin: ${origin} (allowed: ${ALLOWED_ORIGINS.join(', ')})`);
+    return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Request origin not allowed'
+    });
+}
+
+// Apply origin validation to all API routes
+app.use('/api', validateOrigin);
+
+/**
+ * Generate a short room ID (6 alphanumeric characters).
+ * Uses crypto.randomBytes() for cryptographically secure randomness.
+ * @returns {string} 6-character room ID from a 32-character alphabet (~30 bits entropy)
+ */
+function generateRoomId() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No ambiguous chars (0,O,1,I,l)
+    const randomBytes = crypto.randomBytes(6);
+    let id = '';
+    for (let i = 0; i < 6; i++) {
+        // Use modulo to map random byte to alphabet index
+        // Slight bias is acceptable for room IDs (not a security-critical secret)
+        id += chars[randomBytes[i] % chars.length];
+    }
+    return id;
+}
+
+/**
+ * Generate a cryptographically secure room secret (16 bytes, base64url encoded).
+ * This secret must be presented to access room data, preventing room ID enumeration
+ * and unauthorized room access.
+ * @returns {string} 22-character base64url-encoded secret
+ */
+function generateRoomSecret() {
+    return crypto.randomBytes(16).toString('base64url');
+}
+
+/**
+ * Constant-time string comparison to prevent timing attacks on secret validation.
+ * @param {string} a - First string
+ * @param {string} b - Second string
+ * @returns {boolean} True if strings are equal
+ */
+function secureCompare(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') {
+        return false;
+    }
+    if (a.length !== b.length) {
+        return false;
+    }
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/**
+ * Middleware to validate room secret from X-Room-Secret header.
+ * Returns 401 if secret is missing or invalid.
+ */
+function validateRoomSecret(req, res, next) {
+    const room = rooms.get(req.params.id);
+    if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+    }
+
+    const providedSecret = req.headers['x-room-secret'];
+    if (!providedSecret) {
+        return res.status(401).json({ error: 'Room secret required' });
+    }
+
+    if (!secureCompare(providedSecret, room.secret)) {
+        return res.status(401).json({ error: 'Invalid room secret' });
+    }
+
+    // Attach room to request for use in handler
+    req.room = room;
+    next();
+}
+
+/**
+ * Clean up expired rooms periodically
+ */
+function cleanupRooms() {
+    const now = Date.now();
+    for (const [id, room] of rooms.entries()) {
+        if (now - room.created > ROOM_TTL) {
+            rooms.delete(id);
+            console.log(`Room ${id} expired and removed`);
+        }
+    }
+}
+
+// Run cleanup every minute
+setInterval(cleanupRooms, 60 * 1000);
+
+// Serve static files from public directory
+app.use(express.static(path.join(__dirname, 'public')));
+
+/**
+ * Generate time-based TURN credentials using HMAC-SHA1.
+ * This follows the TURN REST API / coturn ephemeral credentials standard.
+ * Username format: expiry_timestamp:random_id
+ * Credential: Base64(HMAC-SHA1(secret, username))
+ *
+ * @returns {{ username: string, credential: string }} Time-based credentials
+ */
+function generateTurnCredentials() {
+    const expiryTime = Math.floor(Date.now() / 1000) + TURN_CREDENTIAL_TTL;
+    // Include a random component to make each credential unique
+    const randomId = crypto.randomBytes(4).toString('hex');
+    const username = `${expiryTime}:${randomId}`;
+    const credential = crypto
+        .createHmac('sha1', TURN_SECRET)
+        .update(username)
+        .digest('base64');
+    return { username, credential };
+}
+
+// Endpoint to get ICE server configuration
+app.get('/api/config', (req, res) => {
+    const iceServers = [];
+
+    // Add self-hosted STUN server if configured
+    if (STUN_SERVER) {
+        iceServers.push({ urls: `stun:${STUN_SERVER}` });
+        debugLog('CONFIG', `Using self-hosted STUN: ${STUN_SERVER}`);
+    }
+
+    // Add Google's public STUN as fallback if allowed
+    if (STUN_GOOGLE_FALLBACK) {
+        iceServers.push({ urls: 'stun:stun.l.google.com:19302' });
+        debugLog('CONFIG', 'Google STUN fallback enabled');
+    }
+
+    // Add TURN server if configured (requires TURN_SECRET for credentials)
+    if (TURN_SERVER && TURN_SECRET) {
+        const { username, credential } = generateTurnCredentials();
+        iceServers.push({
+            urls: [
+                `turn:${TURN_SERVER}?transport=udp`,
+                `turn:${TURN_SERVER}?transport=tcp`
+            ],
+            username,
+            credential
+        });
+        debugLog('CONFIG', `Using TURN server: ${TURN_SERVER}`, {
+            credentialTTL: TURN_CREDENTIAL_TTL,
+            username
+        });
+    } else if (TURN_SERVER && !TURN_SECRET) {
+        // TURN_SERVER set but no secret - log warning
+        console.warn('TURN_SERVER is set but TURN_SECRET is missing. TURN will not be available.');
+    }
+
+    // Warn if no ICE servers at all (connection will likely fail)
+    if (iceServers.length === 0) {
+        console.warn('No ICE servers configured! WebRTC connections will likely fail.');
+    }
+
+    // Note: domain is no longer returned; client uses window.location.origin
+    res.json({
+        iceServers: iceServers,
+        dev: DEV
+    });
+});
+
+// ============ Signaling API ============
+
+/**
+ * Create a new room
+ * POST /api/rooms
+ * Returns: { roomId: "ABC123" }
+ * Rate limited: 5 rooms per minute per IP
+ */
+app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
+    let roomId;
+    // Ensure unique room ID
+    do {
+        roomId = generateRoomId();
+    } while (rooms.has(roomId));
+
+    // Generate cryptographic secret for room access authorization
+    const secret = generateRoomSecret();
+
+    rooms.set(roomId, {
+        created: Date.now(),
+        secret: secret,
+        offer: null,
+        answer: null,
+        iceCandidatesOffer: [],
+        iceCandidatesAnswer: []
+    });
+
+    console.log(`Room ${roomId} created`);
+    debugLog('ROOM', `Room created`, { roomId, clientIp: getClientIp(req) });
+    // Return both roomId and secret; secret is included in QR code URL
+    res.json({ roomId, secret });
+});
+
+/**
+ * Store SDP offer for a room
+ * POST /api/rooms/:id/offer
+ * Body: { sdp: "...", type: "offer" }
+ * Headers: X-Room-Secret required
+ * Rate limited: general (100/min)
+ */
+app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    req.room.offer = req.body;
+    console.log(`Room ${req.params.id}: offer stored`);
+    debugLog('SIGNALING', `Offer stored for room ${req.params.id}`, {
+        sdpLength: req.body.sdp?.length,
+        type: req.body.type
+    });
+    res.json({ success: true });
+});
+
+/**
+ * Get SDP offer for a room
+ * GET /api/rooms/:id/offer
+ * Headers: X-Room-Secret required
+ * Rate limited: 30 lookups per minute per IP
+ */
+app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), validateRoomSecret, (req, res) => {
+    if (!req.room.offer) {
+        debugLog('SIGNALING', `Offer not ready for room ${req.params.id}`);
+        return res.status(404).json({ error: 'Offer not ready yet' });
+    }
+
+    debugLog('SIGNALING', `Offer retrieved for room ${req.params.id}`, {
+        sdpLength: req.room.offer.sdp?.length
+    });
+    res.json(req.room.offer);
+});
+
+/**
+ * Store SDP answer for a room
+ * POST /api/rooms/:id/answer
+ * Body: { sdp: "...", type: "answer" }
+ * Headers: X-Room-Secret required
+ * Rate limited: general (100/min)
+ */
+app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    req.room.answer = req.body;
+    console.log(`Room ${req.params.id}: answer stored`);
+    debugLog('SIGNALING', `Answer stored for room ${req.params.id}`, {
+        sdpLength: req.body.sdp?.length,
+        type: req.body.type
+    });
+    res.json({ success: true });
+});
+
+/**
+ * Get SDP answer for a room (long-polling)
+ * GET /api/rooms/:id/answer
+ * Headers: X-Room-Secret required
+ * Query: ?wait=true for long-polling (up to 30 seconds)
+ */
+app.get('/api/rooms/:id/answer', validateRoomSecret, async (req, res) => {
+    // If answer is ready, return immediately
+    if (req.room.answer) {
+        return res.json(req.room.answer);
+    }
+
+    // Long-polling: wait for answer up to 30 seconds
+    if (req.query.wait === 'true') {
+        const startTime = Date.now();
+        const timeout = 30000; // 30 seconds
+        const pollInterval = 500; // Check every 500ms
+        const roomId = req.params.id;
+
+        const checkAnswer = () => {
+            const currentRoom = rooms.get(roomId);
+            if (!currentRoom) {
+                return res.status(404).json({ error: 'Room not found' });
+            }
+
+            if (currentRoom.answer) {
+                return res.json(currentRoom.answer);
+            }
+
+            if (Date.now() - startTime >= timeout) {
+                return res.status(204).send(); // No content yet
+            }
+
+            setTimeout(checkAnswer, pollInterval);
+        };
+
+        checkAnswer();
+    } else {
+        res.status(204).send(); // No content yet
+    }
+});
+
+/**
+ * Add ICE candidate for offer side (receiver's candidates)
+ * POST /api/rooms/:id/ice/offer
+ * Headers: X-Room-Secret required
+ * Rate limited: general (100/min)
+ */
+app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    req.room.iceCandidatesOffer.push(req.body);
+    debugLog('ICE', `Offer ICE candidate added for room ${req.params.id}`, {
+        candidate: req.body.candidate?.substring(0, 50),
+        total: req.room.iceCandidatesOffer.length
+    });
+    res.json({ success: true });
+});
+
+/**
+ * Get ICE candidates for offer side
+ * GET /api/rooms/:id/ice/offer
+ * Headers: X-Room-Secret required
+ */
+app.get('/api/rooms/:id/ice/offer', validateRoomSecret, (req, res) => {
+    debugLog('ICE', `Offer ICE candidates retrieved for room ${req.params.id}`, {
+        count: req.room.iceCandidatesOffer.length
+    });
+    res.json({ candidates: req.room.iceCandidatesOffer });
+});
+
+/**
+ * Add ICE candidate for answer side (sender's candidates)
+ * POST /api/rooms/:id/ice/answer
+ * Headers: X-Room-Secret required
+ * Rate limited: general (100/min)
+ */
+app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    req.room.iceCandidatesAnswer.push(req.body);
+    debugLog('ICE', `Answer ICE candidate added for room ${req.params.id}`, {
+        candidate: req.body.candidate?.substring(0, 50),
+        total: req.room.iceCandidatesAnswer.length
+    });
+    res.json({ success: true });
+});
+
+/**
+ * Get ICE candidates for answer side
+ * GET /api/rooms/:id/ice/answer
+ * Headers: X-Room-Secret required
+ */
+app.get('/api/rooms/:id/ice/answer', validateRoomSecret, (req, res) => {
+    debugLog('ICE', `Answer ICE candidates retrieved for room ${req.params.id}`, {
+        count: req.room.iceCandidatesAnswer.length
+    });
+    res.json({ candidates: req.room.iceCandidatesAnswer });
+});
+
+/**
+ * Check if room exists
+ * GET /api/rooms/:id
+ * Headers: X-Room-Secret required
+ * Rate limited: 30 lookups per minute per IP (prevents enumeration)
+ */
+app.get('/api/rooms/:id', rateLimitMiddleware('roomLookup'), validateRoomSecret, (req, res) => {
+    res.json({
+        exists: true,
+        hasOffer: !!req.room.offer,
+        hasAnswer: !!req.room.answer
+    });
+});
+
+// Catch-all route for /send/:roomId pattern - serve send.html
+app.get('/send/:roomId', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'send.html'));
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`ImageSecureSend server running on port ${PORT}`);
+    console.log(`DOMAIN configured as: ${DOMAIN}`);
+
+    // Log ICE server configuration for clarity
+    console.log('ICE configuration:');
+    if (STUN_SERVER) {
+        console.log(`  STUN: ${STUN_SERVER} (self-hosted)`);
+    }
+    if (STUN_GOOGLE_FALLBACK) {
+        console.log('  STUN: stun.l.google.com:19302 (Google fallback)');
+    }
+    if (TURN_SERVER && TURN_SECRET) {
+        console.log(`  TURN: ${TURN_SERVER} (time-based credentials, TTL=${TURN_CREDENTIAL_TTL}s)`);
+    } else if (TURN_SERVER) {
+        console.log(`  TURN: ${TURN_SERVER} (WARNING: TURN_SECRET not set, disabled)`);
+    }
+    if (!STUN_SERVER && !STUN_GOOGLE_FALLBACK && !TURN_SERVER) {
+        console.log('  WARNING: No ICE servers configured! Connections will likely fail.');
+    }
+
+    if (DEV) {
+        console.log('[DEV MODE ENABLED] Verbose debug logging active');
+        console.log(`  Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+    }
+});

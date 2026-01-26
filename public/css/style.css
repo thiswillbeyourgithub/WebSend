@@ -1,0 +1,539 @@
+/**
+ * ImageSecureSend CSS
+ * Designed for simplicity and accessibility, especially for older users.
+ * Large touch targets, high contrast, clear typography.
+ */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    /* System font stack for fast rendering without web font downloads */
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    color: #ffffff;
+    min-height: 100vh;
+    line-height: 1.6;
+    /* Prevent double-tap-to-zoom on mobile, keeping single-tap responsive.
+       Does NOT disable pinch-to-zoom (that's handled per-element in JS). */
+    touch-action: manipulation;
+}
+
+.container {
+    max-width: 500px;
+    margin: 0 auto;
+    padding: 20px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+h1 {
+    text-align: center;
+    font-size: 2.5rem;
+    margin-top: 40px;
+    margin-bottom: 10px;
+    color: #e94560;
+}
+
+.subtitle {
+    text-align: center;
+    font-size: 1.2rem;
+    color: #a0a0a0;
+    margin-bottom: 40px;
+}
+
+/* Large button styling for accessibility */
+.button-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    flex: 1;
+    justify-content: center;
+    padding: 20px 0;
+}
+
+.btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 30px 20px;
+    border-radius: 20px;
+    text-decoration: none;
+    font-weight: bold;
+    transition: transform 0.2s, box-shadow 0.2s;
+    cursor: pointer;
+    border: none;
+    min-height: 120px;
+}
+
+.btn:active {
+    transform: scale(0.98);
+}
+
+.btn-large {
+    min-height: 150px;
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, #e94560 0%, #c23a51 100%);
+    color: white;
+    box-shadow: 0 8px 20px rgba(233, 69, 96, 0.3);
+}
+
+.btn-primary:hover {
+    box-shadow: 0 12px 30px rgba(233, 69, 96, 0.4);
+}
+
+.btn-secondary {
+    background: linear-gradient(135deg, #0f3460 0%, #16213e 100%);
+    color: white;
+    border: 2px solid #e94560;
+    box-shadow: 0 8px 20px rgba(15, 52, 96, 0.3);
+}
+
+.btn-secondary:hover {
+    box-shadow: 0 12px 30px rgba(15, 52, 96, 0.4);
+}
+
+.btn-icon {
+    font-size: 3rem;
+    margin-bottom: 10px;
+}
+
+.btn-text {
+    font-size: 1.8rem;
+}
+
+.btn-hint {
+    font-size: 0.9rem;
+    font-weight: normal;
+    opacity: 0.8;
+    margin-top: 5px;
+}
+
+/* Action buttons (smaller, for in-page actions) */
+.btn-action {
+    padding: 20px 40px;
+    font-size: 1.3rem;
+    min-height: 80px;
+    width: 100%;
+    margin: 10px 0;
+}
+
+.btn-success {
+    background: linear-gradient(135deg, #28a745 0%, #218838 100%);
+    color: white;
+    box-shadow: 0 6px 15px rgba(40, 167, 69, 0.3);
+}
+
+.btn-warning {
+    background: linear-gradient(135deg, #ffc107 0%, #e0a800 100%);
+    color: #000;
+    box-shadow: 0 6px 15px rgba(255, 193, 7, 0.3);
+}
+
+.btn-danger {
+    background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+    color: white;
+    box-shadow: 0 6px 15px rgba(220, 53, 69, 0.3);
+}
+
+.btn-info {
+    background: linear-gradient(135deg, #17a2b8 0%, #138496 100%);
+    color: white;
+    box-shadow: 0 6px 15px rgba(23, 162, 184, 0.3);
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    /* Override :active scale transform to prevent visual feedback on disabled buttons */
+    transform: none !important;
+}
+
+/* QR Code display */
+.qr-container {
+    background: white;
+    padding: 20px;
+    border-radius: 20px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: 20px auto;
+    max-width: 320px;
+}
+
+.qr-container canvas,
+.qr-container img {
+    max-width: 100%;
+    height: auto;
+}
+
+/* Camera/Video display */
+.camera-container {
+    position: relative;
+    width: 100%;
+    max-width: 500px;
+    margin: 20px auto;
+    border-radius: 20px;
+    overflow: hidden;
+    background: #000;
+    /* Hide container when video is not active (no srcObject) */
+    display: none;
+}
+
+/* Show camera container only when it has an active video */
+.camera-container.active {
+    display: block;
+}
+
+.camera-container video {
+    width: 100%;
+    height: auto;
+    display: block;
+    /* Pinch-to-zoom handled by JS */
+    touch-action: none;
+}
+
+/* Floating capture button overlay - positioned inside the camera container */
+.capture-btn-floating {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 20px 50px;
+    font-size: 1.3rem;
+    min-height: auto;
+    background: rgba(220, 53, 69, 0.7) !important;
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+    border-radius: 50px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+    z-index: 10;
+}
+
+/* Status messages */
+.status {
+    text-align: center;
+    padding: 15px 20px;
+    border-radius: 10px;
+    margin: 20px 0;
+    font-size: 1.1rem;
+}
+
+.status-waiting {
+    background: rgba(255, 193, 7, 0.2);
+    border: 1px solid #ffc107;
+    color: #ffc107;
+}
+
+.status-connected {
+    background: rgba(40, 167, 69, 0.2);
+    border: 1px solid #28a745;
+    color: #28a745;
+}
+
+.status-error {
+    background: rgba(220, 53, 69, 0.2);
+    border: 1px solid #dc3545;
+    color: #dc3545;
+}
+
+.status-info {
+    background: rgba(23, 162, 184, 0.2);
+    border: 1px solid #17a2b8;
+    color: #17a2b8;
+}
+
+/* Logs panel - debug overlay for troubleshooting WebRTC/crypto issues.
+   Toggle button floats above all content (z-index: 1000), panel slides up
+   from the bottom covering half the viewport. */
+.logs-toggle {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    padding: 15px 20px;
+    border-radius: 50px;
+    background: rgba(51, 51, 51, 0.5);
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 1rem;
+    z-index: 1000; /* Above page content but below modals (z-index: 2000) */
+    box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+    /* Frosted glass effect for visual separation from content behind */
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+}
+
+.logs-panel {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 50vh;
+    background: rgba(0, 0, 0, 0.95);
+    color: #0f0;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85rem;
+    padding: 15px;
+    overflow-y: auto;
+    transform: translateY(100%);
+    transition: transform 0.3s ease;
+    z-index: 999;
+}
+
+.logs-panel.visible {
+    transform: translateY(0);
+}
+
+.logs-panel .log-entry {
+    margin: 5px 0;
+    word-wrap: break-word;
+}
+
+.logs-panel .log-time {
+    color: #888;
+}
+
+.logs-panel .log-error {
+    color: #f55;
+}
+
+.logs-panel .log-success {
+    color: #5f5;
+}
+
+.logs-panel .log-info {
+    color: #5af;
+}
+
+.logs-panel .log-debug {
+    color: #a0a; /* Purple for debug messages */
+}
+
+/* Image preview */
+.image-preview {
+    max-width: 100%;
+    border-radius: 10px;
+    margin: 10px 0;
+}
+
+/* Received images list */
+.received-images {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    margin: 20px 0;
+}
+
+.received-image-item {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 15px;
+    padding: 15px;
+}
+
+.received-image-item img {
+    width: 100%;
+    border-radius: 10px;
+    margin-bottom: 10px;
+}
+
+/* Progress indicator */
+.progress-bar {
+    width: 100%;
+    height: 10px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 5px;
+    overflow: hidden;
+    margin: 10px 0;
+}
+
+.progress-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #e94560, #28a745);
+    transition: width 0.3s ease;
+}
+
+/* Footer */
+footer {
+    text-align: center;
+    padding: 20px;
+    color: #666;
+    font-size: 0.9rem;
+}
+
+/* Back link */
+.back-link {
+    display: inline-block;
+    color: #e94560;
+    text-decoration: none;
+    font-size: 1.1rem;
+    margin-bottom: 20px;
+}
+
+.back-link:hover {
+    text-decoration: underline;
+}
+
+/* Section titles */
+.section-title {
+    font-size: 1.5rem;
+    margin: 20px 0 10px 0;
+    color: #e94560;
+}
+
+/* Hidden utility class - !important overrides flex/block/etc display values
+   set by inline styles or other classes. Used for step-based wizard visibility. */
+.hidden {
+    display: none !important;
+}
+
+/* Choice buttons (for sender to choose camera vs file) */
+.choice-container {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    margin: 20px 0;
+}
+
+/* ============ Image Cropping Modal ============ */
+/*
+ * Minimal document cropping UI for perspective-correcting scanned documents.
+ * Four draggable corner handles allow marking document edges.
+ * Pure CSS + vanilla JS, no external dependencies.
+ */
+
+.crop-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.95);
+    z-index: 2000; /* Above everything including logs panel (z-index: 1000) */
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 15px;
+}
+
+.crop-modal-header {
+    color: white;
+    text-align: center;
+    margin-bottom: 10px;
+}
+
+.crop-modal-header h2 {
+    font-size: 1.3rem;
+    margin: 0 0 5px 0;
+}
+
+.crop-modal-header p {
+    font-size: 0.9rem;
+    color: #aaa;
+    margin: 0;
+}
+
+/* Container for image + corner handles, sized to fit viewport */
+.crop-canvas-container {
+    position: relative;
+    max-width: 100%;
+    max-height: 60vh;
+    touch-action: none; /* Prevent scrolling while dragging handles */
+}
+
+.crop-canvas-container img {
+    max-width: 100%;
+    max-height: 60vh;
+    display: block;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+
+/* SVG overlay for corner lines - sits exactly over the image */
+.crop-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.crop-overlay polygon {
+    fill: rgba(0, 0, 0, 0.4);
+    stroke: #e94560;
+    stroke-width: 2;
+}
+
+/* Draggable corner handles */
+.crop-handle {
+    position: absolute;
+    width: 40px;
+    height: 40px;
+    background: #e94560;
+    border: 3px solid white;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    cursor: grab;
+    touch-action: none;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+    z-index: 10;
+}
+
+.crop-handle:active {
+    cursor: grabbing;
+    background: #ff6b8a;
+}
+
+/* Button row at bottom of modal */
+.crop-buttons {
+    display: flex;
+    gap: 15px;
+    margin-top: 15px;
+    width: 100%;
+    max-width: 400px;
+}
+
+.crop-buttons button {
+    flex: 1;
+    padding: 15px;
+    font-size: 1.1rem;
+    border-radius: 10px;
+    border: none;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.crop-btn-apply {
+    background: #28a745;
+    color: white;
+}
+
+.crop-btn-cancel {
+    background: #6c757d;
+    color: white;
+}
+
+/* Responsive adjustments for small screens (older/budget smartphones).
+   Reduces font sizes to prevent text overflow while keeping touch targets large. */
+@media (max-width: 400px) {
+    h1 {
+        font-size: 2rem;
+    }
+
+    .btn-text {
+        font-size: 1.5rem;
+    }
+
+    .btn-icon {
+        font-size: 2.5rem;
+    }
+}

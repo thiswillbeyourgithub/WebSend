@@ -1,0 +1,69 @@
+services:
+  mobisecuscan:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7395:8080"
+    env_file:
+      - env
+    # Security hardening options
+    security_opt:
+      # Prevent privilege escalation via setuid/setgid binaries
+      - no-new-privileges:true
+    # Read-only root filesystem to prevent runtime modifications
+    read_only: true
+    # Temporary writable directories if needed (none required for this app)
+    # tmpfs:
+    #   - /tmp:size=10M,mode=1777
+    # Drop all capabilities since we don't need any privileged operations
+    cap_drop:
+      - ALL
+    # Run as non-root user (matches Dockerfile USER directive)
+    user: "1001:1001"
+    # Limit resources to prevent DoS
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    # Disable container from gaining additional privileges
+    privileged: false
+    # Health check to ensure the service is responsive
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # TURN relay server - uncomment if direct P2P fails (symmetric NAT, etc.)
+  # Uses time-based credentials with shared secret (see env.example for TURN_SECRET).
+  # If you already have a coturn instance (e.g., for Nextcloud), you can reuse it
+  # by setting TURN_SERVER and TURN_SECRET in your env file instead.
+  #
+  # coturn:
+  #   image: coturn/coturn:latest
+  #   ports:
+  #     # Use a different port if 3478 is already in use (e.g., by another coturn)
+  #     - "3479:3479/udp"
+  #     - "3479:3479/tcp"
+  #     - "49152-49156:49152-49156/udp"
+  #   environment:
+  #     # Pass the shared secret from your env file
+  #     - TURN_SECRET=${TURN_SECRET}
+  #   command: >
+  #     -n
+  #     --log-file=stdout
+  #     --use-auth-secret
+  #     --static-auth-secret=${TURN_SECRET}
+  #     --fingerprint
+  #     --no-multicast-peers
+  #     --no-cli
+  #     --no-tlsv1
+  #     --no-tlsv1_1
+  #     --realm=mobisecuscan
+  #     --min-port=49152
+  #     --max-port=49156
+  #     --listening-port=3479
+  #     --external-ip=${DOMAIN:-127.0.0.1}

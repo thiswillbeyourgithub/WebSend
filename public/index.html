@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en" data-i18n-title="app.name">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#1565c0">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="ImageSecureSend">
+    <title>ImageSecureSend - Secure Photo Transfer</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="/icons/icon-192.png">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-rJ1zdsITzNNb35CJUIz5T1Dj3ffjlKCP95Mi47dGZKVW/8FpIgOlUJ8eQbEZzFrM" crossorigin="anonymous">
+</head>
+<body>
+    <div class="container">
+        <h1 data-i18n="app.name">ImageSecureSend</h1>
+        <p class="subtitle" data-i18n="app.subtitle">Secure Photo Transfer</p>
+
+        <div class="button-container">
+            <a href="/receive.html" class="btn btn-primary btn-large">
+                <span class="btn-icon">📥</span>
+                <span class="btn-text" data-i18n="index.receive">Receive</span>
+                <span class="btn-hint" data-i18n="index.receive.hint">Show QR code on this device</span>
+            </a>
+
+            <a href="/send.html" class="btn btn-secondary btn-large">
+                <span class="btn-icon">📤</span>
+                <span class="btn-text" data-i18n="index.send">Send</span>
+                <span class="btn-hint" data-i18n="index.send.hint">Scan QR & send photos</span>
+            </a>
+        </div>
+
+        <footer>
+            <p data-i18n="index.footer">Your photos are encrypted end-to-end.<br>They never pass through our server.</p>
+            <button id="about-btn" style="margin-top: 15px; background: none; border: none; color: #1565c0; cursor: pointer; font-size: 0.9rem; text-decoration: underline;" data-i18n="index.about">About</button>
+        </footer>
+    </div>
+
+    <!-- About Modal -->
+    <div id="about-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 15px; padding: 25px; max-width: 400px; margin: 20px; max-height: 80vh; overflow-y: auto;">
+            <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="about.title">About ImageSecureSend</h2>
+
+            <p style="color: #555; font-size: 0.95rem; margin-bottom: 15px;" data-i18n="about.description">
+                A secure, end-to-end encrypted photo transfer app designed for environments where data privacy is paramount.
+            </p>
+
+            <h3 style="margin: 15px 0 10px 0; color: #333; font-size: 1rem;" data-i18n="about.techStack">Tech Stack</h3>
+            <ul style="color: #555; font-size: 0.9rem; margin: 0; padding-left: 20px; line-height: 1.6;">
+                <li><strong>Frontend:</strong> <span data-i18n="about.techStack.frontend">Vanilla HTML, CSS, JavaScript (no frameworks)</span></li>
+                <li><strong>Transport:</strong> <span data-i18n="about.techStack.transport">WebRTC peer-to-peer data channels</span></li>
+                <li><strong>Encryption:</strong> <span data-i18n="about.techStack.encryption">ECDH key exchange + AES-GCM (Web Crypto API)</span></li>
+                <li><strong>Signaling:</strong> <span data-i18n="about.techStack.signaling">Express.js server (SDP relay only)</span></li>
+                <li><strong>QR Codes:</strong> <span data-i18n="about.techStack.qr">qrcode.js / jsQR</span></li>
+            </ul>
+
+            <h3 style="margin: 15px 0 10px 0; color: #333; font-size: 1rem;" data-i18n="about.security">Security</h3>
+            <ul style="color: #555; font-size: 0.9rem; margin: 0; padding-left: 20px; line-height: 1.6;">
+                <li data-i18n="about.security.1">Photos are encrypted before leaving your device</li>
+                <li data-i18n="about.security.2">The server only relays connection metadata (SDP)</li>
+                <li data-i18n="about.security.3">Keys are generated fresh for each session</li>
+                <li data-i18n="about.security.4">Fingerprint verification prevents MITM attacks</li>
+            </ul>
+
+            <h3 style="margin: 15px 0 10px 0; color: #333; font-size: 1rem;" data-i18n="about.credits">Credits</h3>
+            <p style="color: #555; font-size: 0.9rem; margin: 0; line-height: 1.6;">
+                <span data-i18n="about.credits.text">Built with</span> <a href="https://claude.ai/claude-code" target="_blank" rel="noopener" style="color: #1565c0;" data-i18n="about.credits.link">Claude Code</a> <span data-i18n="about.credits.suffix">(AI-assisted development).</span>
+            </p>
+
+            <button id="close-about-btn" style="margin-top: 20px; width: 100%; padding: 12px; background: #1565c0; color: white; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer;" data-i18n="common.close">
+                Close
+            </button>
+        </div>
+    </div>
+
+    <script src="/js/i18n.js"></script>
+    <script>
+        // Initialize i18n (detect locale and apply translations)
+        i18n.init();
+
+        // Register service worker for PWA functionality
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/service-worker.js')
+                .then(reg => console.log('SW registered'))
+                .catch(err => console.log('SW registration failed:', err));
+        }
+
+        // About modal
+        document.getElementById('about-btn').addEventListener('click', () => {
+            const modal = document.getElementById('about-modal');
+            modal.classList.remove('hidden');
+            modal.style.display = 'flex';
+        });
+        document.getElementById('close-about-btn').addEventListener('click', () => {
+            const modal = document.getElementById('about-modal');
+            modal.classList.add('hidden');
+            modal.style.display = 'none';
+        });
+        document.getElementById('about-modal').addEventListener('click', (e) => {
+            if (e.target === e.currentTarget) {
+                e.currentTarget.classList.add('hidden');
+                e.currentTarget.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>

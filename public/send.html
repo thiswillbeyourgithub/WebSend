@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en" data-i18n-title="send.title">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#1565c0">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="ImageSecureSend">
+    <title>ImageSecureSend - Send Photos</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="/icons/icon-192.png">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-rJ1zdsITzNNb35CJUIz5T1Dj3ffjlKCP95Mi47dGZKVW/8FpIgOlUJ8eQbEZzFrM" crossorigin="anonymous">
+    <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
+    <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="container">
+        <a href="/" class="back-link" data-i18n="nav.back">&larr; Back</a>
+
+        <h1 data-i18n="send.title">Send Photos</h1>
+
+        <!-- Step 1: Scan QR Code or enter room ID -->
+        <div id="step-scan">
+            <p class="subtitle" data-i18n="send.scanSubtitle">Scan the QR code from the receiver's screen</p>
+
+            <div class="camera-container">
+                <video id="scanner-video" autoplay playsinline></video>
+            </div>
+
+            <button class="btn btn-action btn-primary" id="start-scan-btn">
+                <span class="btn-icon">📷</span>
+                <span data-i18n="send.startCamera">Start Camera to Scan</span>
+            </button>
+
+            <!-- Manual input removed - room secret required for security -->
+            <div style="margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 10px;">
+                <p style="text-align: center; color: #666; margin: 0;" data-i18n="send.tip">
+                    <strong>Tip:</strong> Point your camera at the QR code on the receiver's screen.
+                    The QR code contains a security token that cannot be typed manually.
+                </p>
+            </div>
+        </div>
+
+        <!-- Step 2: Connecting status -->
+        <div id="step-connecting" class="hidden">
+            <div class="status status-info" id="connection-status" data-i18n="send.connecting">
+                Connecting to receiver...
+            </div>
+        </div>
+
+        <!-- Security verification modal (blocking) -->
+        <div id="verification-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+            <div style="background: white; border-radius: 15px; padding: 25px; max-width: 350px; margin: 20px; text-align: center;">
+                <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="verify.title">🔒 Verify Connection</h2>
+                <p style="margin: 0 0 20px 0; color: #555; font-size: 0.95rem;" data-i18n="verify.instruction.sender">
+                    Read these codes aloud to the receiver. Do they match what they see?
+                </p>
+
+                <div style="background: #f5f5f5; border-radius: 10px; padding: 15px; margin-bottom: 20px;">
+                    <!-- Sender key always at top for consistent display on both devices -->
+                    <div style="margin-bottom: 15px;">
+                        <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.senderKey.yours">Sender's key (yours)</span>
+                        <p id="sender-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1b5e20; margin: 5px 0; letter-spacing: 2px;">----</p>
+                    </div>
+                    <div style="border-top: 1px solid #ddd; padding-top: 15px;">
+                        <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.receiverKey.theirs">Receiver's key (theirs)</span>
+                        <p id="receiver-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1565c0; margin: 5px 0; letter-spacing: 2px;">----</p>
+                    </div>
+                </div>
+
+                <p style="margin: 0 0 20px 0; color: #d32f2f; font-size: 0.85rem;" data-i18n="verify.warning">
+                    ⚠️ If codes don't match, someone may be intercepting the connection!
+                </p>
+
+                <button id="confirm-match-btn" class="btn btn-action btn-success" style="width: 100%; margin-bottom: 10px; padding: 15px;" data-i18n="verify.confirm">
+                    ✓ Yes, codes match
+                </button>
+                <button id="deny-match-btn" class="btn btn-action btn-secondary" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" data-i18n="verify.deny">
+                    ✗ No, cancel connection
+                </button>
+            </div>
+        </div>
+
+        <!-- Waiting for receiver confirmation -->
+        <div id="step-waiting-confirmation" class="hidden">
+            <div style="margin: 15px 0; padding: 20px; background: #e3f2fd; border-radius: 10px; border: 1px solid #90caf9; text-align: center;">
+                <p style="margin: 0; color: #1565c0; font-weight: bold;" data-i18n="send.waitingConfirmation">
+                    ⏳ Waiting for receiver to confirm...
+                </p>
+            </div>
+        </div>
+
+        <!-- Step 3: Connected, choose photo source -->
+        <div id="step-choose" class="hidden">
+            <div class="status status-connected" data-i18n="send.connectedSecure">
+                Connected securely!
+            </div>
+
+            <!-- Verified badge (shown after both confirm) -->
+            <div id="verified-badge" class="hidden" style="margin: 15px 0; padding: 15px; background: #e8f5e9; border-radius: 10px; border: 1px solid #a5d6a7; text-align: center;">
+                <p style="margin: 0; color: #2e7d32; font-weight: bold;" data-i18n="send.verified">
+                    ✓ Connection verified by both parties
+                </p>
+            </div>
+
+            <!-- Connection type indicator (shown after connection established) -->
+            <div id="connection-type-badge" class="hidden" style="margin: 10px 0; padding: 10px; background: #f5f5f5; border-radius: 8px; text-align: center;">
+                <span style="font-size: 0.85rem; color: #666;" id="connection-type-text" data-i18n="send.detectingConnection">Detecting connection type...</span>
+            </div>
+
+            <p class="section-title" data-i18n="send.howToSend">How would you like to send photos?</p>
+
+            <div class="choice-container">
+                <button class="btn btn-action btn-primary" id="use-camera-btn">
+                    <span class="btn-icon">📸</span>
+                    <span data-i18n="send.takePhoto">Take New Photo</span>
+                </button>
+
+                <button class="btn btn-action btn-secondary" id="use-file-btn">
+                    <span class="btn-icon">🖼️</span>
+                    <span data-i18n="send.choosePhoto">Choose Existing Photo</span>
+                </button>
+            </div>
+
+            <input type="file" id="file-input" accept="image/*" class="hidden">
+        </div>
+
+        <!-- Step 4: Camera capture -->
+        <div id="step-camera" class="hidden">
+            <div class="camera-container" id="capture-camera-container">
+                <video id="capture-video" autoplay playsinline></video>
+                <!-- Floating capture button inside camera view -->
+                <button class="btn btn-action btn-danger capture-btn-floating" id="capture-btn" data-i18n="send.capture">
+                    📸 Take Photo
+                </button>
+            </div>
+
+            <canvas id="capture-canvas" class="hidden"></canvas>
+
+            <button class="btn btn-action btn-secondary" id="back-to-choose-btn" data-i18n="send.backToOptions">
+                &larr; Back to Options
+            </button>
+        </div>
+
+        <!-- Step 5: Preview and send -->
+        <div id="step-preview" class="hidden">
+            <p class="section-title" data-i18n="send.preview">Preview</p>
+
+            <img id="preview-image" class="image-preview" alt="Photo preview">
+
+            <div class="progress-bar hidden" id="send-progress-bar">
+                <div class="progress-bar-fill" id="send-progress-fill" style="width: 0%"></div>
+            </div>
+
+            <div id="send-status" class="hidden status status-info" data-i18n="send.encrypting">
+                Encrypting and sending...
+            </div>
+
+            <button class="btn btn-action btn-success btn-large" id="send-btn">
+                <span class="btn-icon">📤</span>
+                <span data-i18n="send.sendPhoto">Send Photo</span>
+            </button>
+
+            <button class="btn btn-action btn-secondary" id="retake-btn" data-i18n="send.retake">
+                Retake / Choose Another
+            </button>
+        </div>
+
+        <!-- Step 6: Sent confirmation -->
+        <div id="step-sent" class="hidden">
+            <div class="status status-connected" data-i18n="send.sentSuccess">
+                Photo sent successfully!
+            </div>
+
+            <button class="btn btn-action btn-primary btn-large" id="send-another-btn">
+                <span class="btn-icon">📸</span>
+                <span data-i18n="send.sendAnother">Send Another Photo</span>
+            </button>
+        </div>
+    </div>
+
+    <script src="/js/i18n.js"></script>
+    <script src="/js/logger.js" integrity="sha384-f8Hiox2XBE711JuaX3ej7rRNJo4qhDXWCu2qD7oK1+nAqsfO2XK+7EnWBS1WBLxO"></script>
+    <script src="/js/crypto.js" integrity="sha384-fuS6ghROB8sjaxuHbBV4qJcoxc5vS/kh9uV15SCMqegEjr5RHXRomi2cNXLxlPeF"></script>
+    <script src="/js/webrtc.js" integrity="sha384-K6Iiu1nW5oO0yI9X/s3HWFPDKfYd/rWtHDEc0ETQLUq44jkTB23/6rAFr0tcPmPq"></script>
+    <script>
+        // Initialize i18n first
+        i18n.init();
+    </script>
+    <script>
+        /**
+         * Send page logic
+         * Handles two entry modes:
+         * 1. Direct URL access: /send/ROOMID#SECRET (from QR scanner app)
+         * 2. In-app QR scan: scan QR code with browser camera
+         *
+         * Flow:
+         * 1. Join room via server signaling
+         * 2. Perform ECDH key exchange with receiver (exchange public keys, derive shared AES key)
+         * 3. Both parties verify key fingerprints to prevent MITM
+         * 4. Capture or select photo
+         * 5. Encrypt with ECDH-derived shared AES key
+         * 6. Send through WebRTC data channel
+         */
+
+        let rtc = null;
+        let keyPair = null; // Our ECDH key pair
+        let sharedKey = null; // AES key derived from ECDH
+        let scannerStream = null;
+        let captureStream = null;
+        let currentPhotoBlob = null;
+        let weConfirmed = false;  // Track if we confirmed fingerprints
+        let theyConfirmed = false; // Track if receiver confirmed fingerprints
+        let cameraZoom = 1;
+        let lastPinchDist = 0;
+
+        // UI Elements
+        const stepScan = document.getElementById('step-scan');
+        const stepConnecting = document.getElementById('step-connecting');
+        const stepWaitingConfirmation = document.getElementById('step-waiting-confirmation');
+        const stepChoose = document.getElementById('step-choose');
+        const stepCamera = document.getElementById('step-camera');
+        const stepPreview = document.getElementById('step-preview');
+        const stepSent = document.getElementById('step-sent');
+
+        /**
+         * Show a specific step div and hide all others.
+         * The send page is a linear wizard: scan -> connecting -> verification -> choose -> camera/file -> preview -> sent.
+         * @param {HTMLElement} step - The step container element to display
+         */
+        function showStep(step) {
+            [stepScan, stepConnecting, stepWaitingConfirmation, stepChoose, stepCamera, stepPreview, stepSent].forEach(s => {
+                s.classList.add('hidden');
+            });
+            step.classList.remove('hidden');
+        }
+
+        /**
+         * Extract room ID from URL path (/send/ROOMID)
+         * @returns {string|null} Room ID or null if not found
+         */
+        function getRoomIdFromUrl() {
+            const path = window.location.pathname;
+            const match = path.match(/\/send\/([A-Z0-9]{6})/i);
+            return match ? match[1].toUpperCase() : null;
+        }
+
+        /**
+         * Extract room secret from URL hash fragment (#SECRET).
+         * The secret is a base64url-encoded 16-byte random value.
+         * @returns {string|null} Room secret or null if not found
+         */
+        function getRoomSecretFromUrl() {
+            const hash = window.location.hash;
+            if (hash && hash.length > 1) {
+                return hash.substring(1); // Remove the '#' prefix
+            }
+            return null;
+        }
+
+        async function init() {
+            logger.info('Initializing sender...');
+
+            // Generate our ECDH key pair for key exchange
+            keyPair = await ImageSecureSendCrypto.generateKeyPair();
+
+            rtc = new ImageSecureSendRTC();
+            await rtc.init();
+
+            rtc.onConnected = onConnected;
+            rtc.onDisconnected = onDisconnected;
+            rtc.onMessage = onMessage;
+            rtc.onStateChange = onStateChange;
+            rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+
+            // Set up button handlers
+            document.getElementById('start-scan-btn').addEventListener('click', startScanner);
+            document.getElementById('use-camera-btn').addEventListener('click', startCapture);
+            document.getElementById('use-file-btn').addEventListener('click', () => document.getElementById('file-input').click());
+            document.getElementById('file-input').addEventListener('change', handleFileSelect);
+            document.getElementById('capture-btn').addEventListener('click', capturePhoto);
+            document.getElementById('back-to-choose-btn').addEventListener('click', () => {
+                stopCapture();
+                showStep(stepChoose);
+            });
+            document.getElementById('send-btn').addEventListener('click', sendPhoto);
+            document.getElementById('retake-btn').addEventListener('click', () => showStep(stepChoose));
+            document.getElementById('send-another-btn').addEventListener('click', () => showStep(stepChoose));
+
+            // Set up pinch-to-zoom for camera containers
+            setupPinchZoom(document.getElementById('scanner-video'));
+            setupPinchZoom(document.getElementById('capture-video'));
+
+            // Check if room ID and secret are in URL (from QR scanner app)
+            const roomId = getRoomIdFromUrl();
+            const secret = getRoomSecretFromUrl();
+            if (roomId && secret) {
+                logger.info(`Room ID from URL: ${roomId}`);
+                await joinRoom(roomId, secret);
+            } else if (roomId) {
+                // Room ID without secret - show error
+                logger.error('Room secret missing from URL');
+                document.getElementById('connection-status').textContent = i18n.t('send.invalidQR.secret');
+                document.getElementById('connection-status').className = 'status status-error';
+                showStep(stepConnecting);
+            }
+        }
+
+        // ============ Room Joining ============
+
+        async function joinRoom(roomId, secret) {
+            showStep(stepConnecting);
+            document.getElementById('connection-status').textContent = i18n.t('send.connecting');
+            document.getElementById('connection-status').className = 'status status-info';
+
+            try {
+                await rtc.joinRoom(roomId, secret);
+                // Connection will be established, onConnected will be called
+            } catch (e) {
+                logger.error('Failed to join room: ' + e.message);
+                document.getElementById('connection-status').textContent = i18n.t('send.failed') + ': ' + e.message;
+                document.getElementById('connection-status').className = 'status status-error';
+
+                // Show button to go back to scan
+                setTimeout(() => {
+                    showStep(stepScan);
+                }, 3000);
+            }
+        }
+
+        // ============ QR Scanning ============
+        // Uses the jsQR library to decode QR codes from camera frames.
+        // Runs a requestAnimationFrame loop that captures video frames to a canvas,
+        // then passes the pixel data to jsQR for detection.
+
+        /** Start the rear camera and begin scanning for QR codes */
+        async function startScanner() {
+            logger.info('Starting QR scanner...');
+            const video = document.getElementById('scanner-video');
+            const container = video.parentElement;
+
+            try {
+                scannerStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' }
+                });
+                video.srcObject = scannerStream;
+                container.classList.add('active');
+                video.play();
+
+                document.getElementById('start-scan-btn').textContent = i18n.t('send.scanning');
+                document.getElementById('start-scan-btn').disabled = true;
+
+                // Start scanning loop
+                requestAnimationFrame(scanFrame);
+            } catch (e) {
+                logger.error('Failed to start camera: ' + e.message);
+                alert(i18n.t('send.cameraError'));
+            }
+        }
+
+        /**
+         * Single frame of the QR scanning loop.
+         * Captures current video frame, runs jsQR on pixel data.
+         * On success: stops scanner and processes the QR URL.
+         * On failure: schedules another frame via requestAnimationFrame.
+         */
+        function scanFrame() {
+            if (!scannerStream) return;
+
+            const video = document.getElementById('scanner-video');
+            if (video.readyState !== video.HAVE_ENOUGH_DATA) {
+                requestAnimationFrame(scanFrame);
+                return;
+            }
+
+            // Create canvas to capture frame
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+
+            // Scan for QR code
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                inversionAttempts: 'dontInvert'
+            });
+
+            if (code) {
+                logger.success('QR code detected!');
+                stopScanner();
+                processScannedQR(code.data);
+            } else {
+                requestAnimationFrame(scanFrame);
+            }
+        }
+
+        /** Stop the QR scanner camera, release media tracks, and reset the UI */
+        function stopScanner() {
+            const video = document.getElementById('scanner-video');
+            const container = video.parentElement;
+            if (scannerStream) {
+                scannerStream.getTracks().forEach(track => track.stop());
+                scannerStream = null;
+            }
+            video.srcObject = null;
+            container.classList.remove('active');
+            resetCameraZoom(video);
+            document.getElementById('start-scan-btn').innerHTML = '<span class="btn-icon">📷</span> <span data-i18n="send.startCamera">' + i18n.t('send.startCamera') + '</span>';
+            document.getElementById('start-scan-btn').disabled = false;
+        }
+
+        /**
+         * Process scanned QR code - extract room ID and secret from URL
+         */
+        async function processScannedQR(data) {
+            logger.info('Processing scanned QR: ' + data);
+
+            // Try to extract room ID and secret from URL
+            let roomId = null;
+            let secret = null;
+
+            // Check if it's a URL with /send/ROOMID#SECRET pattern
+            const urlMatch = data.match(/\/send\/([A-Z0-9]{6})#(.+)$/i);
+            if (urlMatch) {
+                roomId = urlMatch[1].toUpperCase();
+                secret = urlMatch[2];
+            }
+
+            if (roomId && secret) {
+                await joinRoom(roomId, secret);
+            } else if (roomId) {
+                logger.error('Invalid QR code - room secret missing');
+                alert(i18n.t('send.invalidQR.secretMissing'));
+                showStep(stepScan);
+            } else {
+                logger.error('Invalid QR code - no room ID found');
+                alert(i18n.t('send.invalidQR.noRoom'));
+                showStep(stepScan);
+            }
+        }
+
+        // ============ Connection Handlers ============
+
+        /** Update the connection status indicator based on WebRTC state changes */
+        function onStateChange(state) {
+            const statusEl = document.getElementById('connection-status');
+            if (state === 'connecting') {
+                statusEl.textContent = i18n.t('send.establishing');
+                statusEl.className = 'status status-info';
+            } else if (state === 'connected') {
+                statusEl.textContent = i18n.t('send.connected');
+                statusEl.className = 'status status-connected';
+            } else if (state === 'failed') {
+                statusEl.textContent = i18n.t('send.failed');
+                statusEl.className = 'status status-error';
+            }
+        }
+
+        /**
+         * Called when WebRTC peer connection is established.
+         * Does NOT immediately show the photo send UI - that happens only after
+         * both parties verify key fingerprints (receiver sends 'ready' message).
+         */
+        function onConnected() {
+            logger.success('Connected to receiver!');
+        }
+
+        function onDisconnected() {
+            logger.warn('Disconnected from receiver');
+            alert(i18n.t('send.disconnected'));
+            window.location.href = '/';
+        }
+
+        /** Display a badge showing whether the connection is direct (P2P) or relayed (TURN) */
+        function onConnectionTypeDetected(info) {
+            const badge = document.getElementById('connection-type-badge');
+            const text = document.getElementById('connection-type-text');
+            badge.classList.remove('hidden');
+
+            // Style based on connection type
+            if (info.type === 'relay') {
+                badge.style.background = '#fff3e0';
+                badge.style.border = '1px solid #ffcc80';
+                text.innerHTML = `🔄 ${info.details}`;
+                text.style.color = '#e65100';
+            } else {
+                badge.style.background = '#e3f2fd';
+                badge.style.border = '1px solid #90caf9';
+                text.innerHTML = `⚡ ${info.details}`;
+                text.style.color = '#1565c0';
+            }
+        }
+
+        async function onMessage(msg) {
+            if (msg.type === 'public-key') {
+                // Receiver sent their ECDH public key
+                logger.info('Received receiver public key, performing key exchange...');
+                try {
+                    // Import receiver's public key
+                    const receiverPublicKey = await ImageSecureSendCrypto.importPublicKey(msg.key);
+
+                    // Derive shared secret using ECDH
+                    sharedKey = await ImageSecureSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
+
+                    // Get fingerprints for verification
+                    const ourFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(keyPair.publicKey);
+                    const theirFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(receiverPublicKey);
+
+                    // Display fingerprints in verification modal
+                    // Sender key at top, receiver key at bottom (consistent on both devices)
+                    document.getElementById('sender-fingerprint').textContent = ourFingerprint;
+                    document.getElementById('receiver-fingerprint').textContent = theirFingerprint;
+
+                    logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
+
+                    // Send our public key to receiver so they can derive the same shared secret
+                    const ourPublicKeyB64 = await ImageSecureSendCrypto.exportPublicKey(keyPair.publicKey);
+                    rtc.sendMessage({
+                        type: 'sender-public-key',
+                        key: ourPublicKeyB64
+                    });
+                    logger.info('Sent our public key to receiver');
+
+                    // Show blocking verification modal
+                    showVerificationModal();
+                } catch (e) {
+                    logger.error('Failed to complete key exchange: ' + e.message);
+                }
+            } else if (msg.type === 'fingerprint-confirmed') {
+                // Receiver confirmed the fingerprints match
+                logger.info('Receiver confirmed fingerprint match');
+                theyConfirmed = true;
+                checkBothConfirmed();
+            } else if (msg.type === 'fingerprint-denied') {
+                // Receiver denied - abort connection
+                logger.error('Receiver denied fingerprint match - possible MITM attack!');
+                alert(i18n.t('verify.deniedByReceiver'));
+                window.location.href = '/';
+            } else if (msg.type === 'ready') {
+                // Receiver confirmed both parties verified - can now send photos
+                logger.success('Both parties verified, can now send photos');
+                document.getElementById('verified-badge').classList.remove('hidden');
+                showStep(stepChoose);
+            }
+        }
+
+        // ============ Photo Capture ============
+        // Photos are captured in-browser only - they never touch the device's
+        // camera roll or filesystem. This is critical for patient data privacy.
+
+        /** Start the rear camera in high resolution mode for photo capture */
+        async function startCapture() {
+            logger.info('Starting camera for capture...');
+            showStep(stepCamera);
+
+            const video = document.getElementById('capture-video');
+            const container = video.parentElement;
+
+            try {
+                // Use back camera, high resolution
+                captureStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment',
+                        width: { ideal: 1920 },
+                        height: { ideal: 1080 }
+                    }
+                });
+                video.srcObject = captureStream;
+                container.classList.add('active');
+                video.play();
+
+                // Scroll camera into view so the capture button is visible
+                container.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } catch (e) {
+                logger.error('Failed to start camera: ' + e.message);
+                alert(i18n.t('send.cameraFailed'));
+                showStep(stepChoose);
+            }
+        }
+
+        /** Stop the capture camera and release media tracks */
+        function stopCapture() {
+            const video = document.getElementById('capture-video');
+            const container = video.parentElement;
+            if (captureStream) {
+                captureStream.getTracks().forEach(track => track.stop());
+                captureStream = null;
+            }
+            video.srcObject = null;
+            container.classList.remove('active');
+            resetCameraZoom(video);
+        }
+
+        /** Capture a single frame from the video stream and convert to JPEG blob */
+        async function capturePhoto() {
+            const video = document.getElementById('capture-video');
+            const canvas = document.getElementById('capture-canvas');
+
+            // Capture at video resolution
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+
+            // Convert to blob
+            canvas.toBlob(blob => {
+                currentPhotoBlob = blob;
+                stopCapture();
+                showPreview(blob);
+            }, 'image/jpeg', 0.85);
+        }
+
+        /** Handle file picker selection - validate it's an image and show preview */
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            if (!file.type.startsWith('image/')) {
+                alert(i18n.t('error.selectImage'));
+                return;
+            }
+
+            logger.info(`Selected file: ${file.name} (${file.size} bytes)`);
+            currentPhotoBlob = file;
+            showPreview(file);
+        }
+
+        /** Display the captured/selected photo in the preview step and reset send UI */
+        function showPreview(blob) {
+            const preview = document.getElementById('preview-image');
+            preview.src = URL.createObjectURL(blob);
+            showStep(stepPreview);
+
+            // Reset send UI
+            document.getElementById('send-progress-bar').classList.add('hidden');
+            document.getElementById('send-status').classList.add('hidden');
+            document.getElementById('send-btn').disabled = false;
+        }
+
+        // ============ Send Photo ============
+
+        async function sendPhoto() {
+            if (!currentPhotoBlob || !sharedKey) {
+                logger.error('No photo or key exchange not complete');
+                return;
+            }
+
+            document.getElementById('send-btn').disabled = true;
+            document.getElementById('send-status').classList.remove('hidden');
+            document.getElementById('send-progress-bar').classList.remove('hidden');
+
+            try {
+                // Read photo as ArrayBuffer
+                const photoData = await currentPhotoBlob.arrayBuffer();
+                logger.info(`Photo size: ${photoData.byteLength} bytes`);
+
+                // Encrypt with metadata bundled and padding applied.
+                // This hides: filename, MIME type, and exact file size.
+                // The encrypted output is padded to a bucket size.
+                document.getElementById('send-status').textContent = i18n.t('send.encrypting');
+
+                // Determine filename - use original if from file picker, otherwise generate
+                const filename = currentPhotoBlob.name || `photo_${Date.now()}.jpg`;
+                const mimeType = currentPhotoBlob.type || 'image/jpeg';
+
+                const encryptedData = await ImageSecureSendCrypto.encryptWithMetadata(
+                    photoData,
+                    {
+                        name: filename,
+                        mimeType: mimeType,
+                        originalSize: photoData.byteLength
+                    },
+                    sharedKey
+                );
+                logger.info(`Encrypted size: ${encryptedData.byteLength} bytes (padded)`);
+
+                // Send through WebRTC - no plaintext metadata is passed
+                document.getElementById('send-status').textContent = i18n.t('send.sendingProgress');
+                await rtc.sendFile(encryptedData, (percent) => {
+                    document.getElementById('send-progress-fill').style.width = percent + '%';
+                });
+
+                logger.success('Photo sent successfully!');
+                showStep(stepSent);
+
+            } catch (e) {
+                logger.error('Failed to send photo: ' + e.message);
+                alert(i18n.t('send.sendFailed'));
+                document.getElementById('send-btn').disabled = false;
+            }
+        }
+
+        // ============ Fingerprint Verification ============
+        // Mutual verification: both parties must confirm fingerprints match.
+        // Sender confirms first, then waits for receiver's 'ready' signal.
+
+        /** Display the blocking verification modal with key fingerprints */
+        function showVerificationModal() {
+            const modal = document.getElementById('verification-modal');
+            modal.classList.remove('hidden');
+            modal.style.display = 'flex';
+
+            // Set up button handlers
+            document.getElementById('confirm-match-btn').onclick = onConfirmMatch;
+            document.getElementById('deny-match-btn').onclick = onDenyMatch;
+        }
+
+        /** Hide the verification modal */
+        function hideVerificationModal() {
+            const modal = document.getElementById('verification-modal');
+            modal.classList.add('hidden');
+            modal.style.display = 'none';
+        }
+
+        /** User confirmed fingerprints match - notify receiver and wait for mutual confirmation */
+        function onConfirmMatch() {
+            logger.info('User confirmed fingerprints match');
+            weConfirmed = true;
+
+            // Hide modal, show waiting message
+            hideVerificationModal();
+            showStep(stepWaitingConfirmation);
+
+            // Tell receiver we confirmed
+            rtc.sendMessage({ type: 'fingerprint-confirmed' });
+
+            checkBothConfirmed();
+        }
+
+        /** User denied fingerprints match - abort connection (possible MITM) */
+        function onDenyMatch() {
+            logger.error('User denied fingerprint match - aborting connection');
+
+            // Tell receiver we denied
+            rtc.sendMessage({ type: 'fingerprint-denied' });
+
+            alert(i18n.t('verify.selfDenied'));
+            window.location.href = '/';
+        }
+
+        /** Check if both parties confirmed - receiver will send 'ready' to trigger photo UI */
+        function checkBothConfirmed() {
+            if (weConfirmed && theyConfirmed) {
+                logger.success('Both parties confirmed - waiting for receiver ready signal');
+                // The receiver will send 'ready' message after both confirm
+                // which triggers showStep(stepChoose)
+            }
+        }
+
+        // ============ Pinch to Zoom ============
+        // CSS-based zoom via transform: scale(). Tracks two-finger pinch distance
+        // across touchmove events and scales the video element accordingly.
+        // Clamped to 1x-5x to prevent excessive zoom.
+
+        /**
+         * Set up two-finger pinch-to-zoom on a video element's container.
+         * Uses CSS transform for visual zoom (the actual camera zoom is not changed).
+         * @param {HTMLVideoElement} video - The video element to enable zoom on
+         */
+        function setupPinchZoom(video) {
+            const container = video.parentElement;
+
+            // Track initial pinch distance on touchstart with 2 fingers
+            container.addEventListener('touchstart', (e) => {
+                if (e.touches.length === 2) {
+                    e.preventDefault();
+                    lastPinchDist = Math.hypot(
+                        e.touches[0].clientX - e.touches[1].clientX,
+                        e.touches[0].clientY - e.touches[1].clientY
+                    );
+                }
+            }, { passive: false });
+
+            // On touchmove with 2 fingers: compute ratio of new distance to old distance
+            // and apply it as a multiplier on the current zoom level
+            container.addEventListener('touchmove', (e) => {
+                if (e.touches.length === 2 && video.srcObject) {
+                    e.preventDefault();
+                    const dist = Math.hypot(
+                        e.touches[0].clientX - e.touches[1].clientX,
+                        e.touches[0].clientY - e.touches[1].clientY
+                    );
+                    if (lastPinchDist > 0) {
+                        cameraZoom *= dist / lastPinchDist;
+                        cameraZoom = Math.max(1, Math.min(5, cameraZoom));
+                        video.style.transform = `scale(${cameraZoom})`;
+                    }
+                    lastPinchDist = dist;
+                }
+            }, { passive: false });
+
+            container.addEventListener('touchend', () => {
+                lastPinchDist = 0;
+            });
+        }
+
+        /** Reset zoom level to 1x and clear the CSS transform */
+        function resetCameraZoom(video) {
+            cameraZoom = 1;
+            video.style.transform = '';
+        }
+
+        // Register service worker for PWA functionality
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/service-worker.js')
+                .then(reg => console.log('SW registered'))
+                .catch(err => console.log('SW registration failed:', err));
+        }
+
+        // Start when page loads
+        init();
+    </script>
+</body>
+</html>

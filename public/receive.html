@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html lang="en" data-i18n-title="receive.title">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#1565c0">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="ImageSecureSend">
+    <title>ImageSecureSend - Receive Photos</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="/icons/icon-192.png">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-rJ1zdsITzNNb35CJUIz5T1Dj3ffjlKCP95Mi47dGZKVW/8FpIgOlUJ8eQbEZzFrM" crossorigin="anonymous">
+    <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
+    <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="container">
+        <a href="/" class="back-link" data-i18n="nav.back">&larr; Back</a>
+
+        <h1 data-i18n="receive.title">Receive Photos</h1>
+
+        <!-- Step 1: Show QR Code -->
+        <div id="step-qr">
+            <p class="subtitle" data-i18n="receive.scanSubtitle">Scan this QR code with your phone</p>
+
+            <div class="qr-container" id="qr-container">
+                <p data-i18n="receive.generating">Generating secure connection...</p>
+            </div>
+
+            <!-- Room ID display removed - secret is required and cannot be typed manually -->
+
+            <div class="status status-waiting" id="status-waiting" data-i18n="receive.waiting">
+                Waiting for sender to scan...
+            </div>
+        </div>
+
+        <!-- Step 2: Connected, receiving photos -->
+        <div id="step-connected" class="hidden">
+            <div class="status status-connected" data-i18n="receive.connectedWaiting">
+                Connected! Waiting for photos...
+            </div>
+
+            <!-- Security verification modal (blocking) -->
+            <div id="verification-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+                <div style="background: white; border-radius: 15px; padding: 25px; max-width: 350px; margin: 20px; text-align: center;">
+                    <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="verify.title">🔒 Verify Connection</h2>
+                    <p style="margin: 0 0 20px 0; color: #555; font-size: 0.95rem;" data-i18n="verify.instruction.receiver">
+                        Read these codes aloud to the sender. Do they match what they see?
+                    </p>
+
+                    <div style="background: #f5f5f5; border-radius: 10px; padding: 15px; margin-bottom: 20px;">
+                        <!-- Sender key always at top for consistent display on both devices -->
+                        <div style="margin-bottom: 15px;">
+                            <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.senderKey.theirs">Sender's key (theirs)</span>
+                            <p id="sender-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1b5e20; margin: 5px 0; letter-spacing: 2px;">----</p>
+                        </div>
+                        <div style="border-top: 1px solid #ddd; padding-top: 15px;">
+                            <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.receiverKey.yours">Receiver's key (yours)</span>
+                            <p id="receiver-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1565c0; margin: 5px 0; letter-spacing: 2px;">----</p>
+                        </div>
+                    </div>
+
+                    <p style="margin: 0 0 20px 0; color: #d32f2f; font-size: 0.85rem;" data-i18n="verify.warning">
+                        ⚠️ If codes don't match, someone may be intercepting the connection!
+                    </p>
+
+                    <button id="confirm-match-btn" class="btn btn-action btn-success" style="width: 100%; margin-bottom: 10px; padding: 15px;" data-i18n="verify.confirm">
+                        ✓ Yes, codes match
+                    </button>
+                    <button id="deny-match-btn" class="btn btn-action btn-secondary" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" data-i18n="verify.deny">
+                        ✗ No, cancel connection
+                    </button>
+                </div>
+            </div>
+
+            <!-- Waiting for sender confirmation -->
+            <div id="waiting-confirmation" class="hidden" style="margin: 15px 0; padding: 20px; background: #e3f2fd; border-radius: 10px; border: 1px solid #90caf9; text-align: center;">
+                <p style="margin: 0; color: #1565c0; font-weight: bold;" data-i18n="receive.waitingConfirmation">
+                    ⏳ Waiting for sender to confirm...
+                </p>
+            </div>
+
+            <!-- Verified badge (shown after both confirm) -->
+            <div id="verified-badge" class="hidden" style="margin: 15px 0; padding: 15px; background: #e8f5e9; border-radius: 10px; border: 1px solid #a5d6a7; text-align: center;">
+                <p style="margin: 0; color: #2e7d32; font-weight: bold;" data-i18n="receive.verified">
+                    ✓ Connection verified by both parties
+                </p>
+            </div>
+
+            <!-- Connection type indicator (shown after connection established) -->
+            <div id="connection-type-badge" class="hidden" style="margin: 10px 0; padding: 10px; background: #f5f5f5; border-radius: 8px; text-align: center;">
+                <span style="font-size: 0.85rem; color: #666;" id="connection-type-text" data-i18n="receive.detectingConnection">Detecting connection type...</span>
+            </div>
+
+            <div class="progress-bar hidden" id="progress-bar">
+                <div class="progress-bar-fill" id="progress-fill" style="width: 0%"></div>
+            </div>
+
+            <h2 class="section-title" data-i18n="receive.receivedPhotos">Received Photos</h2>
+            <div class="received-images" id="received-images">
+                <p style="color: #888; text-align: center;" data-i18n="receive.photosPlaceholder">Photos will appear here as they are received.</p>
+            </div>
+
+            <!-- PDF download button (hidden until images received) -->
+            <div id="pdf-section" class="hidden" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
+                <button id="download-pdf-btn" class="btn btn-action" style="width: 100%; background: #1565c0; color: white;" data-i18n="receive.downloadPdf">
+                    📄 Download All as PDF
+                </button>
+            </div>
+        </div>
+
+        <!-- Crop modal (hidden until user clicks Crop on an image) -->
+        <div id="crop-modal" class="crop-modal hidden">
+            <div class="crop-modal-header">
+                <h2 data-i18n="crop.title">Crop Document</h2>
+                <p data-i18n="crop.instructions">Drag the corners to mark the document edges</p>
+            </div>
+            <div class="crop-canvas-container" id="crop-container">
+                <img id="crop-image" src="" alt="Image to crop">
+                <!-- SVG overlay for the quadrilateral outline -->
+                <svg class="crop-overlay" id="crop-overlay">
+                    <polygon id="crop-polygon" points="0,0 0,0 0,0 0,0"/>
+                </svg>
+                <!-- Four corner handles, positioned by JS -->
+                <div class="crop-handle" id="handle-tl" data-corner="tl"></div>
+                <div class="crop-handle" id="handle-tr" data-corner="tr"></div>
+                <div class="crop-handle" id="handle-br" data-corner="br"></div>
+                <div class="crop-handle" id="handle-bl" data-corner="bl"></div>
+            </div>
+            <div class="crop-buttons">
+                <button class="crop-btn-cancel" onclick="closeCropModal()" data-i18n="crop.cancel">Cancel</button>
+                <button class="crop-btn-apply" onclick="applyCrop()" data-i18n="crop.apply">Apply Crop</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/i18n.js"></script>
+    <script src="/js/logger.js" integrity="sha384-f8Hiox2XBE711JuaX3ej7rRNJo4qhDXWCu2qD7oK1+nAqsfO2XK+7EnWBS1WBLxO"></script>
+    <script src="/js/crypto.js" integrity="sha384-fuS6ghROB8sjaxuHbBV4qJcoxc5vS/kh9uV15SCMqegEjr5RHXRomi2cNXLxlPeF"></script>
+    <script src="/js/webrtc.js" integrity="sha384-K6Iiu1nW5oO0yI9X/s3HWFPDKfYd/rWtHDEc0ETQLUq44jkTB23/6rAFr0tcPmPq"></script>
+    <script>
+        // Initialize i18n first
+        i18n.init();
+    </script>
+    <script>
+        /**
+         * Receive page logic
+         * 1. Generate key pair
+         * 2. Create room on server
+         * 3. Create WebRTC offer and store on server
+         * 4. Display QR code with room URL
+         * 5. Wait for answer via server polling
+         * 6. Send public key to sender
+         * 7. Receive encrypted photos and decrypt them
+         */
+
+        let rtc = null;
+        let keyPair = null;
+        let sharedKey = null; // AES key derived from ECDH, set after sender connects
+        let photoCount = 0;
+        let roomSecret = ''; // Cryptographic secret for room access
+        let weConfirmed = false;  // Track if we confirmed fingerprints
+        let theyConfirmed = false; // Track if sender confirmed fingerprints
+        let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string}
+
+        async function init() {
+            logger.info('Initializing receiver...');
+
+            try {
+                // Fetch config for ICE servers and dev mode
+                const configResponse = await fetch('/api/config');
+                const config = await configResponse.json();
+
+                // Generate encryption key pair
+                keyPair = await ImageSecureSendCrypto.generateKeyPair();
+
+                // Initialize WebRTC
+                rtc = new ImageSecureSendRTC();
+                await rtc.init();
+
+                // Set up connection handlers
+                rtc.onConnected = onConnected;
+                rtc.onDisconnected = onDisconnected;
+                rtc.onMessage = onMessage;
+                rtc.onStateChange = onStateChange;
+                rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+
+                // Create room and offer
+                const roomInfo = await rtc.createRoom();
+                roomSecret = roomInfo.secret;
+                await rtc.createOfferAndStore();
+
+                // Generate QR code with room URL
+                await generateQRCode();
+
+                // Start waiting for answer
+                rtc.waitForAnswer().catch(e => {
+                    logger.error('Failed waiting for answer: ' + e.message);
+                    document.getElementById('status-waiting').textContent = i18n.t('receive.expired');
+                    document.getElementById('status-waiting').className = 'status status-error';
+                });
+
+            } catch (e) {
+                logger.error('Initialization failed: ' + e.message);
+                document.getElementById('qr-container').innerHTML =
+                    '<p style="color: red;">' + i18n.t('receive.initFailed') + '</p>';
+            }
+        }
+
+        async function generateQRCode() {
+            const container = document.getElementById('qr-container');
+            container.innerHTML = '';
+
+            // Build the URL using the current domain the user connected from.
+            // This ensures the QR code works regardless of which whitelisted domain is used.
+            // The secret is in the URL hash fragment (not sent to server in HTTP requests).
+            const url = `${window.location.origin}/send/${rtc.roomId}#${roomSecret}`;
+
+            logger.info(`QR code URL: ${url}`);
+
+            try {
+                const canvas = document.createElement('canvas');
+                await QRCode.toCanvas(canvas, url, {
+                    width: 280,
+                    margin: 2,
+                    errorCorrectionLevel: 'M' // Medium error correction - URL is short
+                });
+                container.appendChild(canvas);
+                logger.success('QR code generated');
+            } catch (e) {
+                logger.error('QR code generation failed: ' + e.message);
+                container.innerHTML = `
+                    <div style="padding: 20px; text-align: center;">
+                        <p style="color: red; margin-bottom: 10px;">${i18n.t('receive.qrFailed')}</p>
+                        <input type="text" value="${url}" readonly
+                            style="width: 100%; padding: 10px; font-size: 0.8rem; border-radius: 5px; border: 1px solid #ccc;"
+                            onclick="this.select()">
+                    </div>
+                `;
+            }
+        }
+
+        /** Update the status indicator based on WebRTC connection state changes */
+        function onStateChange(state) {
+            const statusEl = document.getElementById('status-waiting');
+            if (state === 'connecting') {
+                statusEl.textContent = i18n.t('receive.connecting');
+                statusEl.className = 'status status-info';
+            } else if (state === 'connected') {
+                statusEl.textContent = i18n.t('receive.connected');
+                statusEl.className = 'status status-connected';
+            } else if (state === 'failed') {
+                statusEl.textContent = i18n.t('receive.failed');
+                statusEl.className = 'status status-error';
+            }
+        }
+
+        async function onConnected() {
+            logger.success('Connected to sender!');
+
+            // Hide QR step, show connected step
+            document.getElementById('step-qr').classList.add('hidden');
+            document.getElementById('step-connected').classList.remove('hidden');
+
+            // Wait for data channel to be open before sending public key
+            // The data channel might not be ready immediately after peer connection is established
+            await waitForDataChannel();
+
+            // Send our public key to the sender
+            const publicKeyB64 = await ImageSecureSendCrypto.exportPublicKey(keyPair.publicKey);
+            const sent = rtc.sendMessage({
+                type: 'public-key',
+                key: publicKeyB64
+            });
+            if (sent) {
+                logger.info('Sent public key to sender');
+            } else {
+                logger.error('Failed to send public key - data channel not ready');
+            }
+        }
+
+        /**
+         * Wait for the data channel to be in 'open' state
+         * Returns immediately if already open, otherwise polls with a timeout
+         */
+        function waitForDataChannel() {
+            return new Promise((resolve, reject) => {
+                // Check if already open
+                if (rtc.dataChannel && rtc.dataChannel.readyState === 'open') {
+                    resolve();
+                    return;
+                }
+
+                // Poll for data channel to open
+                const maxWait = 10000; // 10 seconds
+                const startTime = Date.now();
+                const checkInterval = setInterval(() => {
+                    if (rtc.dataChannel && rtc.dataChannel.readyState === 'open') {
+                        clearInterval(checkInterval);
+                        resolve();
+                    } else if (Date.now() - startTime > maxWait) {
+                        clearInterval(checkInterval);
+                        reject(new Error('Data channel did not open in time'));
+                    }
+                }, 100);
+            });
+        }
+
+        function onDisconnected() {
+            logger.warn('Disconnected from sender');
+            document.querySelector('#step-connected .status').textContent = i18n.t('receive.disconnected');
+            document.querySelector('#step-connected .status').className = 'status status-error';
+        }
+
+        /**
+         * Display a badge showing whether the connection is direct (P2P) or relayed (TURN).
+         * Relay connections work fine (data is E2E encrypted anyway) but direct is faster.
+         */
+        function onConnectionTypeDetected(info) {
+            const badge = document.getElementById('connection-type-badge');
+            const text = document.getElementById('connection-type-text');
+            badge.classList.remove('hidden');
+
+            // Style based on connection type
+            if (info.type === 'relay') {
+                badge.style.background = '#fff3e0';
+                badge.style.border = '1px solid #ffcc80';
+                text.innerHTML = `🔄 ${info.details}`;
+                text.style.color = '#e65100';
+            } else {
+                badge.style.background = '#e3f2fd';
+                badge.style.border = '1px solid #90caf9';
+                text.innerHTML = `⚡ ${info.details}`;
+                text.style.color = '#1565c0';
+            }
+        }
+
+        async function onMessage(msg) {
+            if (msg.type === 'sender-public-key') {
+                // Sender sent their ECDH public key - derive shared secret
+                logger.info('Received sender public key, deriving shared secret...');
+                try {
+                    const senderPublicKey = await ImageSecureSendCrypto.importPublicKey(msg.key);
+                    sharedKey = await ImageSecureSendCrypto.deriveSharedKey(keyPair.privateKey, senderPublicKey);
+
+                    // Get fingerprints for verification display
+                    const ourFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(keyPair.publicKey);
+                    const theirFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(senderPublicKey);
+
+                    // Display fingerprints in verification modal
+                    // Sender key at top, receiver key at bottom (consistent on both devices)
+                    document.getElementById('sender-fingerprint').textContent = theirFingerprint;
+                    document.getElementById('receiver-fingerprint').textContent = ourFingerprint;
+
+                    logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
+
+                    // Show blocking verification modal
+                    showVerificationModal();
+                } catch (e) {
+                    logger.error('Failed to derive shared key: ' + e.message);
+                }
+            } else if (msg.type === 'fingerprint-confirmed') {
+                // Sender confirmed the fingerprints match
+                logger.info('Sender confirmed fingerprint match');
+                theyConfirmed = true;
+                checkBothConfirmed();
+            } else if (msg.type === 'fingerprint-denied') {
+                // Sender denied - abort connection
+                logger.error('Sender denied fingerprint match - possible MITM attack!');
+                alert(i18n.t('verify.deniedBySender'));
+                window.location.href = '/';
+            } else if (msg.type === 'progress') {
+                // Show progress bar
+                const progressBar = document.getElementById('progress-bar');
+                const progressFill = document.getElementById('progress-fill');
+                progressBar.classList.remove('hidden');
+                const percent = Math.round((msg.received / msg.total) * 100);
+                progressFill.style.width = percent + '%';
+            } else if (msg.type === 'encrypted-file') {
+                // Received encrypted file with bundled metadata, decrypt it
+                logger.info('Received encrypted file, decrypting with metadata...');
+                document.getElementById('progress-bar').classList.add('hidden');
+
+                if (!sharedKey) {
+                    logger.error('Cannot decrypt - key exchange not complete');
+                    return;
+                }
+
+                try {
+                    const encryptedData = await msg.blob.arrayBuffer();
+
+                    // Decrypt and extract metadata (name, mimeType, originalSize)
+                    // Padding is automatically removed during decryption
+                    const { metadata, data } = await ImageSecureSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
+
+                    logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${metadata.originalSize} bytes)`);
+
+                    // Create blob from decrypted data with original MIME type
+                    const imageBlob = new Blob([data], { type: metadata.mimeType });
+                    const imageUrl = URL.createObjectURL(imageBlob);
+
+                    // Add to received images with original filename
+                    // Store first so we have the index, then add to UI
+                    const imageIndex = receivedImages.length;
+                    receivedImages.push({
+                        data: new Uint8Array(data),
+                        mimeType: metadata.mimeType,
+                        name: metadata.name || `photo_${photoCount + 1}.jpg`
+                    });
+                    photoCount++;
+                    const filename = receivedImages[imageIndex].name;
+                    addReceivedImage(imageUrl, filename, imageIndex);
+
+                    updatePdfButton();
+
+                    logger.success('Photo decrypted and displayed');
+                } catch (e) {
+                    logger.error('Failed to decrypt photo: ' + e.message);
+                }
+            }
+        }
+
+        /**
+         * Add a decrypted image to the received images gallery.
+         * Inserts at top (newest first) with crop and download buttons.
+         * @param {string} url - Object URL of the decrypted image blob
+         * @param {string} filename - Original filename from encrypted metadata
+         * @param {number} imageIndex - Index in receivedImages array, used for crop/download targeting
+         */
+        function addReceivedImage(url, filename, imageIndex) {
+            const container = document.getElementById('received-images');
+
+            // Remove placeholder text on first image
+            if (photoCount === 1) {
+                container.innerHTML = '';
+            }
+
+            const item = document.createElement('div');
+            item.className = 'received-image-item';
+            // Each image has a crop button and download link, identified by index
+            item.setAttribute('data-image-index', imageIndex);
+            item.innerHTML = `
+                <img src="${url}" alt="Received photo" id="img-${imageIndex}">
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button class="btn btn-action btn-info" style="flex: 1; min-width: 120px;" onclick="openCropModal(${imageIndex})">
+                        ${i18n.t('receive.crop')}
+                    </button>
+                    <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="flex: 1; min-width: 120px;" id="download-${imageIndex}">
+                        ${i18n.t('receive.download')}
+                    </a>
+                </div>
+            `;
+            container.insertBefore(item, container.firstChild);
+        }
+
+        // ============ Fingerprint Verification ============
+        // Both sender and receiver must confirm fingerprints match before any
+        // photos can be sent. This prevents MITM attacks where an attacker
+        // substitutes their own keys during the ECDH exchange.
+
+        /**
+         * Display the blocking verification modal with key fingerprints.
+         * User must confirm or deny before any photo transfer can begin.
+         */
+        function showVerificationModal() {
+            const modal = document.getElementById('verification-modal');
+            modal.classList.remove('hidden');
+            modal.style.display = 'flex';
+
+            // Set up button handlers
+            document.getElementById('confirm-match-btn').onclick = onConfirmMatch;
+            document.getElementById('deny-match-btn').onclick = onDenyMatch;
+        }
+
+        /** Hide the verification modal (called after user confirms or denies) */
+        function hideVerificationModal() {
+            const modal = document.getElementById('verification-modal');
+            modal.classList.add('hidden');
+            modal.style.display = 'none';
+        }
+
+        /** User confirmed fingerprints match - notify the sender and wait for mutual confirmation */
+        function onConfirmMatch() {
+            logger.info('User confirmed fingerprints match');
+            weConfirmed = true;
+
+            // Hide modal, show waiting message
+            hideVerificationModal();
+            document.getElementById('waiting-confirmation').classList.remove('hidden');
+
+            // Tell sender we confirmed
+            rtc.sendMessage({ type: 'fingerprint-confirmed' });
+
+            checkBothConfirmed();
+        }
+
+        /** User denied fingerprints match - abort the connection (possible MITM) */
+        function onDenyMatch() {
+            logger.error('User denied fingerprint match - aborting connection');
+
+            // Tell sender we denied
+            rtc.sendMessage({ type: 'fingerprint-denied' });
+
+            alert(i18n.t('verify.selfDenied'));
+            window.location.href = '/';
+        }
+
+        /**
+         * Check if both parties confirmed fingerprints.
+         * When both confirm, show the verified badge and signal to the sender
+         * that they can start sending photos.
+         */
+        function checkBothConfirmed() {
+            if (weConfirmed && theyConfirmed) {
+                logger.success('Both parties confirmed - connection verified!');
+
+                // Hide waiting, show verified badge
+                document.getElementById('waiting-confirmation').classList.add('hidden');
+                document.getElementById('verified-badge').classList.remove('hidden');
+
+                // Tell sender both parties verified, so they can show the photo send UI
+                rtc.sendMessage({ type: 'ready' });
+            }
+        }
+
+        // ============ PDF Generation (no external dependencies) ============
+
+        /** Show/update the PDF download button with current image count */
+        function updatePdfButton() {
+            const section = document.getElementById('pdf-section');
+            const btn = document.getElementById('download-pdf-btn');
+            if (receivedImages.length > 0) {
+                section.classList.remove('hidden');
+                const plural = receivedImages.length > 1 ? 's' : '';
+                btn.textContent = '📄 ' + i18n.t('receive.downloadPdfCount', { count: receivedImages.length, plural: plural });
+                btn.onclick = generatePdf;
+            }
+        }
+
+        /**
+         * Minimal PDF generator - hand-crafted, no dependencies
+         * PDF is a text-based format; JPEG images embed directly with DCTDecode
+         */
+        async function generatePdf() {
+            logger.info('Generating PDF...');
+            const btn = document.getElementById('download-pdf-btn');
+            btn.disabled = true;
+            btn.textContent = i18n.t('receive.generatingPdf');
+
+            try {
+                // Convert all images to JPEG (canvas) for consistent PDF embedding
+                const jpegs = await Promise.all(receivedImages.map(img => toJpegData(img.data, img.mimeType)));
+
+                // Build PDF
+                const pdf = buildPdf(jpegs);
+                const blob = new Blob([pdf], { type: 'application/pdf' });
+                const url = URL.createObjectURL(blob);
+
+                // Trigger download
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `photos_${new Date().toISOString().slice(0,10)}.pdf`;
+                a.click();
+                URL.revokeObjectURL(url);
+
+                logger.success('PDF downloaded');
+            } catch (e) {
+                logger.error('PDF generation failed: ' + e.message);
+                alert('Failed to generate PDF: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                updatePdfButton();
+            }
+        }
+
+        /**
+         * Convert image data to JPEG using canvas, also return dimensions
+         */
+        function toJpegData(data, mimeType) {
+            return new Promise((resolve, reject) => {
+                const blob = new Blob([data], { type: mimeType });
+                const url = URL.createObjectURL(blob);
+                const img = new Image();
+                img.onload = () => {
+                    URL.revokeObjectURL(url);
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    canvas.toBlob(jpegBlob => {
+                        if (!jpegBlob) {
+                            reject(new Error('Canvas toBlob failed'));
+                            return;
+                        }
+                        jpegBlob.arrayBuffer().then(buf => {
+                            resolve({
+                                data: new Uint8Array(buf),
+                                width: img.width,
+                                height: img.height
+                            });
+                        });
+                    }, 'image/jpeg', 0.92);
+                };
+                img.onerror = () => {
+                    URL.revokeObjectURL(url);
+                    reject(new Error('Image load failed'));
+                };
+                img.src = url;
+            });
+        }
+
+        /**
+         * Build a minimal valid PDF with images, one per page
+         * Each page is exactly the size of the image (no margins)
+         */
+        function buildPdf(images) {
+            let objects = [];
+            let objOffsets = [];
+
+            // Helper to add an object and return its 1-based index.
+            // PDF objects are numbered starting at 1 (object 0 is the "free" entry).
+            function addObj(content) {
+                const idx = objects.length + 1;
+                objects.push(content);
+                return idx;
+            }
+
+            // Catalog and Pages are the root of the PDF object tree.
+            // They reference each other, so we create placeholders first
+            // and fill them in after all page objects are built.
+            const catalogIdx = addObj(null); // placeholder - filled after loop
+            const pagesIdx = addObj(null);   // placeholder - filled after loop
+
+            // Build one page + image XObject per JPEG image
+            const pageRefs = [];
+
+            for (let i = 0; i < images.length; i++) {
+                const img = images[i];
+
+                // Page is exactly the image size (no margins, no scaling)
+                const pageW = img.width;
+                const pageH = img.height;
+
+                // Image XObject
+                const imgIdx = addObj({
+                    type: 'image',
+                    width: img.width,
+                    height: img.height,
+                    data: img.data
+                });
+
+                // Content stream: place image at origin, full size
+                const contentStream = `q ${pageW} 0 0 ${pageH} 0 0 cm /Im${imgIdx} Do Q`;
+                const contentIdx = addObj({ type: 'stream', content: contentStream });
+
+                // Page object
+                const pageIdx = addObj({
+                    type: 'page',
+                    parent: pagesIdx,
+                    width: pageW,
+                    height: pageH,
+                    contents: contentIdx,
+                    image: imgIdx
+                });
+
+                pageRefs.push(pageIdx);
+            }
+
+            // Now fill in catalog and pages
+            objects[catalogIdx - 1] = { type: 'catalog', pages: pagesIdx };
+            objects[pagesIdx - 1] = { type: 'pages', kids: pageRefs };
+
+            // Serialize all objects to a byte stream.
+            // PDF mixes text (object headers, xref) with binary data (JPEG streams).
+            // We accumulate text in `currentText` and flush to `parts` (Uint8Array[])
+            // whenever we need to insert raw binary data (JPEG bytes).
+            let parts = [];
+            let currentText = '%PDF-1.4\n%\xFF\xFF\xFF\xFF\n'; // Binary comment marks file as binary for parsers
+            objOffsets = [];
+
+            for (let i = 0; i < objects.length; i++) {
+                objOffsets.push(byteLength(parts, currentText));
+                const obj = objects[i];
+                const idx = i + 1;
+
+                if (obj.type === 'catalog') {
+                    currentText += `${idx} 0 obj\n<< /Type /Catalog /Pages ${obj.pages} 0 R >>\nendobj\n`;
+                } else if (obj.type === 'pages') {
+                    const kids = obj.kids.map(k => `${k} 0 R`).join(' ');
+                    currentText += `${idx} 0 obj\n<< /Type /Pages /Kids [ ${kids} ] /Count ${obj.kids.length} >>\nendobj\n`;
+                } else if (obj.type === 'page') {
+                    currentText += `${idx} 0 obj\n<< /Type /Page /Parent ${obj.parent} 0 R /MediaBox [0 0 ${obj.width} ${obj.height}] /Contents ${obj.contents} 0 R /Resources << /XObject << /Im${obj.image} ${obj.image} 0 R >> >> >>\nendobj\n`;
+                } else if (obj.type === 'stream') {
+                    const len = obj.content.length;
+                    currentText += `${idx} 0 obj\n<< /Length ${len} >>\nstream\n${obj.content}\nendstream\nendobj\n`;
+                } else if (obj.type === 'image') {
+                    const imgLen = obj.data.length;
+                    currentText += `${idx} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${obj.width} /Height ${obj.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${imgLen} >>\nstream\n`;
+                    parts.push(strToBytes(currentText));
+                    parts.push(obj.data);
+                    currentText = '\nendstream\nendobj\n';
+                }
+            }
+
+            // Cross-reference table
+            const xrefOffset = byteLength(parts, currentText);
+            currentText += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+            for (let i = 0; i < objOffsets.length; i++) {
+                currentText += objOffsets[i].toString().padStart(10, '0') + ' 00000 n \n';
+            }
+
+            // Trailer
+            currentText += `trailer\n<< /Size ${objects.length + 1} /Root ${catalogIdx} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+            parts.push(strToBytes(currentText));
+
+            // Concatenate all parts
+            const totalLen = parts.reduce((sum, p) => sum + p.length, 0);
+            const result = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const part of parts) {
+                result.set(part, offset);
+                offset += part.length;
+            }
+
+            return result;
+        }
+
+        /**
+         * Convert a string to a Uint8Array using Latin-1 encoding (1 byte per char).
+         * Used for building raw PDF binary content where each char maps to one byte.
+         */
+        function strToBytes(str) {
+            const arr = new Uint8Array(str.length);
+            for (let i = 0; i < str.length; i++) {
+                arr[i] = str.charCodeAt(i) & 0xFF;
+            }
+            return arr;
+        }
+
+        /**
+         * Calculate total byte length of already-built parts plus the current
+         * text buffer. Used to track PDF object byte offsets for the xref table.
+         */
+        function byteLength(parts, currentText) {
+            return parts.reduce((sum, p) => sum + p.length, 0) + currentText.length;
+        }
+
+        // ============ Image Cropping (Perspective Transform) ============
+        // Minimal document cropping with 4-corner perspective correction.
+        // Pure vanilla JS, no external dependencies.
+
+        let cropState = {
+            imageIndex: null,       // Index in receivedImages array
+            originalUrl: null,      // Object URL of the image being cropped
+            imgWidth: 0,            // Displayed image width in pixels
+            imgHeight: 0,           // Displayed image height in pixels
+            // Corner positions as percentages (0-1) of image dimensions
+            // Order: top-left, top-right, bottom-right, bottom-left
+            corners: {
+                tl: { x: 0.05, y: 0.05 },
+                tr: { x: 0.95, y: 0.05 },
+                br: { x: 0.95, y: 0.95 },
+                bl: { x: 0.05, y: 0.95 }
+            },
+            dragging: null          // Currently dragged handle ID or null
+        };
+
+        /**
+         * Open the crop modal for a specific image
+         */
+        function openCropModal(imageIndex) {
+            logger.info(`Opening crop modal for image ${imageIndex}`);
+            cropState.imageIndex = imageIndex;
+
+            const imgEl = document.getElementById(`img-${imageIndex}`);
+            cropState.originalUrl = imgEl.src;
+
+            // Reset corners to near-edge defaults
+            cropState.corners = {
+                tl: { x: 0.05, y: 0.05 },
+                tr: { x: 0.95, y: 0.05 },
+                br: { x: 0.95, y: 0.95 },
+                bl: { x: 0.05, y: 0.95 }
+            };
+
+            // Load image into crop modal
+            const cropImg = document.getElementById('crop-image');
+            cropImg.src = cropState.originalUrl;
+
+            cropImg.onload = () => {
+                // Store displayed dimensions for coordinate calculations
+                cropState.imgWidth = cropImg.clientWidth;
+                cropState.imgHeight = cropImg.clientHeight;
+                updateCropOverlay();
+            };
+
+            // Show modal
+            document.getElementById('crop-modal').classList.remove('hidden');
+
+            // Set up handle drag listeners
+            setupCropHandles();
+        }
+
+        /**
+         * Close the crop modal without applying changes
+         */
+        function closeCropModal() {
+            logger.info('Crop cancelled');
+            document.getElementById('crop-modal').classList.add('hidden');
+            cropState.imageIndex = null;
+            cropState.dragging = null;
+        }
+
+        /**
+         * Set up touch/mouse drag listeners for corner handles
+         */
+        function setupCropHandles() {
+            const handles = ['tl', 'tr', 'br', 'bl'];
+            const container = document.getElementById('crop-container');
+
+            handles.forEach(corner => {
+                const handle = document.getElementById(`handle-${corner}`);
+
+                // Mouse events
+                handle.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    cropState.dragging = corner;
+                });
+
+                // Touch events (mobile)
+                handle.addEventListener('touchstart', (e) => {
+                    e.preventDefault();
+                    cropState.dragging = corner;
+                }, { passive: false });
+            });
+
+            // Global move/up handlers
+            document.addEventListener('mousemove', onCropDrag);
+            document.addEventListener('mouseup', onCropDragEnd);
+            document.addEventListener('touchmove', onCropDrag, { passive: false });
+            document.addEventListener('touchend', onCropDragEnd);
+        }
+
+        /**
+         * Handle drag movement - update corner position
+         */
+        function onCropDrag(e) {
+            if (!cropState.dragging) return;
+            e.preventDefault();
+
+            const container = document.getElementById('crop-container');
+            const rect = container.getBoundingClientRect();
+
+            // Get coordinates (mouse or touch)
+            let clientX, clientY;
+            if (e.touches) {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+
+            // Convert to percentage of image dimensions (clamped to 0-1)
+            const x = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+            const y = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+
+            cropState.corners[cropState.dragging] = { x, y };
+            updateCropOverlay();
+        }
+
+        /**
+         * Handle drag end
+         */
+        function onCropDragEnd() {
+            cropState.dragging = null;
+        }
+
+        /**
+         * Update the visual overlay (polygon and handle positions)
+         */
+        function updateCropOverlay() {
+            const w = cropState.imgWidth;
+            const h = cropState.imgHeight;
+            const c = cropState.corners;
+
+            // Update handle positions (CSS absolute positioning)
+            document.getElementById('handle-tl').style.left = (c.tl.x * 100) + '%';
+            document.getElementById('handle-tl').style.top = (c.tl.y * 100) + '%';
+            document.getElementById('handle-tr').style.left = (c.tr.x * 100) + '%';
+            document.getElementById('handle-tr').style.top = (c.tr.y * 100) + '%';
+            document.getElementById('handle-br').style.left = (c.br.x * 100) + '%';
+            document.getElementById('handle-br').style.top = (c.br.y * 100) + '%';
+            document.getElementById('handle-bl').style.left = (c.bl.x * 100) + '%';
+            document.getElementById('handle-bl').style.top = (c.bl.y * 100) + '%';
+
+            // Update SVG polygon points (in pixel coordinates relative to container)
+            const polygon = document.getElementById('crop-polygon');
+            const points = [
+                `${c.tl.x * w},${c.tl.y * h}`,
+                `${c.tr.x * w},${c.tr.y * h}`,
+                `${c.br.x * w},${c.br.y * h}`,
+                `${c.bl.x * w},${c.bl.y * h}`
+            ].join(' ');
+            polygon.setAttribute('points', points);
+        }
+
+        /**
+         * Apply the perspective crop and update the image
+         */
+        async function applyCrop() {
+            logger.info('Applying perspective crop...');
+
+            try {
+                // Load the original full-resolution image
+                const imgData = receivedImages[cropState.imageIndex];
+                const originalBlob = new Blob([imgData.data], { type: imgData.mimeType });
+                const originalUrl = URL.createObjectURL(originalBlob);
+
+                const img = new Image();
+                await new Promise((resolve, reject) => {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                    img.src = originalUrl;
+                });
+                URL.revokeObjectURL(originalUrl);
+
+                // Scale corner percentages to actual image pixels
+                const srcW = img.width;
+                const srcH = img.height;
+                const c = cropState.corners;
+
+                const srcCorners = [
+                    { x: c.tl.x * srcW, y: c.tl.y * srcH },
+                    { x: c.tr.x * srcW, y: c.tr.y * srcH },
+                    { x: c.br.x * srcW, y: c.br.y * srcH },
+                    { x: c.bl.x * srcW, y: c.bl.y * srcH }
+                ];
+
+                // Calculate output dimensions based on the longest edges
+                const topWidth = distance(srcCorners[0], srcCorners[1]);
+                const bottomWidth = distance(srcCorners[3], srcCorners[2]);
+                const leftHeight = distance(srcCorners[0], srcCorners[3]);
+                const rightHeight = distance(srcCorners[1], srcCorners[2]);
+
+                const dstW = Math.round(Math.max(topWidth, bottomWidth));
+                const dstH = Math.round(Math.max(leftHeight, rightHeight));
+
+                // Perform perspective transform
+                const resultCanvas = perspectiveTransform(img, srcCorners, dstW, dstH);
+
+                // Convert to blob and update storage
+                const resultBlob = await new Promise(resolve => {
+                    resultCanvas.toBlob(resolve, 'image/jpeg', 0.92);
+                });
+                const resultData = new Uint8Array(await resultBlob.arrayBuffer());
+
+                // Update receivedImages array
+                receivedImages[cropState.imageIndex] = {
+                    data: resultData,
+                    mimeType: 'image/jpeg',
+                    name: imgData.name
+                };
+
+                // Update the displayed image
+                const newUrl = URL.createObjectURL(resultBlob);
+                document.getElementById(`img-${cropState.imageIndex}`).src = newUrl;
+                document.getElementById(`download-${cropState.imageIndex}`).href = newUrl;
+
+                logger.success(`Cropped image: ${dstW}x${dstH}px`);
+                closeCropModal();
+            } catch (e) {
+                logger.error('Crop failed: ' + e.message);
+                alert('Crop failed: ' + e.message);
+            }
+        }
+
+        /**
+         * Euclidean distance between two {x, y} points.
+         * Used to determine output dimensions of the cropped image.
+         */
+        function distance(p1, p2) {
+            return Math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2);
+        }
+
+        /**
+         * Perform perspective transform using inverse mapping.
+         * For each destination pixel, finds the corresponding source pixel.
+         *
+         * Uses bilinear interpolation for smooth results.
+         * Algorithm: Compute 3x3 homography matrix from 4 point correspondences.
+         */
+        function perspectiveTransform(srcImg, srcCorners, dstW, dstH) {
+            // Source canvas to read pixels
+            const srcCanvas = document.createElement('canvas');
+            srcCanvas.width = srcImg.width;
+            srcCanvas.height = srcImg.height;
+            const srcCtx = srcCanvas.getContext('2d');
+            srcCtx.drawImage(srcImg, 0, 0);
+            const srcData = srcCtx.getImageData(0, 0, srcImg.width, srcImg.height);
+
+            // Destination canvas
+            const dstCanvas = document.createElement('canvas');
+            dstCanvas.width = dstW;
+            dstCanvas.height = dstH;
+            const dstCtx = dstCanvas.getContext('2d');
+            const dstData = dstCtx.createImageData(dstW, dstH);
+
+            // Destination corners (rectangle)
+            const dstCorners = [
+                { x: 0, y: 0 },
+                { x: dstW, y: 0 },
+                { x: dstW, y: dstH },
+                { x: 0, y: dstH }
+            ];
+
+            // Compute inverse homography: maps dst coords to src coords
+            const H = computeHomography(dstCorners, srcCorners);
+
+            // For each pixel in destination, find source pixel via inverse mapping
+            for (let y = 0; y < dstH; y++) {
+                for (let x = 0; x < dstW; x++) {
+                    // Apply homography to get source coordinates
+                    const srcPt = applyHomography(H, x, y);
+
+                    // Bilinear interpolation for smooth sampling
+                    const color = bilinearSample(srcData, srcPt.x, srcPt.y);
+
+                    // Write to destination
+                    const dstIdx = (y * dstW + x) * 4;
+                    dstData.data[dstIdx] = color.r;
+                    dstData.data[dstIdx + 1] = color.g;
+                    dstData.data[dstIdx + 2] = color.b;
+                    dstData.data[dstIdx + 3] = 255;
+                }
+            }
+
+            dstCtx.putImageData(dstData, 0, 0);
+            return dstCanvas;
+        }
+
+        /**
+         * Compute 3x3 homography matrix from 4 point correspondences.
+         * Uses Direct Linear Transform (DLT) algorithm.
+         * Returns H such that dst = H * src (in homogeneous coordinates).
+         */
+        function computeHomography(src, dst) {
+            // Build 8x8 matrix A for Ah = 0 (where h is the flattened 3x3 homography)
+            const A = [];
+            for (let i = 0; i < 4; i++) {
+                const sx = src[i].x, sy = src[i].y;
+                const dx = dst[i].x, dy = dst[i].y;
+
+                A.push([-sx, -sy, -1, 0, 0, 0, sx * dx, sy * dx, dx]);
+                A.push([0, 0, 0, -sx, -sy, -1, sx * dy, sy * dy, dy]);
+            }
+
+            // Solve using SVD (simplified: use least squares via normal equations)
+            // For 4 points, we have exactly 8 equations for 8 unknowns (h9 = 1)
+            const h = solveHomography(A);
+
+            // Return as 3x3 matrix
+            return [
+                [h[0], h[1], h[2]],
+                [h[3], h[4], h[5]],
+                [h[6], h[7], 1]
+            ];
+        }
+
+        /**
+         * Solve the homography system Ah = 0 with h[8] = 1.
+         * Uses Gaussian elimination on the augmented system.
+         */
+        function solveHomography(A) {
+            // Rewrite as Ax = b where x = h[0..7] and b = -h[8]*col8
+            // Since h[8] = 1, we have Ax = -col8
+            const n = 8;
+            const M = [];
+            const b = [];
+            for (let i = 0; i < n; i++) {
+                M.push(A[i].slice(0, 8));
+                b.push(-A[i][8]);
+            }
+
+            // Gaussian elimination with partial pivoting
+            for (let col = 0; col < n; col++) {
+                // Find pivot
+                let maxRow = col;
+                for (let row = col + 1; row < n; row++) {
+                    if (Math.abs(M[row][col]) > Math.abs(M[maxRow][col])) {
+                        maxRow = row;
+                    }
+                }
+                [M[col], M[maxRow]] = [M[maxRow], M[col]];
+                [b[col], b[maxRow]] = [b[maxRow], b[col]];
+
+                // Eliminate
+                for (let row = col + 1; row < n; row++) {
+                    const factor = M[row][col] / M[col][col];
+                    for (let j = col; j < n; j++) {
+                        M[row][j] -= factor * M[col][j];
+                    }
+                    b[row] -= factor * b[col];
+                }
+            }
+
+            // Back substitution
+            const x = new Array(n).fill(0);
+            for (let i = n - 1; i >= 0; i--) {
+                x[i] = b[i];
+                for (let j = i + 1; j < n; j++) {
+                    x[i] -= M[i][j] * x[j];
+                }
+                x[i] /= M[i][i];
+            }
+
+            return x;
+        }
+
+        /**
+         * Apply homography matrix to a point (returns normalized coordinates)
+         */
+        function applyHomography(H, x, y) {
+            const w = H[2][0] * x + H[2][1] * y + H[2][2];
+            return {
+                x: (H[0][0] * x + H[0][1] * y + H[0][2]) / w,
+                y: (H[1][0] * x + H[1][1] * y + H[1][2]) / w
+            };
+        }
+
+        /**
+         * Bilinear interpolation sampling from ImageData
+         */
+        function bilinearSample(imgData, x, y) {
+            const w = imgData.width;
+            const h = imgData.height;
+            const data = imgData.data;
+
+            // Clamp to valid range
+            x = Math.max(0, Math.min(w - 1.001, x));
+            y = Math.max(0, Math.min(h - 1.001, y));
+
+            const x0 = Math.floor(x), x1 = Math.min(x0 + 1, w - 1);
+            const y0 = Math.floor(y), y1 = Math.min(y0 + 1, h - 1);
+            const xf = x - x0, yf = y - y0;
+
+            // Get 4 neighboring pixels
+            const idx00 = (y0 * w + x0) * 4;
+            const idx10 = (y0 * w + x1) * 4;
+            const idx01 = (y1 * w + x0) * 4;
+            const idx11 = (y1 * w + x1) * 4;
+
+            // Bilinear interpolation for each channel
+            const lerp = (a, b, t) => a + (b - a) * t;
+            return {
+                r: lerp(lerp(data[idx00], data[idx10], xf), lerp(data[idx01], data[idx11], xf), yf),
+                g: lerp(lerp(data[idx00 + 1], data[idx10 + 1], xf), lerp(data[idx01 + 1], data[idx11 + 1], xf), yf),
+                b: lerp(lerp(data[idx00 + 2], data[idx10 + 2], xf), lerp(data[idx01 + 2], data[idx11 + 2], xf), yf)
+            };
+        }
+
+        // Register service worker for PWA functionality
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/service-worker.js')
+                .then(reg => console.log('SW registered'))
+                .catch(err => console.log('SW registration failed:', err));
+        }
+
+        // Start when page loads
+        init();
+    </script>
+</body>
+</html>
