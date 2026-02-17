@@ -1,5 +1,5 @@
 services:
-  mobisecuscan:
+  imagesecurescan:
     build:
       context: .
       dockerfile: Dockerfile
@@ -62,7 +62,7 @@ services:
   #     --no-cli
   #     --no-tlsv1
   #     --no-tlsv1_1
-  #     --realm=mobisecuscan
+  #     --realm=imagesecurescan
   #     --min-port=49152
   #     --max-port=49156
   #     --listening-port=3479

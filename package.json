@@ -1,5 +1,5 @@
 {
-  "name": "mobisecuscan",
+  "name": "ImageSecureScan",
   "version": "1.0.0",
   "description": "Secure photo sharing between devices using WebRTC",
   "main": "server.js",

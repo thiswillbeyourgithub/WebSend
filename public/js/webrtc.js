@@ -330,7 +330,7 @@ class ImageSecureSendRTC {
         this.createPeerConnection();
 
         // Create data channel
-        const dc = this.pc.createDataChannel('mobisecuscan', { ordered: true });
+        const dc = this.pc.createDataChannel('imagesecurescan', { ordered: true });
         this.setupDataChannel(dc);
 
         // Create offer
