@@ -1,5 +1,6 @@
 services:
   imagesecurescan:
+    container_name: imagesecurescan
     build:
       context: ..
       dockerfile: ./docker/Dockerfile
