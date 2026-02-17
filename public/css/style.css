@@ -522,6 +522,77 @@ footer {
     color: white;
 }
 
+/* ============ Language Switcher ============ */
+/*
+ * Fixed top-right button showing the current language flag.
+ * Clicking opens a small dropdown to switch between EN / FR.
+ * Uses z-index 1500 — above page content and logs toggle (1000)
+ * but below modals (2000) such as the crop and verification modals.
+ */
+
+.lang-switcher {
+    position: fixed;
+    top: 15px;
+    right: 15px;
+    z-index: 1500;
+}
+
+.lang-switcher-btn {
+    background: rgba(255, 255, 255, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    /* Large enough to be tappable on mobile */
+    font-size: 1.4rem;
+    line-height: 1;
+    color: white;
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+}
+
+.lang-switcher-btn:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+/* Dropdown panel revealed on button click */
+.lang-dropdown {
+    position: absolute;
+    top: calc(100% + 5px);
+    right: 0;
+    background: #1a1a2e;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+    /* min-width keeps the panel from being too narrow on short labels */
+    min-width: 130px;
+}
+
+.lang-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 15px;
+    cursor: pointer;
+    color: white;
+    font-size: 0.95rem;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+}
+
+.lang-option:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+/* Highlight the currently active language */
+.lang-option.active {
+    background: rgba(233, 69, 96, 0.2);
+    color: #e94560;
+}
+
 /* Responsive adjustments for small screens (older/budget smartphones).
    Reduces font sizes to prevent text overflow while keeping touch targets large. */
 @media (max-width: 400px) {

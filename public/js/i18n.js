@@ -262,10 +262,21 @@ const i18n = (function() {
     // Detect locale - use French if browser is French, otherwise English
     let currentLocale = 'en';
 
+    // localStorage key for persisted language choice
+    const STORAGE_KEY = 'imageSS_locale';
+
     /**
-     * Detect browser locale and set current locale
+     * Detect browser locale and set current locale.
+     * Checks localStorage first so user preference overrides browser default.
      */
     function detectLocale() {
+        // User's explicit choice takes priority over browser locale
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved && translations[saved]) {
+            currentLocale = saved;
+            console.log(`[i18n] Restored saved locale: ${currentLocale}`);
+            return currentLocale;
+        }
         const browserLang = navigator.language || navigator.userLanguage || 'en';
         // If locale starts with 'fr', use French
         currentLocale = browserLang.toLowerCase().startsWith('fr') ? 'fr' : 'en';
@@ -346,12 +357,15 @@ const i18n = (function() {
     }
 
     /**
-     * Set locale manually (for testing or user preference)
+     * Set locale manually (for user preference or testing).
+     * Persists the choice to localStorage so it survives page navigation.
      * @param {string} locale - Locale code ('en' or 'fr')
      */
     function setLocale(locale) {
         if (translations[locale]) {
             currentLocale = locale;
+            // Persist so the user doesn't have to re-select on every page
+            localStorage.setItem(STORAGE_KEY, locale);
             applyTranslations();
             document.documentElement.lang = currentLocale;
         }

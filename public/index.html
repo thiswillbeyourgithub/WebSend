@@ -10,9 +10,19 @@
     <title>ImageSecureSend - Secure Photo Transfer</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-rJ1zdsITzNNb35CJUIz5T1Dj3ffjlKCP95Mi47dGZKVW/8FpIgOlUJ8eQbEZzFrM" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-3NEcVRmpBpo7cva6vn1MEZvTfdugUZtXjRIQz6hNiHntOoXlT3ssDJjAY3hqXgNx" crossorigin="anonymous">
 </head>
 <body>
+    <!-- Language switcher: flag button fixed top-right, opens a dropdown to pick EN/FR.
+         The choice is persisted in localStorage via i18n.setLocale(). -->
+    <div class="lang-switcher" id="lang-switcher">
+        <button class="lang-switcher-btn" id="lang-switcher-btn" aria-label="Select language">🇬🇧</button>
+        <div class="lang-dropdown hidden" id="lang-dropdown">
+            <button class="lang-option" data-lang="en">🇬🇧 English</button>
+            <button class="lang-option" data-lang="fr">🇫🇷 Français</button>
+        </div>
+    </div>
+
     <div class="container">
         <h1 data-i18n="app.name">ImageSecureSend</h1>
         <p class="subtitle" data-i18n="app.subtitle">Secure Photo Transfer</p>
@@ -103,6 +113,39 @@
                 e.currentTarget.style.display = 'none';
             }
         });
+
+        // Language switcher logic (shared pattern across all pages)
+        (function() {
+            const flags = { en: '🇬🇧', fr: '🇫🇷' };
+            const btn = document.getElementById('lang-switcher-btn');
+            const dropdown = document.getElementById('lang-dropdown');
+            const options = dropdown.querySelectorAll('.lang-option');
+
+            // Sync button flag and active highlight to current locale
+            function updateUI() {
+                const locale = i18n.getLocale();
+                btn.textContent = flags[locale] || flags.en;
+                options.forEach(opt => opt.classList.toggle('active', opt.dataset.lang === locale));
+            }
+
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                dropdown.classList.toggle('hidden');
+            });
+
+            options.forEach(opt => {
+                opt.addEventListener('click', () => {
+                    i18n.setLocale(opt.dataset.lang);
+                    dropdown.classList.add('hidden');
+                    updateUI();
+                });
+            });
+
+            // Close dropdown when clicking anywhere outside
+            document.addEventListener('click', () => dropdown.classList.add('hidden'));
+
+            updateUI();
+        })();
     </script>
 </body>
 </html>
