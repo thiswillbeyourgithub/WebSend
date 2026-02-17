@@ -451,7 +451,10 @@
             // Each image has a crop button and download link, identified by index
             item.setAttribute('data-image-index', imageIndex);
             item.innerHTML = `
-                <img src="${url}" alt="Received photo" id="img-${imageIndex}">
+                <div style="position: relative; display: block;">
+                    <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block;">
+                    <span style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
+                </div>
                 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                     <button class="btn btn-action btn-info" style="flex: 1; min-width: 120px;" onclick="openCropModal(${imageIndex})">
                         ${i18n.t('receive.crop')}
