@@ -26,7 +26,7 @@ const i18n = (function() {
             'index.receive.hint': 'Show QR code on this device',
             'index.send': 'Send',
             'index.send.hint': 'Scan QR & send photos',
-            'index.footer': 'Your photos are encrypted end-to-end.<br>They never pass through our server.',
+            'index.footer': 'Your photos are encrypted end-to-end.<br>They never pass unencrypted through any server.',
             'index.about': 'About',
 
             // About modal
@@ -148,7 +148,7 @@ const i18n = (function() {
             'index.receive.hint': 'Afficher le QR code sur cet appareil',
             'index.send': 'Envoyer',
             'index.send.hint': 'Scanner le QR et envoyer des photos',
-            'index.footer': 'Vos photos sont chiffrées de bout en bout.<br>Elles ne passent jamais par notre serveur.',
+            'index.footer': 'Vos photos sont chiffrées de bout en bout.<br>Elles ne transitent jamais en clair par aucun serveur.',
             'index.about': 'À propos',
 
             // About modal
