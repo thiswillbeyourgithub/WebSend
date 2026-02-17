@@ -1,5 +1,5 @@
 # Environment files with secrets
-docker/.env
+.env
 
 # Node modules
 node_modules/
@@ -17,5 +17,5 @@ Thumbs.db
 # Logs
 *.log
 
-env
+docker/env
 .aider.*
