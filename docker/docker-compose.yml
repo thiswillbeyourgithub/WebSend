@@ -50,9 +50,8 @@ services:
   #     - "3479:3479/udp"
   #     - "3479:3479/tcp"
   #     - "49152-49156:49152-49156/udp"
-  #   environment:
-  #     # Pass the shared secret from your env file
-  #     - TURN_SECRET=${TURN_SECRET}
+  #   env_file:
+  #     - env
   #   command: >
   #     -n
   #     --log-file=stdout
