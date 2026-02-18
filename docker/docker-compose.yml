@@ -7,7 +7,8 @@ services:
     ports:
       - "127.0.0.1:7395:8080"
     env_file:
-      - env
+      - path: env
+        required: true
     # Security hardening options
     security_opt:
       # Prevent privilege escalation via setuid/setgid binaries
@@ -51,7 +52,8 @@ services:
   #     - "3479:3479/tcp"
   #     - "49152-49156:49152-49156/udp"
   #   env_file:
-  #     - env
+  #     - path: env
+  #       required: true
   #   command: >
   #     -n
   #     --log-file=stdout
