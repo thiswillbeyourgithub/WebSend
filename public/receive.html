@@ -174,6 +174,22 @@
         let theyConfirmed = false; // Track if sender confirmed fingerprints
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string}
 
+        /**
+         * Dynamically load eruda mobile devtools console from CDN.
+         * Only called in DEV mode (DEV=1 env var on server) to avoid loading
+         * a ~350KB debug library in production.
+         * @returns {Promise<void>}
+         */
+        function loadEruda() {
+            return new Promise((resolve) => {
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/eruda';
+                script.onload = () => { eruda.init(); resolve(); };
+                script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
+                document.head.appendChild(script);
+            });
+        }
+
         async function init() {
             logger.info('Initializing receiver...');
 
@@ -181,6 +197,9 @@
                 // Fetch config for ICE servers and dev mode
                 const configResponse = await fetch('/api/config');
                 const config = await configResponse.json();
+
+                // Enable eruda mobile console asap when server is in DEV mode
+                if (config.dev) { await loadEruda(); }
 
                 // Generate encryption key pair
                 keyPair = await ImageSecureSendCrypto.generateKeyPair();

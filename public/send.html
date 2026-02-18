@@ -269,8 +269,34 @@
             return null;
         }
 
+        /**
+         * Dynamically load eruda mobile devtools console from CDN.
+         * Only called in DEV mode (DEV=1 env var on server) to avoid loading
+         * a ~350KB debug library in production.
+         * @returns {Promise<void>}
+         */
+        function loadEruda() {
+            return new Promise((resolve) => {
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/eruda';
+                script.onload = () => { eruda.init(); resolve(); };
+                script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
+                document.head.appendChild(script);
+            });
+        }
+
         async function init() {
             logger.info('Initializing sender...');
+
+            // Fetch server config to check DEV mode and enable eruda asap if needed
+            try {
+                const configResponse = await fetch('/api/config');
+                const config = await configResponse.json();
+                if (config.dev) { await loadEruda(); }
+            } catch (e) {
+                // Non-fatal: continue without eruda if config fetch fails
+                logger.warn('Could not fetch server config: ' + e.message);
+            }
 
             // Generate our ECDH key pair for key exchange
             keyPair = await ImageSecureSendCrypto.generateKeyPair();

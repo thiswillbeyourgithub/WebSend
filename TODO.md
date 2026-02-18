@@ -1,0 +1,3 @@
+- On the sender side: you've tried numerous time that one so be careful: when clicking on "Start Camera to Scan", the camera area appears as it should BUT the user has to manually scroll down so that it takes the majority of the screen. Otherwise, we can read "Back" in the top left corner then a big gap and only then starts the camera area. I want you to make sure it scrolls down when the camera expands.
+- investigate whether ocr can be added on the receiver side without too much issue
+- i believe I implemented at some point an about page in the webapp but don't see any button to trigger it currently. right?
