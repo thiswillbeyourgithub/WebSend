@@ -565,28 +565,40 @@ app.get('/send/:roomId', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ImageSecureSend server running on port ${PORT}`);
-    console.log(`DOMAIN configured as: ${DOMAIN}`);
+    console.log('='.repeat(60));
+    console.log('  ImageSecureSend - Startup Configuration');
+    console.log('='.repeat(60));
 
-    // Log ICE server configuration for clarity
-    console.log('ICE configuration:');
-    if (STUN_SERVER) {
-        console.log(`  STUN: ${STUN_SERVER} (self-hosted)`);
+    const envVars = [
+        { name: 'DOMAIN',               value: process.env.DOMAIN,               used: DOMAIN },
+        { name: 'DEV',                   value: process.env.DEV,                  used: DEV ? '1' : '0' },
+        { name: 'STUN_SERVER',           value: process.env.STUN_SERVER,          used: STUN_SERVER || '(none)' },
+        { name: 'STUN_GOOGLE_FALLBACK',  value: process.env.STUN_GOOGLE_FALLBACK, used: String(STUN_GOOGLE_FALLBACK) },
+        { name: 'TURN_SERVER',           value: process.env.TURN_SERVER,          used: TURN_SERVER || '(none)' },
+        { name: 'TURN_SECRET',           value: process.env.TURN_SECRET,          used: TURN_SECRET ? '(set)' : '(not set)' },
+        { name: 'TURN_CREDENTIAL_TTL',   value: process.env.TURN_CREDENTIAL_TTL,  used: String(TURN_CREDENTIAL_TTL) },
+        { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
+    ];
+
+    for (const v of envVars) {
+        const status = v.value === undefined ? ' [NOT SET]' : '';
+        console.log(`  ${v.name}${status}`);
+        console.log(`    -> ${v.used}`);
     }
-    if (STUN_GOOGLE_FALLBACK) {
-        console.log('  STUN: stun.l.google.com:19302 (Google fallback)');
-    }
-    if (TURN_SERVER && TURN_SECRET) {
-        console.log(`  TURN: ${TURN_SERVER} (time-based credentials, TTL=${TURN_CREDENTIAL_TTL}s)`);
-    } else if (TURN_SERVER) {
-        console.log(`  TURN: ${TURN_SERVER} (WARNING: TURN_SECRET not set, disabled)`);
-    }
+
+    console.log('-'.repeat(60));
+    console.log(`  Listening on 0.0.0.0:${PORT}`);
+
+    // Warnings
     if (!STUN_SERVER && !STUN_GOOGLE_FALLBACK && !TURN_SERVER) {
         console.log('  WARNING: No ICE servers configured! Connections will likely fail.');
     }
-
-    if (DEV) {
-        console.log('[DEV MODE ENABLED] Verbose debug logging active');
-        console.log(`  Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+    if (TURN_SERVER && !TURN_SECRET) {
+        console.log('  WARNING: TURN_SERVER is set but TURN_SECRET is missing - TURN disabled.');
     }
+    if (DEV) {
+        console.log('  DEV MODE ENABLED - verbose debug logging active');
+    }
+
+    console.log('='.repeat(60));
 });
