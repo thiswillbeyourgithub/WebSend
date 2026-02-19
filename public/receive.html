@@ -408,8 +408,7 @@
             } else if (msg.type === 'fingerprint-denied') {
                 // Sender denied - abort connection
                 logger.error('Sender denied fingerprint match - possible MITM attack!');
-                alert(i18n.t('verify.deniedBySender'));
-                window.location.href = '/';
+                showToast(i18n.t('verify.deniedBySender'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
             } else if (msg.type === 'progress') {
                 // Show progress bar
                 const progressBar = document.getElementById('progress-bar');
@@ -609,8 +608,7 @@
             // Tell sender we denied
             rtc.sendMessage({ type: 'fingerprint-denied' });
 
-            alert(i18n.t('verify.selfDenied'));
-            window.location.href = '/';
+            showToast(i18n.t('verify.selfDenied'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
         }
 
         /**
@@ -734,7 +732,7 @@
                 logger.success('PDF downloaded');
             } catch (e) {
                 logger.error('PDF generation failed: ' + e.message);
-                alert('Failed to generate PDF: ' + e.message);
+                showToast('Failed to generate PDF: ' + e.message);
             } finally {
                 btn.disabled = false;
                 updatePdfButton();
@@ -1140,7 +1138,7 @@
                 closeCropModal();
             } catch (e) {
                 logger.error('Crop failed: ' + e.message);
-                alert('Crop failed: ' + e.message);
+                showToast('Crop failed: ' + e.message);
             }
         }
 

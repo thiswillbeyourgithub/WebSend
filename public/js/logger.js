@@ -192,6 +192,59 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// ============ Toast Notifications ============
+// Non-blocking replacement for alert(). Shows a dismissable banner
+// that auto-disappears after a few seconds. Doesn't block the UI
+// so users can still read eruda console and log panel output.
+
+/**
+ * Show a non-blocking toast notification.
+ * @param {string} message - Message to display (supports newlines)
+ * @param {Object} [options] - Options
+ * @param {'error'|'warn'|'info'} [options.type='error'] - Visual style
+ * @param {number} [options.duration=5000] - Auto-dismiss time in ms (0 = no auto-dismiss)
+ * @param {Function} [options.onDismiss] - Callback when toast is dismissed
+ */
+function showToast(message, options = {}) {
+    const { type = 'error', duration = 5000, onDismiss = null } = options;
+
+    // Ensure container exists
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        container.className = 'toast-container';
+        document.body.appendChild(container);
+    }
+
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.textContent = message;
+
+    // Click to dismiss
+    toast.addEventListener('click', () => dismiss());
+
+    container.appendChild(toast);
+
+    function dismiss() {
+        toast.classList.add('toast-fade-out');
+        toast.addEventListener('animationend', () => {
+            toast.remove();
+            if (onDismiss) onDismiss();
+        });
+    }
+
+    // Auto-dismiss
+    if (duration > 0) {
+        setTimeout(dismiss, duration);
+    }
+
+    return { dismiss };
+}
+
+// Expose globally so all pages can use it
+window.showToast = showToast;
+
 // Initialize when DOM is ready
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initLogsPanel);

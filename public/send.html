@@ -391,7 +391,7 @@
                 requestAnimationFrame(scanFrame);
             } catch (e) {
                 logger.error('Failed to start camera: ' + e.message);
-                alert(i18n.t('send.cameraError'));
+                showToast(i18n.t('send.cameraError'));
             }
         }
 
@@ -468,11 +468,11 @@
                 await joinRoom(roomId, secret);
             } else if (roomId) {
                 logger.error('Invalid QR code - room secret missing');
-                alert(i18n.t('send.invalidQR.secretMissing'));
+                showToast(i18n.t('send.invalidQR.secretMissing'));
                 showStep(stepScan);
             } else {
                 logger.error('Invalid QR code - no room ID found');
-                alert(i18n.t('send.invalidQR.noRoom'));
+                showToast(i18n.t('send.invalidQR.noRoom'));
                 showStep(stepScan);
             }
         }
@@ -517,8 +517,7 @@
 
         function onDisconnected() {
             logger.warn('Disconnected from receiver');
-            alert(i18n.t('send.disconnected'));
-            window.location.href = '/';
+            showToast(i18n.t('send.disconnected'), { duration: 3000, onDismiss: () => { window.location.href = '/'; } });
         }
 
         /** Display a badge showing whether the connection is direct (P2P) or relayed (TURN) */
@@ -584,8 +583,7 @@
             } else if (msg.type === 'fingerprint-denied') {
                 // Receiver denied - abort connection
                 logger.error('Receiver denied fingerprint match - possible MITM attack!');
-                alert(i18n.t('verify.deniedByReceiver'));
-                window.location.href = '/';
+                showToast(i18n.t('verify.deniedByReceiver'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
             } else if (msg.type === 'ready') {
                 // Receiver confirmed both parties verified - can now send photos
                 logger.success('Both parties verified, can now send photos');
@@ -623,7 +621,7 @@
                 container.scrollIntoView({ behavior: 'smooth', block: 'center' });
             } catch (e) {
                 logger.error('Failed to start camera: ' + e.message);
-                alert(i18n.t('send.cameraFailed'));
+                showToast(i18n.t('send.cameraFailed'));
                 showStep(stepChoose);
             }
         }
@@ -666,7 +664,7 @@
             if (!file) return;
 
             if (!file.type.startsWith('image/')) {
-                alert(i18n.t('error.selectImage'));
+                showToast(i18n.t('error.selectImage'), { type: 'warn' });
                 return;
             }
 
@@ -688,7 +686,7 @@
             } catch (e) {
                 // If stripping fails for any reason, refuse to send rather than leaking metadata
                 logger.error('Metadata stripping failed: ' + e.message);
-                alert('Could not process image. Please try another file.');
+                showToast('Could not process image. Please try another file.');
                 return;
             }
 
@@ -806,7 +804,7 @@
 
             } catch (e) {
                 logger.error('Failed to send photo: ' + e.message);
-                alert(i18n.t('send.sendFailed'));
+                showToast(i18n.t('send.sendFailed'));
                 document.getElementById('send-btn').disabled = false;
             }
         }
@@ -855,8 +853,7 @@
             // Tell receiver we denied
             rtc.sendMessage({ type: 'fingerprint-denied' });
 
-            alert(i18n.t('verify.selfDenied'));
-            window.location.href = '/';
+            showToast(i18n.t('verify.selfDenied'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
         }
 
         /** Check if both parties confirmed - receiver will send 'ready' to trigger photo UI */
