@@ -29,6 +29,14 @@ class ImageSecureSendRTC {
         // ICE candidate handling
         this.pendingIceCandidates = [];
         this.remoteDescriptionSet = false;
+
+        // ICE candidate polling state
+        // After the initial fetch of remote candidates, we poll for newly trickled
+        // candidates until the connection succeeds or fails. This is needed because
+        // candidates arrive asynchronously and the one-shot fetch may miss late ones.
+        this._icePollTimer = null;
+        this._icePollRemoteSide = null; // 'offer' or 'answer' — the side we fetch from
+        this._knownRemoteCandidateCount = 0;
     }
 
     /**
@@ -400,8 +408,9 @@ class ImageSecureSendRTC {
                     }
                     this.pendingIceCandidates = [];
 
-                    // Also fetch and add sender's ICE candidates
+                    // Fetch sender's ICE candidates and start polling for late arrivals
                     await this.fetchRemoteIceCandidates('answer');
+                    this.startIceCandidatePolling('answer');
 
                     logger.success('Answer processed');
                     return;
@@ -472,8 +481,9 @@ class ImageSecureSendRTC {
         this.remoteDescriptionSet = true;
         logger.debug('SIGNALING', 'Remote description set from offer');
 
-        // Fetch and add receiver's ICE candidates
+        // Fetch receiver's ICE candidates and start polling for late arrivals
         await this.fetchRemoteIceCandidates('offer');
+        this.startIceCandidatePolling('offer');
 
         // Create and store answer
         logger.debug('SIGNALING', 'Creating SDP answer...');
@@ -506,7 +516,8 @@ class ImageSecureSendRTC {
     }
 
     /**
-     * Fetch remote ICE candidates from server
+     * Fetch remote ICE candidates from server and add any new ones.
+     * Tracks how many candidates we've already processed to avoid duplicates.
      * @param {string} side - 'offer' or 'answer'
      */
     async fetchRemoteIceCandidates(side) {
@@ -517,8 +528,15 @@ class ImageSecureSendRTC {
             });
             if (response.ok) {
                 const data = await response.json();
-                logger.debug('ICE', `Received ${data.candidates.length} remote candidates`);
-                for (const candidate of data.candidates) {
+                const allCandidates = data.candidates;
+                // Only process candidates we haven't seen yet
+                const newCandidates = allCandidates.slice(this._knownRemoteCandidateCount);
+                if (newCandidates.length > 0) {
+                    logger.debug('ICE', `Got ${newCandidates.length} new remote candidates (total: ${allCandidates.length})`);
+                }
+                this._knownRemoteCandidateCount = allCandidates.length;
+
+                for (const candidate of newCandidates) {
                     if (this.remoteDescriptionSet) {
                         await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
                         logger.info('Added remote ICE candidate');
@@ -533,6 +551,38 @@ class ImageSecureSendRTC {
             }
         } catch (e) {
             logger.warn('Failed to fetch ICE candidates: ' + e.message);
+        }
+    }
+
+    /**
+     * Start polling for new remote ICE candidates.
+     * Trickle ICE means candidates arrive asynchronously — a single fetch may miss
+     * late-arriving candidates (especially STUN srflx). Polling every 1s until the
+     * connection is established ensures we pick them all up.
+     * @param {string} side - 'offer' or 'answer' — the remote side to poll
+     */
+    startIceCandidatePolling(side) {
+        this._icePollRemoteSide = side;
+        logger.debug('ICE', `Starting ICE candidate polling (${side} side)`);
+
+        this._icePollTimer = setInterval(async () => {
+            // Stop polling once connected or failed
+            if (!this.pc || this.pc.connectionState === 'connected' || this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed') {
+                this.stopIceCandidatePolling();
+                return;
+            }
+            await this.fetchRemoteIceCandidates(side);
+        }, 1000);
+    }
+
+    /**
+     * Stop ICE candidate polling (called when connection succeeds or fails)
+     */
+    stopIceCandidatePolling() {
+        if (this._icePollTimer) {
+            clearInterval(this._icePollTimer);
+            this._icePollTimer = null;
+            logger.debug('ICE', 'Stopped ICE candidate polling');
         }
     }
 
@@ -648,6 +698,7 @@ class ImageSecureSendRTC {
      * Close the connection
      */
     close() {
+        this.stopIceCandidatePolling();
         if (this.dataChannel) {
             this.dataChannel.close();
         }
