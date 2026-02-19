@@ -280,8 +280,19 @@
                 statusEl.textContent = i18n.t('receive.connected');
                 statusEl.className = 'status status-connected';
             } else if (state === 'failed') {
-                statusEl.textContent = i18n.t('receive.failed');
+                // Show detailed failure info — the user needs to know what went wrong
+                const hasTurn = rtc.iceServers.some(s => {
+                    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+                    return urls.some(u => u.startsWith('turn:'));
+                });
+                let detail = i18n.t('receive.failed');
+                if (!hasTurn) {
+                    detail += '\n' + i18n.t('receive.failedNoTurn');
+                }
+                statusEl.textContent = detail;
                 statusEl.className = 'status status-error';
+                // Also show it in the whitespace-pre style so newlines render
+                statusEl.style.whiteSpace = 'pre-line';
             }
         }
 

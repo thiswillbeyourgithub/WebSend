@@ -116,33 +116,44 @@ class ImageSecureSendRTC {
 
         // Monitor connection state
         this.pc.onconnectionstatechange = () => {
-            logger.info(`Connection state: ${this.pc.connectionState}`);
+            const state = this.pc.connectionState;
+            logger.info(`Connection state: ${state}`);
             logger.debug('CONNECTION', 'Peer connection state changed', {
-                connectionState: this.pc.connectionState,
+                connectionState: state,
                 iceConnectionState: this.pc.iceConnectionState,
                 iceGatheringState: this.pc.iceGatheringState,
                 signalingState: this.pc.signalingState
             });
             if (this.onStateChange) {
-                this.onStateChange(this.pc.connectionState);
+                this.onStateChange(state);
             }
-            if (this.pc.connectionState === 'connected') {
+            if (state === 'connected') {
                 logger.success('Peer connection established!');
+                this.stopIceCandidatePolling();
                 if (this.onConnected) this.onConnected();
-                // Detect connection type after connection is established
                 this.detectConnectionType();
-            } else if (this.pc.connectionState === 'disconnected' || this.pc.connectionState === 'failed') {
-                logger.error('Peer connection lost');
+            } else if (state === 'failed') {
+                // Gather diagnostic info to explain WHY the connection failed
+                this._logConnectionFailure();
+                if (this.onDisconnected) this.onDisconnected();
+            } else if (state === 'disconnected') {
+                logger.warn('Peer connection disconnected (may recover)');
                 if (this.onDisconnected) this.onDisconnected();
             }
         };
 
         this.pc.oniceconnectionstatechange = () => {
-            logger.info(`ICE connection state: ${this.pc.iceConnectionState}`);
+            const iceState = this.pc.iceConnectionState;
+            logger.info(`ICE connection state: ${iceState}`);
             logger.debug('ICE', 'ICE connection state changed', {
-                iceConnectionState: this.pc.iceConnectionState,
+                iceConnectionState: iceState,
                 connectionState: this.pc.connectionState
             });
+
+            if (iceState === 'failed') {
+                logger.error('ICE connection failed — no network path found between peers');
+                logger.error('This typically means: both peers are behind symmetric NATs and no TURN server is configured');
+            }
         };
 
         // Handle incoming data channel (for sender side when receiver creates one)
@@ -334,42 +345,46 @@ class ImageSecureSendRTC {
      */
     async createOfferAndStore() {
         this.isOfferer = true;
-        logger.debug('SIGNALING', 'Creating peer connection as offerer');
+
+        // Step 1: Create peer connection
+        logger.info('[Step 1/4] Creating peer connection...');
         this.createPeerConnection();
 
-        // Create data channel
+        // Step 2: Create data channel and SDP offer
+        logger.info('[Step 2/4] Creating data channel and SDP offer...');
         const dc = this.pc.createDataChannel('imagesecuresend', { ordered: true });
         this.setupDataChannel(dc);
 
-        // Create offer
-        logger.debug('SIGNALING', 'Creating SDP offer...');
         const offer = await this.pc.createOffer();
         await this.pc.setLocalDescription(offer);
-        logger.info('Created offer, gathering ICE candidates...');
+        logger.info('[Step 2/4] Offer created, gathering ICE candidates...');
         logger.debug('SIGNALING', 'Local description set', {
             type: offer.type,
             sdpLength: offer.sdp?.length
         });
 
-        // Wait for ICE gathering
+        // Step 3: Wait for ICE gathering
+        logger.info('[Step 3/4] Waiting for ICE candidate gathering...');
         await this.waitForICE();
 
-        // Store offer on server (with gathered candidates in the SDP)
+        // Step 4: Store offer on server
+        logger.info('[Step 4/4] Storing offer on signaling server...');
         const fullOffer = {
             type: this.pc.localDescription.type,
             sdp: this.pc.localDescription.sdp
         };
 
-        logger.debug('SIGNALING', 'Storing offer on server', {
-            sdpLength: fullOffer.sdp?.length
-        });
-        await fetch(`/api/rooms/${this.roomId}/offer`, {
+        const response = await fetch(`/api/rooms/${this.roomId}/offer`, {
             method: 'POST',
             headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(fullOffer)
         });
 
-        logger.success('Offer stored on server');
+        if (!response.ok) {
+            throw new Error(`Failed to store offer on server (HTTP ${response.status})`);
+        }
+
+        logger.success('Offer stored on server — ready for sender to connect');
         return { roomId: this.roomId, secret: this.roomSecret };
     }
 
@@ -439,80 +454,76 @@ class ImageSecureSendRTC {
         this.roomId = roomId;
         this.roomSecret = secret;
         this.isOfferer = false;
-        logger.info(`Joining room: ${roomId}`);
-        logger.debug('SIGNALING', 'Joining room as answerer', { roomId });
 
-        // Check room exists and has offer (requires secret)
+        // Step 1: Verify room exists and has an offer
+        logger.info(`[Step 1/6] Checking room ${roomId} exists...`);
         const checkResponse = await fetch(`/api/rooms/${roomId}`, {
             headers: this.getAuthHeaders()
         });
-        logger.debug('SIGNALING', 'Room check response', { status: checkResponse.status });
         if (!checkResponse.ok) {
             if (checkResponse.status === 401) {
-                throw new Error('Invalid room secret - QR code may be corrupted');
+                throw new Error('Invalid room secret — the QR code may be corrupted or expired');
             }
-            throw new Error('Room not found or expired');
+            if (checkResponse.status === 404) {
+                throw new Error('Room not found — it may have expired (rooms last 10 minutes)');
+            }
+            throw new Error(`Room check failed (HTTP ${checkResponse.status})`);
         }
 
         const roomInfo = await checkResponse.json();
-        logger.debug('SIGNALING', 'Room info', roomInfo);
         if (!roomInfo.hasOffer) {
-            throw new Error('Room exists but offer not ready yet');
+            throw new Error('Room exists but the receiver has not finished setting up yet — try again in a moment');
         }
+        logger.success('[Step 1/6] Room found and offer is ready');
 
-        // Fetch offer
+        // Step 2: Fetch receiver's SDP offer
+        logger.info('[Step 2/6] Fetching receiver\'s connection offer...');
         const offerResponse = await fetch(`/api/rooms/${roomId}/offer`, {
             headers: this.getAuthHeaders()
         });
         if (!offerResponse.ok) {
-            throw new Error('Failed to get offer');
+            throw new Error(`Failed to get offer from server (HTTP ${offerResponse.status})`);
         }
         const offer = await offerResponse.json();
-        logger.info('Got offer from server');
-        logger.debug('SIGNALING', 'Offer received', {
-            type: offer.type,
-            sdpLength: offer.sdp?.length
-        });
+        logger.success('[Step 2/6] Got offer from receiver');
 
-        // Process offer
-        logger.debug('SIGNALING', 'Creating peer connection as answerer');
+        // Step 3: Create peer connection and set remote description
+        logger.info('[Step 3/6] Setting up peer connection...');
         this.createPeerConnection();
         await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
         this.remoteDescriptionSet = true;
-        logger.debug('SIGNALING', 'Remote description set from offer');
 
-        // Fetch receiver's ICE candidates and start polling for late arrivals
+        // Step 4: Fetch receiver's ICE candidates
+        logger.info('[Step 4/6] Fetching receiver\'s ICE candidates...');
         await this.fetchRemoteIceCandidates('offer');
         this.startIceCandidatePolling('offer');
 
-        // Create and store answer
-        logger.debug('SIGNALING', 'Creating SDP answer...');
+        // Step 5: Create and send SDP answer
+        logger.info('[Step 5/6] Creating connection answer...');
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
-        logger.info('Created answer, gathering ICE candidates...');
-        logger.debug('SIGNALING', 'Local description set', {
-            type: answer.type,
-            sdpLength: answer.sdp?.length
-        });
+        logger.info('[Step 5/6] Answer created, gathering ICE candidates...');
 
         await this.waitForICE();
 
-        // Store answer on server
+        // Step 6: Store answer on server
+        logger.info('[Step 6/6] Sending answer to signaling server...');
         const fullAnswer = {
             type: this.pc.localDescription.type,
             sdp: this.pc.localDescription.sdp
         };
 
-        logger.debug('SIGNALING', 'Storing answer on server', {
-            sdpLength: fullAnswer.sdp?.length
-        });
-        await fetch(`/api/rooms/${roomId}/answer`, {
+        const answerResponse = await fetch(`/api/rooms/${roomId}/answer`, {
             method: 'POST',
             headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(fullAnswer)
         });
 
-        logger.success('Answer stored on server, waiting for connection...');
+        if (!answerResponse.ok) {
+            throw new Error(`Failed to store answer on server (HTTP ${answerResponse.status})`);
+        }
+
+        logger.success('[Step 6/6] Answer sent — establishing peer connection...');
     }
 
     /**
@@ -608,6 +619,70 @@ class ImageSecureSendRTC {
                 }
             };
         });
+    }
+
+    /**
+     * Log detailed diagnostics when a connection fails.
+     * Collects ICE candidate info, connection stats, and configuration to help
+     * the user understand exactly what was tried and why it failed.
+     */
+    async _logConnectionFailure() {
+        logger.error('=== CONNECTION FAILURE DIAGNOSTICS ===');
+        logger.error(`ICE connection state: ${this.pc.iceConnectionState}`);
+        logger.error(`ICE gathering state: ${this.pc.iceGatheringState}`);
+        logger.error(`Signaling state: ${this.pc.signalingState}`);
+
+        // Log configured ICE servers
+        const config = this.pc.getConfiguration();
+        const serverCount = config.iceServers?.length || 0;
+        const hasStun = config.iceServers?.some(s => {
+            const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+            return urls.some(u => u.startsWith('stun:'));
+        });
+        const hasTurn = config.iceServers?.some(s => {
+            const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+            return urls.some(u => u.startsWith('turn:'));
+        });
+        logger.error(`ICE servers configured: ${serverCount} (STUN: ${hasStun ? 'yes' : 'NO'}, TURN: ${hasTurn ? 'yes' : 'NO'})`);
+
+        if (!hasTurn) {
+            logger.error('No TURN server configured — connection will fail if both peers are behind symmetric NATs');
+        }
+
+        // Gather candidate pair stats to show what was attempted
+        try {
+            const stats = await this.pc.getStats();
+            let localCandidateTypes = [];
+            let remoteCandidateTypes = [];
+            let pairStates = [];
+
+            stats.forEach(report => {
+                if (report.type === 'local-candidate') {
+                    localCandidateTypes.push(`${report.candidateType}/${report.protocol || '?'}/${report.address || '?'}:${report.port || '?'}`);
+                }
+                if (report.type === 'remote-candidate') {
+                    remoteCandidateTypes.push(`${report.candidateType}/${report.protocol || '?'}/${report.address || '?'}:${report.port || '?'}`);
+                }
+                if (report.type === 'candidate-pair') {
+                    pairStates.push(`${report.state} (nominated:${report.nominated})`);
+                }
+            });
+
+            logger.error(`Local candidates gathered: ${localCandidateTypes.length > 0 ? localCandidateTypes.join(', ') : 'NONE'}`);
+            logger.error(`Remote candidates received: ${remoteCandidateTypes.length > 0 ? remoteCandidateTypes.join(', ') : 'NONE'}`);
+            logger.error(`Candidate pairs tried: ${pairStates.length > 0 ? pairStates.join(', ') : 'NONE'}`);
+
+            if (localCandidateTypes.length === 0) {
+                logger.error('No local candidates — STUN server may be unreachable or blocked by firewall');
+            }
+            if (remoteCandidateTypes.length === 0) {
+                logger.error('No remote candidates — the other peer may have failed to gather candidates');
+            }
+        } catch (e) {
+            logger.error('Could not gather stats: ' + e.message);
+        }
+
+        logger.error('=== END DIAGNOSTICS ===');
     }
 
     /**

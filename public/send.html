@@ -489,8 +489,20 @@
                 statusEl.textContent = i18n.t('send.connected');
                 statusEl.className = 'status status-connected';
             } else if (state === 'failed') {
-                statusEl.textContent = i18n.t('send.failed');
+                // Show detailed failure info — the user needs to know what went wrong
+                const hasTurn = rtc.iceServers.some(s => {
+                    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+                    return urls.some(u => u.startsWith('turn:'));
+                });
+                let detail = i18n.t('send.failed');
+                if (!hasTurn) {
+                    detail += '\n' + i18n.t('send.failedNoTurn');
+                }
+                statusEl.textContent = detail;
                 statusEl.className = 'status status-error';
+                statusEl.style.whiteSpace = 'pre-line';
+                // Keep step-connecting visible so the error message is shown
+                showStep(stepConnecting);
             }
         }
 
