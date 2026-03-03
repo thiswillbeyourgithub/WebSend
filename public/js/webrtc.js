@@ -62,12 +62,17 @@ class ImageSecureSendRTC {
             const response = await fetch('/api/config');
             const config = await response.json();
             this.iceServers = config.iceServers;
+            // iceTransportPolicy: 'relay' forces TURN-only (set by DEV_FORCE_CONNECTION on server)
+            this.iceTransportPolicy = config.iceTransportPolicy || 'all';
             // Enable DEV mode in logger if server has it enabled
             if (config.dev) {
                 logger.setDevMode(true);
             }
-            logger.success(`Got ${this.iceServers.length} ICE servers`);
-            logger.debug('CONFIG', 'ICE servers loaded', { servers: this.iceServers });
+            if (config.forceConnection) {
+                logger.warn(`DEV_FORCE_CONNECTION=${config.forceConnection} — ICE servers filtered for debugging`);
+            }
+            logger.success(`Got ${this.iceServers.length} ICE servers (transport policy: ${this.iceTransportPolicy})`);
+            logger.debug('CONFIG', 'ICE servers loaded', { servers: this.iceServers, iceTransportPolicy: this.iceTransportPolicy });
         } catch (e) {
             logger.warn('Failed to fetch config, using defaults: ' + e.message);
             this.iceServers = [
@@ -83,7 +88,8 @@ class ImageSecureSendRTC {
         logger.info('Creating peer connection...');
 
         this.pc = new RTCPeerConnection({
-            iceServers: this.iceServers
+            iceServers: this.iceServers,
+            iceTransportPolicy: this.iceTransportPolicy
         });
 
         // Track ICE candidates and send to server

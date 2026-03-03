@@ -28,6 +28,15 @@ const TURN_CREDENTIAL_TTL = parseInt(process.env.TURN_CREDENTIAL_TTL, 10) || 864
 // TURNS_PORT: if set, a turns: (TURN-over-TLS) URL is added to ICE candidates,
 // allowing WebRTC to traverse corporate firewalls that block non-HTTPS ports.
 const TURNS_PORT = process.env.TURNS_PORT || '';
+// DEV_FORCE_CONNECTION: force a specific ICE transport for debugging.
+// Valid values: DIRECT, STUN, GOOGLE_STUN, TURN, TURNS, ALL (default).
+// DIRECT = no ICE servers (LAN host candidates only)
+// STUN = self-hosted STUN only
+// GOOGLE_STUN = Google's public STUN only
+// TURN = TURN UDP+TCP relay only (forces iceTransportPolicy: relay)
+// TURNS = TURN-over-TLS only (forces iceTransportPolicy: relay)
+// ALL or unset = normal behavior (all configured servers)
+const DEV_FORCE_CONNECTION = (process.env.DEV_FORCE_CONNECTION || 'DEFAULT').toUpperCase();
 
 /**
  * Debug logging helper - only logs when DEV=1
@@ -357,14 +366,80 @@ app.get('/api/config', (req, res) => {
         console.warn('TURN_SERVER is set but TURN_SECRET is missing. TURN will not be available.');
     }
 
-    // Warn if no ICE servers at all (connection will likely fail)
-    if (iceServers.length === 0) {
+    // DEV_FORCE_CONNECTION: filter ICE servers to isolate a specific transport for debugging.
+    // This lets you verify each connection method independently (e.g., confirm TURN works
+    // before troubleshooting TURNS).
+    let filteredServers = iceServers;
+    let forceRelay = false;
+
+    if (DEV_FORCE_CONNECTION !== 'DEFAULT') {
+        debugLog('CONFIG', `DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION}: filtering ICE servers`);
+
+        switch (DEV_FORCE_CONNECTION) {
+            case 'DIRECT':
+                // No ICE servers at all — only host candidates (LAN only)
+                filteredServers = [];
+                break;
+
+            case 'STUN':
+                // Self-hosted STUN only (no Google, no TURN)
+                filteredServers = iceServers.filter(s =>
+                    typeof s.urls === 'string' && s.urls.startsWith('stun:') && !s.urls.includes('google')
+                );
+                break;
+
+            case 'GOOGLE_STUN':
+                // Google's public STUN only
+                filteredServers = iceServers.filter(s =>
+                    typeof s.urls === 'string' && s.urls.includes('stun.l.google.com')
+                );
+                break;
+
+            case 'TURN':
+                // TURN UDP+TCP only (no TURNS, no STUN) — force relay so STUN discovery is skipped
+                filteredServers = iceServers
+                    .filter(s => Array.isArray(s.urls))
+                    .map(s => ({
+                        ...s,
+                        urls: s.urls.filter(u => u.startsWith('turn:'))
+                    }))
+                    .filter(s => s.urls.length > 0);
+                forceRelay = true;
+                break;
+
+            case 'TURNS':
+            case 'TURN_TLS':
+                // TURNS (TURN-over-TLS) only — force relay
+                filteredServers = iceServers
+                    .filter(s => Array.isArray(s.urls))
+                    .map(s => ({
+                        ...s,
+                        urls: s.urls.filter(u => u.startsWith('turns:'))
+                    }))
+                    .filter(s => s.urls.length > 0);
+                forceRelay = true;
+                break;
+
+            default:
+                console.warn(`Unknown DEV_FORCE_CONNECTION value: "${DEV_FORCE_CONNECTION}", using ALL`);
+                break;
+        }
+
+        debugLog('CONFIG', `Filtered ICE servers (${DEV_FORCE_CONNECTION}):`, filteredServers);
+    }
+
+    // Warn if no ICE servers at all and we're not intentionally in DIRECT mode
+    if (filteredServers.length === 0 && DEV_FORCE_CONNECTION !== 'DIRECT') {
         console.warn('No ICE servers configured! WebRTC connections will likely fail.');
     }
 
     // Note: domain is no longer returned; client uses window.location.origin
     res.json({
-        iceServers: iceServers,
+        iceServers: filteredServers,
+        // iceTransportPolicy: 'relay' forces WebRTC to only use relay (TURN) candidates,
+        // skipping direct and STUN-discovered paths. Only set when forcing TURN/TURNS.
+        ...(forceRelay ? { iceTransportPolicy: 'relay' } : {}),
+        forceConnection: DEV_FORCE_CONNECTION !== 'DEFAULT' ? DEV_FORCE_CONNECTION : undefined,
         dev: DEV
     });
 });
