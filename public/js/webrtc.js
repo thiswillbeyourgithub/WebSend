@@ -37,6 +37,12 @@ class ImageSecureSendRTC {
         this._icePollTimer = null;
         this._icePollRemoteSide = null; // 'offer' or 'answer' — the side we fetch from
         this._knownRemoteCandidateCount = 0;
+
+        // Connection timeout — if WebRTC doesn't reach 'connected' or 'failed' within
+        // this duration (e.g. TURN server unreachable), we force-fail instead of polling
+        // forever. 10s is generous: STUN typically resolves in <2s, TURN in <5s.
+        this._connectionTimeout = null;
+        this._CONNECTION_TIMEOUT_MS = 10000;
     }
 
     /**
@@ -538,7 +544,6 @@ class ImageSecureSendRTC {
      * @param {string} side - 'offer' or 'answer'
      */
     async fetchRemoteIceCandidates(side) {
-        logger.debug('ICE', `Fetching remote ICE candidates (${side} side)`);
         try {
             const response = await fetch(`/api/rooms/${this.roomId}/ice/${side}`, {
                 headers: this.getAuthHeaders()
@@ -590,10 +595,16 @@ class ImageSecureSendRTC {
             }
             await this.fetchRemoteIceCandidates(side);
         }, 1000);
+
+        // Start connection timeout — if WebRTC stays stuck in 'connecting' or
+        // 'checking' (e.g. TURN server unreachable, bad credentials), this fires
+        // after 10s to stop the infinite polling and surface a clear error.
+        this._startConnectionTimeout();
     }
 
     /**
-     * Stop ICE candidate polling (called when connection succeeds or fails)
+     * Stop ICE candidate polling and connection timeout.
+     * Called when connection succeeds, fails, or times out.
      */
     stopIceCandidatePolling() {
         if (this._icePollTimer) {
@@ -601,6 +612,33 @@ class ImageSecureSendRTC {
             this._icePollTimer = null;
             logger.debug('ICE', 'Stopped ICE candidate polling');
         }
+        if (this._connectionTimeout) {
+            clearTimeout(this._connectionTimeout);
+            this._connectionTimeout = null;
+        }
+    }
+
+    /**
+     * Start a timeout that fires if WebRTC never reaches a terminal state.
+     * Without this, a misconfigured TURN server (unreachable, bad credentials)
+     * causes infinite polling with no user-visible error.
+     */
+    _startConnectionTimeout() {
+        if (this._connectionTimeout) return; // already running
+        this._connectionTimeout = setTimeout(() => {
+            if (!this.pc) return;
+            const state = this.pc.connectionState;
+            const iceState = this.pc.iceConnectionState;
+            // Only fire if still stuck in a non-terminal state
+            if (state !== 'connected' && state !== 'failed' && state !== 'closed') {
+                logger.error(`Connection timed out after ${this._CONNECTION_TIMEOUT_MS / 1000}s — WebRTC never connected`);
+                logger.error(`Final states: connectionState=${state}, iceConnectionState=${iceState}`);
+                logger.error('Likely causes: TURN server unreachable, bad TURN credentials, or firewall blocking UDP/TCP relay ports');
+                this._logConnectionFailure();
+                this.stopIceCandidatePolling();
+                if (this.onDisconnected) this.onDisconnected();
+            }
+        }, this._CONNECTION_TIMEOUT_MS);
     }
 
     /**
