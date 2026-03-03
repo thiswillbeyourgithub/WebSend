@@ -658,6 +658,8 @@ app.listen(PORT, '0.0.0.0', () => {
         { name: 'TURN_SECRET',           value: process.env.TURN_SECRET,          used: TURN_SECRET ? '(set)' : '(not set)' },
         { name: 'TURN_CREDENTIAL_TTL',   value: process.env.TURN_CREDENTIAL_TTL,  used: String(TURN_CREDENTIAL_TTL) },
         { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
+        { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
+        { name: 'DEV_FORCE_CONNECTION',  value: process.env.DEV_FORCE_CONNECTION, used: DEV_FORCE_CONNECTION },
     ];
 
     for (const v of envVars) {
