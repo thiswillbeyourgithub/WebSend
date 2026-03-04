@@ -65,3 +65,7 @@ The app is expected to run behind a **Caddy** reverse proxy which handles:
 - Adding `X-Forwarded-For` headers with the real client IP
 
 The Express server must be configured to trust proxy headers only from Caddy (localhost/Docker network), not from arbitrary clients. This prevents attackers from spoofing their IP to bypass rate limiting.
+
+## Before committing
+
+Always run `node update-sri.js` to regenerate SRI hashes before every commit. The HTML files use Subresource Integrity attributes that must match the current JS/CSS files.

@@ -426,6 +426,23 @@ app.get('/api/config', (req, res) => {
         }
 
         debugLog('CONFIG', `Filtered ICE servers (${DEV_FORCE_CONNECTION}):`, filteredServers);
+
+        // Crash if the forced connection mode has no matching servers
+        if (filteredServers.length === 0) {
+            const serverRequirements = {
+                'STUN': 'a self-hosted STUN server (TURN_SERVER)',
+                'GOOGLE_STUN': 'Google STUN (should always be available — this is a bug)',
+                'TURN': 'a TURN server (TURN_SERVER + TURN_SECRET)',
+                'TURNS': 'a TURNS server (TURN_SERVER + TURN_SECRET + TURNS_PORT)',
+                'TURN_TLS': 'a TURNS server (TURN_SERVER + TURN_SECRET + TURNS_PORT)',
+            };
+            const requirement = serverRequirements[DEV_FORCE_CONNECTION];
+            if (requirement) {
+                console.error(`FATAL: DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION} but no matching ICE servers found.`);
+                console.error(`This mode requires ${requirement}.`);
+                process.exit(1);
+            }
+        }
     }
 
     // Warn if no ICE servers at all and we're not intentionally in DIRECT mode
