@@ -685,7 +685,7 @@ class ImageSecureSendRTC {
         });
         const hasTurn = config.iceServers?.some(s => {
             const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-            return urls.some(u => u.startsWith('turn:'));
+            return urls.some(u => u.startsWith('turn:') || u.startsWith('turns:'));
         });
         logger.error(`ICE servers configured: ${serverCount} (STUN: ${hasStun ? 'yes' : 'NO'}, TURN: ${hasTurn ? 'yes' : 'NO'})`);
 
