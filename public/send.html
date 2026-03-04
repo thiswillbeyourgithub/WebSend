@@ -517,7 +517,7 @@
 
         function onDisconnected() {
             logger.warn('Disconnected from receiver');
-            showToast(i18n.t('send.disconnected'), { duration: 3000, onDismiss: () => { window.location.href = '/'; } });
+            showToast(i18n.t('send.disconnected'), { duration: 5000 });
         }
 
         /** Display a badge showing whether the connection is direct (P2P) or relayed (TURN) */
@@ -583,7 +583,7 @@
             } else if (msg.type === 'fingerprint-denied') {
                 // Receiver denied - abort connection
                 logger.error('Receiver denied fingerprint match - possible MITM attack!');
-                showToast(i18n.t('verify.deniedByReceiver'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
+                showToast(i18n.t('verify.deniedByReceiver'), { duration: 5000 });
             } else if (msg.type === 'ready') {
                 // Receiver confirmed both parties verified - can now send photos
                 logger.success('Both parties verified, can now send photos');
@@ -853,7 +853,7 @@
             // Tell receiver we denied
             rtc.sendMessage({ type: 'fingerprint-denied' });
 
-            showToast(i18n.t('verify.selfDenied'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
+            showToast(i18n.t('verify.selfDenied'), { duration: 5000 });
         }
 
         /** Check if both parties confirmed - receiver will send 'ready' to trigger photo UI */
