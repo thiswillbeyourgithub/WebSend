@@ -1,6 +1,4 @@
 # Environment files with secrets
-./env
-
 # Node modules
 node_modules/
 
@@ -17,7 +15,7 @@ Thumbs.db
 # Logs
 *.log
 
-docker/env
+docker/.env
 .aider.*
 
 deploy.sh

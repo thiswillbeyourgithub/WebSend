@@ -6,9 +6,18 @@ services:
       dockerfile: ./docker/Dockerfile
     ports:
       - "127.0.0.1:7395:8080"
-    env_file:
-      - path: env
-        required: true
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - DEV=${DEV:-0}
+      - STUN_SERVER=${STUN_SERVER:-}
+      - STUN_GOOGLE_FALLBACK=${STUN_GOOGLE_FALLBACK:-true}
+      - TURN_SERVER=${TURN_SERVER:-}
+      - TURN_SECRET=${TURN_SECRET:-}
+      - TURN_CREDENTIAL_TTL=${TURN_CREDENTIAL_TTL:-86400}
+      - TURN_TIMEOUT=${TURN_TIMEOUT:-15}
+      - TURNS_PORT=${TURNS_PORT:-}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      - DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION:-DEFAULT}
     # Security hardening options
     security_opt:
       # Prevent privilege escalation via setuid/setgid binaries
@@ -51,9 +60,6 @@ services:
   #     - "3479:3479/udp"
   #     - "3479:3479/tcp"
   #     - "49152-49156:49152-49156/udp"
-  #   env_file:
-  #     - path: env
-  #       required: true
   #   command: >
   #     -n
   #     --log-file=stdout

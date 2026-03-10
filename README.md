@@ -105,13 +105,13 @@ Ideally, the WebRTC signaling server would be replaced by [iroh](https://iroh.co
 
 1. Copy the environment file and configure your domain/IP:
    ```bash
-   cp env.example env
-   # Edit env and set DOMAIN to your server's IP or hostname
+   cp env.example .env
+   # Edit .env and set DOMAIN to your server's IP or hostname
    ```
 
 2. Start the services:
    ```bash
-   docker-compose up -d
+   docker compose up -d
    ```
 
 3. Set up [Caddy](https://caddyserver.com/) (or another reverse proxy) to terminate HTTPS and proxy to port 7395
@@ -120,7 +120,9 @@ Ideally, the WebRTC signaling server would be replaced by [iroh](https://iroh.co
 
 ## Configuration
 
-See `env.example` for all available environment variables.
+All configuration is done via environment variables in `docker/.env` (see `docker/env.example` for documentation). Docker Compose automatically loads `.env` and substitutes variables into `docker-compose.yml`.
+
+**Important**: after changing `.env`, you must run `docker compose up -d` (not `docker compose restart`) for changes to take effect, because `restart` reuses the existing container with old environment values.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -139,7 +141,7 @@ See `env.example` for all available environment variables.
 - **Camera not working**: make sure you're using HTTPS. Browsers require a secure context for camera access. Set up [Caddy](https://caddyserver.com/) or another reverse proxy for automatic HTTPS.
 - **Connection failing**: check that both devices can reach the server. If behind symmetric NAT, enable the TURN relay (see `env.example`). Check firewall rules for UDP traffic. A good way to test your network's STUN/TURN/TURNS capabilities is [Twilio's Network Test](https://networktest.twilio.com/).
 - **QR code not scanning**: ensure good lighting and that the QR code is fully visible. The QR code contains a URL with a security token.
-- **Click "Logs" button**: both sender and receiver pages have a logs panel for detailed connection debugging. Set `DEV=1` in your env file for verbose output.
+- **Click "Logs" button**: both sender and receiver pages have a logs panel for detailed connection debugging. Set `DEV=1` in `.env` for verbose output.
 
 ## Tech Stack
 
