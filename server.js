@@ -25,6 +25,8 @@ const TURN_SERVER = process.env.TURN_SERVER || '';
 const TURN_SECRET = process.env.TURN_SECRET || '';
 // TURN_CREDENTIAL_TTL: how long TURN credentials are valid (default: 24 hours)
 const TURN_CREDENTIAL_TTL = parseInt(process.env.TURN_CREDENTIAL_TTL, 10) || 86400;
+// TURN_TIMEOUT: WebRTC connection timeout in seconds (default: 15s)
+const TURN_TIMEOUT = parseInt(process.env.TURN_TIMEOUT, 10) || 15;
 // TURNS_PORT: if set, a turns: (TURN-over-TLS) URL is added to ICE candidates,
 // allowing WebRTC to traverse corporate firewalls that block non-HTTPS ports.
 const TURNS_PORT = process.env.TURNS_PORT || '';
@@ -457,7 +459,8 @@ app.get('/api/config', (req, res) => {
         // skipping direct and STUN-discovered paths. Only set when forcing TURN/TURNS.
         ...(forceRelay ? { iceTransportPolicy: 'relay' } : {}),
         forceConnection: DEV_FORCE_CONNECTION !== 'DEFAULT' ? DEV_FORCE_CONNECTION : undefined,
-        dev: DEV
+        dev: DEV,
+        turnTimeout: TURN_TIMEOUT
     });
 });
 
@@ -674,6 +677,7 @@ app.listen(PORT, '0.0.0.0', () => {
         { name: 'TURN_SERVER',           value: process.env.TURN_SERVER,          used: TURN_SERVER || '(none)' },
         { name: 'TURN_SECRET',           value: process.env.TURN_SECRET,          used: TURN_SECRET ? '(set)' : '(not set)' },
         { name: 'TURN_CREDENTIAL_TTL',   value: process.env.TURN_CREDENTIAL_TTL,  used: String(TURN_CREDENTIAL_TTL) },
+        { name: 'TURN_TIMEOUT',          value: process.env.TURN_TIMEOUT,         used: String(TURN_TIMEOUT) },
         { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
         { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
         { name: 'DEV_FORCE_CONNECTION',  value: process.env.DEV_FORCE_CONNECTION, used: DEV_FORCE_CONNECTION },

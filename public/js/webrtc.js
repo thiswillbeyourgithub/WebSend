@@ -40,9 +40,9 @@ class ImageSecureSendRTC {
 
         // Connection timeout — if WebRTC doesn't reach 'connected' or 'failed' within
         // this duration (e.g. TURN server unreachable), we force-fail instead of polling
-        // forever. 10s is generous: STUN typically resolves in <2s, TURN in <5s.
+        // forever. Configurable via TURN_TIMEOUT env var (default: 15s).
         this._connectionTimeout = null;
-        this._CONNECTION_TIMEOUT_MS = 10000;
+        this._CONNECTION_TIMEOUT_MS = 15000; // default, overridden by server config
     }
 
     /**
@@ -76,6 +76,9 @@ class ImageSecureSendRTC {
             }
             if (config.forceConnection) {
                 logger.warn(`DEV_FORCE_CONNECTION=${config.forceConnection} — ICE servers filtered for debugging`);
+            }
+            if (config.turnTimeout) {
+                this._CONNECTION_TIMEOUT_MS = config.turnTimeout * 1000;
             }
             logger.success(`Got ${this.iceServers.length} ICE servers (transport policy: ${this.iceTransportPolicy})`);
             logger.debug('CONFIG', 'ICE servers loaded', { servers: this.iceServers, iceTransportPolicy: this.iceTransportPolicy });
