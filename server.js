@@ -7,6 +7,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
+const { version: APP_VERSION } = require('./package.json');
 
 const app = express();
 const PORT = 8080;
@@ -500,7 +501,8 @@ app.get('/api/config', (req, res) => {
         ...(forceRelay ? { iceTransportPolicy: 'relay' } : {}),
         forceConnection: DEV_FORCE_CONNECTION !== 'DEFAULT' ? DEV_FORCE_CONNECTION : undefined,
         dev: DEV,
-        turnTimeout: TURN_TIMEOUT
+        turnTimeout: TURN_TIMEOUT,
+        version: APP_VERSION
     });
 });
 
