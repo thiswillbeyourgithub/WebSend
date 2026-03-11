@@ -76,6 +76,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 ### TURN Relay Security
 - TURN credentials are **time-based** (HMAC-SHA1, standard coturn ephemeral credentials) and expire after a configurable TTL (default: 24 hours)
 - Even when relayed through TURN, photos are still **end-to-end encrypted** -- the TURN server only sees encrypted blobs
+- TURNS (TURN-over-TLS) requires TLS certificates; if you use **Caddy**, you can mount its managed certificates into the coturn container (see the commented example in `docker-compose.yml`)
 
 ## Non-Security Features
 

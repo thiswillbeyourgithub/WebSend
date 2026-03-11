@@ -77,6 +77,11 @@ services:
   #     # Then mount the certificate files via a volume:
   #     # volumes:
   #     #   - /path/to/certs:/etc/coturn/certs:ro
+  #     # If you use Caddy, you can reuse its managed certificates. Caddy stores them
+  #     # under its data directory; the exact path depends on the ACME issuer and domain.
+  #     # Example (adjust to your domain and Caddy data path):
+  #     # volumes:
+  #     #   - /path/to/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/your.domain:/certs:ro
   #     # And expose the TURNS port:
   #     #   - "${TURNS_PORT:-8443}:${TURNS_PORT:-8443}/tcp"
   #     --realm=imagesecuresend
