@@ -14,6 +14,15 @@ const DOMAIN = process.env.DOMAIN || 'localhost';
 // DEV mode: when 1, enables verbose debug logging for handshake/connection troubleshooting
 const DEV = process.env.DEV === '1';
 
+// ============ Analytics (Umami) ============
+// Privacy-preserving analytics via Umami. Only enabled when both URL and website ID are set.
+// UMAMI_URL: base URL of the Umami instance (e.g., https://u.example.org)
+const UMAMI_URL = process.env.UMAMI_URL || '';
+// UMAMI_WEBSITE_ID: the data-website-id for the Umami tracking script
+const UMAMI_WEBSITE_ID = process.env.UMAMI_WEBSITE_ID || '';
+// UMAMI_DNT: whether to respect Do Not Track browser setting ("true" or "false", default: "true")
+const UMAMI_DNT = process.env.UMAMI_DNT || 'true';
+
 // ============ ICE Server Configuration ============
 // STUN_SERVER: optional self-hosted STUN server (host:port)
 const STUN_SERVER = process.env.STUN_SERVER || '';
@@ -306,6 +315,37 @@ function cleanupRooms() {
 
 // Run cleanup every minute
 setInterval(cleanupRooms, 60 * 1000);
+
+// ============ Umami Analytics Injection ============
+// When Umami is configured, serve HTML files with the tracking script injected
+// before </head>. This avoids modifying static HTML files and keeps analytics
+// config server-side. Non-HTML static files are served normally below.
+const fs = require('fs');
+
+if (UMAMI_URL && UMAMI_WEBSITE_ID) {
+    const umamiScript = `    <script defer src="${UMAMI_URL}/getinfo" data-website-id="${UMAMI_WEBSITE_ID}" data-do-not-track="${UMAMI_DNT}"></script>\n`;
+
+    // Intercept requests for HTML pages and inject the analytics script
+    app.use((req, res, next) => {
+        // Determine which HTML file to serve (if any)
+        let htmlFile = null;
+        if (req.path === '/' || req.path === '/index.html') {
+            htmlFile = path.join(__dirname, 'public', 'index.html');
+        } else if (req.path === '/send.html') {
+            htmlFile = path.join(__dirname, 'public', 'send.html');
+        } else if (req.path === '/receive.html') {
+            htmlFile = path.join(__dirname, 'public', 'receive.html');
+        }
+
+        if (!htmlFile) return next();
+
+        fs.readFile(htmlFile, 'utf8', (err, html) => {
+            if (err) return next();
+            html = html.replace('</head>', umamiScript + '</head>');
+            res.type('html').send(html);
+        });
+    });
+}
 
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, 'public')));
@@ -681,6 +721,9 @@ app.listen(PORT, '0.0.0.0', () => {
         { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
         { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
         { name: 'DEV_FORCE_CONNECTION',  value: process.env.DEV_FORCE_CONNECTION, used: DEV_FORCE_CONNECTION },
+        { name: 'UMAMI_URL',             value: process.env.UMAMI_URL,            used: UMAMI_URL || '(none)' },
+        { name: 'UMAMI_WEBSITE_ID',      value: process.env.UMAMI_WEBSITE_ID,     used: UMAMI_WEBSITE_ID || '(none)' },
+        { name: 'UMAMI_DNT',             value: process.env.UMAMI_DNT,            used: UMAMI_DNT },
     ];
 
     for (const v of envVars) {

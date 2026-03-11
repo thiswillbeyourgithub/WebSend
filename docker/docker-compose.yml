@@ -18,6 +18,9 @@ services:
       - TURNS_PORT=${TURNS_PORT:-}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
       - DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION:-DEFAULT}
+      - UMAMI_URL=${UMAMI_URL:-}
+      - UMAMI_WEBSITE_ID=${UMAMI_WEBSITE_ID:-}
+      - UMAMI_DNT=${UMAMI_DNT:-true}
     # Security hardening options
     security_opt:
       # Prevent privilege escalation via setuid/setgid binaries

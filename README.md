@@ -130,6 +130,9 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `TURN_SECRET` | Shared secret for TURN time-based credentials | _(empty)_ |
 | `TURN_CREDENTIAL_TTL` | TURN credential validity in seconds | `86400` (24h) |
 | `TURNS_PORT` | TURN-over-TLS (TURNS) port; enables `turns:` ICE candidates | _(empty -- TURNS disabled)_ |
+| `UMAMI_URL` | Base URL of your [Umami](https://umami.is/) analytics instance | _(empty -- analytics disabled)_ |
+| `UMAMI_WEBSITE_ID` | Website ID from your Umami dashboard (UUID) | _(empty)_ |
+| `UMAMI_DNT` | Respect browser Do Not Track setting (`true` or `false`) | `true` |
 
 ## Firewall (UFW)
 
