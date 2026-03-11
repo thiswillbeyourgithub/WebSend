@@ -10,7 +10,7 @@
     <title>ImageSecureSend - Secure Photo Transfer</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-xvhN0Q+7Ql22JhEH0B8zre6PF6abFMn2OBv0+c5oWu4ZM7UhcC5fwARFJOdlGztc" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-RAQWrkqeLhw9nOv2UBoStuSj3vdt+X9I/51JaeOqT+o3BCliyQxX0W9Co5RluKCK" crossorigin="anonymous">
 </head>
 <body>
     <!-- Kebab menu button: opens sidebar with settings, logs, about -->
@@ -38,7 +38,8 @@
 
         <!-- Actions -->
         <div class="sidebar-section">
-            <button class="sidebar-action" id="sidebar-logs-btn">
+            <!-- Logs button hidden on index page, only shown on send/receive pages -->
+            <button class="sidebar-action hidden" id="sidebar-logs-btn">
                 <span>📋</span>
                 <span data-i18n="menu.logs">Logs</span>
             </button>
@@ -58,6 +59,8 @@
         <h1 data-i18n="app.name">ImageSecureSend</h1>
         <p class="subtitle" data-i18n="app.subtitle">Secure Photo Transfer</p>
 
+        <p class="e2e-notice" data-i18n="index.footer">Your photos are encrypted end-to-end.<br>They never pass unencrypted through any server.</p>
+
         <div class="button-container">
             <a href="/receive.html" class="btn btn-primary btn-large">
                 <span class="btn-icon">📥</span>
@@ -73,14 +76,13 @@
         </div>
 
         <footer>
-            <p data-i18n="index.footer">Your photos are encrypted end-to-end.<br>They never pass unencrypted through any server.</p>
             <div style="margin-top: 10px; color: #999; font-size: 0.75rem;">v1.5.0</div>
         </footer>
     </div>
 
     <!-- About Modal -->
     <div id="about-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
-        <div style="background: white; border-radius: 15px; padding: 25px; max-width: 400px; margin: 20px; max-height: 80vh; overflow-y: auto;">
+        <div style="background: white; border-radius: 15px; padding: 25px; max-width: 600px; width: 90vw; margin: 20px; max-height: 80vh; overflow-y: auto;">
             <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="about.title">About ImageSecureSend</h2>
 
             <p style="color: #555; font-size: 0.95rem; margin-bottom: 15px;" data-i18n="about.description">
