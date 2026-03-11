@@ -40,7 +40,7 @@
 
             <!-- Room ID display removed - secret is required and cannot be typed manually -->
 
-            <div class="status status-waiting" id="status-waiting" data-i18n="receive.waiting">
+            <div class="status status-waiting hidden" id="status-waiting" data-i18n="receive.waiting">
                 Waiting for sender to scan...
             </div>
         </div>
@@ -257,6 +257,7 @@
                 });
                 container.appendChild(canvas);
                 logger.success('QR code generated');
+                document.getElementById('status-waiting').classList.remove('hidden');
             } catch (e) {
                 logger.error('QR code generation failed: ' + e.message);
                 container.innerHTML = `
@@ -267,6 +268,7 @@
                             onclick="this.select()">
                     </div>
                 `;
+                document.getElementById('status-waiting').classList.remove('hidden');
             }
         }
 
