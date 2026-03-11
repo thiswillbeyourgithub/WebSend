@@ -1,11 +1,5 @@
 # ImageSecureSend
 
-> **⚠️ WARNING: WORK IN PROGRESS ⚠️**
-> 
-> **This project is not ready for production use. Do not use it yet. Breaking changes will come.**
-> 
-> This codebase has not been audited by security professionals. While built with security best practices in mind, it may contain vulnerabilities. Use at your own risk.
-
 **Use your regular smartphone as a secure document scanner** -- even for sensitive documents.
 
 ImageSecureSend transfers photos directly between devices using WebRTC and end-to-end encryption. Photos are encrypted on the sender's device and decrypted only on the receiver's device. They never pass through any server unencrypted, and they never touch the phone's storage.
