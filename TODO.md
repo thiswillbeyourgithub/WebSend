@@ -1,0 +1,9 @@
+- ~~See if we can improve security by adding things to the coturn container~~ **DONE**
+    - ✅ no-new-privileges: true
+    - ✅ cap_drop ALL
+    - ✅ read_only: true (with tmpfs for /tmp)
+    - ✅ resource limits (128M RAM, 0.5 CPU)
+    - ✅ privileged: false
+    - ⚠️ running as unprivileged skipped (coturn image expects root)
+- On the sender side: you've tried numerous time that one so be careful: when clicking on "Start Camera to Scan", the camera area appears as it should BUT the user has to manually scroll down so that it takes the majority of the screen. Otherwise, we can read "Back" in the top left corner then a big gap and only then starts the camera area. I want you to make sure it scrolls down when the camera expands.
+- investigate whether ocr can be added on the receiver side without too much issue. i guess xith tesseract.js
