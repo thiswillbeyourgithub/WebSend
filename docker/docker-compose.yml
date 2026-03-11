@@ -48,54 +48,54 @@ services:
       retries: 3
       start_period: 10s
 
-  # TURN relay server - uncomment if direct P2P fails (symmetric NAT, etc.)
+  # TURN relay server for when direct P2P fails (symmetric NAT, etc.)
   # Uses time-based credentials with shared secret (see env.example for TURN_SECRET).
   # If you already have a coturn instance (e.g., for Nextcloud), you can reuse it
   # by setting TURN_SERVER and TURN_SECRET in your env file instead.
-  #
-  # coturn:
-  #   image: coturn/coturn:latest
-  #   ports:
-  #     # Use a different port if 3478 is already in use (e.g., by another coturn)
-  #     - "3478:3478/udp"
-  #     - "3478:3478/tcp"
-  #     - "49152-49161:49152-49161/udp"
-  #   command: >
-  #     -n
-  #     --log-file=stdout
-  #     --use-auth-secret
-  #     --static-auth-secret=${TURN_SECRET}
-  #     --fingerprint
-  #     --no-multicast-peers
-  #     --no-cli
-  #     --no-dtls
-  #     --no-tls
-  #     # To enable TURNS (TURN-over-TLS), remove --no-tls above and add:
-  #     # --tls-listening-port=${TURNS_PORT:-8443}
-  #     # --cert=/etc/coturn/certs/cert.pem
-  #     # --pkey=/etc/coturn/certs/key.pem
-  #     # Then mount the certificate files via a volume:
-  #     # volumes:
-  #     #   - /path/to/certs:/etc/coturn/certs:ro
-  #     # If you use Caddy, you can reuse its managed certificates. Caddy stores them
-  #     # under its data directory; the exact path depends on the ACME issuer and domain.
-  #     # Example (adjust to your domain and Caddy data path):
-  #     # volumes:
-  #     #   - /path/to/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/your.domain:/certs:ro
-  #     # And expose the TURNS port:
-  #     #   - "${TURNS_PORT:-8443}:${TURNS_PORT:-8443}/tcp"
-  #     --realm=imagesecuresend
-  #     --min-port=49152
-  #     --max-port=49161
-  #     --listening-port=3478
-  #     # Docker NAT: format is --external-ip=PUBLIC_IP/INTERNAL_IP.
-  #     # 0.0.0.0 as internal means "all container interfaces" (correct for Docker).
-  #     # NOTE: DOMAIN must be an IP address here, NOT a hostname — coturn does not
-  #     # resolve DNS for --external-ip. Set a separate TURN_EXTERNAL_IP env var if
-  #     # your DOMAIN is a hostname.
-  #     --external-ip=${TURN_EXTERNAL_IP:-${DOMAIN:-127.0.0.1}}
-  #     # Explicitly bind relay sockets to all interfaces so packets actually leave
-  #     # the container (without this, coturn may silently fail to relay in Docker).
-  #     --no-stun
-  #     --check-origin-consistency
-  #     --cpus=1
+  coturn:
+    image: coturn/coturn:latest
+    container_name: coturn
+    ports:
+      # Use a different port if 3478 is already in use (e.g., by another coturn)
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49152-49161:49152-49161/udp"
+    command: >
+      -n
+      --log-file=stdout
+      --use-auth-secret
+      --static-auth-secret=${TURN_SECRET}
+      --fingerprint
+      --no-multicast-peers
+      --no-cli
+      --no-dtls
+      --no-tls
+      # To enable TURNS (TURN-over-TLS), remove --no-tls above and add:
+      # --tls-listening-port=${TURNS_PORT:-8443}
+      # --cert=/etc/coturn/certs/cert.pem
+      # --pkey=/etc/coturn/certs/key.pem
+      # Then mount the certificate files via a volume:
+      # volumes:
+      #   - /path/to/certs:/etc/coturn/certs:ro
+      # If you use Caddy, you can reuse its managed certificates. Caddy stores them
+      # under its data directory; the exact path depends on the ACME issuer and domain.
+      # Example (adjust to your domain and Caddy data path):
+      # volumes:
+      #   - /path/to/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/your.domain:/certs:ro
+      # And expose the TURNS port:
+      #   - "${TURNS_PORT:-8443}:${TURNS_PORT:-8443}/tcp"
+      --realm=imagesecuresend
+      --min-port=49152
+      --max-port=49161
+      --listening-port=3478
+      # Docker NAT: format is --external-ip=PUBLIC_IP/INTERNAL_IP.
+      # 0.0.0.0 as internal means "all container interfaces" (correct for Docker).
+      # NOTE: DOMAIN must be an IP address here, NOT a hostname — coturn does not
+      # resolve DNS for --external-ip. Set a separate TURN_EXTERNAL_IP env var if
+      # your DOMAIN is a hostname.
+      --external-ip=${TURN_EXTERNAL_IP:-${DOMAIN:-127.0.0.1}}
+      # Explicitly bind relay sockets to all interfaces so packets actually leave
+      # the container (without this, coturn may silently fail to relay in Docker).
+      --no-stun
+      --check-origin-consistency
+      --cpus=1
