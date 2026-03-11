@@ -88,6 +88,10 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 
 Ideally, the WebRTC signaling server would be replaced by [iroh](https://iroh.computer/) in the future, which would eliminate the need for a signaling server entirely. However, iroh is not yet easy to embed in phone browsers.
 
+## Public Instance
+
+A small public instance is available at **https://imagesecuresend.olicorne.org/** for anyone to use.
+
 ## Requirements
 
 - Docker and Docker Compose
