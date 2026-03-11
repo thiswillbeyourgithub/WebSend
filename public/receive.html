@@ -10,18 +10,49 @@
     <title>ImageSecureSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-6iVhl4wqguafy/xyIZ1J9tKR+X2DHkeyj95FXB970tVTh1eQwiVkaUAFJdUCjdEW" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-xvhN0Q+7Ql22JhEH0B8zre6PF6abFMn2OBv0+c5oWu4ZM7UhcC5fwARFJOdlGztc" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
 <body>
-    <!-- Language switcher: flag button fixed top-right, opens a dropdown to pick EN/FR.
-         The choice is persisted in localStorage via i18n.setLocale(). -->
-    <div class="lang-switcher" id="lang-switcher">
-        <button class="lang-switcher-btn" id="lang-switcher-btn" aria-label="Select language">🇬🇧</button>
-        <div class="lang-dropdown hidden" id="lang-dropdown">
+    <!-- Kebab menu button: opens sidebar with settings, logs, about -->
+    <button class="kebab-btn" id="kebab-btn" aria-label="Menu">⋮</button>
+
+    <!-- Sidebar overlay (dark background) -->
+    <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+    <!-- Sidebar -->
+    <div class="sidebar" id="sidebar">
+        <button class="sidebar-close" id="sidebar-close">✕</button>
+
+        <!-- Language section -->
+        <div class="sidebar-section">
+            <div class="sidebar-section-title" data-i18n="menu.language">Language</div>
             <button class="lang-option" data-lang="en">🇬🇧 English</button>
             <button class="lang-option" data-lang="fr">🇫🇷 Français</button>
+        </div>
+
+        <!-- Connection info (only visible when connected) -->
+        <div class="sidebar-section hidden" id="sidebar-connection-section">
+            <div class="sidebar-section-title" data-i18n="menu.connection">Connection</div>
+            <div class="sidebar-connection-info" id="sidebar-connection-info"></div>
+        </div>
+
+        <!-- Actions -->
+        <div class="sidebar-section">
+            <button class="sidebar-action" id="sidebar-logs-btn">
+                <span>📋</span>
+                <span data-i18n="menu.logs">Logs</span>
+            </button>
+            <button class="sidebar-action" id="sidebar-about-btn">
+                <span>ℹ️</span>
+                <span data-i18n="menu.about">About</span>
+            </button>
+        </div>
+
+        <!-- DEV mode indicator (updated after fetching /api/config) -->
+        <div class="sidebar-section" id="sidebar-dev-section">
+            <div class="sidebar-dev-badge" id="sidebar-dev-badge" data-i18n="menu.prodMode">Production mode</div>
         </div>
     </div>
 
@@ -98,11 +129,6 @@
                 </p>
             </div>
 
-            <!-- Connection type indicator (shown after connection established) -->
-            <div id="connection-type-badge" class="hidden" style="margin: 10px 0; padding: 10px; background: #f5f5f5; border-radius: 8px; text-align: center;">
-                <span style="font-size: 0.85rem; color: #666;" id="connection-type-text" data-i18n="receive.detectingConnection">Detecting connection type...</span>
-            </div>
-
             <div class="progress-bar hidden" id="progress-bar">
                 <div class="progress-bar-fill" id="progress-fill" style="width: 0%"></div>
             </div>
@@ -146,7 +172,7 @@
     </div>
 
     <script src="/js/i18n.js"></script>
-    <script src="/js/logger.js" integrity="sha384-Dv8VkT+ccVxNWxcrtj/Gtb2CUOFMQvEOGHBXThiJ1NLy/yjub0dHtFegJVcZaKEd"></script>
+    <script src="/js/logger.js" integrity="sha384-zPT2T91QHba565vXwJxab95C1QnsZqMlJGqu2r6if1pP7NvTSfqNmCXXGTG/Qwff"></script>
     <script src="/js/crypto.js" integrity="sha384-fNGfKN+6FZ5Q+O6t5r3jiX7dqukFAEFnLX4qyvWtF6VkvWzKGa7yIrgUiQJu2Apq"></script>
     <script src="/js/webrtc.js" integrity="sha384-6LVh3QhUzBgDqk1UZ8FT/65inTEXNuw0TdlM0rfBgBU+z4ws5lRT1JjeA6qNVLDx"></script>
     <script>
@@ -200,6 +226,9 @@
 
                 // Enable eruda mobile console asap when server is in DEV mode
                 if (config.dev) { await loadEruda(); }
+
+                // Show DEV mode status in sidebar
+                updateDevBadge(config.dev);
 
                 // Generate encryption key pair
                 keyPair = await ImageSecureSendCrypto.generateKeyPair();
@@ -351,7 +380,7 @@
 
         function onDisconnected() {
             logger.warn('Disconnected from sender');
-            document.querySelector('#step-connected .status').textContent = i18n.t('receive.disconnected');
+            document.querySelector('#step-connected .status').textContent = i18n.t('receive.disconnectedHint');
             document.querySelector('#step-connected .status').className = 'status status-error';
         }
 
@@ -390,21 +419,22 @@
          * Relay connections work fine (data is E2E encrypted anyway) but direct is faster.
          */
         function onConnectionTypeDetected(info) {
-            const badge = document.getElementById('connection-type-badge');
-            const text = document.getElementById('connection-type-text');
-            badge.classList.remove('hidden');
+            // Show connection type in sidebar instead of inline badge
+            const section = document.getElementById('sidebar-connection-section');
+            const infoDiv = document.getElementById('sidebar-connection-info');
+            if (!section || !infoDiv) return;
+            section.classList.remove('hidden');
 
-            // Style based on connection type
             if (info.type === 'relay') {
-                badge.style.background = '#fff3e0';
-                badge.style.border = '1px solid #ffcc80';
-                text.innerHTML = `🔄 ${info.details}`;
-                text.style.color = '#e65100';
+                infoDiv.style.background = '#fff3e0';
+                infoDiv.style.border = '1px solid #ffcc80';
+                infoDiv.innerHTML = `🔄 ${info.details}`;
+                infoDiv.style.color = '#e65100';
             } else {
-                badge.style.background = '#e3f2fd';
-                badge.style.border = '1px solid #90caf9';
-                text.innerHTML = `⚡ ${info.details}`;
-                text.style.color = '#1565c0';
+                infoDiv.style.background = '#e3f2fd';
+                infoDiv.style.border = '1px solid #90caf9';
+                infoDiv.innerHTML = `⚡ ${info.details}`;
+                infoDiv.style.color = '#1565c0';
             }
         }
 
@@ -1353,37 +1383,80 @@
         // Start when page loads
         init();
 
-        // Language switcher logic (shared pattern across all pages)
-        (function() {
-            const flags = { en: '🇬🇧', fr: '🇫🇷' };
-            const btn = document.getElementById('lang-switcher-btn');
-            const dropdown = document.getElementById('lang-dropdown');
-            const options = dropdown.querySelectorAll('.lang-option');
+        /**
+         * Update the DEV mode badge in the sidebar.
+         * Called after fetching /api/config to reflect server-side DEV=1 setting.
+         */
+        function updateDevBadge(isDev) {
+            const badge = document.getElementById('sidebar-dev-badge');
+            if (!badge) return;
+            if (isDev) {
+                badge.textContent = i18n.t('menu.devMode');
+                badge.setAttribute('data-i18n', 'menu.devMode');
+                badge.classList.add('dev-active');
+            } else {
+                badge.textContent = i18n.t('menu.prodMode');
+                badge.setAttribute('data-i18n', 'menu.prodMode');
+                badge.classList.remove('dev-active');
+            }
+        }
 
-            // Sync button flag and active highlight to current locale
-            function updateUI() {
-                const locale = i18n.getLocale();
-                btn.textContent = flags[locale] || flags.en;
-                options.forEach(opt => opt.classList.toggle('active', opt.dataset.lang === locale));
+        // Sidebar menu logic (kebab button opens sidebar with lang, logs, about)
+        (function() {
+            const kebabBtn = document.getElementById('kebab-btn');
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            const closeBtn = document.getElementById('sidebar-close');
+
+            function openSidebar() {
+                sidebar.classList.add('visible');
+                overlay.classList.add('visible');
+            }
+            function closeSidebar() {
+                sidebar.classList.remove('visible');
+                overlay.classList.remove('visible');
             }
 
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                dropdown.classList.toggle('hidden');
-            });
+            kebabBtn.addEventListener('click', openSidebar);
+            closeBtn.addEventListener('click', closeSidebar);
+            overlay.addEventListener('click', closeSidebar);
 
+            // Language options
+            const options = sidebar.querySelectorAll('.lang-option');
+            function updateLangUI() {
+                const locale = i18n.getLocale();
+                options.forEach(opt => opt.classList.toggle('active', opt.dataset.lang === locale));
+            }
             options.forEach(opt => {
                 opt.addEventListener('click', () => {
                     i18n.setLocale(opt.dataset.lang);
-                    dropdown.classList.add('hidden');
-                    updateUI();
+                    updateLangUI();
+                    // Update logs toolbar button text after language change
+                    const closeLogsBtn = document.getElementById('logs-close-btn');
+                    const copyLogsBtn = document.getElementById('logs-copy-btn');
+                    if (closeLogsBtn) closeLogsBtn.textContent = i18n.t('menu.closeLogs');
+                    if (copyLogsBtn) copyLogsBtn.textContent = i18n.t('menu.copyLogs');
                 });
             });
+            updateLangUI();
 
-            // Close dropdown when clicking anywhere outside
-            document.addEventListener('click', () => dropdown.classList.add('hidden'));
+            // Logs button
+            document.getElementById('sidebar-logs-btn').addEventListener('click', () => {
+                closeSidebar();
+                if (window.openLogsPanel) window.openLogsPanel();
+            });
 
-            updateUI();
+            // About button - navigate to index or open modal
+            document.getElementById('sidebar-about-btn').addEventListener('click', () => {
+                closeSidebar();
+                const aboutModal = document.getElementById('about-modal');
+                if (aboutModal) {
+                    aboutModal.classList.remove('hidden');
+                    aboutModal.style.display = 'flex';
+                } else {
+                    window.location.href = '/#about';
+                }
+            });
         })();
     </script>
 </body>

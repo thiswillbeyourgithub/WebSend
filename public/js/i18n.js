@@ -98,7 +98,7 @@ const i18n = (function() {
             'receive.verified': 'Connection verified by both parties',
             'receive.detectingConnection': 'Detecting connection type...',
             'receive.receivedPhotos': 'Received Photos',
-            'receive.photosPlaceholder': 'Photos will appear here as they are received.',
+            'receive.photosPlaceholder': 'Waiting for sender to send photos.',
             'receive.downloadPdf': 'Download All as PDF',
             'receive.downloadPdfCount': 'Download All as PDF ({count} image{plural})',
             'receive.generatingPdf': '⏳ Generating PDF...',
@@ -140,6 +140,21 @@ const i18n = (function() {
             'connection.relayDetails': 'Relayed via TURN server',
             'connection.directLocalDetails': 'Direct (local network)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
+
+            // Menu / Sidebar
+            'menu.logs': 'Logs',
+            'menu.closeLogs': 'Close Logs',
+            'menu.copyLogs': 'Copy Logs',
+            'menu.logsCopied': 'Copied!',
+            'menu.about': 'About',
+            'menu.language': 'Language',
+            'menu.connection': 'Connection',
+            'menu.devMode': 'DEV mode enabled',
+            'menu.prodMode': 'Production mode',
+
+            // Disconnection hints
+            'receive.disconnectedHint': 'Disconnected. Reload the page or click Back to restart.',
+            'send.disconnectedHint': 'Connection lost. Reload the page or click Back to restart.',
 
             // Errors
             'error.noPhotoOrKey': 'No photo or key exchange not complete',
@@ -230,7 +245,7 @@ const i18n = (function() {
             'receive.verified': 'Connexion vérifiée par les deux parties',
             'receive.detectingConnection': 'Détection du type de connexion...',
             'receive.receivedPhotos': 'Photos reçues',
-            'receive.photosPlaceholder': 'Les photos apparaîtront ici à mesure qu\'elles sont reçues.',
+            'receive.photosPlaceholder': 'En attente d\'envoi des photos par l\'expéditeur.',
             'receive.downloadPdf': 'Télécharger tout en PDF',
             'receive.downloadPdfCount': 'Télécharger tout en PDF ({count} image{plural})',
             'receive.generatingPdf': '⏳ Génération du PDF...',
@@ -272,6 +287,21 @@ const i18n = (function() {
             'connection.relayDetails': 'Relayé via le serveur TURN',
             'connection.directLocalDetails': 'Direct (réseau local)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
+
+            // Menu / Sidebar
+            'menu.logs': 'Journaux',
+            'menu.closeLogs': 'Fermer les journaux',
+            'menu.copyLogs': 'Copier les journaux',
+            'menu.logsCopied': 'Copié !',
+            'menu.about': 'À propos',
+            'menu.language': 'Langue',
+            'menu.connection': 'Connexion',
+            'menu.devMode': 'Mode DEV activé',
+            'menu.prodMode': 'Mode production',
+
+            // Disconnection hints
+            'receive.disconnectedHint': 'Déconnecté. Rechargez la page ou cliquez sur Retour pour redémarrer.',
+            'send.disconnectedHint': 'Connexion perdue. Rechargez la page ou cliquez sur Retour pour redémarrer.',
 
             // Errors
             'error.noPhotoOrKey': 'Pas de photo ou échange de clés incomplet',

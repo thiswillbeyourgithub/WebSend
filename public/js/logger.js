@@ -124,30 +124,53 @@ window.logger = new Logger();
  * Should be called after DOM is ready
  */
 function initLogsPanel() {
-    // Create toggle button
-    const toggleBtn = document.createElement('button');
-    toggleBtn.className = 'logs-toggle';
-    toggleBtn.textContent = 'Logs';
-    document.body.appendChild(toggleBtn);
-
-    // Create logs panel
+    // Create logs panel (fullscreen overlay)
     const panel = document.createElement('div');
     panel.className = 'logs-panel';
     panel.id = 'logs-panel';
     document.body.appendChild(panel);
 
-    // Toggle visibility
-    toggleBtn.addEventListener('click', () => {
-        panel.classList.toggle('visible');
-        if (panel.classList.contains('visible')) {
-            toggleBtn.textContent = 'Close Logs';
-            renderLogs();
-        } else {
-            toggleBtn.textContent = 'Logs';
-        }
+    // Create toolbar (close + copy buttons, fixed at top of logs panel)
+    const toolbar = document.createElement('div');
+    toolbar.className = 'logs-toolbar';
+    toolbar.id = 'logs-toolbar';
+
+    const closeBtn = document.createElement('button');
+    closeBtn.id = 'logs-close-btn';
+    closeBtn.textContent = (typeof i18n !== 'undefined') ? i18n.t('menu.closeLogs') : 'Close Logs';
+    closeBtn.addEventListener('click', () => window.closeLogsPanel());
+
+    const copyBtn = document.createElement('button');
+    copyBtn.id = 'logs-copy-btn';
+    copyBtn.textContent = (typeof i18n !== 'undefined') ? i18n.t('menu.copyLogs') : 'Copy Logs';
+    copyBtn.addEventListener('click', () => {
+        const logText = window.logger.getLogs()
+            .map(e => `[${e.time}] [${e.level.toUpperCase()}] ${e.message}`)
+            .join('\n');
+        navigator.clipboard.writeText(logText).then(() => {
+            const origText = copyBtn.textContent;
+            copyBtn.textContent = (typeof i18n !== 'undefined') ? i18n.t('menu.logsCopied') : 'Copied!';
+            setTimeout(() => { copyBtn.textContent = origText; }, 1500);
+        });
     });
 
-    // Render existing logs
+    toolbar.appendChild(closeBtn);
+    toolbar.appendChild(copyBtn);
+    document.body.appendChild(toolbar);
+
+    // Global open/close functions for sidebar to call
+    window.openLogsPanel = function() {
+        panel.classList.add('visible');
+        toolbar.classList.add('visible');
+        renderLogs();
+    };
+
+    window.closeLogsPanel = function() {
+        panel.classList.remove('visible');
+        toolbar.classList.remove('visible');
+    };
+
+    // Render all existing logs into the panel
     function renderLogs() {
         panel.innerHTML = '';
         window.logger.getLogs().forEach(entry => {

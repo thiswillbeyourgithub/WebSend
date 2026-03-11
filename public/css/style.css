@@ -250,42 +250,227 @@ h1 {
     color: #17a2b8;
 }
 
-/* Logs panel - debug overlay for troubleshooting WebRTC/crypto issues.
-   Toggle button floats above all content (z-index: 1000), panel slides up
-   from the bottom covering half the viewport. */
-.logs-toggle {
+/* ============ Kebab Menu & Sidebar ============ */
+/*
+ * Top-right kebab (⋮) button that opens a slide-in sidebar.
+ * The sidebar consolidates language switching, logs, connection info, and about.
+ * z-index 1500 matches the old lang-switcher level.
+ */
+
+.kebab-btn {
     position: fixed;
-    bottom: 20px;
-    right: 20px;
-    padding: 15px 20px;
-    border-radius: 50px;
-    background: rgba(51, 51, 51, 0.5);
-    color: white;
-    border: none;
+    top: 15px;
+    right: 15px;
+    z-index: 1500;
+    background: rgba(255, 255, 255, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 8px;
+    padding: 6px 12px;
     cursor: pointer;
-    font-size: 1rem;
-    z-index: 1000; /* Above page content but below modals (z-index: 2000) */
-    box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-    /* Frosted glass effect for visual separation from content behind */
+    font-size: 1.6rem;
+    line-height: 1;
+    color: white;
     backdrop-filter: blur(5px);
     -webkit-backdrop-filter: blur(5px);
 }
 
-.logs-panel {
+.kebab-btn:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+/* Dark overlay behind sidebar */
+.sidebar-overlay {
     position: fixed;
-    bottom: 0;
+    top: 0;
     left: 0;
     right: 0;
-    height: 50vh;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 1999;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+
+.sidebar-overlay.visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.sidebar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 280px;
+    max-width: 80vw;
+    background: #1a1a2e;
+    border-left: 1px solid rgba(255, 255, 255, 0.15);
+    z-index: 2000;
+    transform: translateX(100%);
+    transition: transform 0.3s ease;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.sidebar.visible {
+    transform: translateX(0);
+}
+
+.sidebar-close {
+    align-self: flex-end;
+    background: none;
+    border: none;
+    color: white;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 5px;
+}
+
+.sidebar-section {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    padding-bottom: 15px;
+}
+
+.sidebar-section:last-child {
+    border-bottom: none;
+}
+
+.sidebar-section-title {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #888;
+    margin-bottom: 10px;
+}
+
+/* Language options in sidebar */
+.sidebar .lang-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 15px;
+    cursor: pointer;
+    color: white;
+    font-size: 0.95rem;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    border-radius: 8px;
+}
+
+.sidebar .lang-option:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.sidebar .lang-option.active {
+    background: rgba(233, 69, 96, 0.2);
+    color: #e94560;
+}
+
+/* Connection type in sidebar */
+.sidebar-connection-info {
+    padding: 10px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    text-align: center;
+}
+
+/* Sidebar action buttons (logs, about) */
+.sidebar-action {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 15px;
+    cursor: pointer;
+    color: white;
+    font-size: 1rem;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    border-radius: 8px;
+}
+
+.sidebar-action:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+/* DEV/production mode indicator at bottom of sidebar */
+.sidebar-dev-badge {
+    font-size: 0.75rem;
+    padding: 6px 10px;
+    border-radius: 6px;
+    text-align: center;
+    color: #888;
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.sidebar-dev-badge.dev-active {
+    color: #ff9800;
+    background: rgba(255, 152, 0, 0.15);
+    border: 1px solid rgba(255, 152, 0, 0.3);
+}
+
+/* Fullscreen logs panel (replaces old half-height panel) */
+.logs-panel {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 100vh;
     background: rgba(0, 0, 0, 0.95);
     color: #0f0;
     font-family: 'Courier New', monospace;
     font-size: 0.85rem;
-    padding: 15px;
+    padding: 60px 15px 15px 15px; /* top padding for close/copy buttons */
     overflow-y: auto;
     transform: translateY(100%);
     transition: transform 0.3s ease;
-    z-index: 999;
+    z-index: 2500; /* Above sidebar */
+}
+
+/* Logs panel toolbar (close + copy buttons) */
+.logs-toolbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 50px;
+    background: rgba(0, 0, 0, 0.98);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 15px;
+    z-index: 2501;
+    border-bottom: 1px solid #333;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+
+.logs-toolbar.visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.logs-toolbar button {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: white;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+
+.logs-toolbar button:hover {
+    background: rgba(255, 255, 255, 0.2);
 }
 
 .logs-panel.visible {
@@ -520,77 +705,6 @@ footer {
 .crop-btn-cancel {
     background: #6c757d;
     color: white;
-}
-
-/* ============ Language Switcher ============ */
-/*
- * Fixed top-right button showing the current language flag.
- * Clicking opens a small dropdown to switch between EN / FR.
- * Uses z-index 1500 — above page content and logs toggle (1000)
- * but below modals (2000) such as the crop and verification modals.
- */
-
-.lang-switcher {
-    position: fixed;
-    top: 15px;
-    right: 15px;
-    z-index: 1500;
-}
-
-.lang-switcher-btn {
-    background: rgba(255, 255, 255, 0.15);
-    border: 1px solid rgba(255, 255, 255, 0.3);
-    border-radius: 8px;
-    padding: 6px 10px;
-    cursor: pointer;
-    /* Large enough to be tappable on mobile */
-    font-size: 1.4rem;
-    line-height: 1;
-    color: white;
-    backdrop-filter: blur(5px);
-    -webkit-backdrop-filter: blur(5px);
-}
-
-.lang-switcher-btn:hover {
-    background: rgba(255, 255, 255, 0.25);
-}
-
-/* Dropdown panel revealed on button click */
-.lang-dropdown {
-    position: absolute;
-    top: calc(100% + 5px);
-    right: 0;
-    background: #1a1a2e;
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    border-radius: 8px;
-    overflow: hidden;
-    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
-    /* min-width keeps the panel from being too narrow on short labels */
-    min-width: 130px;
-}
-
-.lang-option {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 15px;
-    cursor: pointer;
-    color: white;
-    font-size: 0.95rem;
-    border: none;
-    background: none;
-    width: 100%;
-    text-align: left;
-}
-
-.lang-option:hover {
-    background: rgba(255, 255, 255, 0.1);
-}
-
-/* Highlight the currently active language */
-.lang-option.active {
-    background: rgba(233, 69, 96, 0.2);
-    color: #e94560;
 }
 
 /* ============ Toast Notifications ============ */
