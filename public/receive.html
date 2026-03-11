@@ -10,7 +10,7 @@
     <title>ImageSecureSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-HOCHv79VSpKYYEoPTYOSwdMs9OKB8oc0geTJWhMSiOxbhiq3ekbxMdpG+Sm8LGSZ" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-0z9Nf/oOqukWevG4zZD8KrFBcs9zqrKn9on37lwOuZLQc7CcMvRLhRYVn2dCkKtn" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -163,6 +163,11 @@
                 <div class="crop-handle" id="handle-tr" data-corner="tr"></div>
                 <div class="crop-handle" id="handle-br" data-corner="br"></div>
                 <div class="crop-handle" id="handle-bl" data-corner="bl"></div>
+                <!-- Magnifier loupe: shows zoomed view under the dragged handle -->
+                <div class="crop-magnifier hidden" id="crop-magnifier">
+                    <canvas id="crop-magnifier-canvas" width="120" height="120"></canvas>
+                    <div class="crop-magnifier-crosshair"></div>
+                </div>
             </div>
             <div class="crop-buttons">
                 <button class="crop-btn-cancel" onclick="closeCropModal()" data-i18n="crop.cancel">Cancel</button>
@@ -966,7 +971,9 @@
                 br: { x: 0.95, y: 0.95 },
                 bl: { x: 0.05, y: 0.95 }
             },
-            dragging: null          // Currently dragged handle ID or null
+            dragging: null,         // Currently dragged handle ID or null
+            // Full-resolution image element for magnifier sampling
+            fullResImg: null
         };
 
         /**
@@ -996,6 +1003,11 @@
                 cropState.imgWidth = cropImg.clientWidth;
                 cropState.imgHeight = cropImg.clientHeight;
                 updateCropOverlay();
+
+                // Preload full-resolution image for magnifier sampling
+                const fullImg = new Image();
+                fullImg.src = cropState.originalUrl;
+                cropState.fullResImg = fullImg;
             };
 
             // Show modal
@@ -1029,12 +1041,15 @@
                 handle.addEventListener('mousedown', (e) => {
                     e.preventDefault();
                     cropState.dragging = corner;
+                    // Show magnifier immediately at current handle position
+                    updateCropMagnifier(cropState.corners[corner].x, cropState.corners[corner].y);
                 });
 
                 // Touch events (mobile)
                 handle.addEventListener('touchstart', (e) => {
                     e.preventDefault();
                     cropState.dragging = corner;
+                    updateCropMagnifier(cropState.corners[corner].x, cropState.corners[corner].y);
                 }, { passive: false });
             });
 
@@ -1071,6 +1086,7 @@
 
             cropState.corners[cropState.dragging] = { x, y };
             updateCropOverlay();
+            updateCropMagnifier(x, y);
         }
 
         /**
@@ -1078,6 +1094,8 @@
          */
         function onCropDragEnd() {
             cropState.dragging = null;
+            // Hide magnifier when not dragging
+            document.getElementById('crop-magnifier').classList.add('hidden');
         }
 
         /**
@@ -1107,6 +1125,63 @@
                 `${c.bl.x * w},${c.bl.y * h}`
             ].join(' ');
             polygon.setAttribute('points', points);
+        }
+
+        /**
+         * Show and update the magnifier loupe during handle dragging.
+         * Renders a zoomed-in portion of the full-resolution image centered on
+         * the current handle position. Positioned offset from the handle so
+         * it's not hidden under the user's thumb.
+         * @param {number} x - Handle x position as fraction (0-1) of image width
+         * @param {number} y - Handle y position as fraction (0-1) of image height
+         */
+        function updateCropMagnifier(x, y) {
+            const magnifier = document.getElementById('crop-magnifier');
+            const canvas = document.getElementById('crop-magnifier-canvas');
+            const ctx = canvas.getContext('2d');
+            const img = cropState.fullResImg;
+
+            if (!img || !img.naturalWidth) {
+                magnifier.classList.add('hidden');
+                return;
+            }
+
+            magnifier.classList.remove('hidden');
+
+            // Position the magnifier offset from the handle (above and to the left
+            // by default, but flip direction near edges to stay within the container)
+            const magnifierSize = 124; // matches CSS width/height
+            const offset = 70; // distance from handle center to magnifier center
+
+            // Place magnifier above the handle by default; flip below if near top
+            let magX = x * 100; // percentage
+            let magY = y * 100;
+
+            // Offset upward; flip down if handle is in the top 20%
+            const yOffsetPx = y < 0.2 ? offset : -offset;
+            // Offset left; flip right if handle is in the left 20%
+            const xOffsetPx = x < 0.2 ? offset : -offset;
+
+            // Convert pixel offset to percentage of container dimensions
+            magnifier.style.left = `calc(${magX}% + ${xOffsetPx}px)`;
+            magnifier.style.top = `calc(${magY}% + ${yOffsetPx}px)`;
+
+            // Draw zoomed section of the full-resolution image onto the canvas.
+            // The zoom factor determines how many source pixels map to the loupe.
+            const zoomFactor = 3;
+            const canvasSize = canvas.width; // 120px
+            // Number of source pixels visible in the loupe
+            const srcSize = canvasSize / zoomFactor;
+            // Source coordinates centered on the handle position
+            const srcX = x * img.naturalWidth - srcSize / 2;
+            const srcY = y * img.naturalHeight - srcSize / 2;
+
+            ctx.clearRect(0, 0, canvasSize, canvasSize);
+            ctx.drawImage(
+                img,
+                srcX, srcY, srcSize, srcSize,  // source rectangle
+                0, 0, canvasSize, canvasSize    // destination (full canvas)
+            );
         }
 
         /**
