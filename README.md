@@ -30,6 +30,12 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - All photo data travels **peer-to-peer** via WebRTC data channels (or encrypted through TURN if relaying is needed)
 - Rooms and signaling data are **ephemeral** (10-minute TTL, stored in memory only)
 
+### Supply Chain Attack Resistance
+- **No frameworks, no bundlers, no build tools**: the entire frontend is vanilla HTML, CSS, and JavaScript -- there is no `node_modules` in the browser, no transpilation step, and no dependency tree that could be poisoned
+- The only third-party client-side libraries are **jsQR** and **qrcode.js**, both vendored directly into the repository (not pulled from npm or a CDN at runtime)
+- **Subresource Integrity (SRI)** hashes on all local `<script>` and `<link>` tags ensure that even a compromised server cannot silently swap in tampered files
+- The server-side dependency footprint is intentionally minimal (Express.js only)
+
 ### Man-in-the-Middle Protection
 - **Key fingerprint verification**: after connection, both parties see short fingerprint codes (SHA-256 hash of public keys) that they can compare aloud to confirm no MITM key substitution occurred
 - Both parties must **explicitly confirm** the fingerprints match before photo transfer begins
