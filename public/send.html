@@ -254,7 +254,7 @@
 
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-zPT2T91QHba565vXwJxab95C1QnsZqMlJGqu2r6if1pP7NvTSfqNmCXXGTG/Qwff"></script>
-    <script src="/js/crypto.js" integrity="sha384-fNGfKN+6FZ5Q+O6t5r3jiX7dqukFAEFnLX4qyvWtF6VkvWzKGa7yIrgUiQJu2Apq"></script>
+    <script src="/js/crypto.js" integrity="sha384-r5sHmJyAdRtgYaEnTUr4/yo4TuM3Bam1ocszzxay+s7Ej70ksSo/WWZCyclKreOL"></script>
     <script src="/js/webrtc.js" integrity="sha384-6LVh3QhUzBgDqk1UZ8FT/65inTEXNuw0TdlM0rfBgBU+z4ws5lRT1JjeA6qNVLDx"></script>
     <script>
         // Initialize i18n first
@@ -648,9 +648,22 @@
                     // Derive shared secret using ECDH
                     sharedKey = await ImageSecureSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
 
-                    // Get fingerprints for verification
-                    const ourFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(keyPair.publicKey);
-                    const theirFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(receiverPublicKey);
+                    // Fetch active room count to adapt fingerprint length:
+                    // fewer rooms = shorter key (easier to compare), more = longer (collision resistance)
+                    let fpLength = 12; // fallback to max if stats unavailable
+                    try {
+                        const statsRes = await fetch('/api/stats');
+                        if (statsRes.ok) {
+                            const stats = await statsRes.json();
+                            fpLength = ImageSecureSendCrypto.computeFingerprintLength(stats.activeRooms);
+                        }
+                    } catch (e) {
+                        logger.warn('Could not fetch room stats, using max fingerprint length');
+                    }
+
+                    // Get fingerprints for verification (length adapts to server load)
+                    const ourFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(keyPair.publicKey, fpLength);
+                    const theirFingerprint = await ImageSecureSendCrypto.getKeyFingerprint(receiverPublicKey, fpLength);
 
                     // Display fingerprints in verification modal
                     // Sender key at top, receiver key at bottom (consistent on both devices)

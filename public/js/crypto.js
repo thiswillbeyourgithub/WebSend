@@ -133,24 +133,54 @@ const ImageSecureSendCrypto = {
 
     /**
      * Compute SHA-256 fingerprint of a public key for visual verification.
-     * Returns first 12 hex characters (48 bits) for human comparison.
-     * 48 bits provides ~280 trillion combinations, making MITM key substitution
-     * attacks impractical while remaining human-readable.
+     * Length is adaptive: fewer concurrent rooms = shorter key (easier to compare),
+     * more rooms = longer key (more collision resistance needed).
+     *
      * @param {CryptoKey} publicKey - The public key to fingerprint
-     * @returns {Promise<string>} Short hex fingerprint (12 chars, grouped as XXXX-XXXX-XXXX)
+     * @param {number} [hexLength=12] - Number of hex characters to use (3-12).
+     *   Clamped to [3, 12]. Grouped in chunks of 4 with dashes for readability.
+     * @returns {Promise<string>} Hex fingerprint grouped as XXXX-XXXX-... (length varies)
      */
-    async getKeyFingerprint(publicKey) {
+    async getKeyFingerprint(publicKey, hexLength = 12) {
+        // Clamp to valid range: min 3 hex chars (12 bits / 4096 combinations),
+        // max 12 hex chars (48 bits / ~280 trillion combinations)
+        const len = Math.max(3, Math.min(12, Math.floor(hexLength)));
+
         const exported = await crypto.subtle.exportKey('raw', publicKey);
         const hash = await crypto.subtle.digest('SHA-256', exported);
         const hashArray = new Uint8Array(hash);
-        // Take first 6 bytes (12 hex chars / 48 bits) for human-readable verification
-        const hexChars = Array.from(hashArray.slice(0, 6))
+        // Take enough bytes to cover requested hex length (2 hex chars per byte)
+        const bytesNeeded = Math.ceil(len / 2);
+        const hexChars = Array.from(hashArray.slice(0, bytesNeeded))
             .map(b => b.toString(16).padStart(2, '0'))
             .join('')
-            .toUpperCase();
-        // Format as XXXX-XXXX-XXXX for easier visual comparison
-        const fingerprint = `${hexChars.slice(0, 4)}-${hexChars.slice(4, 8)}-${hexChars.slice(8, 12)}`;
-        return fingerprint;
+            .toUpperCase()
+            .slice(0, len);
+        // Group in chunks of 4 with dashes for readability (e.g. "A1B2-C3D4" or "A1B")
+        const groups = [];
+        for (let i = 0; i < hexChars.length; i += 4) {
+            groups.push(hexChars.slice(i, i + 4));
+        }
+        return groups.join('-');
+    },
+
+    /**
+     * Compute adaptive fingerprint hex length based on active room count.
+     * Uses birthday problem logic: with N rooms (2 keys each), we need enough
+     * hex chars so that accidental collisions are extremely unlikely.
+     * - 1-10 rooms:    3 hex chars (4096 combinations)
+     * - 11-100 rooms:  6 hex chars (~16M combinations)
+     * - 101-1000:      9 hex chars (~68B combinations)
+     * - 1000+:        12 hex chars (~280T combinations)
+     *
+     * @param {number} activeRooms - Number of currently active rooms on the server
+     * @returns {number} Recommended hex length (3-12)
+     */
+    computeFingerprintLength(activeRooms) {
+        if (activeRooms <= 10) return 3;
+        if (activeRooms <= 100) return 6;
+        if (activeRooms <= 1000) return 9;
+        return 12;
     },
 
     /**
