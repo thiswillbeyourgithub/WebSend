@@ -10,7 +10,7 @@
  * mode won't work. But the UI shell loads instantly from cache.
  */
 
-const CACHE_NAME = 'imagesecuresend-v1';
+const CACHE_NAME = 'imagesecuresend-v20260312091028';
 
 // Static assets to cache on install
 const STATIC_ASSETS = [

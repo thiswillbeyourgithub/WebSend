@@ -1449,7 +1449,16 @@
         }
 
         // Register service worker for PWA functionality
+        // Auto-reload when a new SW version takes control, so users
+        // always get the latest deployed version without manual refresh.
         if ('serviceWorker' in navigator) {
+            let refreshing = false;
+            navigator.serviceWorker.addEventListener('controllerchange', () => {
+                if (!refreshing) {
+                    refreshing = true;
+                    window.location.reload();
+                }
+            });
             navigator.serviceWorker.register('/service-worker.js')
                 .then(reg => console.log('SW registered'))
                 .catch(err => console.log('SW registration failed:', err));

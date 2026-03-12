@@ -90,6 +90,25 @@ function updateHtmlFile(filePath, hashes) {
   return updateCount;
 }
 
+/**
+ * Stamp the service worker's CACHE_NAME with the current timestamp.
+ * This ensures each deploy produces a byte-different SW file, which
+ * triggers the browser's SW update check and cache invalidation.
+ */
+function updateServiceWorkerVersion() {
+  const swPath = path.join(PUBLIC_DIR, 'service-worker.js');
+  if (!fs.existsSync(swPath)) return;
+
+  const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+  let content = fs.readFileSync(swPath, 'utf-8');
+  content = content.replace(
+    /const CACHE_NAME = '[^']*';/,
+    `const CACHE_NAME = 'imagesecuresend-v${timestamp}';`
+  );
+  fs.writeFileSync(swPath, content, 'utf-8');
+  console.log(`  service-worker.js: CACHE_NAME set to imagesecuresend-v${timestamp}`);
+}
+
 // --- Main ---
 
 const hashes = buildHashMap();
@@ -107,3 +126,6 @@ for (const htmlFile of HTML_FILES) {
   const count = updateHtmlFile(htmlFile, hashes);
   console.log(`  ${path.basename(htmlFile)}: ${count} integrity attribute(s) updated`);
 }
+
+// Stamp SW with fresh version so browsers detect the update
+updateServiceWorkerVersion();
