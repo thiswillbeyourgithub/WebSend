@@ -1,13 +1,13 @@
 /**
  * ImageSecureSend Service Worker
  *
- * Caches static assets for faster loading and enables PWA installation.
- * Uses a "stale-while-revalidate" strategy for most assets:
- * - Return cached version immediately (fast)
- * - Fetch fresh version in background and update cache
+ * Caches static assets for offline fallback and enables PWA installation.
+ * Uses a "network-first" strategy for all assets:
+ * - Always fetch from network to ensure latest version
+ * - Fall back to cache only when network is unavailable
  *
- * Note: The app requires network for WebRTC signaling, so true offline
- * mode won't work. But the UI shell loads instantly from cache.
+ * Note: The app requires network for WebRTC signaling, so serving
+ * the freshest assets from network costs nothing extra.
  */
 
 const CACHE_NAME = 'imagesecuresend-v1';
@@ -61,7 +61,7 @@ self.addEventListener('activate', (event) => {
     self.clients.claim();
 });
 
-// Fetch event: stale-while-revalidate for static assets, network-first for API
+// Fetch event: network-first for all assets
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
 
@@ -76,25 +76,20 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
-    // Static assets: stale-while-revalidate
+    // All assets: network-first, cache fallback
     event.respondWith(
-        caches.open(CACHE_NAME).then((cache) => {
-            return cache.match(event.request).then((cachedResponse) => {
-                // Fetch fresh version in background
-                const fetchPromise = fetch(event.request).then((networkResponse) => {
-                    // Only cache successful responses
-                    if (networkResponse.ok) {
-                        cache.put(event.request, networkResponse.clone());
-                    }
-                    return networkResponse;
-                }).catch(() => {
-                    // Network failed, return cached if available
-                    return cachedResponse;
+        fetch(event.request).then((networkResponse) => {
+            // Update cache with fresh response
+            if (networkResponse.ok) {
+                const responseClone = networkResponse.clone();
+                caches.open(CACHE_NAME).then((cache) => {
+                    cache.put(event.request, responseClone);
                 });
-
-                // Return cached immediately, or wait for network
-                return cachedResponse || fetchPromise;
-            });
+            }
+            return networkResponse;
+        }).catch(() => {
+            // Network failed, try cache
+            return caches.match(event.request);
         })
     );
 });
