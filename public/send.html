@@ -350,6 +350,23 @@
         async function init() {
             logger.info('Initializing sender...');
 
+            // Check URL immediately before any async work so the UI updates
+            // right away when opened from a camera QR scanner app
+            const roomId = getRoomIdFromUrl();
+            const secret = getRoomSecretFromUrl();
+            if (roomId && secret) {
+                logger.info(`Room ID from URL: ${roomId}`);
+                showStep(stepConnecting);
+                document.getElementById('connection-status').textContent = i18n.t('send.connecting');
+                document.getElementById('connection-status').className = 'status status-info';
+            } else if (roomId) {
+                logger.error('Room secret missing from URL');
+                document.getElementById('connection-status').textContent = i18n.t('send.invalidQR.secret');
+                document.getElementById('connection-status').className = 'status status-error';
+                showStep(stepConnecting);
+                return; // No point continuing without the secret
+            }
+
             // Fetch server config to check DEV mode and enable eruda asap if needed
             try {
                 const configResponse = await fetch('/api/config');
@@ -392,18 +409,9 @@
             setupPinchZoom(document.getElementById('scanner-video'));
             setupPinchZoom(document.getElementById('capture-video'));
 
-            // Check if room ID and secret are in URL (from QR scanner app)
-            const roomId = getRoomIdFromUrl();
-            const secret = getRoomSecretFromUrl();
+            // Join room after async initialization is complete
             if (roomId && secret) {
-                logger.info(`Room ID from URL: ${roomId}`);
                 await joinRoom(roomId, secret);
-            } else if (roomId) {
-                // Room ID without secret - show error
-                logger.error('Room secret missing from URL');
-                document.getElementById('connection-status').textContent = i18n.t('send.invalidQR.secret');
-                document.getElementById('connection-status').className = 'status status-error';
-                showStep(stepConnecting);
             }
         }
 
@@ -1422,7 +1430,9 @@
         }
 
         // Start when page loads
-        init();
+        init().catch(e => {
+            logger.error('Initialization failed: ' + e.message);
+        });
 
         /**
          * Update the DEV mode badge in the sidebar.
