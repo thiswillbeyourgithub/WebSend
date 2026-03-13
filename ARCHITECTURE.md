@@ -134,7 +134,10 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
    fragment (never sent to server in HTTP requests). Constant-time comparison prevents
    timing attacks. Prevents room enumeration even if the short room ID is guessed.
 4. **Fingerprint verification**: Both parties see short hex fingerprints of each other's
-   public keys and must manually confirm they match, defeating MITM attacks.
+   public keys and must manually confirm they match, defeating MITM attacks. The fingerprint
+   length adapts to the number of currently active rooms (fetched from `GET /api/stats`):
+   fewer concurrent sessions → shorter codes (as few as 3 hex chars) to reduce verification
+   fatigue; more sessions → longer codes (up to 12 hex chars) to maintain collision resistance.
 5. **Size obfuscation**: Photos are padded to power-of-2 bucket sizes before encryption,
    hiding exact file sizes from network observers. Padding uses random bytes to prevent
    compression-based attacks.

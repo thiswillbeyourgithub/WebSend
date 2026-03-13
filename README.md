@@ -38,6 +38,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 
 ### Man-in-the-Middle Protection
 - **Key fingerprint verification**: after connection, both parties see short fingerprint codes (SHA-256 hash of public keys) that they can compare aloud to confirm no MITM key substitution occurred
+- **Adaptive fingerprint length**: the fingerprint code length scales with the number of active rooms on the server (from 3 hex chars for a handful of rooms up to 12 for thousands), keeping codes short and easy to verify when traffic is low while maintaining collision resistance as concurrency grows
 - Both parties must **explicitly confirm** the fingerprints match before photo transfer begins
 - Either party can **abort** if fingerprints don't match
 
