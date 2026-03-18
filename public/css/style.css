@@ -205,8 +205,9 @@ h1 {
     width: 100%;
     height: auto;
     display: block;
-    /* Pinch-to-zoom handled by JS */
-    touch-action: none;
+    /* Allow single-finger vertical scrolling (pan-y) while JS handles
+       two-finger pinch-to-zoom via touchstart/touchmove preventDefault */
+    touch-action: pan-y;
 }
 
 /* Flash toggle button - top-right corner of camera view */
