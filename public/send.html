@@ -989,11 +989,30 @@
             // Set up button handlers
             document.getElementById('confirm-match-btn').onclick = onConfirmMatch;
             document.getElementById('deny-match-btn').onclick = onDenyMatch;
+
+            // Keyboard shortcuts: Enter/Space = confirm, Escape = deny
+            function onVerifyKeydown(e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    onConfirmMatch();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    onDenyMatch();
+                }
+            }
+            document.addEventListener('keydown', onVerifyKeydown);
+            // Store reference so we can remove it when modal closes
+            modal._verifyKeydown = onVerifyKeydown;
         }
 
         /** Hide the verification modal */
         function hideVerificationModal() {
             const modal = document.getElementById('verification-modal');
+            // Remove keyboard listener added by showVerificationModal
+            if (modal._verifyKeydown) {
+                document.removeEventListener('keydown', modal._verifyKeydown);
+                modal._verifyKeydown = null;
+            }
             modal.classList.add('hidden');
             modal.style.display = 'none';
         }
@@ -1120,6 +1139,33 @@
                     updateCropMagnifier(cropState.corners[corner].x, cropState.corners[corner].y);
                 }, { passive: false });
             });
+
+            // Clicking anywhere on the container starts dragging the nearest corner
+            function startNearestCorner(e) {
+                if (e.target.classList.contains('crop-handle')) return;
+                e.preventDefault();
+                const rect = container.getBoundingClientRect();
+                const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+                const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+                const x = (clientX - rect.left) / rect.width;
+                const y = (clientY - rect.top) / rect.height;
+                let closest = null, minDist = Infinity;
+                for (const c of handles) {
+                    const dx = cropState.corners[c].x - x;
+                    const dy = cropState.corners[c].y - y;
+                    const d = dx * dx + dy * dy;
+                    if (d < minDist) { minDist = d; closest = c; }
+                }
+                cropState.dragging = closest;
+                cropState.corners[closest] = {
+                    x: Math.max(0, Math.min(1, x)),
+                    y: Math.max(0, Math.min(1, y))
+                };
+                updateCropOverlay();
+                updateCropMagnifier(x, y);
+            }
+            container.addEventListener('mousedown', startNearestCorner);
+            container.addEventListener('touchstart', startNearestCorner, { passive: false });
 
             document.addEventListener('mousemove', onCropDrag);
             document.addEventListener('mouseup', onCropDragEnd);

@@ -674,11 +674,28 @@
             // Set up button handlers
             document.getElementById('confirm-match-btn').onclick = onConfirmMatch;
             document.getElementById('deny-match-btn').onclick = onDenyMatch;
+
+            // Keyboard shortcuts: Enter/Space = confirm, Escape = deny
+            function onVerifyKeydown(e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    onConfirmMatch();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    onDenyMatch();
+                }
+            }
+            document.addEventListener('keydown', onVerifyKeydown);
+            modal._verifyKeydown = onVerifyKeydown;
         }
 
         /** Hide the verification modal (called after user confirms or denies) */
         function hideVerificationModal() {
             const modal = document.getElementById('verification-modal');
+            if (modal._verifyKeydown) {
+                document.removeEventListener('keydown', modal._verifyKeydown);
+                modal._verifyKeydown = null;
+            }
             modal.classList.add('hidden');
             modal.style.display = 'none';
         }
@@ -789,7 +806,13 @@
                 // Trigger download
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `photos_${new Date().toISOString().slice(0,10)}.pdf`;
+                // Format date as DD-MM-YYYY for French, YYYY-MM-DD for English
+                const now = new Date();
+                const pad = n => String(n).padStart(2, '0');
+                const datePart = i18n.getLocale() === 'fr'
+                    ? `${pad(now.getDate())}-${pad(now.getMonth()+1)}-${now.getFullYear()}`
+                    : `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+                a.download = `websend_${datePart}.pdf`;
                 a.click();
                 URL.revokeObjectURL(url);
 
@@ -1074,6 +1097,33 @@
                     updateCropMagnifier(cropState.corners[corner].x, cropState.corners[corner].y);
                 }, { passive: false });
             });
+
+            // Clicking anywhere on the container starts dragging the nearest corner
+            function startNearestCorner(e) {
+                if (e.target.classList.contains('crop-handle')) return;
+                e.preventDefault();
+                const rect = container.getBoundingClientRect();
+                const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+                const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+                const x = (clientX - rect.left) / rect.width;
+                const y = (clientY - rect.top) / rect.height;
+                let closest = null, minDist = Infinity;
+                for (const c of handles) {
+                    const dx = cropState.corners[c].x - x;
+                    const dy = cropState.corners[c].y - y;
+                    const d = dx * dx + dy * dy;
+                    if (d < minDist) { minDist = d; closest = c; }
+                }
+                cropState.dragging = closest;
+                cropState.corners[closest] = {
+                    x: Math.max(0, Math.min(1, x)),
+                    y: Math.max(0, Math.min(1, y))
+                };
+                updateCropOverlay();
+                updateCropMagnifier(x, y);
+            }
+            container.addEventListener('mousedown', startNearestCorner);
+            container.addEventListener('touchstart', startNearestCorner, { passive: false });
 
             // Global move/up handlers
             document.addEventListener('mousemove', onCropDrag);
