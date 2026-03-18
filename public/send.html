@@ -794,8 +794,12 @@
                 return;
             }
             btn.classList.remove('hidden');
-            flashMode = 'off';
+            // Restore previous flash mode (persists across photos within session)
             updateFlashUI();
+            // Apply torch if it was on from previous photo
+            if (flashMode === 'torch') {
+                track.applyConstraints({ advanced: [{ torch: true }] });
+            }
 
             // Remove old listener by replacing element (simple approach)
             const newBtn = btn.cloneNode(true);
@@ -851,7 +855,7 @@
             video.srcObject = null;
             container.classList.remove('active');
             resetCameraZoom(video);
-            flashMode = 'off';
+            // flashMode is intentionally NOT reset here so it persists across photos
             const flashBtn = document.getElementById('flash-toggle-btn');
             if (flashBtn) flashBtn.classList.add('hidden');
         }
