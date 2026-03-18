@@ -1,22 +1,7 @@
 # Environment files with secrets
-# Node modules
-node_modules/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Logs
-*.log
-
 docker/.env
-.aider.*
 
+# dev
+.aider.*
 deploy.sh
 TODO.md
