@@ -470,6 +470,9 @@
                 document.getElementById('start-scan-btn').textContent = i18n.t('send.scanning');
                 document.getElementById('start-scan-btn').disabled = true;
 
+                // Scroll camera into view so user doesn't see a gap above it
+                container.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
                 // Start scanning loop
                 requestAnimationFrame(scanFrame);
             } catch (e) {
@@ -780,8 +783,8 @@
                 const settings = track.getSettings();
                 logger.info(`Camera resolution: ${settings.width}x${settings.height}`);
 
-                // Scroll camera into view so the capture button is visible
-                container.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                // Scroll camera into view so it fills the screen without a gap at top
+                container.scrollIntoView({ behavior: 'smooth', block: 'start' });
             } catch (e) {
                 logger.error('Failed to start camera: ' + e.message);
                 showToast(i18n.t('send.cameraFailed'));
