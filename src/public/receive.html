@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-UfqgZTvz6GfoUZIOElmLvEuOR9g02ypFqt/0ZkCh8xq9lCMxrxWgaC/6r9ldROPM" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-cuYJcdbapStRA20/B24/DnGeI4FAflwPIS8A43LXSk0BZTaoUq5AjTQ7U5Fw67ho" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -138,11 +138,49 @@
                 <p style="color: #888; text-align: center;" data-i18n="receive.photosPlaceholder">Photos will appear here as they are received.</p>
             </div>
 
-            <!-- PDF download button (hidden until images received) -->
-            <div id="pdf-section" class="hidden" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
-                <button id="download-pdf-btn" class="btn btn-action" style="width: 100%; background: #1565c0; color: white;" data-i18n="receive.downloadPdf">
-                    📄 Download All as PDF
+            <!-- Export button (hidden until images received) -->
+            <div id="export-section" class="hidden" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
+                <button id="export-btn" class="btn btn-action" style="width: 100%; background: #1565c0; color: white;" data-i18n="receive.exportBtn">
+                    📦 Export All
                 </button>
+            </div>
+
+            <!-- Export modal -->
+            <div id="export-modal" class="export-modal hidden">
+                <div class="export-modal-content">
+                    <h3 data-i18n="receive.exportTitle">Export</h3>
+
+                    <div class="export-format-options">
+                        <label class="export-radio-label">
+                            <input type="radio" name="export-format" value="zip" disabled>
+                            <span data-i18n="receive.exportZip">ZIP of all images</span>
+                            <span class="coming-soon" data-i18n="receive.comingSoon">(coming soon)</span>
+                        </label>
+                        <label class="export-radio-label">
+                            <input type="radio" name="export-format" value="pdf" checked>
+                            <span data-i18n="receive.exportPdf">PDF</span>
+                        </label>
+                    </div>
+
+                    <!-- PDF-specific options (shown only when PDF is selected) -->
+                    <div id="export-pdf-options" class="export-pdf-options">
+                        <label class="export-checkbox-label">
+                            <input type="checkbox" id="export-bw" disabled>
+                            <span data-i18n="receive.exportBW">Black & white (document mode)</span>
+                            <span class="coming-soon" data-i18n="receive.comingSoon">(coming soon)</span>
+                        </label>
+                        <label class="export-checkbox-label">
+                            <input type="checkbox" id="export-ocr" disabled>
+                            <span data-i18n="receive.exportOCR">OCR (searchable PDF)</span>
+                            <span class="coming-soon" data-i18n="receive.comingSoon">(coming soon)</span>
+                        </label>
+                    </div>
+
+                    <div class="export-modal-buttons">
+                        <button id="export-confirm-btn" class="btn btn-action btn-success" data-i18n="receive.exportConfirm">Export</button>
+                        <button id="export-cancel-btn" class="btn btn-action" style="background: #6c757d; color: white;" data-i18n="receive.exportCancel">Cancel</button>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -539,7 +577,7 @@
                     const filename = receivedImages[imageIndex].name;
                     addReceivedImage(imageUrl, filename, imageIndex);
 
-                    updatePdfButton();
+                    updateExportButton();
 
                     // Compute SHA-256 of the decrypted plaintext data and send
                     // file-ack back to the sender for end-to-end integrity verification.
@@ -653,7 +691,7 @@
             }
             receivedImages[imageIndex] = null;
             card.remove();
-            updatePdfButton();
+            updateExportButton();
             logger.success(`Image ${imageIndex} discarded`);
         }
 
@@ -766,21 +804,64 @@
 
         // ============ PDF Generation (no external dependencies) ============
 
-        /** Show/update the PDF download button with current (non-discarded) image count */
-        function updatePdfButton() {
-            const section = document.getElementById('pdf-section');
-            const btn = document.getElementById('download-pdf-btn');
+        /** Show/update the Export button with current (non-discarded) image count */
+        function updateExportButton() {
+            const section = document.getElementById('export-section');
+            const btn = document.getElementById('export-btn');
             // Only count images that haven't been discarded (null marks discarded entries)
             const activeCount = receivedImages.filter(img => img !== null).length;
             if (activeCount > 0) {
                 section.classList.remove('hidden');
                 const plural = activeCount > 1 ? 's' : '';
-                btn.textContent = '📄 ' + i18n.t('receive.downloadPdfCount', { count: activeCount, plural: plural });
-                btn.onclick = generatePdf;
+                btn.textContent = '📦 ' + i18n.t('receive.exportBtnCount', { count: activeCount, plural: plural });
+                btn.onclick = openExportModal;
             } else {
-                // Hide PDF button when all images have been discarded
                 section.classList.add('hidden');
             }
+        }
+
+        /** Open the export modal */
+        function openExportModal() {
+            document.getElementById('export-modal').classList.remove('hidden');
+        }
+
+        /** Close the export modal */
+        function closeExportModal() {
+            document.getElementById('export-modal').classList.add('hidden');
+        }
+
+        /** Toggle PDF options visibility based on selected format radio */
+        function updateExportOptions() {
+            const pdfSelected = document.querySelector('input[name="export-format"][value="pdf"]').checked;
+            document.getElementById('export-pdf-options').style.display = pdfSelected ? 'block' : 'none';
+        }
+
+        // Wire up export modal events once DOM is ready
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('export-cancel-btn').addEventListener('click', closeExportModal);
+            document.getElementById('export-confirm-btn').addEventListener('click', handleExportConfirm);
+
+            // Show/hide PDF options when format radio changes
+            document.querySelectorAll('input[name="export-format"]').forEach(radio => {
+                radio.addEventListener('change', updateExportOptions);
+            });
+
+            // Close modal on overlay click (click outside content)
+            document.getElementById('export-modal').addEventListener('click', (e) => {
+                if (e.target === document.getElementById('export-modal')) {
+                    closeExportModal();
+                }
+            });
+        });
+
+        /** Handle Export button click in modal - dispatch to appropriate exporter */
+        async function handleExportConfirm() {
+            const format = document.querySelector('input[name="export-format"]:checked').value;
+            closeExportModal();
+            if (format === 'pdf') {
+                await generatePdf();
+            }
+            // ZIP handler will be added in a later commit
         }
 
         /**
@@ -789,7 +870,7 @@
          */
         async function generatePdf() {
             logger.info('Generating PDF...');
-            const btn = document.getElementById('download-pdf-btn');
+            const btn = document.getElementById('export-btn');
             btn.disabled = true;
             btn.textContent = i18n.t('receive.generatingPdf');
 
@@ -822,7 +903,7 @@
                 showToast('Failed to generate PDF: ' + e.message);
             } finally {
                 btn.disabled = false;
-                updatePdfButton();
+                updateExportButton();
             }
         }
 

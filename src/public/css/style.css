@@ -807,6 +807,96 @@ footer {
     transform: translateY(-50%);
 }
 
+/* ============ Export Modal ============ */
+/*
+ * Modal dialog for choosing export format (ZIP, PDF) and options (B&W, OCR).
+ * Reuses visual patterns from the crop modal (dark overlay, centered content).
+ */
+
+.export-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 15px;
+}
+
+.export-modal-content {
+    background: #1a1a2e;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 16px;
+    padding: 25px;
+    max-width: 400px;
+    width: 100%;
+}
+
+.export-modal-content h3 {
+    color: #e94560;
+    font-size: 1.3rem;
+    margin-bottom: 20px;
+    text-align: center;
+}
+
+.export-format-options {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+.export-radio-label,
+.export-checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1rem;
+    color: #fff;
+}
+
+.export-radio-label:hover,
+.export-checkbox-label:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* Dim labels whose input is disabled */
+.export-radio-label:has(input:disabled),
+.export-checkbox-label:has(input:disabled) {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.coming-soon {
+    font-size: 0.8rem;
+    color: #888;
+    font-style: italic;
+}
+
+.export-pdf-options {
+    margin-left: 20px;
+    margin-bottom: 15px;
+    padding-left: 10px;
+    border-left: 2px solid rgba(233, 69, 96, 0.3);
+}
+
+.export-modal-buttons {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.export-modal-buttons button {
+    flex: 1;
+}
+
 /* ============ Toast Notifications ============ */
 /*
  * Non-blocking inline notifications that replace alert() popups.
