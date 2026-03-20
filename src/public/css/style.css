@@ -240,6 +240,52 @@ h1 {
     border-color: rgba(255, 193, 7, 0.8);
 }
 
+/* Document detection toggle button - right side of camera view, mirrors flash button */
+.detect-toggle-btn {
+    position: absolute;
+    bottom: 20px;
+    right: 12px;
+    z-index: 11;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 20px;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.detect-toggle-btn:active {
+    background: rgba(255, 255, 255, 0.3);
+}
+.detect-toggle-btn.detect-active {
+    background: rgba(33, 150, 243, 0.6);
+    border-color: rgba(33, 150, 243, 0.8);
+}
+
+/* SVG overlay showing detected document outline on live camera feed */
+.detect-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 5;
+}
+.detect-overlay polygon {
+    fill: rgba(255, 255, 255, 0.2);
+    stroke: rgba(33, 150, 243, 0.8);
+    stroke-width: 2;
+    stroke-dasharray: 8 4;
+}
+
 /* Floating capture button overlay - positioned inside the camera container */
 .capture-btn-floating {
     position: absolute;

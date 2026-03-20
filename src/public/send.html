@@ -10,7 +10,7 @@
     <title>WebSend - Send Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-+/iiiCxf15vT/qJ4kNlnZ5DzhgCYshWKM2b24p88dnvCzRySJPBY9ABZTQqRWQ5Z" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-y/cFBLA4Wu+By/kw1mIcyWALqiflbrZ/5RUalg/okNUEa29ttpts0ZfBVfuwrvdb" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -172,6 +172,15 @@
                     <span id="flash-icon">⚡</span>
                     <span id="flash-label" data-i18n="send.flashOff">Off</span>
                 </button>
+                <!-- Document detection toggle: auto-detect page edges in live view -->
+                <button class="detect-toggle-btn" id="detect-toggle-btn" title="Document detection">
+                    <span id="detect-icon">📐</span>
+                    <span id="detect-label" data-i18n="send.detectOff">Detect</span>
+                </button>
+                <!-- SVG overlay for live document detection outline -->
+                <svg class="detect-overlay hidden" id="detect-overlay">
+                    <polygon id="detect-polygon" points="0,0 0,0 0,0 0,0"/>
+                </svg>
                 <!-- Floating capture button inside camera view -->
                 <button class="btn btn-action btn-danger capture-btn-floating" id="capture-btn" data-i18n="send.capture">
                     📸 Take Photo
@@ -273,6 +282,7 @@
         </div>
     </div>
 
+    <script src="/js/doc-detect.js" integrity="sha384-SM981FX3JFKQV9Lx0rS3Ocxr0LlsCpaokRahE71ug7tSZ3JGm5XA8pweCtPoAqOt" crossorigin="anonymous"></script>
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-nBOWPHjrcPtwoIFqx8RKQiKeSaX7L0+apb4xg2Sg4Li46AAnkzyOpS7bJXy0XrYB"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
@@ -312,6 +322,10 @@
         // Flash modes: 'off' → 'torch' (constant light) → 'flash' (fire on capture) → 'off'
         let flashMode = 'off';
         let torchSupported = false;
+        // Document detection state
+        let detectEnabled = localStorage.getItem('docDetectEnabled') === 'true';
+        let detectInterval = null;
+        let lastDetectedCorners = null;
 
         // UI Elements
         const stepScan = document.getElementById('step-scan');
@@ -430,6 +444,9 @@
             document.getElementById('send-btn').addEventListener('click', sendPhoto);
             document.getElementById('retake-btn').addEventListener('click', () => showStep(stepChoose));
             document.getElementById('send-another-btn').addEventListener('click', () => showStep(stepChoose));
+
+            // Set up document detection toggle button
+            setupDetectButton();
 
             // Set up pinch-to-zoom for camera containers
             setupPinchZoom(document.getElementById('scanner-video'));
@@ -819,6 +836,8 @@
                 // so the container has its full height for accurate scroll positioning
                 video.addEventListener('loadeddata', () => {
                     container.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    // Start live document detection if enabled
+                    if (detectEnabled) startDetectionLoop();
                 }, { once: true });
             } catch (e) {
                 logger.error('Failed to start camera: ' + e.message);
@@ -885,8 +904,74 @@
             }
         }
 
+        // ============ Document Detection (live edge detection) ============
+
+        /** Set up the detect toggle button and restore saved state */
+        function setupDetectButton() {
+            const btn = document.getElementById('detect-toggle-btn');
+            updateDetectUI();
+            btn.addEventListener('click', () => {
+                detectEnabled = !detectEnabled;
+                localStorage.setItem('docDetectEnabled', String(detectEnabled));
+                updateDetectUI();
+                if (detectEnabled && captureStream) {
+                    startDetectionLoop();
+                } else {
+                    stopDetectionLoop();
+                }
+            });
+        }
+
+        /** Update detect button appearance based on detectEnabled state */
+        function updateDetectUI() {
+            const btn = document.getElementById('detect-toggle-btn');
+            const label = document.getElementById('detect-label');
+            if (detectEnabled) {
+                btn.classList.add('detect-active');
+                label.textContent = i18n.t('send.detectOn');
+            } else {
+                btn.classList.remove('detect-active');
+                label.textContent = i18n.t('send.detectOff');
+            }
+        }
+
+        /** Start running document detection every second on the live video feed */
+        function startDetectionLoop() {
+            stopDetectionLoop();
+            const video = document.getElementById('capture-video');
+            const overlay = document.getElementById('detect-overlay');
+            overlay.classList.remove('hidden');
+            detectInterval = setInterval(() => {
+                if (!captureStream || video.readyState < 2) return;
+                const result = DocDetect.detectFromVideo(video);
+                const polygon = document.getElementById('detect-polygon');
+                if (result) {
+                    lastDetectedCorners = result;
+                    const w = video.clientWidth, h = video.clientHeight;
+                    const pts = [result.tl, result.tr, result.br, result.bl]
+                        .map(p => `${(p.x * w).toFixed(1)},${(p.y * h).toFixed(1)}`)
+                        .join(' ');
+                    polygon.setAttribute('points', pts);
+                    overlay.classList.remove('hidden');
+                } else {
+                    lastDetectedCorners = null;
+                    overlay.classList.add('hidden');
+                }
+            }, 1000);
+        }
+
+        /** Stop the detection loop and hide the overlay */
+        function stopDetectionLoop() {
+            if (detectInterval) {
+                clearInterval(detectInterval);
+                detectInterval = null;
+            }
+            document.getElementById('detect-overlay').classList.add('hidden');
+        }
+
         /** Stop the capture camera and release media tracks */
         function stopCapture() {
+            stopDetectionLoop();
             const video = document.getElementById('capture-video');
             const container = video.parentElement;
             if (captureStream) {
@@ -1263,13 +1348,25 @@
             const sourceBlob = originalPhotoBlob || currentPhotoBlob;
             cropState.originalUrl = URL.createObjectURL(sourceBlob);
 
-            // Reset corners to near-edge defaults
-            cropState.corners = {
-                tl: { x: 0.05, y: 0.05 },
-                tr: { x: 0.95, y: 0.05 },
-                br: { x: 0.95, y: 0.95 },
-                bl: { x: 0.05, y: 0.95 }
-            };
+            // Use detected corners if available, otherwise try one-shot detection,
+            // falling back to near-edge defaults
+            if (lastDetectedCorners) {
+                cropState.corners = {
+                    tl: { ...lastDetectedCorners.tl },
+                    tr: { ...lastDetectedCorners.tr },
+                    br: { ...lastDetectedCorners.br },
+                    bl: { ...lastDetectedCorners.bl }
+                };
+                lastDetectedCorners = null;
+                logger.info('Using live-detected corners for crop');
+            } else {
+                cropState.corners = {
+                    tl: { x: 0.05, y: 0.05 },
+                    tr: { x: 0.95, y: 0.05 },
+                    br: { x: 0.95, y: 0.95 },
+                    bl: { x: 0.05, y: 0.95 }
+                };
+            }
 
             const cropImg = document.getElementById('crop-image');
             cropImg.src = cropState.originalUrl;
@@ -1277,6 +1374,21 @@
             cropImg.onload = () => {
                 cropState.imgWidth = cropImg.clientWidth;
                 cropState.imgHeight = cropImg.clientHeight;
+
+                // If no live-detected corners, try one-shot detection on the static image
+                if (cropState.corners.tl.x === 0.05 && cropState.corners.tl.y === 0.05) {
+                    const detected = DocDetect.detectFromImage(cropImg);
+                    if (detected) {
+                        cropState.corners = {
+                            tl: { ...detected.tl },
+                            tr: { ...detected.tr },
+                            br: { ...detected.br },
+                            bl: { ...detected.bl }
+                        };
+                        logger.info('Auto-detected document edges for crop');
+                    }
+                }
+
                 updateCropOverlay();
 
                 // Preload full-resolution image for magnifier sampling
