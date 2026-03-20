@@ -35,7 +35,8 @@ WebSend/
         ├── index.html      # Landing page: "Receive" and "Send" buttons, About modal
         ├── receive.html    # Receiver flow: key generation, room creation, QR display,
         │                   #   WebRTC answer polling, decryption, image display,
-        │                   #   perspective crop tool, PDF generation
+        │                   #   perspective crop tool, Otsu B&W binarization,
+        │                   #   PDF generation, export modal (ZIP/PDF/B&W/OCR)
         ├── send.html       # Sender flow: QR scanning (jsQR), room joining, key exchange,
         │                   #   camera capture or file picker, encryption, chunked sending
         ├── manifest.json   # PWA manifest (installable as app on mobile)
