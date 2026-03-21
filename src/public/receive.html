@@ -619,12 +619,26 @@
                     <span style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
                 </div>
                 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button class="btn btn-action btn-info" style="flex: 1; min-width: 120px;" onclick="openCropModal(${imageIndex})">
-                        ${i18n.t('receive.crop')}
+                    <button class="btn btn-action btn-secondary" style="flex: 1; min-width: 80px;" onclick="toggleEditToolbar(${imageIndex})">
+                        ${i18n.t('send.edit')}
                     </button>
                     <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="flex: 1; min-width: 120px;" id="download-${imageIndex}">
                         ${i18n.t('receive.download')}
                     </a>
+                </div>
+                <div class="edit-toolbar hidden" id="edit-toolbar-${imageIndex}">
+                    <button class="edit-tool-btn" onclick="rotateReceivedImage(${imageIndex})">
+                        <span>🔄</span>
+                        <span>${i18n.t('send.rotate')}</span>
+                    </button>
+                    <button class="edit-tool-btn" onclick="openCropModal(${imageIndex})">
+                        <span>✂️</span>
+                        <span>${i18n.t('receive.crop')}</span>
+                    </button>
+                    <button class="edit-tool-btn" onclick="applyBWToImage(${imageIndex})">
+                        <span>⬛</span>
+                        <span>${i18n.t('send.applyBW')}</span>
+                    </button>
                 </div>
                 <!-- Single-click shows inline confirmation before discarding -->
                 <div class="discard-btn" style="margin-top: 8px;">
@@ -645,6 +659,90 @@
                 </div>
             `;
             container.insertBefore(item, container.firstChild);
+        }
+
+        // ============ Per-image editing ============
+
+        function toggleEditToolbar(imageIndex) {
+            document.getElementById(`edit-toolbar-${imageIndex}`).classList.toggle('hidden');
+        }
+
+        /**
+         * Rotate a received image 90° clockwise and update both the display and stored data.
+         */
+        async function rotateReceivedImage(imageIndex) {
+            const img = receivedImages[imageIndex];
+            if (!img) return;
+
+            const bitmap = await createImageBitmap(new Blob([img.data], { type: img.mimeType }));
+            const canvas = document.createElement('canvas');
+            canvas.width = bitmap.height;
+            canvas.height = bitmap.width;
+            const ctx = canvas.getContext('2d');
+            ctx.translate(canvas.width / 2, canvas.height / 2);
+            ctx.rotate(Math.PI / 2);
+            ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+            bitmap.close();
+
+            const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
+            const arrayBuf = await blob.arrayBuffer();
+            img.data = new Uint8Array(arrayBuf);
+            img.mimeType = 'image/jpeg';
+
+            // Update display
+            const displayImg = document.getElementById(`img-${imageIndex}`);
+            const oldSrc = displayImg.src;
+            const newUrl = URL.createObjectURL(new Blob([img.data], { type: img.mimeType }));
+            displayImg.src = newUrl;
+            if (oldSrc.startsWith('blob:')) URL.revokeObjectURL(oldSrc);
+
+            // Update download link
+            const dl = document.getElementById(`download-${imageIndex}`);
+            if (dl.href.startsWith('blob:')) URL.revokeObjectURL(dl.href);
+            dl.href = newUrl;
+
+            logger.success(`Image #${imageIndex + 1} rotated`);
+        }
+
+        /**
+         * Apply Otsu B&W binarization to a received image in place.
+         */
+        async function applyBWToImage(imageIndex) {
+            const img = receivedImages[imageIndex];
+            if (!img) return;
+
+            const bitmap = await createImageBitmap(new Blob([img.data], { type: img.mimeType }));
+            const canvas = document.createElement('canvas');
+            canvas.width = bitmap.width;
+            canvas.height = bitmap.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(bitmap, 0, 0);
+            bitmap.close();
+
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            applyOtsu(imageData);
+            ctx.putImageData(imageData, 0, 0);
+
+            const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+            const arrayBuf = await blob.arrayBuffer();
+            img.data = new Uint8Array(arrayBuf);
+            img.mimeType = 'image/png';
+            img.name = img.name.replace(/\.[^.]+$/, '.png');
+
+            // Update display
+            const displayImg = document.getElementById(`img-${imageIndex}`);
+            const oldSrc = displayImg.src;
+            const newUrl = URL.createObjectURL(new Blob([img.data], { type: img.mimeType }));
+            displayImg.src = newUrl;
+            if (oldSrc.startsWith('blob:')) URL.revokeObjectURL(oldSrc);
+
+            // Update download link
+            const dl = document.getElementById(`download-${imageIndex}`);
+            if (dl.href.startsWith('blob:')) URL.revokeObjectURL(dl.href);
+            dl.href = newUrl;
+            dl.download = img.name;
+
+            logger.success(`B&W applied to image #${imageIndex + 1}`);
         }
 
         // ============ Image Discard ============
