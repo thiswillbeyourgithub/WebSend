@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-FUFOLMw2Malsbapo10HlHaA4oV7tBZT66CaoS+wZm/DYnRQF2p513WtQG3iv1eaB" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-Ehh6JThfuGjWSRXUIVTA3Cttwx9QJBQdfuTMZX3QSIC3NUtsYM30oReum+uSryXF" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -156,26 +156,16 @@
                     <h3 data-i18n="receive.exportTitle">Export</h3>
 
                     <div class="export-format-options">
-                        <label class="export-radio-label">
-                            <input type="radio" name="export-format" value="zip">
-                            <span data-i18n="receive.exportZip">ZIP of all images</span>
-                        </label>
-                        <label class="export-radio-label">
-                            <input type="radio" name="export-format" value="pdf" checked>
-                            <span data-i18n="receive.exportPdf">PDF</span>
-                        </label>
+                        <div class="export-segmented">
+                            <button type="button" class="export-seg-btn" data-format="zip" data-i18n="receive.exportZip">ZIP of all images</button>
+                            <button type="button" class="export-seg-btn active" data-format="pdf" data-i18n="receive.exportPdf">PDF</button>
+                        </div>
                     </div>
 
                     <!-- PDF-specific options (shown only when PDF is selected) -->
                     <div id="export-pdf-options" class="export-pdf-options">
-                        <label class="export-checkbox-label">
-                            <input type="checkbox" id="export-bw">
-                            <span data-i18n="receive.exportBW">Black & white (document mode)</span>
-                        </label>
-                        <label class="export-checkbox-label">
-                            <input type="checkbox" id="export-ocr">
-                            <span data-i18n="receive.exportOCR">OCR (searchable PDF)</span>
-                        </label>
+                        <button type="button" class="export-toggle-btn" id="export-bw" data-i18n="receive.exportBW">Black & white (document mode)</button>
+                        <button type="button" class="export-toggle-btn" id="export-ocr" data-i18n="receive.exportOCR">OCR (searchable PDF) — experimental</button>
                     </div>
 
                     <div class="export-modal-buttons">
@@ -1032,15 +1022,26 @@
             document.getElementById('export-modal').classList.add('hidden');
         }
 
-        /** Toggle options visibility based on selected format radio.
+        /** Get currently selected export format from segmented buttons */
+        function getSelectedFormat() {
+            const active = document.querySelector('.export-seg-btn.active');
+            return active ? active.dataset.format : 'pdf';
+        }
+
+        /** Check if a toggle button is active (replaces .checked for checkboxes) */
+        function isToggleActive(id) {
+            return document.getElementById(id).classList.contains('active');
+        }
+
+        /** Toggle options visibility based on selected format.
          *  B&W is available for both ZIP and PDF; OCR only for PDF. */
         function updateExportOptions() {
-            const pdfSelected = document.querySelector('input[name="export-format"][value="pdf"]').checked;
-            // B&W options section is always visible (works with both formats)
+            const pdfSelected = getSelectedFormat() === 'pdf';
             document.getElementById('export-pdf-options').style.display = 'block';
             // OCR only makes sense for PDF output
-            const ocrLabel = document.getElementById('export-ocr').closest('label');
-            ocrLabel.style.display = pdfSelected ? 'flex' : 'none';
+            const ocrBtn = document.getElementById('export-ocr');
+            ocrBtn.style.display = pdfSelected ? '' : 'none';
+            if (!pdfSelected) ocrBtn.classList.remove('active');
         }
 
         // Wire up export modal events once DOM is ready
@@ -1048,9 +1049,18 @@
             document.getElementById('export-cancel-btn').addEventListener('click', closeExportModal);
             document.getElementById('export-confirm-btn').addEventListener('click', handleExportConfirm);
 
-            // Show/hide PDF options when format radio changes
-            document.querySelectorAll('input[name="export-format"]').forEach(radio => {
-                radio.addEventListener('change', updateExportOptions);
+            // Segmented format buttons
+            document.querySelectorAll('.export-seg-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('.export-seg-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    updateExportOptions();
+                });
+            });
+
+            // Toggle buttons (B&W, OCR)
+            document.querySelectorAll('.export-toggle-btn').forEach(btn => {
+                btn.addEventListener('click', () => btn.classList.toggle('active'));
             });
 
             // Close modal on overlay click (click outside content)
@@ -1063,7 +1073,7 @@
 
         /** Handle Export button click in modal - dispatch to appropriate exporter */
         async function handleExportConfirm() {
-            const format = document.querySelector('input[name="export-format"]:checked').value;
+            const format = getSelectedFormat();
             closeExportModal();
             if (format === 'pdf') {
                 await generatePdf();
@@ -1087,7 +1097,7 @@
                 // Lazy-load client-zip only when needed
                 const { downloadZip } = await import('/js/vendor/client-zip.js');
 
-                const bw = document.getElementById('export-bw').checked;
+                const bw = isToggleActive('export-bw');
                 const activeImages = receivedImages.filter(img => img !== null);
 
                 // Build file entries for client-zip
@@ -1164,7 +1174,7 @@
          * or scribe.js for OCR (searchable PDF with invisible text layer).
          */
         async function generatePdf() {
-            const ocr = document.getElementById('export-ocr').checked;
+            const ocr = isToggleActive('export-ocr');
             if (ocr) {
                 await generateOcrPdf();
             } else {
@@ -1184,7 +1194,7 @@
 
             try {
                 // Convert all non-discarded images to JPEG for consistent PDF embedding
-                const bw = document.getElementById('export-bw').checked;
+                const bw = isToggleActive('export-bw');
                 const activeImages = receivedImages.filter(img => img !== null);
                 const jpegs = await Promise.all(activeImages.map(img => toJpegData(img.data, img.mimeType, { bw })));
 
@@ -1231,7 +1241,10 @@
                 btn.textContent = i18n.t('receive.ocrInitializing');
                 await scribe.init({ ocr: true, font: true });
 
-                const bw = document.getElementById('export-bw').checked;
+                // Use invisible text layer (not visible proof overlay)
+                scribe.opt.displayMode = 'invis';
+
+                const bw = isToggleActive('export-bw');
                 const activeImages = receivedImages.filter(img => img !== null);
 
                 // Convert images to File objects for scribe.importFiles.
@@ -1280,7 +1293,11 @@
                 URL.revokeObjectURL(url);
 
                 // Clean up scribe state for next use
-                await scribe.clearData();
+                if (typeof scribe.clear === 'function') {
+                    await scribe.clear();
+                } else if (typeof scribe.terminate === 'function') {
+                    await scribe.terminate();
+                }
 
                 logger.success('OCR PDF downloaded');
             } catch (e) {
