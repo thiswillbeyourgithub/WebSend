@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "dependencies": {
+    "canvaskit-wasm": "^0.39.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.20"
+  }
+}
