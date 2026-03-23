@@ -27,7 +27,7 @@ WebSend/
 │
 └── src/
     ├── server.js           # Express server: signaling API, ICE config, static serving,
-    │                       #   serves scribe.js-ocr from node_modules at /scribe/
+    │                       #   serves vendored libs at /vendor/, /scribe/, /tessdata/
     ├── package.json        # Dependencies (express only)
     ├── update-sri.js       # SRI hash generator for script/link integrity attributes
     ├── sri-hashes.json     # Generated SRI hashes (used by update-sri.js)
@@ -69,9 +69,14 @@ WebSend/
         │   │               #   compresses with deflate, reconstructs minimal valid SDP).
         │   │               #   Used to keep QR codes small
         │   ├── qrcode.min.js # QR code generator library (vendored, used by receiver)
-        │   ├── jsqr.min.js # QR code scanner library (vendored, used by sender)
-        │   └── vendor/
-        │       └── client-zip.js # ZIP generator (ESM, ~6KB, lazy-loaded on demand)
+        │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
+        │
+        ├── vendor/             # Vendored third-party libraries (committed to repo)
+        │   ├── client-zip.js   # ZIP generator (ESM, ~6KB, lazy-loaded on demand)
+        │   ├── scribe.js-ocr/  # OCR engine (AGPL-3.0): scribe.js + Tesseract WASM,
+        │   │                   #   fonts, and mupdf — lazy-loaded when user requests OCR
+        │   └── tessdata/       # Tesseract language models (eng + fra .traineddata),
+        │                       #   served locally to avoid CDN dependency
         │
         └── icons/
             ├── icon-192.png # PWA icon (192x192)
@@ -166,9 +171,10 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
    never written to the phone's gallery, filesystem, or local storage. Photos are kept in
    memory until the receiver confirms successful receipt.
 9. **Supply chain attack resistance**: No frameworks, bundlers, or build tools — the frontend
-   is vanilla HTML/CSS/JS with zero `node_modules` in the browser. The only third-party
-   client-side libraries (jsQR, qrcode.js) are vendored directly in the repository. The
-   server-side dependency footprint is minimal (Express.js only).
+   is vanilla HTML/CSS/JS with zero `node_modules` in the browser. All third-party
+   client-side libraries (jsQR, qrcode.js, client-zip, scribe.js-ocr, Tesseract WASM +
+   language models) are vendored directly in the repository — no CDN fetches at runtime.
+   The server-side dependency footprint is minimal (Express.js only).
 10. **SRI**: All `<script>` and `<link>` tags use `integrity` attributes (Subresource
    Integrity), ensuring even a compromised server cannot silently swap in tampered files.
 11. **Rate limiting**: Per-IP sliding window limits on room creation (5/min), room lookup
