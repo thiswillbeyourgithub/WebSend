@@ -991,11 +991,14 @@
                 }
             }
 
-            // Apply threshold: convert each pixel to black or white
+            // Apply threshold with a soft sigmoid transition to avoid harsh edges.
+            // Pixels far from the threshold become pure black/white; those near it
+            // get intermediate values, producing smoother lettering.
+            const sharpness = 0.15; // lower = softer transition (range ~0.05–0.5)
             for (let i = 0; i < len; i++) {
                 const idx = i * 4;
                 const gray = Math.round(0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2]);
-                const val = gray > bestThreshold ? 255 : 0;
+                const val = Math.round(255 / (1 + Math.exp(-sharpness * (gray - bestThreshold))));
                 data[idx] = val;
                 data[idx + 1] = val;
                 data[idx + 2] = val;
