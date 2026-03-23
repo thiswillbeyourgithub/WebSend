@@ -242,9 +242,20 @@ function showToast(message, options = {}) {
 
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
-    toast.textContent = message;
 
-    // Click to dismiss
+    // Message text
+    const msgSpan = document.createElement('span');
+    msgSpan.textContent = message;
+    toast.appendChild(msgSpan);
+
+    // Small close button in top-right corner
+    const closeBtn = document.createElement('span');
+    closeBtn.className = 'toast-close';
+    closeBtn.textContent = '✕';
+    closeBtn.addEventListener('click', (e) => { e.stopPropagation(); dismiss(); });
+    toast.appendChild(closeBtn);
+
+    // Click anywhere on toast to dismiss
     toast.addEventListener('click', () => dismiss());
 
     container.appendChild(toast);
