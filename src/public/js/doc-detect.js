@@ -102,15 +102,17 @@ const DocDetect = (function () {
             binary[i] = edges[i] >= threshold ? 1 : 0;
         }
 
-        // 5. Dilate multiple times to close gaps in edges (e.g. grid lines on paper)
-        let dilated = _dilate(binary, w, h);
-        dilated = _dilate(dilated, w, h);
-        dilated = _dilate(dilated, w, h);
+        // 5. Dilate to close gaps in edges
+        let dilated = binary;
+        for (let i = 0; i < 5; i++) dilated = _dilate(dilated, w, h);
 
-        // 6. Find contours
-        const contours = _findContours(dilated, w, h);
+        // 6. Flood-fill from image borders to find background, then extract foreground
+        const foreground = _extractForeground(dilated, w, h);
 
-        // 7. Find largest quad
+        // 7. Find contours of the foreground (document) region
+        const contours = _findContours(foreground, w, h);
+
+        // 8. Find largest quad
         const quad = _findLargestQuad(contours, w, h);
         if (!quad) return null;
 
@@ -210,6 +212,57 @@ const DocDetect = (function () {
             }
         }
         return out;
+    }
+
+    /**
+     * Flood-fill from image borders through non-edge pixels to identify background.
+     * Everything not reachable from the border is foreground (the document).
+     */
+    function _extractForeground(edges, w, h) {
+        // 0 = unvisited, 1 = background (reachable from border)
+        const bg = new Uint8Array(w * h);
+        const stack = [];
+
+        // Seed from all border pixels that are NOT edge pixels
+        for (let x = 0; x < w; x++) {
+            if (!edges[x]) stack.push(x);                       // top row
+            if (!edges[(h - 1) * w + x]) stack.push((h - 1) * w + x); // bottom row
+        }
+        for (let y = 1; y < h - 1; y++) {
+            if (!edges[y * w]) stack.push(y * w);               // left col
+            if (!edges[y * w + w - 1]) stack.push(y * w + w - 1); // right col
+        }
+
+        // Mark seeds
+        for (const idx of stack) bg[idx] = 1;
+
+        // BFS flood fill
+        while (stack.length > 0) {
+            const idx = stack.pop();
+            const x = idx % w, y = (idx - x) / w;
+            const neighbors = [
+                idx - 1, idx + 1, idx - w, idx + w // 4-connectivity
+            ];
+            for (const ni of neighbors) {
+                if (ni >= 0 && ni < w * h && !bg[ni] && !edges[ni]) {
+                    // For left/right neighbors, ensure we don't wrap rows
+                    const nx = ni % w;
+                    if (Math.abs(nx - x) > 1) continue;
+                    bg[ni] = 1;
+                    stack.push(ni);
+                }
+            }
+        }
+
+        // Foreground = anything not background and not too close to border
+        const fg = new Uint8Array(w * h);
+        for (let y = 2; y < h - 2; y++) {
+            for (let x = 2; x < w - 2; x++) {
+                const i = y * w + x;
+                if (!bg[i]) fg[i] = 1;
+            }
+        }
+        return fg;
     }
 
     /**
