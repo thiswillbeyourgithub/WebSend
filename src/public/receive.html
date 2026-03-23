@@ -1289,20 +1289,30 @@
                 timeoutId = setTimeout(() => reject(new Error('OCR_TIMEOUT')), timeoutMs);
             });
 
-            // Cancel guard
+            // Cancel guard — polls ocrCancelled flag, cleaned up via ocrDone
+            let ocrDone = false;
             const cancelPromise = new Promise((_, reject) => {
                 const checkCancel = () => {
                     if (ocrCancelled) return reject(new Error('OCR_CANCELLED'));
-                    timeoutId && setTimeout(checkCancel, 300);
+                    if (!ocrDone) setTimeout(checkCancel, 300);
                 };
                 checkCancel();
             });
 
-            // Acquire a Web Lock to prevent the browser from throttling this tab
-            const lockName = 'websend-ocr-' + Date.now();
-            const lockPromise = navigator.locks
-                ? navigator.locks.request(lockName, { mode: 'exclusive' }, () => cancelPromise.catch(() => {}))
-                : Promise.resolve();
+            // Prevent browser from throttling this tab by keeping a silent
+            // AudioContext running. Browsers exempt tabs with active audio
+            // from timer throttling applied to background tabs.
+            let keepaliveCtx = null;
+            try {
+                keepaliveCtx = new (window.AudioContext || window.webkitAudioContext)();
+                // Create a silent oscillator to keep the context "active"
+                const osc = keepaliveCtx.createOscillator();
+                const gain = keepaliveCtx.createGain();
+                gain.gain.value = 0; // silent
+                osc.connect(gain);
+                gain.connect(keepaliveCtx.destination);
+                osc.start();
+            } catch (_) { /* AudioContext not available — best effort */ }
 
             try {
                 const ocrWork = (async () => {
@@ -1355,6 +1365,7 @@
                 })();
 
                 const pdfResult = await Promise.race([ocrWork, timeoutPromise, cancelPromise]);
+                ocrDone = true;
                 clearTimeout(timeoutId);
 
                 let pdfBlob;
@@ -1393,6 +1404,8 @@
                     showToast(i18n.t('receive.ocrFailed', { error: e.message }));
                 }
             } finally {
+                ocrDone = true;
+                if (keepaliveCtx) keepaliveCtx.close().catch(() => {});
                 btn.disabled = false;
                 btn.style.background = '#1565c0';
                 updateExportButton();
