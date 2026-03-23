@@ -1320,7 +1320,7 @@
                     showToast(i18n.t('receive.ocrTimeout', { minutes: imageCount }));
                 } else {
                     logger.error('OCR PDF generation failed: ' + e.message);
-                    showToast('Failed to generate OCR PDF: ' + e.message);
+                    showToast(i18n.t('receive.ocrFailed', { error: e.message }));
                 }
             } finally {
                 btn.disabled = false;
