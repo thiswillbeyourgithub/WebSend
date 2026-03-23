@@ -1239,60 +1239,68 @@
             logger.info('Generating OCR PDF...');
             const btn = document.getElementById('export-btn');
             btn.disabled = true;
-            btn.textContent = i18n.t('receive.ocrProcessing');
+
+            const activeImages = receivedImages.filter(img => img !== null);
+            const imageCount = activeImages.length;
+            const timeoutMs = imageCount * 60000; // 60s per image
+
+            btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
+
+            // Timeout guard
+            let timeoutId;
+            const timeoutPromise = new Promise((_, reject) => {
+                timeoutId = setTimeout(() => reject(new Error('OCR_TIMEOUT')), timeoutMs);
+            });
 
             try {
-                // Lazy-load scribe.js from the /scribe/ static route
-                const scribeModule = await import('/scribe/scribe.js');
-                const scribe = scribeModule.default;
+                const ocrWork = (async () => {
+                    const scribeModule = await import('/scribe/scribe.js');
+                    const scribe = scribeModule.default;
 
-                // Initialize OCR engine with font support (needed for text layer)
-                btn.textContent = i18n.t('receive.ocrInitializing');
-                await scribe.init({ ocr: true, font: true });
+                    btn.textContent = i18n.t('receive.ocrInitializing');
+                    await scribe.init({ ocr: true, font: true });
+                    scribe.opt.displayMode = 'invis';
 
-                // Use invisible text layer (not visible proof overlay)
-                scribe.opt.displayMode = 'invis';
+                    const bw = isToggleActive('export-bw');
+                    const files = await Promise.all(activeImages.map(async (img, i) => {
+                        let blob;
+                        if (bw) {
+                            blob = await toBWPng(img.data, img.mimeType);
+                        } else {
+                            blob = new Blob([img.data], { type: img.mimeType });
+                        }
+                        return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
+                    }));
 
-                const bw = isToggleActive('export-bw');
-                const activeImages = receivedImages.filter(img => img !== null);
+                    btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
+                    await scribe.importFiles(files);
 
-                // Convert images to File objects for scribe.importFiles.
-                // If B&W is requested, binarize first.
-                const files = await Promise.all(activeImages.map(async (img, i) => {
-                    let blob;
-                    if (bw) {
-                        blob = await toBWPng(img.data, img.mimeType);
-                    } else {
-                        blob = new Blob([img.data], { type: img.mimeType });
+                    const ocrLangs = window.__wsConfig?.ocrLangs || ['eng', 'fra'];
+                    const ocrPsm = window.__wsConfig?.ocrPsm || '12';
+                    await scribe.recognize({ langs: ocrLangs, modeAdv: 'combined', config: { tessedit_pageseg_mode: ocrPsm } });
+
+                    const pdfResult = await scribe.exportData('pdf');
+
+                    if (typeof scribe.clear === 'function') {
+                        await scribe.clear();
+                    } else if (typeof scribe.terminate === 'function') {
+                        await scribe.terminate();
                     }
-                    // scribe expects File objects with names
-                    return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
-                }));
+                    return pdfResult;
+                })();
 
-                // Import files into scribe
-                btn.textContent = i18n.t('receive.ocrProcessing');
-                await scribe.importFiles(files);
+                const pdfResult = await Promise.race([ocrWork, timeoutPromise]);
+                clearTimeout(timeoutId);
 
-                // Run OCR recognition with server-configured languages, PSM, and best accuracy (combined OEM)
-                const ocrLangs = window.__wsConfig?.ocrLangs || ['eng', 'fra'];
-                const ocrPsm = window.__wsConfig?.ocrPsm || '12';
-                await scribe.recognize({ langs: ocrLangs, modeAdv: 'combined', config: { tessedit_pageseg_mode: ocrPsm } });
-
-                // Export as searchable PDF
-                const pdfResult = await scribe.exportData('pdf');
-
-                // scribe.exportData may return a Blob, ArrayBuffer, or Uint8Array depending on version
                 let pdfBlob;
                 if (pdfResult instanceof Blob) {
                     pdfBlob = pdfResult;
                 } else if (pdfResult instanceof ArrayBuffer || pdfResult instanceof Uint8Array) {
                     pdfBlob = new Blob([pdfResult], { type: 'application/pdf' });
                 } else {
-                    // Try wrapping whatever it returns
                     pdfBlob = new Blob([pdfResult], { type: 'application/pdf' });
                 }
 
-                // Trigger download
                 const url = URL.createObjectURL(pdfBlob);
                 const a = document.createElement('a');
                 a.href = url;
@@ -1301,17 +1309,16 @@
                 a.click();
                 URL.revokeObjectURL(url);
 
-                // Clean up scribe state for next use
-                if (typeof scribe.clear === 'function') {
-                    await scribe.clear();
-                } else if (typeof scribe.terminate === 'function') {
-                    await scribe.terminate();
-                }
-
                 logger.success('OCR PDF downloaded');
             } catch (e) {
-                logger.error('OCR PDF generation failed: ' + e.message);
-                showToast('Failed to generate OCR PDF: ' + e.message);
+                clearTimeout(timeoutId);
+                if (e.message === 'OCR_TIMEOUT') {
+                    logger.error(`OCR timed out after ${imageCount} min`);
+                    showToast(i18n.t('receive.ocrTimeout', { minutes: imageCount }));
+                } else {
+                    logger.error('OCR PDF generation failed: ' + e.message);
+                    showToast('Failed to generate OCR PDF: ' + e.message);
+                }
             } finally {
                 btn.disabled = false;
                 updateExportButton();
