@@ -581,6 +581,11 @@
 
                     updateExportButton();
 
+                    // Preload OCR engine after first image arrives
+                    if (receivedImages.filter(img => img !== null).length === 1) {
+                        preloadScribe();
+                    }
+
                     // Compute SHA-256 of the decrypted plaintext data and send
                     // file-ack back to the sender for end-to-end integrity verification.
                     // The sender compares this hash against its pre-encryption hash.
@@ -1234,20 +1239,49 @@
         }
 
         /**
-         * Generate a searchable PDF using scribe.js OCR.
-         * Lazy-loads scribe.js only when needed (several MB of WASM + models).
-         * Produces a PDF with an invisible text layer for copy/paste and search.
+         * Preload scribe.js OCR engine in the background so it's ready when
+         * the user clicks Export. Called once after the first image is received.
          */
+        let scribePreloaded = null; // Promise<scribe module> or null
+        function preloadScribe() {
+            if (scribePreloaded) return;
+            scribePreloaded = (async () => {
+                try {
+                    logger.info('Preloading OCR engine...');
+                    const scribeModule = await import('/scribe/scribe.js');
+                    const scribe = scribeModule.default;
+                    await scribe.init({ ocr: true, font: true });
+                    scribe.opt.displayMode = 'invis';
+                    logger.info('OCR engine preloaded');
+                    return scribe;
+                } catch (e) {
+                    logger.warn('OCR preload failed (will retry on export): ' + e.message);
+                    scribePreloaded = null;
+                    return null;
+                }
+            })();
+        }
+
+        /**
+         * Generate a searchable PDF using scribe.js OCR.
+         * Uses preloaded scribe.js engine if available, otherwise loads on demand.
+         * Produces a PDF with an invisible text layer for copy/paste and search.
+         * Acquires a Web Lock to prevent browser throttling during OCR.
+         * Offers a cancel button that falls back to plain (non-OCR) PDF export.
+         */
+        let ocrCancelled = false;
         async function generateOcrPdf() {
             logger.info('Generating OCR PDF...');
+            ocrCancelled = false;
             const btn = document.getElementById('export-btn');
-            btn.disabled = true;
+            btn.disabled = false;
+            btn.style.background = '#c62828';
+            btn.textContent = i18n.t('receive.ocrCancel');
+            btn.onclick = () => { ocrCancelled = true; };
 
             const activeImages = receivedImages.filter(img => img !== null);
             const imageCount = activeImages.length;
             const timeoutMs = imageCount * 60000; // 60s per image
-
-            btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
 
             // Timeout guard
             let timeoutId;
@@ -1255,14 +1289,34 @@
                 timeoutId = setTimeout(() => reject(new Error('OCR_TIMEOUT')), timeoutMs);
             });
 
+            // Cancel guard
+            const cancelPromise = new Promise((_, reject) => {
+                const checkCancel = () => {
+                    if (ocrCancelled) return reject(new Error('OCR_CANCELLED'));
+                    timeoutId && setTimeout(checkCancel, 300);
+                };
+                checkCancel();
+            });
+
+            // Acquire a Web Lock to prevent the browser from throttling this tab
+            const lockName = 'websend-ocr-' + Date.now();
+            const lockPromise = navigator.locks
+                ? navigator.locks.request(lockName, { mode: 'exclusive' }, () => cancelPromise.catch(() => {}))
+                : Promise.resolve();
+
             try {
                 const ocrWork = (async () => {
-                    const scribeModule = await import('/scribe/scribe.js');
-                    const scribe = scribeModule.default;
+                    // Use preloaded scribe or load on demand
+                    let scribe = scribePreloaded ? await scribePreloaded : null;
+                    if (!scribe) {
+                        btn.textContent = i18n.t('receive.ocrInitializing');
+                        const scribeModule = await import('/scribe/scribe.js');
+                        scribe = scribeModule.default;
+                        await scribe.init({ ocr: true, font: true });
+                        scribe.opt.displayMode = 'invis';
+                    }
 
-                    btn.textContent = i18n.t('receive.ocrInitializing');
-                    await scribe.init({ ocr: true, font: true });
-                    scribe.opt.displayMode = 'invis';
+                    if (ocrCancelled) throw new Error('OCR_CANCELLED');
 
                     const bw = isToggleActive('export-bw');
                     const files = await Promise.all(activeImages.map(async (img, i) => {
@@ -1275,12 +1329,18 @@
                         return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
                     }));
 
+                    if (ocrCancelled) throw new Error('OCR_CANCELLED');
+
                     btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
                     await scribe.importFiles(files);
+
+                    if (ocrCancelled) throw new Error('OCR_CANCELLED');
 
                     const ocrLangs = window.__wsConfig?.ocrLangs || ['eng', 'fra'];
                     const ocrPsm = window.__wsConfig?.ocrPsm || '12';
                     await scribe.recognize({ langs: ocrLangs, modeAdv: 'combined', config: { tessedit_pageseg_mode: ocrPsm } });
+
+                    if (ocrCancelled) throw new Error('OCR_CANCELLED');
 
                     const pdfResult = await scribe.exportData('pdf');
 
@@ -1289,10 +1349,12 @@
                     } else if (typeof scribe.terminate === 'function') {
                         await scribe.terminate();
                     }
+                    // Reset preload so next OCR re-initializes cleanly
+                    scribePreloaded = null;
                     return pdfResult;
                 })();
 
-                const pdfResult = await Promise.race([ocrWork, timeoutPromise]);
+                const pdfResult = await Promise.race([ocrWork, timeoutPromise, cancelPromise]);
                 clearTimeout(timeoutId);
 
                 let pdfBlob;
@@ -1315,7 +1377,15 @@
                 logger.success('OCR PDF downloaded');
             } catch (e) {
                 clearTimeout(timeoutId);
-                if (e.message === 'OCR_TIMEOUT') {
+                if (e.message === 'OCR_CANCELLED') {
+                    logger.warn('OCR cancelled by user — falling back to plain PDF');
+                    showToast(i18n.t('receive.ocrCancelledFallback'));
+                    // Reset button before generating plain PDF
+                    btn.style.background = '#1565c0';
+                    btn.disabled = true;
+                    await generatePlainPdf();
+                    return;
+                } else if (e.message === 'OCR_TIMEOUT') {
                     logger.error(`OCR timed out after ${imageCount} min`);
                     showToast(i18n.t('receive.ocrTimeout', { minutes: imageCount }));
                 } else {
@@ -1324,6 +1394,7 @@
                 }
             } finally {
                 btn.disabled = false;
+                btn.style.background = '#1565c0';
                 updateExportButton();
             }
         }
