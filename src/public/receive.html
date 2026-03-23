@@ -363,8 +363,15 @@
             }
         }
 
+        // Timestamp recorded when the connection is established, used for filenames
+        let connectionTimestamp = '';
+
         async function onConnected() {
             logger.success('Connected to sender!');
+            // Record connection time for image naming
+            const now = new Date();
+            const pad = n => String(n).padStart(2, '0');
+            connectionTimestamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 
             // Hide QR step, show connected step
             document.getElementById('step-qr').classList.add('hidden');
@@ -556,7 +563,9 @@
                     const imageBlob = new Blob([imageData], { type: imageMimeType });
                     const imageUrl = URL.createObjectURL(imageBlob);
 
-                    const imageName = metadata.name || `websend_${photoCount + 1}.png`;
+                    // Name: websend_<connection-timestamp>_<1-based-index>.<ext>
+                    const ext = (metadata.mimeType || 'image/png').split('/')[1] || 'png';
+                    const imageName = `websend_${connectionTimestamp}_${photoCount + 1}.${ext}`;
 
                     // Add to received images with original filename
                     // Store first so we have the index, then add to UI
