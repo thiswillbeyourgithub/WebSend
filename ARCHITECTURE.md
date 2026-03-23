@@ -181,6 +181,31 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     when relayed through TURN, photos remain end-to-end encrypted — the TURN server only
     sees encrypted blobs.
 
+## SSO (Experimental)
+
+WebSend can optionally be gated behind **Keycloak** SSO using **oauth2-proxy** as a
+reverse authentication proxy. The architecture with SSO enabled:
+
+```
+Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend (:8080)
+                                    │
+                                    ▼
+                               Keycloak (OIDC)
+```
+
+- oauth2-proxy intercepts all HTTP/WS requests and redirects unauthenticated users
+  to Keycloak's login page. After login, requests are proxied to the websend container.
+- **WebSocket signaling** passes through oauth2-proxy (it supports WS upgrade), but
+  long-lived connections may drop when the OAuth token expires. This can be mitigated
+  by increasing token lifetimes in Keycloak or by adding reconnection logic.
+- **coturn (TURN/STUN)** uses UDP/TCP protocols that oauth2-proxy cannot intercept.
+  However, TURN credentials are only issued via the HTTP signaling API, so
+  unauthenticated users cannot obtain them.
+- No user, group, or permission mapping is performed — it is a simple authentication gate.
+
+This feature is experimental and was added with assistance from
+[Claude Code](https://claude.ai/claude-code).
+
 ## Deployment
 
 Expected to run behind **Caddy** reverse proxy which handles HTTPS termination.

@@ -100,6 +100,14 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - **Large button UI**: designed for usability by non-technical users
 - **No heavy frameworks**: vanilla HTML5 + CSS + JavaScript only
 
+## Keycloak SSO (Experimental)
+
+WebSend can be placed behind [Keycloak](https://www.keycloak.org/) authentication using [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/). This provides a simple "authenticated or not" gate — only users who log in via Keycloak can access the app. No user, group, or permission mapping is performed.
+
+A commented-out oauth2-proxy service is included in `docker-compose.yml` along with corresponding environment variables in `env.example`. This feature was added with assistance from [Claude Code](https://claude.ai/claude-code).
+
+**Status**: Experimental. WebSocket signaling should work through oauth2-proxy, but long-lived connections may break when OAuth tokens expire. Token lifetime tuning in Keycloak may be required. coturn (TURN/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because unauthenticated users cannot obtain TURN credentials.
+
 ## Future Ideas
 
 Ideally, the WebRTC signaling server would be replaced by [iroh](https://iroh.computer/) in the future, which would eliminate the need for a signaling server entirely. However, iroh is not yet easy to embed in phone browsers.

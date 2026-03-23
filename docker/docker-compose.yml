@@ -5,6 +5,8 @@ services:
       context: ../src
       dockerfile: ../docker/Dockerfile
     ports:
+      # If using oauth2-proxy, do NOT expose this port directly.
+      # Instead, access the app through oauth2-proxy's port (4180).
       - "127.0.0.1:7395:8080"
     restart: unless-stopped
     environment:
@@ -51,6 +53,58 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # ── oauth2-proxy (Keycloak SSO) — Experimental ─────────────────────
+  # Uncomment to put WebSend behind Keycloak authentication via oauth2-proxy.
+  # This provides SSO gating: only authenticated Keycloak users can access
+  # the app. No user/group/permission mapping is performed — it is a simple
+  # "authenticated or not" gate.
+  #
+  # Prerequisites:
+  #   1. A running Keycloak instance with a client configured for WebSend
+  #   2. Set OAUTH2_* variables in your .env file (see env.example)
+  #   3. Point your reverse proxy (Caddy) at 127.0.0.1:4180 instead of 7395
+  #   4. Remove or comment out the websend "ports" section above
+  #
+  # Note on WebSocket: oauth2-proxy supports WebSocket proxying, but
+  # long-lived WS connections (used for signaling) may break when the
+  # OAuth token expires mid-session. Monitor and adjust token lifetimes
+  # in Keycloak if you experience disconnections.
+  #
+  # Note on coturn: oauth2-proxy only protects HTTP/WS traffic. coturn
+  # (STUN/TURN over UDP/TCP) is outside its scope, but is indirectly
+  # protected because unauthenticated users cannot reach the signaling
+  # server to obtain TURN credentials.
+  # ─────────────────────────────────────────────────────────────────────
+  # oauth2-proxy:
+  #   image: quay.io/oauth2-proxy/oauth2-proxy:latest
+  #   container_name: oauth2-proxy
+  #   ports:
+  #     - "127.0.0.1:4180:4180"
+  #   environment:
+  #     - OAUTH2_PROXY_PROVIDER=keycloak-oidc
+  #     - OAUTH2_PROXY_OIDC_ISSUER_URL=${OAUTH2_OIDC_ISSUER_URL}
+  #     - OAUTH2_PROXY_CLIENT_ID=${OAUTH2_CLIENT_ID}
+  #     - OAUTH2_PROXY_CLIENT_SECRET=${OAUTH2_CLIENT_SECRET}
+  #     - OAUTH2_PROXY_COOKIE_SECRET=${OAUTH2_COOKIE_SECRET}
+  #     - OAUTH2_PROXY_UPSTREAM=http://websend:8080
+  #     - OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:4180
+  #     - OAUTH2_PROXY_EMAIL_DOMAINS=*
+  #     - OAUTH2_PROXY_COOKIE_SECURE=true
+  #     - OAUTH2_PROXY_PASS_ACCESS_TOKEN=true
+  #   depends_on:
+  #     - websend
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   read_only: true
+  #   cap_drop:
+  #     - ALL
+  #   restart: unless-stopped
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 128M
+  #         cpus: '0.5'
 
   # ── coturn TURN relay server ──────────────────────────────────────────
   # This project ships with a bundled coturn (https://github.com/coturn/coturn)
