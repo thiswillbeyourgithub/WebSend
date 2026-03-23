@@ -1107,7 +1107,7 @@
 
             try {
                 // Lazy-load client-zip only when needed
-                const { downloadZip } = await import('/js/vendor/client-zip.js');
+                const { downloadZip } = await import('/vendor/client-zip.js');
 
                 const bw = isToggleActive('export-bw');
                 const activeImages = receivedImages.filter(img => img !== null);

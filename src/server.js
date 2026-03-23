@@ -355,9 +355,8 @@ if (UMAMI_URL && UMAMI_WEBSITE_ID) {
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Serve scribe.js-ocr files from node_modules so the browser can lazy-load
-// the OCR engine on demand. These are heavy (WASM + models) and only fetched
-// when the user explicitly requests OCR in the export modal.
+// Serve vendored libraries (scribe.js-ocr, client-zip, tessdata, etc.)
+app.use('/vendor', express.static(path.join(__dirname, 'public', 'vendor')));
 app.use('/scribe', express.static(path.join(__dirname, 'public', 'vendor', 'scribe.js-ocr')));
 app.use('/tessdata', express.static(path.join(__dirname, 'public', 'vendor', 'tessdata')));
 
