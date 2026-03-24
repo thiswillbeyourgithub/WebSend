@@ -211,6 +211,10 @@
                     <span>✂️</span>
                     <span data-i18n="crop.title">Crop</span>
                 </button>
+                <button class="edit-tool-btn" id="flip-btn">
+                    <span>↔️</span>
+                    <span data-i18n="send.flip">Flip</span>
+                </button>
                 <button class="edit-tool-btn" id="bw-btn">
                     <span>⬛</span>
                     <span data-i18n="send.applyBW">B&W</span>
@@ -283,7 +287,7 @@
         </div>
     </div>
 
-    <script src="/js/doc-detect.js" integrity="sha384-fiWnuBgrEcG0/73OzXL3e/mnsfZPVyFeUlPIRMXLILGZSzVsSwsM+qxZYcY8cCxb" crossorigin="anonymous"></script>
+    <script src="/js/doc-detect.js" integrity="sha384-PSeaYvmJ7PFWT86sqE4zNQO4t6PJGSn5wy8KTJnAqNlf86g0i8mD7HfuVR25k1Vu" crossorigin="anonymous"></script>
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
@@ -1342,6 +1346,7 @@
 
         document.getElementById('crop-btn').addEventListener('click', openCropModal);
         document.getElementById('rotate-btn').addEventListener('click', rotateCW);
+        document.getElementById('flip-btn').addEventListener('click', flipHorizontal);
         document.getElementById('bw-btn').addEventListener('click', applyBWMode);
 
         /**
@@ -1456,6 +1461,39 @@
             // Rotation is applied to the "base" image — re-crop must use this as origin
             originalPhotoBlob = currentPhotoBlob;
             logger.success(`Rotated: ${canvas.width}x${canvas.height}px`);
+            showPreview(currentPhotoBlob);
+        }
+
+        /**
+         * Flip (mirror) currentPhotoBlob horizontally.
+         * Updates both currentPhotoBlob and the preview image.
+         */
+        async function flipHorizontal() {
+            if (!currentPhotoBlob) return;
+            logger.info('Flipping horizontally...');
+
+            const img = new Image();
+            const url = URL.createObjectURL(currentPhotoBlob);
+            await new Promise((resolve, reject) => {
+                img.onload = resolve;
+                img.onerror = reject;
+                img.src = url;
+            });
+            URL.revokeObjectURL(url);
+
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(img, 0, 0);
+
+            const flippedBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+            const filename = currentPhotoBlob.name || `websend_${Date.now()}.jpg`;
+            currentPhotoBlob = new File([flippedBlob], filename, { type: 'image/jpeg' });
+            originalPhotoBlob = currentPhotoBlob;
+            logger.success('Flipped horizontally');
             showPreview(currentPhotoBlob);
         }
 
@@ -1724,10 +1762,29 @@
                     img.src = cropState.originalUrl;
                 });
 
+                // Re-sort corners into proper tl/tr/br/bl order before applying,
+                // in case the user dragged handles into a crossed/flipped arrangement
+                const rawCorners = [
+                    cropState.corners.tl, cropState.corners.tr,
+                    cropState.corners.br, cropState.corners.bl
+                ];
+                const cx = rawCorners.reduce((s, p) => s + p.x, 0) / 4;
+                const cy = rawCorners.reduce((s, p) => s + p.y, 0) / 4;
+                const sorted = rawCorners.slice().sort((a, b) =>
+                    Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx)
+                );
+                // Find tl (smallest x+y) and rotate
+                let tlIdx = 0, minSum = Infinity;
+                for (let i = 0; i < 4; i++) {
+                    const s = sorted[i].x + sorted[i].y;
+                    if (s < minSum) { minSum = s; tlIdx = i; }
+                }
+                const r = i => sorted[(tlIdx + i) % 4];
+                const c = { tl: r(0), bl: r(1), br: r(2), tr: r(3) };
+
                 // Scale corner percentages to actual image pixels
                 const srcW = img.width;
                 const srcH = img.height;
-                const c = cropState.corners;
 
                 const srcCorners = [
                     { x: c.tl.x * srcW, y: c.tl.y * srcH },

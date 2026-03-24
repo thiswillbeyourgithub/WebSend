@@ -98,6 +98,7 @@ const i18n = (function() {
             'send.disconnected': 'Connection lost. Please start over.',
             'send.edit': 'Edit',
             'send.rotate': 'Rotate',
+            'send.flip': 'Flip',
             'send.applyBW': 'B&W',
 
             // Receive page
@@ -279,6 +280,7 @@ const i18n = (function() {
             'send.disconnected': 'Connexion perdue. Veuillez recommencer.',
             'send.edit': 'Modifier',
             'send.rotate': 'Tourner',
+            'send.flip': 'Miroir',
             'send.applyBW': 'N&B',
 
             // Receive page
