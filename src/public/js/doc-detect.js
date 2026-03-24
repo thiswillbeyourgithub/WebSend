@@ -102,21 +102,38 @@ const DocDetect = (function () {
             binary[i] = edges[i] >= threshold ? 1 : 0;
         }
 
-        // 5. Dilate to close gaps in edges
+        // 5. Suppress edges near the four image corners (diagonal strips)
+        // Paper curling at corners creates false edges that distort the detected quad
+        const cornerRadius = Math.round(Math.min(w, h) * 0.12);
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                // Distance from each image corner
+                const dTL = Math.max(cornerRadius - x, 0) + Math.max(cornerRadius - y, 0);
+                const dTR = Math.max(x - (w - 1 - cornerRadius), 0) + Math.max(cornerRadius - y, 0);
+                const dBL = Math.max(cornerRadius - x, 0) + Math.max(y - (h - 1 - cornerRadius), 0);
+                const dBR = Math.max(x - (w - 1 - cornerRadius), 0) + Math.max(y - (h - 1 - cornerRadius), 0);
+                if (dTL > cornerRadius * 0.5 || dTR > cornerRadius * 0.5 ||
+                    dBL > cornerRadius * 0.5 || dBR > cornerRadius * 0.5) {
+                    binary[y * w + x] = 0;
+                }
+            }
+        }
+
+        // 6. Dilate to close gaps in edges
         let dilated = binary;
         for (let i = 0; i < 5; i++) dilated = _dilate(dilated, w, h);
 
-        // 6. Flood-fill from image borders to find background, then extract foreground
+        // 7. Flood-fill from image borders to find background, then extract foreground
         const foreground = _extractForeground(dilated, w, h);
 
-        // 7. Find contours of the foreground (document) region
+        // 8. Find contours of the foreground (document) region
         const contours = _findContours(foreground, w, h);
 
-        // 8. Find largest quad
+        // 9. Find largest quad
         const quad = _findLargestQuad(contours, w, h);
         if (!quad) return null;
 
-        // 8. Normalize to 0-1 and sort corners
+        // 10. Normalize to 0-1 and sort corners
         return _sortCorners(quad.map(p => ({ x: p.x / w, y: p.y / h })));
     }
 
@@ -441,20 +458,65 @@ const DocDetect = (function () {
 
     /**
      * Sort 4 points into tl, tr, br, bl order.
-     * Uses centroid-relative angle classification.
+     * Uses angle from centroid to assign each point to a unique corner.
+     * Returns null if points are degenerate (collinear or near-duplicate).
      */
     function _sortCorners(pts) {
+        if (pts.length !== 4) return null;
+
         // Centroid
         const cx = pts.reduce((s, p) => s + p.x, 0) / 4;
         const cy = pts.reduce((s, p) => s + p.y, 0) / 4;
 
-        // Classify each point by quadrant relative to centroid
-        const tl = pts.reduce((best, p) => (p.x + p.y < best.x + best.y ? p : best));
-        const br = pts.reduce((best, p) => (p.x + p.y > best.x + best.y ? p : best));
-        const tr = pts.reduce((best, p) => (p.x - p.y > best.x - best.y ? p : best));
-        const bl = pts.reduce((best, p) => (p.x - p.y < best.x - best.y ? p : best));
+        // Sort by angle from centroid (atan2), giving clockwise order: tl, tr, br, bl
+        const sorted = pts.slice().sort((a, b) => {
+            const angA = Math.atan2(a.y - cy, a.x - cx);
+            const angB = Math.atan2(b.y - cy, b.x - cx);
+            return angA - angB;
+        });
 
-        return { tl, tr, br, bl };
+        // sorted is in order of increasing angle: starts from ~-PI (left)
+        // We need to find which is tl. Angles: tl ~ -3π/4, tr ~ -π/4, br ~ π/4, bl ~ 3π/4
+        // Remap: the point with smallest (x+y) is tl — find its index and rotate
+        let tlIdx = 0;
+        let minSum = Infinity;
+        for (let i = 0; i < 4; i++) {
+            const s = sorted[i].x + sorted[i].y;
+            if (s < minSum) { minSum = s; tlIdx = i; }
+        }
+
+        // Rotate so tl is first, then order is tl, bl, br, tr (CCW from atan2)
+        // atan2 goes CCW, so after tl comes bl, br, tr
+        const r = i => sorted[(tlIdx + i) % 4];
+        const result = { tl: r(0), bl: r(1), br: r(2), tr: r(3) };
+
+        // Validate: check all 4 corners are distinct (no triangle/line degeneracy)
+        const corners = [result.tl, result.tr, result.br, result.bl];
+        for (let i = 0; i < 4; i++) {
+            for (let j = i + 1; j < 4; j++) {
+                const dx = corners[i].x - corners[j].x;
+                const dy = corners[i].y - corners[j].y;
+                if (dx * dx + dy * dy < 0.001) return null; // Too close — degenerate
+            }
+        }
+
+        // Validate: check minimum angle (reject near-collinear quads)
+        for (let i = 0; i < 4; i++) {
+            const a = corners[i];
+            const b = corners[(i + 1) % 4];
+            const c = corners[(i + 2) % 4];
+            const v1x = a.x - b.x, v1y = a.y - b.y;
+            const v2x = c.x - b.x, v2y = c.y - b.y;
+            const dot = v1x * v2x + v1y * v2y;
+            const len1 = Math.sqrt(v1x * v1x + v1y * v1y);
+            const len2 = Math.sqrt(v2x * v2x + v2y * v2y);
+            if (len1 < 0.001 || len2 < 0.001) return null;
+            const cosAngle = dot / (len1 * len2);
+            // Reject if any angle < ~15° or > ~165° (cos > 0.966 or cos < -0.966)
+            if (Math.abs(cosAngle) > 0.966) return null;
+        }
+
+        return result;
     }
 
     return { detectFromVideo, detectFromCanvas, detectFromImage };
