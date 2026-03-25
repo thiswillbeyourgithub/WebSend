@@ -187,7 +187,7 @@ const i18n = (function() {
             'menu.connection': 'Connection',
             'menu.devMode': 'DEV mode enabled',
             'menu.prodMode': 'Production mode',
-            'maintenance.banner': '\u26a0\ufe0f Maintenance in progress — please come back later.',
+            'maintenance.banner': '\u26a0\ufe0f Developer instance — expect occasional restarts. Things should work, but if something seems off, it\'s likely being actively worked on.',
 
             // Disconnection hints
             'receive.disconnectedHint': 'Disconnected. Reload the page or click Back to restart.',
@@ -371,7 +371,7 @@ const i18n = (function() {
             'menu.connection': 'Connexion',
             'menu.devMode': 'Mode DEV activé',
             'menu.prodMode': 'Mode production',
-            'maintenance.banner': '\u26a0\ufe0f Maintenance en cours — merci de revenir plus tard.',
+            'maintenance.banner': '\u26a0\ufe0f Instance de développement — des redémarrages sont possibles. Tout devrait fonctionner, mais en cas de souci, c\'est probablement en cours de modification.',
 
             // Disconnection hints
             'receive.disconnectedHint': 'Déconnecté. Rechargez la page ou cliquez sur Retour pour redémarrer.',
