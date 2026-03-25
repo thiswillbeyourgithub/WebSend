@@ -49,6 +49,8 @@ const i18n = (function() {
             'about.credits.link': 'Claude Code',
             'about.credits.suffix': '(AI-assisted development).',
             'about.credits.repo': 'Source code on GitHub (AGPLv3)',
+            'about.thirdParty': 'Third-Party Libraries',
+            'about.thirdParty.note': 'All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.',
 
             // Send page
             'send.title': 'Send Photos',
@@ -231,6 +233,8 @@ const i18n = (function() {
             'about.credits.link': 'Claude Code',
             'about.credits.suffix': '(développement assisté par IA).',
             'about.credits.repo': 'Code source sur GitHub (AGPLv3)',
+            'about.thirdParty': 'Bibliothèques tierces',
+            'about.thirdParty.note': 'Toutes les bibliothèques côté client sont incluses directement dans le dépôt (pas de CDN à l\'exécution). Toutes les licences sont compatibles avec l\'AGPL-3.0.',
 
             // Send page
             'send.title': 'Envoyer des Photos',

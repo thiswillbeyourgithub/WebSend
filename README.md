@@ -32,7 +32,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 
 ### Supply Chain Attack Resistance
 - **No frameworks, no bundlers, no build tools**: the entire frontend is vanilla HTML, CSS, and JavaScript -- there is no `node_modules` in the browser, no transpilation step, and no dependency tree that could be poisoned
-- The only third-party client-side libraries are **jsQR** and **qrcode.js**, both vendored directly into the repository (not pulled from npm or a CDN at runtime)
+- All third-party client-side libraries are vendored directly into the repository (not pulled from npm or a CDN at runtime) — see [Third-Party Libraries](#third-party-libraries) below
 - **Subresource Integrity (SRI)** hashes on all local `<script>` and `<link>` tags ensure that even a compromised server cannot silently swap in tampered files
 - The server-side dependency footprint is intentionally minimal (Express.js only)
 
@@ -212,6 +212,18 @@ sudo ufw-docker allow coturn 49161/udp
 ## Development
 
 Built with assistance from [Claude Code](https://claude.ai/claude-code) (AI-assisted development).
+
+## Third-Party Libraries
+
+All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.
+
+| Library | Version | License | Source |
+|---------|---------|---------|--------|
+| [qrcode.js](https://github.com/soldair/node-qrcode) | 1.5.1 | MIT | QR code generation |
+| [jsQR](https://github.com/cozmo/jsQR) | 1.4.0 | Apache-2.0 | QR code scanning |
+| [client-zip](https://github.com/Touffy/client-zip) | — | MIT | ZIP export |
+| [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (lazy-loaded) |
+| [Express.js](https://expressjs.com) | 4.18.2 | MIT | Server-side HTTP framework |
 
 ## License
 
