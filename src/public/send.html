@@ -75,12 +75,19 @@
                 <span data-i18n="send.startCamera">Start Camera to Scan</span>
             </button>
 
-            <!-- Manual input removed - room secret required for security -->
+            <!-- Manual URL paste as alternative to camera scanning -->
             <div style="margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 10px;">
-                <p style="text-align: center; color: #666; margin: 0;" data-i18n="send.tip">
-                    <strong>Tip:</strong> Point your camera at the QR code on the receiver's screen.
-                    The QR code contains a security token that cannot be typed manually.
+                <p style="text-align: center; color: #666; margin: 0 0 10px 0;" data-i18n="send.orPasteLink">
+                    <strong>No camera?</strong> Paste the link from the receiver's screen:
                 </p>
+                <div style="display: flex; gap: 6px; align-items: center;">
+                    <input type="text" id="manual-url-input" placeholder="https://..."
+                        style="flex: 1; padding: 10px; font-size: 0.85rem; border-radius: 5px; border: 1px solid #ccc; font-family: monospace;">
+                    <button id="manual-url-btn"
+                        style="padding: 10px 16px; border: none; border-radius: 5px; background: #1565c0; color: white; cursor: pointer; font-size: 0.85rem;">
+                        Go
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -439,6 +446,13 @@
 
             // Set up button handlers
             document.getElementById('start-scan-btn').addEventListener('click', startScanner);
+            document.getElementById('manual-url-btn').addEventListener('click', () => {
+                const val = document.getElementById('manual-url-input').value.trim();
+                if (val) processScannedQR(val);
+            });
+            document.getElementById('manual-url-input').addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') document.getElementById('manual-url-btn').click();
+            });
             document.getElementById('use-camera-btn').addEventListener('click', startCapture);
             document.getElementById('use-file-btn').addEventListener('click', () => document.getElementById('file-input').click());
             document.getElementById('file-input').addEventListener('change', handleFileSelect);

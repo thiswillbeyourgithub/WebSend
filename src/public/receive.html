@@ -321,6 +321,23 @@
                     errorCorrectionLevel: 'M' // Medium error correction - URL is short
                 });
                 container.appendChild(canvas);
+
+                // Add copyable URL below the QR code
+                const urlBox = document.createElement('div');
+                urlBox.style.cssText = 'margin-top: 12px; text-align: center;';
+                urlBox.innerHTML = `
+                    <p style="margin: 0 0 6px 0; color: #666; font-size: 0.85rem;">${i18n.t('receive.orCopyLink', 'Or copy this link:')}</p>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                        <input type="text" value="${url}" readonly id="qr-url-input"
+                            style="flex: 1; padding: 8px 10px; font-size: 0.75rem; border-radius: 5px; border: 1px solid #ccc; background: #f8f9fa; font-family: monospace;"
+                            onclick="this.select()">
+                        <button onclick="navigator.clipboard.writeText('${url}').then(() => this.textContent = '✓').catch(() => document.getElementById('qr-url-input').select())"
+                            style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 5px; background: #fff; cursor: pointer; font-size: 0.85rem;"
+                            title="Copy">📋</button>
+                    </div>
+                `;
+                container.appendChild(urlBox);
+
                 logger.success('QR code generated');
                 document.getElementById('status-waiting').classList.remove('hidden');
             } catch (e) {
