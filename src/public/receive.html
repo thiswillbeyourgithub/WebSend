@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-OfmkvkQ8Sz9RMog7OLGa37FTcyWKqD4NX7SMtATcAqVGg7mgjP34u+Bs1OYegbtR" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-reF0E+quDkdv/Sn58KK6IZuQfML2o9SJWlzWnkOapPmggr2NDLpoiQvrT3Jkdg9K" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -324,7 +324,7 @@
 
                 // Add copyable URL below the QR code
                 const urlBox = document.createElement('div');
-                urlBox.style.cssText = 'margin-top: 12px; text-align: center;';
+                urlBox.style.cssText = 'margin-top: 12px; text-align: center; width: 100%;';
                 urlBox.innerHTML = `
                     <p style="margin: 0 0 6px 0; color: #666; font-size: 0.85rem;">${i18n.t('receive.orCopyLink', 'Or copy this link:')}</p>
                     <div style="display: flex; gap: 6px; align-items: center;">

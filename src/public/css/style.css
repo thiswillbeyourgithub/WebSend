@@ -191,6 +191,7 @@ h1 {
     padding: 20px;
     border-radius: 20px;
     display: flex;
+    flex-direction: column;
     justify-content: center;
     align-items: center;
     margin: 20px auto;
