@@ -163,7 +163,6 @@ services:
       --max-port=49161
       --listening-port=3478
       --external-ip=${TURN_EXTERNAL_IP:-${DOMAIN:-127.0.0.1}}
-      --no-stun
       --check-origin-consistency
       --cpus=1
     # Security hardening options
