@@ -20,6 +20,10 @@ RUN npm install --production && \
 # Copy application files
 COPY server.js ./
 COPY public/ ./public/
+COPY check-sri.js ./
+
+# Verify SRI hashes are up to date (fails the build if not)
+RUN node check-sri.js
 
 # Change ownership of app files to non-root user
 RUN chown -R appuser:appgroup /app
