@@ -10,7 +10,7 @@
     <title>WebSend - Secure Photo Transfer</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-reF0E+quDkdv/Sn58KK6IZuQfML2o9SJWlzWnkOapPmggr2NDLpoiQvrT3Jkdg9K" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-BxamCIteZB+aCP97xDtwVtsIWMt4pcWLO+6kxc43AfIbLSFmXGDY6AbCs+zTYRm0" crossorigin="anonymous">
 </head>
 <body>
     <div id="maintenance-banner" class="maintenance-banner" data-i18n="maintenance.banner"></div>
@@ -172,7 +172,7 @@
                 if (banner) {
                     banner.textContent = i18n.t('maintenance.banner');
                     banner.classList.add('visible');
-
+                    banner.addEventListener('click', () => { banner.style.opacity = '0'; setTimeout(() => banner.classList.remove('visible'), 300); });
                 }
             }
             const versionEl = document.getElementById('app-version');

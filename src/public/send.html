@@ -10,7 +10,7 @@
     <title>WebSend - Send Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-reF0E+quDkdv/Sn58KK6IZuQfML2o9SJWlzWnkOapPmggr2NDLpoiQvrT3Jkdg9K" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-BxamCIteZB+aCP97xDtwVtsIWMt4pcWLO+6kxc43AfIbLSFmXGDY6AbCs+zTYRm0" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -2052,7 +2052,7 @@
                 if (banner) {
                     banner.textContent = i18n.t('maintenance.banner');
                     banner.classList.add('visible');
-
+                    banner.addEventListener('click', () => { banner.style.opacity = '0'; setTimeout(() => banner.classList.remove('visible'), 300); });
                 }
             } else {
                 badge.textContent = i18n.t('menu.prodMode');
