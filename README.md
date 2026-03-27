@@ -27,7 +27,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 ### Zero Server Trust
 - The server acts as a **signaling relay only** (exchanges SDP connection metadata between peers)
 - The server **never sees encryption keys, plaintext photos, or file metadata**
-- All photo data travels **peer-to-peer** via WebRTC data channels (or encrypted through TURN if relaying is needed)
+- All photo data travels **peer-to-peer** via WebRTC data channels (or encrypted through TURN/TURNS if relaying is needed)
 - Rooms and signaling data are **ephemeral** (10-minute TTL, stored in memory only)
 
 ### Supply Chain Attack Resistance
@@ -95,7 +95,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - **ZIP export**: download all received images as a ZIP archive (client-zip, lazy-loaded on demand)
 - **B&W document mode**: Otsu's automatic binarization for crisp scanned documents
 - **QR code scanning**: in-browser QR code scanning (jsQR) and generation (qrcode.js)
-- **Connection type detection**: shows whether the connection is direct (local network or via STUN) or relayed (TURN)
+- **Connection type detection**: shows whether the connection is direct (local network or via STUN) or relayed (TURN/TURNS)
 - **Debug logging**: "Logs" button on both sender and receiver pages for troubleshooting, with optional verbose DEV mode
 - **Large button UI**: designed for usability by non-technical users
 - **No heavy frameworks**: vanilla HTML5 + CSS + JavaScript only
@@ -106,7 +106,7 @@ WebSend can be placed behind [Keycloak](https://www.keycloak.org/) authenticatio
 
 A commented-out oauth2-proxy service is included in `docker-compose.yml` along with corresponding environment variables in `env.example`. This feature was added with assistance from [Claude Code](https://claude.ai/claude-code).
 
-**Status**: Experimental. WebSocket signaling should work through oauth2-proxy, but long-lived connections may break when OAuth tokens expire. Token lifetime tuning in Keycloak may be required. coturn (TURN/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because unauthenticated users cannot obtain TURN credentials.
+**Status**: Experimental. WebSocket signaling should work through oauth2-proxy, but long-lived connections may break when OAuth tokens expire. Token lifetime tuning in Keycloak may be required. coturn (TURN/TURNS/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because unauthenticated users cannot obtain TURN/TURNS credentials.
 
 ## Future Ideas
 
@@ -120,7 +120,7 @@ A small public instance is available at **https://websend.olicorne.org/** for an
 
 - Docker and Docker Compose
 - HTTPS (required for camera access in browsers) -- I recommend [Caddy](https://caddyserver.com/) as a reverse proxy for automatic Let's Encrypt certificates
-- The devices must be able to reach each other (same network, or TURN relay)
+- The devices must be able to reach each other (same network, or TURN/TURNS relay)
 
 ## Quick Start
 
