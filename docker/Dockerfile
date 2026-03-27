@@ -21,6 +21,7 @@ RUN npm install --production && \
 COPY server.js ./
 COPY public/ ./public/
 COPY check-sri.js ./
+COPY healthcheck.js ./
 
 # Verify SRI hashes are up to date (fails the build if not)
 RUN node check-sri.js
@@ -33,6 +34,10 @@ USER appuser
 
 # Expose port (unprivileged port, no root needed)
 EXPOSE 8080
+
+# Healthcheck: verifies Express + configured STUN/TURN/TURNS servers are alive
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD node healthcheck.js
 
 # Run the server
 CMD ["node", "server.js"]
