@@ -79,6 +79,7 @@ class WebSendRTC {
             // iceTransportPolicy: 'relay' forces TURN-only (set by DEV_FORCE_CONNECTION on server)
             this.iceTransportPolicy = config.iceTransportPolicy || 'all';
             // Enable DEV mode in logger if server has it enabled
+            this._devMode = !!config.dev;
             if (config.dev) {
                 logger.setDevMode(true);
             }
@@ -90,6 +91,8 @@ class WebSendRTC {
             }
             logger.success(`Got ${this.iceServers.length} ICE servers (transport policy: ${this.iceTransportPolicy})`);
             logger.debug('CONFIG', 'ICE servers loaded', { servers: this.iceServers, iceTransportPolicy: this.iceTransportPolicy });
+            // Fire-and-forget ICE server reachability check (DEV mode only)
+            this.diagnoseIceServers();
         } catch (e) {
             logger.warn('Failed to fetch config, using defaults: ' + e.message);
             this.iceServers = [
@@ -878,6 +881,117 @@ class WebSendRTC {
         } catch (e) {
             logger.warn('Failed to detect connection type: ' + e.message);
         }
+    }
+
+    /**
+     * Probe each configured ICE server for reachability (DEV mode only).
+     * Creates a temporary RTCPeerConnection per server, triggers ICE gathering,
+     * and checks whether the expected candidate type appears within a timeout.
+     * Results are logged to help diagnose firewall/configuration issues.
+     */
+    async diagnoseIceServers() {
+        if (!this._devMode) return;
+        if (!this.iceServers || this.iceServers.length === 0) {
+            logger.debug('DIAG', 'No ICE servers to diagnose');
+            return;
+        }
+
+        logger.info('=== ICE SERVER REACHABILITY CHECK (DEV) ===');
+
+        // Build a list of individual probes: one per URL
+        const probes = [];
+        for (const server of this.iceServers) {
+            const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+            for (const url of urls) {
+                probes.push({
+                    url,
+                    username: server.username,
+                    credential: server.credential
+                });
+            }
+        }
+
+        const results = await Promise.all(probes.map(probe => this._probeIceServer(probe)));
+
+        let allOk = true;
+        for (const r of results) {
+            if (r.reachable) {
+                logger.success(`[DIAG] ${r.url} — reachable (got ${r.candidateType} candidate in ${r.elapsed}ms)`);
+            } else {
+                allOk = false;
+                logger.error(`[DIAG] ${r.url} — UNREACHABLE (no candidate after ${r.elapsed}ms) — likely blocked by firewall or server is down`);
+            }
+        }
+
+        if (allOk) {
+            logger.success('=== All ICE servers reachable ===');
+        } else {
+            logger.warn('=== Some ICE servers unreachable — check firewall rules ===');
+        }
+    }
+
+    /**
+     * Probe a single ICE server URL by creating a temporary peer connection
+     * and checking if the expected candidate type is gathered.
+     * @param {Object} probe - {url, username, credential}
+     * @returns {Promise<{url, reachable, candidateType, elapsed}>}
+     */
+    _probeIceServer(probe) {
+        return new Promise((resolve) => {
+            const TIMEOUT_MS = 5000;
+            const start = performance.now();
+
+            const iceServer = { urls: probe.url };
+            if (probe.username) iceServer.username = probe.username;
+            if (probe.credential) iceServer.credential = probe.credential;
+
+            // For TURN/TURNS probes, force relay-only so we specifically test relay reachability
+            const isTurn = probe.url.startsWith('turn:') || probe.url.startsWith('turns:');
+            const pc = new RTCPeerConnection({
+                iceServers: [iceServer],
+                iceTransportPolicy: isTurn ? 'relay' : 'all'
+            });
+
+            let resolved = false;
+            const expectedType = isTurn ? 'relay' : 'srflx';
+
+            const done = (reachable, candidateType) => {
+                if (resolved) return;
+                resolved = true;
+                clearTimeout(timer);
+                pc.close();
+                resolve({
+                    url: probe.url,
+                    reachable,
+                    candidateType: candidateType || null,
+                    elapsed: Math.round(performance.now() - start)
+                });
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    const type = event.candidate.type;
+                    if (type === expectedType || type === 'relay') {
+                        done(true, type);
+                    }
+                }
+            };
+
+            // Also check gathering complete with no matching candidate
+            pc.onicegatheringstatechange = () => {
+                if (pc.iceGatheringState === 'complete' && !resolved) {
+                    done(false, null);
+                }
+            };
+
+            const timer = setTimeout(() => done(false, null), TIMEOUT_MS);
+
+            // Create a dummy data channel and offer to trigger ICE gathering
+            pc.createDataChannel('probe');
+            pc.createOffer()
+                .then(offer => pc.setLocalDescription(offer))
+                .catch(() => done(false, null));
+        });
     }
 
     /**
