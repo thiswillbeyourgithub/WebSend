@@ -137,6 +137,7 @@
             <div class="progress-bar hidden" id="progress-bar">
                 <div class="progress-bar-fill" id="progress-fill" style="width: 0%"></div>
             </div>
+            <div id="transfer-stats" style="font-size: 0.75rem; color: #555; margin-top: 3px; text-align: center;"></div>
 
             <h2 class="section-title" data-i18n="receive.receivedPhotos">Received Photos</h2>
             <div class="received-images" id="received-images">
@@ -209,7 +210,7 @@
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
-    <script src="/js/webrtc.js" integrity="sha384-gxFlQL/CeeI1H73eFC+bMOldN8+LYmGDtS2M0Yn0hyN1l1JhSaCfdmyA4Dl55BXp"></script>
+    <script src="/js/webrtc.js" integrity="sha384-bGyKD+SWPGRrTgaNLcuijRJeiGkV3Z2LaWTS0XOesxllKnNpLamO34W2cIxtpcjB"></script>
     <script>
         // Initialize i18n first
         i18n.init();
@@ -229,6 +230,26 @@
         let rtc = null;
         let keyPair = null;
         let sharedKey = null; // AES key derived from ECDH, set after sender connects
+
+        // Transfer stats state
+        let receiveXferStart = null;
+        let receiveLastStatsUpdate = 0;
+        let receiveLastTotal = 0;
+
+        function formatRate(bytesPerSec) {
+            if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / (1024 * 1024)).toFixed(1) + ' MB/s';
+            return (bytesPerSec / 1024).toFixed(0) + ' kB/s';
+        }
+
+        function formatTransferStats(percent, rate, remaining) {
+            let s = percent + '%  ' + formatRate(rate);
+            if (isFinite(remaining) && remaining > 10) {
+                const m = Math.floor(remaining / 60);
+                const sec = Math.round(remaining % 60);
+                s += '  ' + (m > 0 ? m + 'm ' : '') + sec + 's';
+            }
+            return s;
+        }
         let photoCount = 0;
         let roomSecret = ''; // Cryptographic secret for room access
         let weConfirmed = false;  // Track if we confirmed fingerprints
@@ -667,10 +688,30 @@
                 progressBar.classList.remove('hidden');
                 const percent = Math.round((msg.received / msg.total) * 100);
                 progressFill.style.width = percent + '%';
+                if (!receiveXferStart) receiveXferStart = Date.now();
+                receiveLastTotal = msg.total;
+                const now = Date.now();
+                if (now - receiveLastStatsUpdate >= 200) {
+                    receiveLastStatsUpdate = now;
+                    const elapsed = (now - receiveXferStart) / 1000;
+                    const rate = elapsed > 0 ? msg.received / elapsed : 0;
+                    const remaining = rate > 0 ? (msg.total - msg.received) / rate : Infinity;
+                    const statsEl = document.getElementById('transfer-stats');
+                    if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);
+                }
             } else if (msg.type === 'encrypted-file') {
                 // Received encrypted file with bundled metadata, decrypt it
                 logger.info('Received encrypted file, decrypting with metadata...');
+                {
+                    const elapsed = receiveXferStart ? (Date.now() - receiveXferStart) / 1000 : 0;
+                    if (elapsed > 0) {
+                        const actualRate = receiveLastTotal > 0 ? receiveLastTotal / elapsed : 0;
+                        logger.info(`Receive complete: ${formatRate(actualRate)} avg (${elapsed.toFixed(1)}s)`);
+                    }
+                    receiveXferStart = null; receiveLastStatsUpdate = 0; receiveLastTotal = 0;
+                }
                 document.getElementById('progress-bar').classList.add('hidden');
+                document.getElementById('transfer-stats').textContent = '';
 
                 if (!sharedKey) {
                     logger.error('Cannot decrypt - key exchange not complete');

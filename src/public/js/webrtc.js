@@ -374,7 +374,7 @@ class WebSendRTC {
             offset += chunk.byteLength;
 
             const percent = Math.round((offset / totalSize) * 100);
-            if (onProgress) onProgress(percent);
+            if (onProgress) onProgress(percent, offset, totalSize);
         }
 
         this.sendMessage({ type: 'file-end' });

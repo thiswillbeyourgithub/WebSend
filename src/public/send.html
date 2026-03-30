@@ -63,6 +63,7 @@
         <div class="progress-bar" id="queue-progress-bar" style="margin: 6px 0 0 0; height: 4px;">
             <div class="progress-bar-fill" id="queue-progress-fill" style="width: 0%; transition: width 0.3s;"></div>
         </div>
+        <div id="queue-transfer-stats" style="font-size: 0.75rem; color: #1565c0; margin-top: 3px; opacity: 0.85;"></div>
     </div>
 
     <div class="container">
@@ -306,7 +307,7 @@
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
-    <script src="/js/webrtc.js" integrity="sha384-gxFlQL/CeeI1H73eFC+bMOldN8+LYmGDtS2M0Yn0hyN1l1JhSaCfdmyA4Dl55BXp"></script>
+    <script src="/js/webrtc.js" integrity="sha384-bGyKD+SWPGRrTgaNLcuijRJeiGkV3Z2LaWTS0XOesxllKnNpLamO34W2cIxtpcjB"></script>
     <script>
         // Initialize i18n first
         i18n.init();
@@ -1341,6 +1342,21 @@
             }
         }
 
+        function formatRate(bytesPerSec) {
+            if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / (1024 * 1024)).toFixed(1) + ' MB/s';
+            return (bytesPerSec / 1024).toFixed(0) + ' kB/s';
+        }
+
+        function formatTransferStats(percent, rate, remaining) {
+            let s = percent + '%  ' + formatRate(rate);
+            if (isFinite(remaining) && remaining > 10) {
+                const m = Math.floor(remaining / 60);
+                const sec = Math.round(remaining % 60);
+                s += '  ' + (m > 0 ? m + 'm ' : '') + sec + 's';
+            }
+            return s;
+        }
+
         /**
          * Encrypt and transmit a single photo blob over the WebRTC data channel.
          * Resolves when the receiver sends a file-ack; throws on nack or timeout.
@@ -1363,10 +1379,28 @@
             );
             logger.info(`Encrypted size: ${encryptedData.byteLength} bytes (padded)`);
 
-            await rtc.sendFile(encryptedData, (percent) => {
+            let xferStart = Date.now();
+            let lastStatsUpdate = 0;
+            await rtc.sendFile(encryptedData, (percent, offset, totalSize) => {
                 const fill = document.getElementById('queue-progress-fill');
                 if (fill) fill.style.width = percent + '%';
+                const now = Date.now();
+                if (now - lastStatsUpdate >= 200) {
+                    lastStatsUpdate = now;
+                    const elapsed = (now - xferStart) / 1000;
+                    const rate = elapsed > 0 ? offset / elapsed : 0;
+                    const remaining = rate > 0 ? (totalSize - offset) / rate : Infinity;
+                    const statsEl = document.getElementById('queue-transfer-stats');
+                    if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);
+                }
             });
+            {
+                const elapsed = (Date.now() - xferStart) / 1000;
+                const actualRate = elapsed > 0 ? encryptedData.byteLength / elapsed : 0;
+                logger.info(`Transfer complete: ${formatRate(actualRate)} avg (${elapsed.toFixed(1)}s, ${encryptedData.byteLength} bytes)`);
+                const statsEl = document.getElementById('queue-transfer-stats');
+                if (statsEl) statsEl.textContent = '';
+            }
         }
 
         // ============ Fingerprint Verification ============
