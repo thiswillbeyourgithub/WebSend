@@ -178,6 +178,8 @@ services:
     privileged: false
     # Note: coturn image runs as root by default; running as non-root
     # may break startup. The other hardening measures mitigate this.
+    # We run coturn as root so it can read TLS certificate files mounted from Caddy.
+    user: "0:0"
     restart: unless-stopped
     deploy:
       resources:
