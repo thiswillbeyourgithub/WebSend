@@ -197,6 +197,11 @@ sudo ufw-docker allow coturn 49161/udp
 
 - **Camera not working**: make sure you're using HTTPS. Browsers require a secure context for camera access. Set up [Caddy](https://caddyserver.com/) or another reverse proxy for automatic HTTPS.
 - **Connection failing**: check that both devices can reach the server. If behind symmetric NAT, enable the TURN relay (see `env.example`). Check firewall rules for UDP traffic. A good way to test your network's STUN/TURN/TURNS capabilities is [Twilio's Network Test](https://networktest.twilio.com/).
+- **TURN/TURNS not reachable**: use `misc/check_turn.py` to verify that your TURN or TURNS server is up and responding. It sends an unauthenticated Allocate request and reports whether the server answers correctly (a 401 response means the server is alive and asking for credentials, which is the expected behaviour):
+  ```bash
+  uv run misc/check_turn.py --turns-server myrelay.example.com 5349
+  uv run misc/check_turn.py --turn-server  myrelay.example.com 3478
+  ```
 - **QR code not scanning**: ensure good lighting and that the QR code is fully visible. The QR code contains a URL with a security token.
 - **Click "Logs" button**: both sender and receiver pages have a logs panel for detailed connection debugging. Set `DEV=1` in `.env` for verbose output.
 
