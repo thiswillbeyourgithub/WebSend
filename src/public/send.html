@@ -57,6 +57,14 @@
         </div>
     </div>
 
+    <!-- Queue status banner: shown when photos are sending in background -->
+    <div id="queue-banner" class="hidden" style="position: sticky; top: 0; z-index: 100; background: #e3f2fd; border-bottom: 2px solid #90caf9; padding: 10px 15px; text-align: center; color: #1565c0; font-size: 0.9rem;">
+        <span id="queue-banner-text"></span>
+        <div class="progress-bar" id="queue-progress-bar" style="margin: 6px 0 0 0; height: 4px;">
+            <div class="progress-bar-fill" id="queue-progress-fill" style="width: 0%; transition: width 0.3s;"></div>
+        </div>
+    </div>
+
     <div class="container">
         <a href="/" class="back-link" data-i18n="nav.back">&larr; Back</a>
 
@@ -339,6 +347,8 @@
         let detectEnabled = localStorage.getItem('docDetectEnabled') === 'true';
         let detectInterval = null;
         let lastDetectedCorners = null;
+        let sendQueue = [];       // Pending photo blobs awaiting transmission
+        let isSendingQueue = false; // Whether the queue drain loop is running
 
         // UI Elements
         const stepScan = document.getElementById('step-scan');
@@ -688,6 +698,8 @@
             currentPhotoBlob = null;
             originalPhotoBlob = null;
             preBWBlob = null;
+            sendQueue = [];
+            isSendingQueue = false;
             // Revoke preview image URL
             const preview = document.getElementById('preview-image');
             if (preview && preview.src && preview.src.startsWith('blob:')) {
@@ -1159,102 +1171,119 @@
 
         // ============ Send Photo ============
 
+        /**
+         * Queue the current photo for background transmission and return immediately
+         * to the choose step so the user can take another photo straight away.
+         * Multiple photos can be queued; they are sent one by one by drainQueue().
+         */
         async function sendPhoto() {
             if (!currentPhotoBlob || !sharedKey) {
                 logger.error('No photo or key exchange not complete');
                 return;
             }
 
-            document.getElementById('send-btn').disabled = true;
-            document.getElementById('send-status').classList.remove('hidden');
-            document.getElementById('send-progress-bar').classList.remove('hidden');
+            sendQueue.push(currentPhotoBlob);
+            logger.info(`Photo queued for background send (${sendQueue.length} in queue)`);
 
-            try {
-                // Read photo as ArrayBuffer
-                const photoData = await currentPhotoBlob.arrayBuffer();
-                logger.info(`Photo size: ${photoData.byteLength} bytes`);
-
-                // Compute SHA-256 of raw plaintext data BEFORE encryption.
-                // This hash will be compared against the receiver's hash of the
-                // decrypted data to verify end-to-end integrity.
-                const localHash = await WebSendCrypto.sha256Hex(photoData);
-                logger.info(`Plaintext SHA-256: ${localHash}`);
-
-                // Encrypt with metadata bundled and padding applied.
-                // This hides: filename, MIME type, and exact file size.
-                // The encrypted output is padded to a bucket size.
-                document.getElementById('send-status').textContent = i18n.t('send.encrypting');
-
-                // Determine filename - use original if from file picker, otherwise generate
-                const filename = currentPhotoBlob.name || `websend_${Date.now()}.png`;
-                const mimeType = currentPhotoBlob.type || 'image/png';
-
-                const encryptedData = await WebSendCrypto.encryptWithMetadata(
-                    photoData,
-                    {
-                        name: filename,
-                        mimeType: mimeType,
-                        originalSize: photoData.byteLength
-                    },
-                    sharedKey
-                );
-                logger.info(`Encrypted size: ${encryptedData.byteLength} bytes (padded)`);
-
-                // Send through WebRTC - no plaintext metadata is passed
-                document.getElementById('send-status').textContent = i18n.t('send.sendingProgress');
-                await rtc.sendFile(encryptedData, (percent) => {
-                    document.getElementById('send-progress-fill').style.width = percent + '%';
-                    // Once all chunks are sent, show "awaiting confirmation" while
-                    // waiting for the receiver's file-ack (checksum verification).
-                    if (percent >= 100) {
-                        document.getElementById('send-status').textContent = i18n.t('send.awaitingConfirmation');
-                    }
-                });
-
-                // sendFile() now waits — this point is only reached after file-ack/nack/timeout.
-                // The above line returns { acknowledged: true, sha256: '<hex>' } on success,
-                // or throws on nack/timeout. If we're here, we got an ack.
-            } catch (e) {
-                // Distinguish timeout/nack from other errors (e.g. encryption failure).
-                // On timeout or nack, keep photo in memory so the user can retry.
-                logger.error('Failed to send photo: ' + e.message);
-                const isTimeout = e.message.includes('timeout');
-                const isNack = e.message.includes('Receiver decryption failed');
-                if (isTimeout) {
-                    showToast(i18n.t('send.transferTimeout'));
-                } else if (isNack) {
-                    showToast(i18n.t('send.checksumMismatch'));
-                } else {
-                    showToast(i18n.t('send.sendFailed'));
-                }
-                document.getElementById('send-btn').disabled = false;
-                document.getElementById('send-status').classList.add('hidden');
-                document.getElementById('send-progress-bar').classList.add('hidden');
-                // Do NOT clear currentPhotoBlob — user can retry
-                return;
-            }
-
-            // If we reach here, sendFile() resolved with a file-ack.
-            // The ack object is not used directly since sendFile() would have
-            // thrown on nack/timeout. Success path:
-            logger.success('Photo sent and verified by receiver!');
-
-            // Clear sent photo data from memory — receiver confirmed receipt
+            // Clear preview state immediately so user can take the next shot
             currentPhotoBlob = null;
             originalPhotoBlob = null;
             preBWBlob = null;
+            document.getElementById('bw-btn').classList.remove('active');
+            document.getElementById('edit-toolbar').classList.add('hidden');
             const preview = document.getElementById('preview-image');
             if (preview.src && preview.src.startsWith('blob:')) {
                 URL.revokeObjectURL(preview.src);
                 preview.src = '';
             }
 
-            // Update success message to show verification
-            const sentStatus = stepSent.querySelector('.status');
-            if (sentStatus) {
-                sentStatus.textContent = i18n.t('send.transferVerified');
+            showStep(stepChoose);
+            updateQueueBanner();
+            drainQueue();
+        }
+
+        /** Update the sticky banner that shows background-send progress */
+        function updateQueueBanner() {
+            const banner = document.getElementById('queue-banner');
+            const text = document.getElementById('queue-banner-text');
+            if (sendQueue.length === 0 && !isSendingQueue) {
+                banner.classList.add('hidden');
+                document.getElementById('queue-progress-fill').style.width = '0%';
+                return;
             }
-            showStep(stepSent);
+            banner.classList.remove('hidden');
+            text.textContent = i18n.t('send.queueSending').replace('{n}', sendQueue.length);
+        }
+
+        /**
+         * Drain the send queue serially in the background.
+         * Safe to call multiple times; only one drain loop runs at a time.
+         */
+        async function drainQueue() {
+            if (isSendingQueue) return;
+            isSendingQueue = true;
+            updateQueueBanner();
+
+            let successCount = 0;
+            while (sendQueue.length > 0) {
+                const blob = sendQueue[0];
+                try {
+                    await sendOnePhoto(blob);
+                    sendQueue.shift();
+                    successCount++;
+                    logger.success('Queued photo sent and verified by receiver');
+                } catch (e) {
+                    sendQueue.shift();
+                    logger.error('Queued photo failed: ' + e.message);
+                    const isTimeout = e.message.includes('timeout');
+                    const isNack = e.message.includes('Receiver decryption failed');
+                    if (isTimeout) {
+                        showToast(i18n.t('send.transferTimeout'));
+                    } else if (isNack) {
+                        showToast(i18n.t('send.checksumMismatch'));
+                    } else {
+                        showToast(i18n.t('send.sendFailed'));
+                    }
+                }
+                updateQueueBanner();
+            }
+
+            isSendingQueue = false;
+            updateQueueBanner();
+
+            if (successCount === 1) {
+                showToast(i18n.t('send.transferVerified'));
+            } else if (successCount > 1) {
+                showToast(i18n.t('send.allSent').replace('{n}', successCount));
+            }
+        }
+
+        /**
+         * Encrypt and transmit a single photo blob over the WebRTC data channel.
+         * Resolves when the receiver sends a file-ack; throws on nack or timeout.
+         * @param {Blob} blob - Photo blob to send
+         */
+        async function sendOnePhoto(blob) {
+            const photoData = await blob.arrayBuffer();
+            logger.info(`Sending queued photo: ${photoData.byteLength} bytes`);
+
+            const localHash = await WebSendCrypto.sha256Hex(photoData);
+            logger.info(`Plaintext SHA-256: ${localHash}`);
+
+            const filename = blob.name || `websend_${Date.now()}.png`;
+            const mimeType = blob.type || 'image/png';
+
+            const encryptedData = await WebSendCrypto.encryptWithMetadata(
+                photoData,
+                { name: filename, mimeType: mimeType, originalSize: photoData.byteLength },
+                sharedKey
+            );
+            logger.info(`Encrypted size: ${encryptedData.byteLength} bytes (padded)`);
+
+            await rtc.sendFile(encryptedData, (percent) => {
+                const fill = document.getElementById('queue-progress-fill');
+                if (fill) fill.style.width = percent + '%';
+            });
         }
 
         // ============ Fingerprint Verification ============

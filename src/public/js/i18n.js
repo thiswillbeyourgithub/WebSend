@@ -102,6 +102,8 @@ const i18n = (function() {
             'send.rotate': 'Rotate',
             'send.flip': 'Flip',
             'send.applyBW': 'B&W',
+            'send.queueSending': '📤 Sending {n} photo(s) in background…',
+            'send.allSent': 'All {n} photos sent!',
 
             // Receive page
             'receive.title': 'Receive Photos',
@@ -286,6 +288,8 @@ const i18n = (function() {
             'send.rotate': 'Tourner',
             'send.flip': 'Miroir',
             'send.applyBW': 'N&B',
+            'send.queueSending': '📤 Envoi de {n} photo(s) en arrière-plan…',
+            'send.allSent': '{n} photos envoyées !',
 
             // Receive page
             'receive.title': 'Recevoir des Photos',
