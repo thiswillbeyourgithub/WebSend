@@ -340,6 +340,7 @@
 
                 logger.success('QR code generated');
                 document.getElementById('status-waiting').classList.remove('hidden');
+                preloadScribe();
             } catch (e) {
                 logger.error('QR code generation failed: ' + e.message);
                 container.innerHTML = `
@@ -351,6 +352,7 @@
                     </div>
                 `;
                 document.getElementById('status-waiting').classList.remove('hidden');
+                preloadScribe();
             }
         }
 
@@ -1257,7 +1259,7 @@
 
         /**
          * Preload scribe.js OCR engine in the background so it's ready when
-         * the user clicks Export. Called once after the first image is received.
+         * the user clicks Export. Called as soon as the receiver starts waiting for images.
          */
         let scribePreloaded = null; // Promise<scribe module> or null
         function preloadScribe() {
