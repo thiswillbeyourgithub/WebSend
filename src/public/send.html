@@ -350,6 +350,50 @@
         let sendQueue = [];       // Pending photo blobs awaiting transmission
         let isSendingQueue = false; // Whether the queue drain loop is running
 
+        // Wake lock state
+        let wakeLock = null;
+        let wakeLockDesired = false;
+
+        async function acquireWakeLock() {
+            if (!('wakeLock' in navigator)) return;
+            try {
+                wakeLock = await navigator.wakeLock.request('screen');
+                logger.info('Wake lock acquired');
+                wakeLock.addEventListener('release', () => {
+                    wakeLock = null;
+                    logger.info('Wake lock released');
+                });
+            } catch (e) {
+                logger.warn('Wake lock request failed: ' + e.message);
+            }
+        }
+
+        function releaseWakeLock() {
+            wakeLockDesired = false;
+            if (wakeLock) {
+                wakeLock.release();
+                wakeLock = null;
+            }
+        }
+
+        // Re-acquire wake lock and auto-reconnect when screen wakes up
+        document.addEventListener('visibilitychange', async () => {
+            if (document.visibilityState !== 'visible') return;
+            if (wakeLockDesired && !wakeLock) {
+                await acquireWakeLock();
+            }
+            // If we have a room in the URL and the connection dropped, reconnect
+            const roomId = getRoomIdFromUrl();
+            const secret = getRoomSecretFromUrl();
+            if (roomId && secret && rtc && rtc.pc) {
+                const state = rtc.pc.connectionState;
+                if (state === 'failed' || state === 'disconnected') {
+                    logger.info('Page visible again — connection lost, reconnecting...');
+                    reconnectSender(roomId, secret);
+                }
+            }
+        });
+
         // UI Elements
         const stepScan = document.getElementById('step-scan');
         const stepConnecting = document.getElementById('step-connecting');
@@ -681,13 +725,50 @@
          * Does NOT immediately show the photo send UI - that happens only after
          * both parties verify key fingerprints (receiver sends 'ready' message).
          */
-        function onConnected() {
+        async function onConnected() {
             logger.success('Connected to receiver!');
+            // Keep screen awake while connected
+            wakeLockDesired = true;
+            await acquireWakeLock();
         }
 
         function onDisconnected() {
             logger.warn('Disconnected from receiver');
+            releaseWakeLock();
             showToast(i18n.t('send.disconnectedHint'), { duration: 0 });
+        }
+
+        async function reconnectSender(roomId, secret) {
+            logger.info('Reconnecting sender...');
+            showToast(i18n.t('send.reconnecting'), { duration: 3000 });
+
+            // Close existing connection
+            if (rtc) {
+                try { rtc.close(); } catch (_) {}
+            }
+
+            // Reset crypto and queue state
+            keyPair = await WebSendCrypto.generateKeyPair();
+            sharedKey = null;
+            weConfirmed = false;
+            theyConfirmed = false;
+            sendQueue = [];
+            isSendingQueue = false;
+
+            rtc = new WebSendRTC();
+            await rtc.init();
+            rtc.onConnected = onConnected;
+            rtc.onDisconnected = onDisconnected;
+            rtc.onMessage = onMessage;
+            rtc.onStateChange = onStateChange;
+            rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+
+            try {
+                await joinRoom(roomId, secret);
+            } catch (e) {
+                logger.error('Reconnect failed: ' + e.message);
+                showToast(i18n.t('send.reconnectFailed'), { duration: 0 });
+            }
         }
 
         /**
@@ -722,6 +803,8 @@
             // Clear crypto keys
             keyPair = null;
             sharedKey = null;
+            // Release wake lock
+            releaseWakeLock();
         }
 
         window.addEventListener('beforeunload', cleanupAllData);

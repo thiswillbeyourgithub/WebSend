@@ -193,7 +193,11 @@ const i18n = (function() {
 
             // Disconnection hints
             'receive.disconnectedHint': 'Disconnected. Reload the page or click Back to restart.',
+            'receive.reconnecting': 'Reconnecting...',
+            'receive.reconnectFailed': 'Reconnection failed. Reload the page to restart.',
             'send.disconnectedHint': 'Connection lost. Reload the page or click Back to restart.',
+            'send.reconnecting': 'Reconnecting...',
+            'send.reconnectFailed': 'Reconnection failed. Reload the page or click Back to restart.',
 
             // Errors
             'error.noPhotoOrKey': 'No photo or key exchange not complete',
@@ -379,7 +383,11 @@ const i18n = (function() {
 
             // Disconnection hints
             'receive.disconnectedHint': 'Déconnecté. Rechargez la page ou cliquez sur Retour pour redémarrer.',
+            'receive.reconnecting': 'Reconnexion en cours...',
+            'receive.reconnectFailed': 'Reconnexion échouée. Rechargez la page pour recommencer.',
             'send.disconnectedHint': 'Connexion perdue. Rechargez la page ou cliquez sur Retour pour redémarrer.',
+            'send.reconnecting': 'Reconnexion en cours...',
+            'send.reconnectFailed': 'Reconnexion échouée. Rechargez la page ou cliquez sur Retour pour recommencer.',
 
             // Errors
             'error.noPhotoOrKey': 'Pas de photo ou échange de clés incomplet',

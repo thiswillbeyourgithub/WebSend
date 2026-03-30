@@ -235,6 +235,48 @@
         let theyConfirmed = false; // Track if sender confirmed fingerprints
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string}
 
+        // Wake lock state
+        let wakeLock = null;
+        let wakeLockDesired = false; // true when we want to hold the wake lock
+
+        async function acquireWakeLock() {
+            if (!('wakeLock' in navigator)) return;
+            try {
+                wakeLock = await navigator.wakeLock.request('screen');
+                logger.info('Wake lock acquired');
+                wakeLock.addEventListener('release', () => {
+                    wakeLock = null;
+                    logger.info('Wake lock released');
+                });
+            } catch (e) {
+                logger.warn('Wake lock request failed: ' + e.message);
+            }
+        }
+
+        function releaseWakeLock() {
+            wakeLockDesired = false;
+            if (wakeLock) {
+                wakeLock.release();
+                wakeLock = null;
+            }
+        }
+
+        // Re-acquire wake lock after the screen wakes up (browsers release it on hide)
+        document.addEventListener('visibilitychange', async () => {
+            if (document.visibilityState !== 'visible') return;
+            if (wakeLockDesired && !wakeLock) {
+                await acquireWakeLock();
+            }
+            // If connection dropped while page was hidden, reconnect
+            if (rtc && rtc.pc) {
+                const state = rtc.pc.connectionState;
+                if (state === 'failed' || state === 'disconnected') {
+                    logger.info('Page visible again — connection lost, restarting...');
+                    reconnectReceiver();
+                }
+            }
+        });
+
         /**
          * Dynamically load eruda mobile devtools console from CDN.
          * Only called in DEV mode (DEV=1 env var on server) to avoid loading
@@ -287,6 +329,10 @@
 
                 // Generate QR code with room URL
                 await generateQRCode();
+
+                // Keep screen awake while waiting for sender to scan QR
+                wakeLockDesired = true;
+                await acquireWakeLock();
 
                 // Start waiting for answer
                 rtc.waitForAnswer().catch(e => {
@@ -387,6 +433,9 @@
 
         async function onConnected() {
             logger.success('Connected to sender!');
+            // Keep screen awake while connected
+            wakeLockDesired = true;
+            await acquireWakeLock();
             // Record connection time for image naming
             const now = new Date();
             const pad = n => String(n).padStart(2, '0');
@@ -442,8 +491,71 @@
 
         function onDisconnected() {
             logger.warn('Disconnected from sender');
-            document.querySelector('#step-connected .status').textContent = i18n.t('receive.disconnectedHint');
-            document.querySelector('#step-connected .status').className = 'status status-error';
+            releaseWakeLock();
+            // Auto-reconnect: restart the receiver so a new QR code is shown
+            reconnectReceiver();
+        }
+
+        async function reconnectReceiver() {
+            logger.info('Reconnecting receiver...');
+            // Show reconnecting status on whichever step is currently visible
+            const statusEl = document.querySelector('#step-connected .status') ||
+                             document.querySelector('#step-qr .status');
+            if (statusEl) {
+                statusEl.textContent = i18n.t('receive.reconnecting');
+                statusEl.className = 'status status-info';
+            }
+
+            // Close existing connection
+            if (rtc) {
+                try { rtc.close(); } catch (_) {}
+                rtc = null;
+            }
+
+            // Reset crypto state
+            keyPair = null;
+            sharedKey = null;
+            weConfirmed = false;
+            theyConfirmed = false;
+
+            // Restart from scratch: show QR step, hide connected step
+            document.getElementById('step-connected').classList.add('hidden');
+            document.getElementById('step-qr').classList.remove('hidden');
+
+            try {
+                keyPair = await WebSendCrypto.generateKeyPair();
+                rtc = new WebSendRTC();
+                await rtc.init();
+                rtc.onConnected = onConnected;
+                rtc.onDisconnected = onDisconnected;
+                rtc.onMessage = onMessage;
+                rtc.onStateChange = onStateChange;
+                rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+
+                const roomInfo = await rtc.createRoom();
+                roomSecret = roomInfo.secret;
+                await rtc.createOfferAndStore();
+                await generateQRCode();
+
+                // Acquire wake lock while waiting for new sender
+                wakeLockDesired = true;
+                await acquireWakeLock();
+
+                rtc.waitForAnswer().catch(e => {
+                    logger.error('Failed waiting for answer: ' + e.message);
+                    const statusWaiting = document.getElementById('status-waiting');
+                    if (statusWaiting) {
+                        statusWaiting.textContent = i18n.t('receive.expired');
+                        statusWaiting.className = 'status status-error';
+                    }
+                });
+            } catch (e) {
+                logger.error('Reconnect failed: ' + e.message);
+                if (statusEl) {
+                    statusEl.textContent = i18n.t('receive.reconnectFailed');
+                    statusEl.className = 'status status-error';
+                }
+            }
         }
 
         /**
@@ -472,6 +584,8 @@
             // Clear crypto keys
             keyPair = null;
             sharedKey = null;
+            // Release wake lock
+            releaseWakeLock();
         }
 
         window.addEventListener('beforeunload', cleanupAllData);
