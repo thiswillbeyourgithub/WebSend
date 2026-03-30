@@ -1414,7 +1414,8 @@
 
             const activeImages = receivedImages.filter(img => img !== null);
             const imageCount = activeImages.length;
-            const timeoutMs = imageCount * 60000; // 60s per image
+            const timeoutMs = imageCount * 3 * 60000; // 3 min per image
+            const timeoutMinutes = imageCount * 3;
 
             // Timeout guard
             let timeoutId;
@@ -1530,8 +1531,8 @@
                     await generatePlainPdf();
                     return;
                 } else if (e.message === 'OCR_TIMEOUT') {
-                    logger.error(`OCR timed out after ${imageCount} min`);
-                    showToast(i18n.t('receive.ocrTimeout', { minutes: imageCount }));
+                    logger.error(`OCR timed out after ${timeoutMinutes} min`);
+                    showToast(i18n.t('receive.ocrTimeout', { minutes: timeoutMinutes }));
                 } else {
                     logger.error('OCR PDF generation failed: ' + e.message);
                     showToast(i18n.t('receive.ocrFailed', { error: e.message }));
