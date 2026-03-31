@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-BxamCIteZB+aCP97xDtwVtsIWMt4pcWLO+6kxc43AfIbLSFmXGDY6AbCs+zTYRm0" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-P/zp9vL3TbS6+sCUpiLTP46V8CWJB4VR/l1vntejciZbTsdHxdeoP0rM2anSEia+" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -805,47 +805,49 @@
             // Each image has a crop button and download link, identified by index
             item.setAttribute('data-image-index', imageIndex);
             item.innerHTML = `
-                <div style="position: relative; display: block;">
+                <div class="image-thumb-container" style="position: relative; display: block;">
                     <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block;">
                     <span style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
                 </div>
-                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button class="btn btn-action btn-secondary" style="flex: 1; min-width: 80px;" onclick="toggleEditToolbar(${imageIndex})">
-                        ${i18n.t('send.edit')}
-                    </button>
-                    <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="flex: 1; min-width: 120px;" id="download-${imageIndex}">
-                        ${i18n.t('receive.download')}
-                    </a>
-                </div>
-                <div class="edit-toolbar hidden" id="edit-toolbar-${imageIndex}">
-                    <button class="edit-tool-btn" onclick="rotateReceivedImage(${imageIndex})">
-                        <span>🔄</span>
-                        <span>${i18n.t('send.rotate')}</span>
-                    </button>
-                    <button class="edit-tool-btn" onclick="openCropModal(${imageIndex})">
-                        <span>✂️</span>
-                        <span>${i18n.t('receive.crop')}</span>
-                    </button>
-                    <button class="edit-tool-btn" onclick="applyBWToImage(${imageIndex})">
-                        <span>⬛</span>
-                        <span>${i18n.t('send.applyBW')}</span>
-                    </button>
-                </div>
-                <!-- Single-click shows inline confirmation before discarding -->
-                <div class="discard-btn" style="margin-top: 8px;">
-                    <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
-                        ${i18n.t('receive.discard')}
-                    </button>
-                </div>
-                <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                    <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                    <div style="display: flex; gap: 10px;">
-                        <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                            ${i18n.t('receive.discardYes')}
+                <div class="image-actions">
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <button class="btn btn-action btn-secondary" style="flex: 1; min-width: 80px;" onclick="toggleEditToolbar(${imageIndex})">
+                            ${i18n.t('send.edit')}
                         </button>
-                        <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                            ${i18n.t('receive.discardNo')}
+                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="flex: 1; min-width: 120px;" id="download-${imageIndex}">
+                            ${i18n.t('receive.download')}
+                        </a>
+                    </div>
+                    <div class="edit-toolbar hidden" id="edit-toolbar-${imageIndex}">
+                        <button class="edit-tool-btn" onclick="rotateReceivedImage(${imageIndex})">
+                            <span>🔄</span>
+                            <span>${i18n.t('send.rotate')}</span>
                         </button>
+                        <button class="edit-tool-btn" onclick="openCropModal(${imageIndex})">
+                            <span>✂️</span>
+                            <span>${i18n.t('receive.crop')}</span>
+                        </button>
+                        <button class="edit-tool-btn" onclick="applyBWToImage(${imageIndex})">
+                            <span>⬛</span>
+                            <span>${i18n.t('send.applyBW')}</span>
+                        </button>
+                    </div>
+                    <!-- Single-click shows inline confirmation before discarding -->
+                    <div class="discard-btn" style="margin-top: 8px;">
+                        <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
+                            ${i18n.t('receive.discard')}
+                        </button>
+                    </div>
+                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
+                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
+                        <div style="display: flex; gap: 10px;">
+                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardYes')}
+                            </button>
+                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardNo')}
+                            </button>
+                        </div>
                     </div>
                 </div>
             `;

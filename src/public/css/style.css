@@ -688,6 +688,66 @@ h1 {
     margin-bottom: 10px;
 }
 
+/* Horizontal compact layout for wide screens */
+@media (min-width: 900px) {
+    .received-images {
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: 12px;
+        overflow-x: auto;
+    }
+
+    .received-image-item {
+        display: flex;
+        flex-direction: row;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 10px;
+        max-width: 480px;
+        flex-shrink: 0;
+    }
+
+    .received-image-item .image-thumb-container {
+        flex-shrink: 0;
+        width: 150px;
+        height: 150px;
+    }
+
+    .received-image-item .image-thumb-container img {
+        width: 150px;
+        height: 150px;
+        object-fit: cover;
+        margin-bottom: 0;
+        cursor: pointer;
+    }
+
+    .received-image-item .image-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 120px;
+        flex: 1;
+    }
+
+    .received-image-item .image-actions .btn {
+        font-size: 0.85rem;
+        padding: 6px 10px;
+    }
+
+    .received-image-item .edit-toolbar {
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    .received-image-item .edit-tool-btn {
+        min-height: 40px;
+        font-size: 0.85rem;
+        flex-direction: row;
+        gap: 6px;
+        padding: 6px 10px;
+    }
+}
+
 /* Progress indicator */
 .progress-bar {
     width: 100%;
