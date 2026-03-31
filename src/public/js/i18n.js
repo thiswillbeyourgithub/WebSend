@@ -64,7 +64,6 @@ const i18n = (function() {
             'send.failed': 'Connection failed. Please try again.',
             'send.failedNoTurn': 'No relay (TURN) server is configured. Direct connection may be impossible if both devices are behind restrictive networks. Check the Logs for details.',
             'send.connectedSecure': 'Connected securely!',
-            'send.verified': 'Connection verified by both parties',
             'send.detectingConnection': 'Detecting connection type...',
             'send.howToSend': 'How would you like to send photos?',
             'send.takePhoto': 'Take New Photo',
@@ -116,7 +115,6 @@ const i18n = (function() {
             'receive.failedNoTurn': 'No relay (TURN) server is configured. Direct connection may be impossible if both devices are behind restrictive networks. Check the Logs for details.',
             'receive.connectedWaiting': 'Connected! Waiting for photos...',
             'receive.waitingConfirmation': '⏳ Waiting for sender to confirm...',
-            'receive.verified': 'Connection verified by both parties',
             'receive.detectingConnection': 'Detecting connection type...',
             'receive.receivedPhotos': 'Received Photos',
             'receive.photosPlaceholder': 'Waiting for sender to send photos.',
@@ -176,8 +174,10 @@ const i18n = (function() {
             'connection.relay': '🔄 {details}',
             'connection.direct': '⚡ {details}',
             'connection.relayDetails': 'Relayed via TURN server',
+            'connection.relaySecureDetails': 'Relayed via TURNS server (TLS)',
             'connection.directLocalDetails': 'Direct (local network)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
+            'connection.verified': '✓ Verified by both parties',
 
             // Menu / Sidebar
             'menu.logs': 'Logs',
@@ -254,7 +254,6 @@ const i18n = (function() {
             'send.failed': 'Échec de la connexion. Veuillez réessayer.',
             'send.failedNoTurn': 'Aucun serveur relais (TURN) n\'est configuré. La connexion directe peut être impossible si les deux appareils sont derrière des réseaux restrictifs. Consultez les Logs pour plus de détails.',
             'send.connectedSecure': 'Connecté de manière sécurisée !',
-            'send.verified': 'Connexion vérifiée par les deux parties',
             'send.detectingConnection': 'Détection du type de connexion...',
             'send.howToSend': 'Comment souhaitez-vous envoyer des photos ?',
             'send.takePhoto': 'Prendre une nouvelle photo',
@@ -306,7 +305,6 @@ const i18n = (function() {
             'receive.failedNoTurn': 'Aucun serveur relais (TURN) n\'est configuré. La connexion directe peut être impossible si les deux appareils sont derrière des réseaux restrictifs. Consultez les Logs pour plus de détails.',
             'receive.connectedWaiting': 'Connecté ! En attente des photos...',
             'receive.waitingConfirmation': '⏳ En attente de confirmation de l\'expéditeur...',
-            'receive.verified': 'Connexion vérifiée par les deux parties',
             'receive.detectingConnection': 'Détection du type de connexion...',
             'receive.receivedPhotos': 'Photos reçues',
             'receive.photosPlaceholder': 'En attente d\'envoi des photos par l\'expéditeur.',
@@ -366,8 +364,10 @@ const i18n = (function() {
             'connection.relay': '🔄 {details}',
             'connection.direct': '⚡ {details}',
             'connection.relayDetails': 'Relayé via le serveur TURN',
+            'connection.relaySecureDetails': 'Relayé via le serveur TURNS (TLS)',
             'connection.directLocalDetails': 'Direct (réseau local)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
+            'connection.verified': '✓ Vérifié par les deux parties',
 
             // Menu / Sidebar
             'menu.logs': 'Journaux',

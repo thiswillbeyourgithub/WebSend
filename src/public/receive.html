@@ -127,12 +127,6 @@
                 </p>
             </div>
 
-            <!-- Verified badge (shown after both confirm) -->
-            <div id="verified-badge" class="hidden" style="margin: 15px 0; padding: 15px; background: #e8f5e9; border-radius: 10px; border: 1px solid #a5d6a7; text-align: center;">
-                <p style="margin: 0; color: #2e7d32; font-weight: bold;" data-i18n="receive.verified">
-                    ✓ Connection verified by both parties
-                </p>
-            </div>
 
             <div class="progress-bar hidden" id="progress-bar">
                 <div class="progress-bar-fill" id="progress-fill" style="width: 0%"></div>
@@ -210,7 +204,7 @@
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
-    <script src="/js/webrtc.js" integrity="sha384-bGyKD+SWPGRrTgaNLcuijRJeiGkV3Z2LaWTS0XOesxllKnNpLamO34W2cIxtpcjB"></script>
+    <script src="/js/webrtc.js" integrity="sha384-vsKDAfrCRnQaNvnno8khnPnrUrKB8UdqTrLY9PRR+qYevM9EQkjkCjmuoD1+FPY9"></script>
     <script>
         // Initialize i18n first
         i18n.init();
@@ -633,6 +627,18 @@
                 infoDiv.innerHTML = `⚡ ${info.details}`;
                 infoDiv.style.color = '#1565c0';
             }
+        }
+
+        /** Show "verified" status inside the sidebar CONNECTION section */
+        function showVerifiedInSidebar() {
+            const section = document.getElementById('sidebar-connection-section');
+            const infoDiv = document.getElementById('sidebar-connection-info');
+            if (!section || !infoDiv) return;
+            section.classList.remove('hidden');
+            const verifiedEl = document.createElement('div');
+            verifiedEl.style.cssText = 'margin-top: 6px; color: #2e7d32; font-weight: bold;';
+            verifiedEl.textContent = i18n.t('connection.verified');
+            infoDiv.appendChild(verifiedEl);
         }
 
         async function onMessage(msg) {
@@ -1091,7 +1097,7 @@
 
                 // Hide waiting, show verified badge
                 document.getElementById('waiting-confirmation').classList.add('hidden');
-                document.getElementById('verified-badge').classList.remove('hidden');
+                showVerifiedInSidebar();
 
                 // Tell sender both parties verified, so they can show the photo send UI
                 rtc.sendMessage({ type: 'ready' });

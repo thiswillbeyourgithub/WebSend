@@ -852,7 +852,13 @@ class WebSendRTC {
 
             if (localType === 'relay' || remoteType === 'relay') {
                 connectionType = 'relay';
-                connectionDetails = i18n.t('connection.relayDetails');
+                // Distinguish TURN (UDP/TCP) from TURNS (TLS) via relayProtocol
+                const relayProtocol = localCandidate?.relayProtocol || remoteCandidate?.relayProtocol;
+                if (relayProtocol === 'tls') {
+                    connectionDetails = i18n.t('connection.relaySecureDetails');
+                } else {
+                    connectionDetails = i18n.t('connection.relayDetails');
+                }
             } else if (localType === 'host' && remoteType === 'host') {
                 connectionType = 'direct-local';
                 connectionDetails = i18n.t('connection.directLocalDetails');
