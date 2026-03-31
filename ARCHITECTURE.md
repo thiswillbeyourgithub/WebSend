@@ -2,6 +2,16 @@
 
 > Written with the help of [Claude Code](https://claude.ai/claude-code).
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Directory Structure](#directory-structure)
+- [Data Flow](#data-flow)
+- [Server API Endpoints](#server-api-endpoints)
+- [Security Layers](#security-layers)
+- [SSO (Experimental)](#sso-experimental)
+- [Deployment](#deployment)
+
 ## Overview
 
 WebSend is a webapp for securely transferring photos from a phone (sender) to a

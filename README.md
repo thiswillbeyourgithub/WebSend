@@ -2,6 +2,37 @@
 
 **Use your regular smartphone as a secure document scanner** -- even for sensitive documents.
 
+## Table of Contents
+
+- [Disclaimer](#disclaimer)
+- [How It Works](#how-it-works)
+- [Security Features](#security-features)
+  - [End-to-End Encryption](#end-to-end-encryption)
+  - [Zero Server Trust](#zero-server-trust)
+  - [Supply Chain Attack Resistance](#supply-chain-attack-resistance)
+  - [Man-in-the-Middle Protection](#man-in-the-middle-protection)
+  - [Room Security](#room-security)
+  - [Rate Limiting and Origin Validation](#rate-limiting-and-origin-validation)
+  - [Metadata Protection](#metadata-protection)
+  - [Transfer Verification](#transfer-verification)
+  - [No Phone Storage](#no-phone-storage)
+  - [Docker Hardening](#docker-hardening)
+  - [Subresource Integrity (SRI)](#subresource-integrity-sri)
+  - [TURN Relay Security](#turn-relay-security)
+- [Non-Security Features](#non-security-features)
+- [Keycloak SSO (Experimental)](#keycloak-sso-experimental)
+- [Future Ideas](#future-ideas)
+- [Public Instance](#public-instance)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Firewall (UFW)](#firewall-ufw)
+- [Troubleshooting](#troubleshooting)
+- [Tech Stack](#tech-stack)
+- [Development](#development)
+- [Third-Party Libraries](#third-party-libraries)
+- [License](#license)
+
 WebSend transfers photos directly between devices using WebRTC and end-to-end encryption. Photos are encrypted on the sender's device and decrypted only on the receiver's device. They never pass through any server unencrypted, and they never touch the phone's storage.
 
 ## Disclaimer
