@@ -123,7 +123,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - **Document cropping**: perspective-corrected 4-corner crop tool on the receiver side (pure vanilla JS, no dependencies)
 - **Export modal**: download all received images as PDF or ZIP, with optional B&W (Otsu thresholding) and **experimental OCR** (scribe.js)
 - **PDF export**: download all received images as a single PDF (hand-crafted minimal PDF generator, no dependencies)
-- **ZIP export**: download all received images as a ZIP archive (client-zip, lazy-loaded on demand)
+- **ZIP export**: download all received images as a ZIP archive (client-zip, preloaded in background)
 - **B&W document mode**: Otsu's automatic binarization for crisp scanned documents
 - **QR code scanning**: in-browser QR code scanning (jsQR) and generation (qrcode.js)
 - **Connection type detection**: shows whether the connection is direct (local network or via STUN) or relayed (TURN/TURNS)
@@ -258,7 +258,7 @@ All client-side libraries are vendored directly in the repository (no CDN at run
 | [qrcode.js](https://github.com/soldair/node-qrcode) | 1.5.1 | MIT | QR code generation |
 | [jsQR](https://github.com/cozmo/jsQR) | 1.4.0 | Apache-2.0 | QR code scanning |
 | [client-zip](https://github.com/Touffy/client-zip) | — | MIT | ZIP export |
-| [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (lazy-loaded) |
+| [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (preloaded in background) |
 | [Express.js](https://expressjs.com) | 4.18.2 | MIT | Server-side HTTP framework |
 
 ## License

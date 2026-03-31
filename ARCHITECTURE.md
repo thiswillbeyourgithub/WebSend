@@ -82,9 +82,9 @@ WebSend/
         │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
         │
         ├── vendor/             # Vendored third-party libraries (committed to repo)
-        │   ├── client-zip.js   # ZIP generator (ESM, ~6KB, lazy-loaded on demand)
+        │   ├── client-zip.js   # ZIP generator (ESM, ~6KB, preloaded in background)
         │   ├── scribe.js-ocr/  # OCR engine (AGPL-3.0): scribe.js + Tesseract WASM,
-        │   │                   #   fonts, and mupdf — lazy-loaded when user requests OCR
+        │   │                   #   fonts, and mupdf — preloaded in background
         │   └── tessdata/       # Tesseract language models (eng + fra .traineddata),
         │                       #   served locally to avoid CDN dependency
         │

@@ -401,6 +401,7 @@
 
                 logger.success('QR code generated');
                 document.getElementById('status-waiting').classList.remove('hidden');
+                preloadClientZip();
                 preloadScribe();
             } catch (e) {
                 logger.error('QR code generation failed: ' + e.message);
@@ -413,6 +414,7 @@
                     </div>
                 `;
                 document.getElementById('status-waiting').classList.remove('hidden');
+                preloadClientZip();
                 preloadScribe();
             }
         }
@@ -763,7 +765,8 @@
 
                     // Preload OCR engine after first image arrives
                     if (receivedImages.filter(img => img !== null).length === 1) {
-                        preloadScribe();
+                        preloadClientZip();
+                preloadScribe();
                     }
 
                     // Compute SHA-256 of the decrypted plaintext data and send
@@ -1280,7 +1283,7 @@
         }
 
         /**
-         * Generate a ZIP of all images using lazy-loaded client-zip.
+         * Generate a ZIP of all images using client-zip (preloaded in background).
          * If B&W is checked, images are Otsu-binarized and exported as PNGs.
          * Otherwise, original image data is used with original filenames/MIME types.
          */
@@ -1291,8 +1294,9 @@
             btn.textContent = i18n.t('receive.generatingZip');
 
             try {
-                // Lazy-load client-zip only when needed
-                const { downloadZip } = await import('/vendor/client-zip.js');
+                // Use preloaded client-zip or load on demand
+                const clientZipModule = clientZipPreloaded ? await clientZipPreloaded : await import('/vendor/client-zip.js');
+                const { downloadZip } = clientZipModule;
 
                 const bw = isToggleActive('export-bw');
                 const activeImages = receivedImages.filter(img => img !== null);
@@ -1422,6 +1426,16 @@
          * Preload scribe.js OCR engine in the background so it's ready when
          * the user clicks Export. Called as soon as the receiver starts waiting for images.
          */
+        let clientZipPreloaded = null; // Promise<{downloadZip}> or null
+        function preloadClientZip() {
+            if (clientZipPreloaded) return;
+            clientZipPreloaded = import('/vendor/client-zip.js').catch(e => {
+                logger.warn('client-zip preload failed (will retry on export): ' + e.message);
+                clientZipPreloaded = null;
+                return null;
+            });
+        }
+
         let scribePreloaded = null; // Promise<scribe module> or null
         function preloadScribe() {
             if (scribePreloaded) return;
