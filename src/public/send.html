@@ -178,7 +178,7 @@
             <div class="camera-container" id="capture-camera-container">
                 <video id="capture-video" autoplay playsinline></video>
                 <!-- Flash mode toggle: cycles off → torch → flash-on-capture → off
-                     Only visible when the device supports torch via ImageCapture API -->
+                     Only visible when the device supports torch or fillLightMode -->
                 <button class="flash-toggle-btn hidden" id="flash-toggle-btn" title="Flash mode">
                     <span id="flash-icon">⚡</span>
                     <span id="flash-label" data-i18n="send.flashOff">Off</span>
@@ -338,6 +338,7 @@
         // Flash modes: 'off' → 'torch' (constant light) → 'flash' (fire on capture) → 'off'
         let flashMode = 'off';
         let torchSupported = false;
+        let fillLightSupported = false; // ImageCapture fillLightMode support
         // Document detection state
         let detectEnabled = localStorage.getItem('docDetectEnabled') === 'true';
         let detectInterval = null;
@@ -951,8 +952,25 @@
                         logger.info('Applied advanced camera constraints: ' + JSON.stringify(advanced));
                     }
 
-                    // Detect torch support and show/hide flash button
+                    // Detect torch support
                     torchSupported = !!(caps.torch);
+
+                    // Also probe ImageCapture fillLightMode for devices that
+                    // lack torch but support flash via ImageCapture API
+                    fillLightSupported = false;
+                    if (!torchSupported && typeof ImageCapture !== 'undefined') {
+                        try {
+                            const imgCapture = new ImageCapture(track);
+                            const photoCaps = await imgCapture.getPhotoCapabilities();
+                            if (photoCaps.fillLightMode && photoCaps.fillLightMode.length > 1) {
+                                fillLightSupported = true;
+                                logger.info('Flash via ImageCapture fillLightMode: ' + JSON.stringify(photoCaps.fillLightMode));
+                            }
+                        } catch (icErr) {
+                            logger.info('ImageCapture flash probe failed: ' + icErr.message);
+                        }
+                    }
+
                     setupFlashButton(track);
                 } catch (constraintErr) {
                     logger.warn('Could not apply advanced constraints: ' + constraintErr.message);
@@ -978,11 +996,15 @@
         /** Configure the flash toggle button visibility and click handler */
         function setupFlashButton(track) {
             const btn = document.getElementById('flash-toggle-btn');
-            if (!torchSupported) {
+            if (!torchSupported && !fillLightSupported) {
                 btn.classList.add('hidden');
                 return;
             }
             btn.classList.remove('hidden');
+            // If only fillLightMode (no torch), reset to a compatible mode
+            if (!torchSupported && flashMode === 'torch') {
+                flashMode = 'flash';
+            }
             // Restore previous flash mode (persists across photos within session)
             updateFlashUI();
             // Apply torch if it was on from previous photo
@@ -998,7 +1020,8 @@
 
         /** Cycle flash mode: off → torch → flash → off */
         function cycleFlashMode(track) {
-            const modes = ['off', 'torch', 'flash'];
+            // Skip 'torch' mode when only ImageCapture fillLightMode is available
+            const modes = torchSupported ? ['off', 'torch', 'flash'] : ['off', 'flash'];
             const idx = modes.indexOf(flashMode);
             flashMode = modes[(idx + 1) % modes.length];
             logger.info('Flash mode: ' + flashMode);
@@ -1124,16 +1147,36 @@
             const canvas = document.getElementById('capture-canvas');
             const track = captureStream ? captureStream.getVideoTracks()[0] : null;
 
-            // If flash mode is 'flash', turn on torch briefly for the capture
-            if (flashMode === 'flash' && track && torchSupported) {
-                try {
-                    await track.applyConstraints({ advanced: [{ torch: true }] });
-                    // Small delay to let the light stabilize and camera adjust exposure
-                    await new Promise(resolve => setTimeout(resolve, 300));
-                } catch (e) {
-                    logger.warn('Flash fire failed: ' + e.message);
+            // If flash mode is 'flash', use torch or ImageCapture fillLightMode
+            let usedImageCapture = false;
+            if (flashMode === 'flash' && track) {
+                if (torchSupported) {
+                    try {
+                        await track.applyConstraints({ advanced: [{ torch: true }] });
+                        // Small delay to let the light stabilize and camera adjust exposure
+                        await new Promise(resolve => setTimeout(resolve, 300));
+                    } catch (e) {
+                        logger.warn('Flash fire failed: ' + e.message);
+                    }
+                } else if (fillLightSupported) {
+                    // Use ImageCapture API for devices without torch support
+                    try {
+                        const imgCapture = new ImageCapture(track);
+                        const blob = await imgCapture.takePhoto({ fillLightMode: 'flash' });
+                        // ImageCapture returns a full-res photo with flash
+                        currentPhotoBlob = blob;
+                        originalPhotoBlob = blob;
+                        logger.info(`Captured photo via ImageCapture with flash, ${(blob.size / 1024).toFixed(0)} KB`);
+                        stopCapture();
+                        showPreview(blob);
+                        usedImageCapture = true;
+                    } catch (e) {
+                        logger.warn('ImageCapture flash failed, falling back to canvas: ' + e.message);
+                    }
                 }
             }
+
+            if (usedImageCapture) return;
 
             // Capture at full video resolution
             canvas.width = video.videoWidth;
