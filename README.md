@@ -121,7 +121,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - **PWA (Progressive Web App)**: installable on mobile home screens, with service worker for fast UI shell loading
 - **Internationalization (i18n)**: supports English and French, auto-detected from browser locale
 - **Document cropping**: perspective-corrected 4-corner crop tool on the receiver side (pure vanilla JS, no dependencies)
-- **Export modal**: download all received images as PDF or ZIP, with optional B&W (Otsu thresholding) and **experimental OCR** (scribe.js)
+- **Export modal**: download all received images as PDF or ZIP, with optional B&W (Otsu thresholding) and **experimental OCR** (scribe.js). OCR uses LSTM-only mode (instead of combined Legacy+LSTM) and downscales large images to 2000px for recognition to improve responsiveness, while preserving original image quality in the final PDF. These trade-offs were chosen with Claude Code to keep OCR usable in a browser context where processing time can otherwise reach ~1 min/image.
 - **PDF export**: download all received images as a single PDF (hand-crafted minimal PDF generator, no dependencies)
 - **ZIP export**: download all received images as a ZIP archive (client-zip, preloaded in background)
 - **B&W document mode**: Otsu's automatic binarization for crisp scanned documents
