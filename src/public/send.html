@@ -170,7 +170,7 @@
                 </button>
             </div>
 
-            <input type="file" id="file-input" accept="image/*" class="hidden">
+            <input type="file" id="file-input" accept="image/*" multiple class="hidden">
         </div>
 
         <!-- Step 4: Camera capture -->
@@ -1157,40 +1157,81 @@
             }, 'image/jpeg', 0.95);
         }
 
-        /** Handle file picker selection - validate it's an image, strip metadata, then show preview */
-        async function handleFileSelect(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-
+        /** Strip metadata from a single file and return a processed File, or null on failure */
+        async function stripFileMetadata(file) {
             if (!file.type.startsWith('image/')) {
+                logger.warn(`Skipping non-image file: ${file.name}`);
+                return null;
+            }
+            try {
+                const rawData = new Uint8Array(await file.arrayBuffer());
+                const stripped = await stripImageMetadata(rawData, file.type);
+                const processed = new File([stripped.data], file.name.replace(/\.[^.]+$/, '.png'), {
+                    type: stripped.mimeType
+                });
+                logger.success(`Metadata stripped: ${file.name} ${file.size} → ${processed.size} bytes`);
+                return processed;
+            } catch (e) {
+                logger.error(`Metadata stripping failed for ${file.name}: ${e.message}`);
+                return null;
+            }
+        }
+
+        /** Handle file picker selection - validate images, strip metadata, then show preview or queue */
+        async function handleFileSelect(event) {
+            const files = Array.from(event.target.files);
+            if (!files.length) return;
+
+            // Single file: keep existing behavior (preview + optional edit before send)
+            if (files.length === 1) {
+                const file = files[0];
+                if (!file.type.startsWith('image/')) {
+                    showToast(i18n.t('error.selectImage'), { type: 'warn' });
+                    return;
+                }
+                logger.info(`Selected file: ${file.name} (${file.size} bytes)`);
+                const processed = await stripFileMetadata(file);
+                if (!processed) {
+                    showToast('Could not process image. Please try another file.');
+                    return;
+                }
+                currentPhotoBlob = processed;
+                originalPhotoBlob = currentPhotoBlob;
+                showPreview(currentPhotoBlob);
+                return;
+            }
+
+            // Multiple files: strip metadata on all, queue them directly for sending
+            if (!sharedKey) {
                 showToast(i18n.t('error.selectImage'), { type: 'warn' });
                 return;
             }
 
-            logger.info(`Selected file: ${file.name} (${file.size} bytes)`);
-
-            // Strip all metadata (EXIF, XMP, IPTC, GPS, etc.) by re-encoding through canvas.
-            // Camera captures are already metadata-free (they go through capturePhoto's canvas),
-            // but gallery files retain their original metadata and must be stripped here.
-            try {
-                logger.info('Stripping metadata from selected file...');
-                const rawData = new Uint8Array(await file.arrayBuffer());
-                const stripped = await stripImageMetadata(rawData, file.type);
-
-                // Build a new Blob preserving the original filename (used as metadata in sendPhoto)
-                currentPhotoBlob = new File([stripped.data], file.name.replace(/\.[^.]+$/, '.png'), {
-                    type: stripped.mimeType
-                });
-                originalPhotoBlob = currentPhotoBlob;
-                logger.success(`Metadata stripped: ${file.size} → ${currentPhotoBlob.size} bytes`);
-            } catch (e) {
-                // If stripping fails for any reason, refuse to send rather than leaking metadata
-                logger.error('Metadata stripping failed: ' + e.message);
-                showToast('Could not process image. Please try another file.');
-                return;
+            logger.info(`Selected ${files.length} files, processing and queuing...`);
+            let queued = 0;
+            let failed = 0;
+            for (const file of files) {
+                const processed = await stripFileMetadata(file);
+                if (processed) {
+                    sendQueue.push(processed);
+                    queued++;
+                } else {
+                    failed++;
+                }
             }
 
-            showPreview(currentPhotoBlob);
+            logger.info(`Queued ${queued} photos${failed ? `, ${failed} failed` : ''}`);
+            if (failed > 0) {
+                showToast(`${failed} image(s) could not be processed`, { type: 'warn' });
+            }
+            if (queued > 0) {
+                showToast(`${queued} photo(s) queued for sending`);
+                updateQueueBanner();
+                drainQueue();
+            }
+
+            // Reset file input so selecting the same files again triggers change
+            event.target.value = '';
         }
 
         /**
