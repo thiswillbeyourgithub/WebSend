@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-uJhV9Nzb+PbMF95eplSiYo/6x4A0Dngjh/87RpuT8mW1VxdCwV3YtokMgnPtM7dF" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-GY6r39An6nJqmlb/XzeXkxpe+sCHTGtnfTINVZrJ5ZQZcuKaxrtjyxNADeYxVW6k" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -814,10 +814,12 @@
             item.className = 'received-image-item';
             // Each image has a crop button and download link, identified by index
             item.setAttribute('data-image-index', imageIndex);
+            item.setAttribute('draggable', 'true');
             item.innerHTML = `
+                <div class="drag-handle" title="Drag to reorder">☰</div>
                 <div class="image-thumb-container" style="position: relative; display: block;">
                     <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block; cursor: pointer;" onclick="openLightbox(${imageIndex})">
-                    <span style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
+                    <span class="image-badge" style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
                     <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
                         <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
                     </label>
@@ -865,6 +867,7 @@
                 </div>
             `;
             container.insertBefore(item, container.firstChild);
+            setupDragEvents(item);
         }
 
         // ============ Image preview lightbox ============
@@ -1228,14 +1231,18 @@
 
         // ============ PDF Generation (no external dependencies) ============
 
-        /** Get indices of images currently selected via checkboxes (non-discarded only) */
+        /** Get indices of images currently selected via checkboxes, in DOM order (respects drag reorder) */
         function getSelectedImageIndices() {
             const indices = [];
-            receivedImages.forEach((img, i) => {
-                if (img === null) return;
+            const container = document.getElementById('received-images');
+            const items = container.querySelectorAll('.received-image-item');
+            // Iterate in reverse DOM order since newest is first in DOM but we want ascending visual order
+            for (let j = items.length - 1; j >= 0; j--) {
+                const i = parseInt(items[j].getAttribute('data-image-index'));
+                if (receivedImages[i] === null) continue;
                 const cb = document.getElementById(`select-${i}`);
                 if (cb && cb.checked) indices.push(i);
-            });
+            }
             return indices;
         }
 
@@ -1293,6 +1300,197 @@
             } else {
                 section.classList.add('hidden');
             }
+        }
+
+        // ============ Drag & Drop Reordering ============
+
+        let dragSrcEl = null;
+        let touchDragEl = null;
+        let touchClone = null;
+        let longPressTimer = null;
+
+        function setupDragEvents(item) {
+            // Desktop drag events
+            item.addEventListener('dragstart', handleDragStart);
+            item.addEventListener('dragover', handleDragOver);
+            item.addEventListener('dragenter', handleDragEnter);
+            item.addEventListener('dragleave', handleDragLeave);
+            item.addEventListener('drop', handleDrop);
+            item.addEventListener('dragend', handleDragEnd);
+
+            // Mobile touch events (long press to drag)
+            const handle = item.querySelector('.drag-handle');
+            handle.addEventListener('touchstart', handleTouchStart, { passive: false });
+            handle.addEventListener('touchmove', handleTouchMove, { passive: false });
+            handle.addEventListener('touchend', handleTouchEnd);
+        }
+
+        function handleDragStart(e) {
+            dragSrcEl = this;
+            this.classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', this.getAttribute('data-image-index'));
+        }
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+        }
+
+        function handleDragEnter(e) {
+            e.preventDefault();
+            if (this !== dragSrcEl) this.classList.add('drag-over');
+        }
+
+        function handleDragLeave() {
+            this.classList.remove('drag-over');
+        }
+
+        function handleDrop(e) {
+            e.stopPropagation();
+            e.preventDefault();
+            if (dragSrcEl === this) return;
+            this.classList.remove('drag-over');
+            reorderImages(dragSrcEl, this);
+        }
+
+        function handleDragEnd() {
+            this.classList.remove('dragging');
+            document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
+        }
+
+        // Touch-based drag for mobile
+        function handleTouchStart(e) {
+            const item = e.target.closest('.received-image-item');
+            longPressTimer = setTimeout(() => {
+                e.preventDefault();
+                touchDragEl = item;
+                item.classList.add('dragging');
+
+                // Create a floating clone
+                touchClone = item.cloneNode(true);
+                touchClone.style.cssText = 'position:fixed;pointer-events:none;z-index:9999;opacity:0.7;width:' + item.offsetWidth + 'px;';
+                const touch = e.touches[0];
+                touchClone.style.left = touch.clientX - 30 + 'px';
+                touchClone.style.top = touch.clientY - 30 + 'px';
+                document.body.appendChild(touchClone);
+            }, 400);
+        }
+
+        function handleTouchMove(e) {
+            if (!touchDragEl) {
+                clearTimeout(longPressTimer);
+                return;
+            }
+            e.preventDefault();
+            const touch = e.touches[0];
+            if (touchClone) {
+                touchClone.style.left = touch.clientX - 30 + 'px';
+                touchClone.style.top = touch.clientY - 30 + 'px';
+            }
+            // Highlight drop target
+            document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
+            const target = document.elementFromPoint(touch.clientX, touch.clientY);
+            if (target) {
+                const targetItem = target.closest('.received-image-item');
+                if (targetItem && targetItem !== touchDragEl) {
+                    targetItem.classList.add('drag-over');
+                }
+            }
+        }
+
+        function handleTouchEnd(e) {
+            clearTimeout(longPressTimer);
+            if (!touchDragEl) return;
+
+            // Find drop target
+            const touch = e.changedTouches[0];
+            if (touchClone) {
+                touchClone.style.display = 'none'; // hide clone so elementFromPoint finds underlying element
+            }
+            const target = document.elementFromPoint(touch.clientX, touch.clientY);
+            const targetItem = target ? target.closest('.received-image-item') : null;
+
+            if (targetItem && targetItem !== touchDragEl) {
+                reorderImages(touchDragEl, targetItem);
+            }
+
+            // Cleanup
+            touchDragEl.classList.remove('dragging');
+            document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
+            if (touchClone) { touchClone.remove(); touchClone = null; }
+            touchDragEl = null;
+        }
+
+        function reorderImages(srcEl, targetEl) {
+            const container = document.getElementById('received-images');
+            const items = [...container.querySelectorAll('.received-image-item')];
+            const srcIdx = items.indexOf(srcEl);
+            const targetIdx = items.indexOf(targetEl);
+
+            // Swap in receivedImages array: map DOM positions to data indices
+            const srcDataIdx = parseInt(srcEl.getAttribute('data-image-index'));
+            const targetDataIdx = parseInt(targetEl.getAttribute('data-image-index'));
+
+            // Swap the data in the array
+            const tmp = receivedImages[srcDataIdx];
+            receivedImages[srcDataIdx] = receivedImages[targetDataIdx];
+            receivedImages[targetDataIdx] = tmp;
+
+            // Swap data-image-index attributes
+            srcEl.setAttribute('data-image-index', targetDataIdx);
+            targetEl.setAttribute('data-image-index', srcDataIdx);
+
+            // Update all index-dependent IDs and attributes
+            updateImageCardIndex(srcEl, targetDataIdx);
+            updateImageCardIndex(targetEl, srcDataIdx);
+
+            // Move DOM elements
+            if (srcIdx < targetIdx) {
+                container.insertBefore(srcEl, targetEl.nextSibling);
+            } else {
+                container.insertBefore(srcEl, targetEl);
+            }
+
+            // Update all badge numbers based on DOM order
+            updateBadgeNumbers();
+        }
+
+        function updateImageCardIndex(card, newIndex) {
+            // Update img id
+            const img = card.querySelector('img[id^="img-"]');
+            if (img) {
+                img.id = `img-${newIndex}`;
+                img.setAttribute('onclick', `openLightbox(${newIndex})`);
+            }
+            // Update checkbox
+            const cb = card.querySelector('input[type="checkbox"][id^="select-"]');
+            if (cb) cb.id = `select-${newIndex}`;
+            // Update download link
+            const dl = card.querySelector('a[id^="download-"]');
+            if (dl) dl.id = `download-${newIndex}`;
+            // Update edit toolbar
+            const toolbar = card.querySelector('[id^="edit-toolbar-"]');
+            if (toolbar) toolbar.id = `edit-toolbar-${newIndex}`;
+            // Update button onclicks
+            card.querySelectorAll('button[onclick]').forEach(btn => {
+                btn.setAttribute('onclick', btn.getAttribute('onclick').replace(/\(\d+\)/, `(${newIndex})`));
+            });
+            // Update download filename
+            if (dl && receivedImages[newIndex]) {
+                dl.setAttribute('download', receivedImages[newIndex].name);
+            }
+        }
+
+        function updateBadgeNumbers() {
+            const container = document.getElementById('received-images');
+            const items = container.querySelectorAll('.received-image-item');
+            // Items are newest-first in DOM, so badge = total - domIndex
+            const total = items.length;
+            items.forEach((item, domIdx) => {
+                const badge = item.querySelector('.image-badge');
+                if (badge) badge.textContent = `#${total - domIdx}`;
+            });
         }
 
         /** Open the export modal */

@@ -687,6 +687,28 @@ h1 {
     opacity: 0.4;
 }
 
+.received-image-item.dragging {
+    opacity: 0.4;
+    outline: 2px dashed #1565c0;
+}
+
+.received-image-item.drag-over {
+    border-top: 3px solid #1565c0;
+}
+
+.drag-handle {
+    cursor: grab;
+    user-select: none;
+    font-size: 1.3em;
+    padding: 4px 8px;
+    color: #888;
+    touch-action: none;
+}
+
+.drag-handle:active {
+    cursor: grabbing;
+}
+
 .image-select-checkbox input[type="checkbox"] {
     filter: drop-shadow(0 1px 3px rgba(0,0,0,0.4));
 }
@@ -714,6 +736,11 @@ h1 {
         padding: 10px;
         min-width: 300px;
         flex: 1;
+    }
+
+    .drag-handle {
+        align-self: center;
+        flex-shrink: 0;
     }
 
     .received-image-item .image-thumb-container {
