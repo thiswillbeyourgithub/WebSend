@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-QJwKNxjCa8jAVNixRJICTXe6aVp7F0LB++SnS52OZlG+7jFoAPHdoMId6De7smLc" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-uJhV9Nzb+PbMF95eplSiYo/6x4A0Dngjh/87RpuT8mW1VxdCwV3YtokMgnPtM7dF" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -140,6 +140,11 @@
 
             <!-- Export button (hidden until images received) -->
             <div id="export-section" class="hidden" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
+                <div id="selection-bar" style="display: flex; gap: 10px; margin-bottom: 10px; align-items: center; flex-wrap: wrap;">
+                    <button id="select-all-btn" class="btn btn-action btn-secondary" style="flex: 1; min-width: 120px;" onclick="toggleSelectAll()">
+                    </button>
+                    <span id="selection-count" style="font-size: 0.9em; color: #666;"></span>
+                </div>
                 <button id="export-btn" class="btn btn-action" style="width: 100%; background: #1565c0; color: white;" data-i18n="receive.exportBtn">
                     📦 Export All
                 </button>
@@ -813,6 +818,9 @@
                 <div class="image-thumb-container" style="position: relative; display: block;">
                     <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block; cursor: pointer;" onclick="openLightbox(${imageIndex})">
                     <span style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
+                    <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
+                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
+                    </label>
                 </div>
                 <div class="image-actions">
                     <div style="display: flex; gap: 10px; flex-wrap: wrap;">
@@ -1220,17 +1228,68 @@
 
         // ============ PDF Generation (no external dependencies) ============
 
+        /** Get indices of images currently selected via checkboxes (non-discarded only) */
+        function getSelectedImageIndices() {
+            const indices = [];
+            receivedImages.forEach((img, i) => {
+                if (img === null) return;
+                const cb = document.getElementById(`select-${i}`);
+                if (cb && cb.checked) indices.push(i);
+            });
+            return indices;
+        }
+
+        /** Called when any image checkbox changes */
+        function onSelectionChange() {
+            // Update visual state of all image cards
+            receivedImages.forEach((img, i) => {
+                if (img === null) return;
+                const card = document.querySelector(`[data-image-index="${i}"]`);
+                const cb = document.getElementById(`select-${i}`);
+                if (card && cb) {
+                    card.classList.toggle('deselected', !cb.checked);
+                }
+            });
+            updateExportButton();
+        }
+
+        /** Toggle select all / deselect all */
+        function toggleSelectAll() {
+            const activeCount = receivedImages.filter(img => img !== null).length;
+            const selectedCount = getSelectedImageIndices().length;
+            const shouldSelectAll = selectedCount < activeCount;
+            receivedImages.forEach((img, i) => {
+                if (img === null) return;
+                const cb = document.getElementById(`select-${i}`);
+                if (cb) cb.checked = shouldSelectAll;
+            });
+            updateExportButton();
+        }
+
         /** Show/update the Export button with current (non-discarded) image count */
         function updateExportButton() {
             const section = document.getElementById('export-section');
             const btn = document.getElementById('export-btn');
             // Only count images that haven't been discarded (null marks discarded entries)
             const activeCount = receivedImages.filter(img => img !== null).length;
+            const selectedCount = getSelectedImageIndices().length;
             if (activeCount > 0) {
                 section.classList.remove('hidden');
-                const plural = activeCount > 1 ? 's' : '';
-                btn.textContent = '📦 ' + i18n.t('receive.exportBtnCount', { count: activeCount, plural: plural });
+                const plural = selectedCount > 1 ? 's' : '';
+                btn.textContent = '📦 ' + i18n.t('receive.exportBtnCount', { count: selectedCount, plural: plural });
                 btn.onclick = openExportModal;
+                btn.disabled = selectedCount === 0;
+                btn.style.opacity = selectedCount === 0 ? '0.5' : '1';
+
+                // Update selection bar
+                const selectAllBtn = document.getElementById('select-all-btn');
+                const selectionCount = document.getElementById('selection-count');
+                if (selectedCount === activeCount) {
+                    selectAllBtn.textContent = i18n.t('receive.deselectAll');
+                } else {
+                    selectAllBtn.textContent = i18n.t('receive.selectAll');
+                }
+                selectionCount.textContent = i18n.t('receive.selectionCount', { selected: selectedCount, total: activeCount });
             } else {
                 section.classList.add('hidden');
             }
@@ -1323,7 +1382,8 @@
                 const { downloadZip } = clientZipModule;
 
                 const bw = isToggleActive('export-bw');
-                const activeImages = receivedImages.filter(img => img !== null);
+                const selectedIndices = getSelectedImageIndices();
+                const activeImages = selectedIndices.map(i => receivedImages[i]);
 
                 // Build file entries for client-zip
                 const files = await Promise.all(activeImages.map(async (img) => {
@@ -1418,9 +1478,10 @@
             btn.textContent = i18n.t('receive.generatingPdf');
 
             try {
-                // Convert all non-discarded images to JPEG for consistent PDF embedding
+                // Convert selected images to JPEG for consistent PDF embedding
                 const bw = isToggleActive('export-bw');
-                const activeImages = receivedImages.filter(img => img !== null);
+                const selectedIndices = getSelectedImageIndices();
+                const activeImages = selectedIndices.map(i => receivedImages[i]);
                 const jpegs = await Promise.all(activeImages.map(img => toJpegData(img.data, img.mimeType, { bw })));
 
                 // Build PDF
@@ -1497,7 +1558,8 @@
             btn.textContent = i18n.t('receive.ocrCancel');
             btn.onclick = () => { ocrCancelled = true; };
 
-            const activeImages = receivedImages.filter(img => img !== null);
+            const selectedIndices = getSelectedImageIndices();
+            const activeImages = selectedIndices.map(i => receivedImages[i]);
             const imageCount = activeImages.length;
             const timeoutMs = imageCount * 3 * 60000; // 3 min per image
             const timeoutMinutes = imageCount * 3;

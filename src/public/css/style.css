@@ -680,6 +680,15 @@ h1 {
     background: rgba(255, 255, 255, 0.1);
     border-radius: 15px;
     padding: 15px;
+    transition: opacity 0.2s;
+}
+
+.received-image-item.deselected {
+    opacity: 0.4;
+}
+
+.image-select-checkbox input[type="checkbox"] {
+    filter: drop-shadow(0 1px 3px rgba(0,0,0,0.4));
 }
 
 .received-image-item img {
