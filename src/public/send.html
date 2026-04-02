@@ -10,7 +10,7 @@
     <title>WebSend - Send Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-GY6r39An6nJqmlb/XzeXkxpe+sCHTGtnfTINVZrJ5ZQZcuKaxrtjyxNADeYxVW6k" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-Rqa0WeCL9BsU0+RosoWRCv7P3uoG5Gh/XigmD5N6V245o7Fufk75y9ghw970a8vj" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -173,17 +173,16 @@
             <input type="file" id="file-input" accept="image/*" multiple class="hidden">
         </div>
 
-        <!-- Step 4: Camera capture -->
+        <!-- Step 4: Camera capture (Genius Scan-like continuous mode) -->
         <div id="step-camera" class="hidden">
             <div class="camera-container" id="capture-camera-container">
                 <video id="capture-video" autoplay playsinline></video>
-                <!-- Flash mode toggle: cycles off → torch → flash-on-capture → off
-                     Only visible when the device supports torch or fillLightMode -->
+                <!-- Flash mode toggle: top-left -->
                 <button class="flash-toggle-btn hidden" id="flash-toggle-btn" title="Flash mode">
                     <span id="flash-icon">⚡</span>
                     <span id="flash-label" data-i18n="send.flashOff">Off</span>
                 </button>
-                <!-- Document detection toggle: auto-detect page edges in live view -->
+                <!-- Document detection toggle: top-right -->
                 <button class="detect-toggle-btn" id="detect-toggle-btn" title="Document detection">
                     <span id="detect-icon">📐</span>
                     <span id="detect-label" data-i18n="send.detectOff">Detect</span>
@@ -192,10 +191,19 @@
                 <svg class="detect-overlay hidden" id="detect-overlay">
                     <polygon id="detect-polygon" points="0,0 0,0 0,0 0,0"/>
                 </svg>
-                <!-- Floating capture button inside camera view -->
-                <button class="btn btn-action btn-danger capture-btn-floating" id="capture-btn" data-i18n="send.capture">
-                    📸
-                </button>
+                <!-- Bottom bar: gallery (left), capture (center), done (right) -->
+                <div class="camera-bottom-bar">
+                    <button class="camera-bar-btn" id="gallery-btn" title="Gallery">
+                        <span>🖼️</span>
+                        <span class="gallery-badge hidden" id="gallery-badge">0</span>
+                    </button>
+                    <button class="btn btn-action btn-danger capture-btn-floating" id="capture-btn" data-i18n="send.capture">
+                        📸
+                    </button>
+                    <button class="camera-bar-btn camera-done-btn" id="camera-done-btn" title="Done" data-i18n="send.done">
+                        ✓
+                    </button>
+                </div>
             </div>
 
             <canvas id="capture-canvas" class="hidden"></canvas>
@@ -203,6 +211,49 @@
             <button class="btn btn-action btn-secondary" id="back-to-choose-btn" data-i18n="send.backToOptions">
                 &larr; Back
             </button>
+        </div>
+
+        <!-- Gallery modal: browse, reorder, edit, delete captured photos -->
+        <div id="gallery-modal" class="gallery-modal hidden">
+            <div class="gallery-modal-header">
+                <button class="gallery-back-btn" id="gallery-back-btn">&larr;</button>
+                <h2 id="gallery-title" data-i18n="send.gallery">Gallery</h2>
+                <button class="gallery-clear-btn" id="gallery-clear-btn" data-i18n="send.clearAll">Clear</button>
+            </div>
+            <div class="gallery-grid" id="gallery-grid"></div>
+            <div class="gallery-modal-footer">
+                <button class="btn btn-action btn-success btn-large" id="gallery-send-btn">
+                    <span class="btn-icon">📤</span>
+                    <span id="gallery-send-label" data-i18n="send.sendAll">Send All</span>
+                </button>
+            </div>
+            <!-- Gallery edit view (single image editing) -->
+            <div class="gallery-edit-view hidden" id="gallery-edit-view">
+                <div class="gallery-edit-header">
+                    <button class="gallery-back-btn" id="gallery-edit-back-btn">&larr;</button>
+                    <h2 data-i18n="send.editPhoto">Edit</h2>
+                    <button class="gallery-delete-btn" id="gallery-edit-delete-btn">🗑️</button>
+                </div>
+                <img id="gallery-edit-image" class="image-preview" alt="Edit preview">
+                <div class="edit-toolbar" id="gallery-edit-toolbar">
+                    <button class="edit-tool-btn" id="gallery-rotate-btn">
+                        <span>🔄</span>
+                        <span data-i18n="send.rotate">Rotate</span>
+                    </button>
+                    <button class="edit-tool-btn" id="gallery-crop-btn">
+                        <span>✂️</span>
+                        <span data-i18n="crop.title">Crop</span>
+                    </button>
+                    <button class="edit-tool-btn" id="gallery-flip-btn">
+                        <span>↔️</span>
+                        <span data-i18n="send.flip">Flip</span>
+                    </button>
+                    <button class="edit-tool-btn" id="gallery-bw-btn">
+                        <span>⬛</span>
+                        <span data-i18n="send.applyBW">B&W</span>
+                    </button>
+                </div>
+            </div>
         </div>
 
         <!-- Step 5: Preview and send -->
@@ -345,6 +396,9 @@
         let lastDetectedCorners = null;
         let sendQueue = [];       // Pending photo blobs awaiting transmission
         let isSendingQueue = false; // Whether the queue drain loop is running
+        // Gallery: photos captured in continuous camera mode (Genius Scan-like)
+        let galleryPhotos = [];    // Array of { blob, thumbUrl, originalBlob }
+        let galleryEditIndex = -1; // Index of photo being edited in gallery
 
         // Wake lock state
         let wakeLock = null;
@@ -507,7 +561,27 @@
             document.getElementById('use-file-btn').addEventListener('click', () => document.getElementById('file-input').click());
             document.getElementById('file-input').addEventListener('change', handleFileSelect);
             document.getElementById('capture-btn').addEventListener('click', capturePhoto);
+            document.getElementById('gallery-btn').addEventListener('click', openGallery);
+            document.getElementById('camera-done-btn').addEventListener('click', sendGalleryPhotos);
+            document.getElementById('gallery-back-btn').addEventListener('click', closeGallery);
+            document.getElementById('gallery-clear-btn').addEventListener('click', clearGallery);
+            document.getElementById('gallery-send-btn').addEventListener('click', sendGalleryPhotos);
+            document.getElementById('gallery-edit-back-btn').addEventListener('click', closeGalleryEdit);
+            document.getElementById('gallery-edit-delete-btn').addEventListener('click', () => {
+                if (galleryEditIndex >= 0) {
+                    const idx = galleryEditIndex;
+                    closeGalleryEdit();
+                    deleteGalleryPhoto(idx);
+                }
+            });
+            document.getElementById('gallery-rotate-btn').addEventListener('click', galleryRotateCW);
+            document.getElementById('gallery-crop-btn').addEventListener('click', galleryOpenCrop);
+            document.getElementById('gallery-flip-btn').addEventListener('click', galleryFlipH);
+            document.getElementById('gallery-bw-btn').addEventListener('click', galleryApplyBW);
             document.getElementById('back-to-choose-btn').addEventListener('click', () => {
+                // Warn if gallery has photos
+                if (galleryPhotos.length > 0 && !confirm(i18n.t('send.galleryEmpty') + '?')) return;
+                clearGallery();
                 stopCapture();
                 showStep(stepChoose);
             });
@@ -1142,62 +1216,348 @@
          *  Uses high-quality JPEG (0.95) for much better file size vs PNG while
          *  retaining excellent visual quality. If flash mode is 'flash', the torch
          *  is fired briefly during capture to illuminate the scene. */
+        /** Capture a photo and add it to the gallery without leaving camera view */
         async function capturePhoto() {
             const video = document.getElementById('capture-video');
             const canvas = document.getElementById('capture-canvas');
             const track = captureStream ? captureStream.getVideoTracks()[0] : null;
 
             // If flash mode is 'flash', use torch or ImageCapture fillLightMode
-            let usedImageCapture = false;
+            let capturedBlob = null;
             if (flashMode === 'flash' && track) {
                 if (torchSupported) {
                     try {
                         await track.applyConstraints({ advanced: [{ torch: true }] });
-                        // Small delay to let the light stabilize and camera adjust exposure
                         await new Promise(resolve => setTimeout(resolve, 300));
                     } catch (e) {
                         logger.warn('Flash fire failed: ' + e.message);
                     }
                 } else if (fillLightSupported) {
-                    // Use ImageCapture API for devices without torch support
                     try {
                         const imgCapture = new ImageCapture(track);
-                        const blob = await imgCapture.takePhoto({ fillLightMode: 'flash' });
-                        // ImageCapture returns a full-res photo with flash
-                        currentPhotoBlob = blob;
-                        originalPhotoBlob = blob;
-                        logger.info(`Captured photo via ImageCapture with flash, ${(blob.size / 1024).toFixed(0)} KB`);
-                        stopCapture();
-                        showPreview(blob);
-                        usedImageCapture = true;
+                        capturedBlob = await imgCapture.takePhoto({ fillLightMode: 'flash' });
+                        logger.info(`Captured photo via ImageCapture with flash, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
                     } catch (e) {
                         logger.warn('ImageCapture flash failed, falling back to canvas: ' + e.message);
                     }
                 }
             }
 
-            if (usedImageCapture) return;
+            if (!capturedBlob) {
+                // Capture at full video resolution
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0);
 
-            // Capture at full video resolution
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0);
+                // Turn off flash torch after capture
+                if (flashMode === 'flash' && track && torchSupported) {
+                    track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {});
+                }
 
-            // Turn off flash torch after capture
-            if (flashMode === 'flash' && track && torchSupported) {
-                track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {});
+                capturedBlob = await new Promise(resolve =>
+                    canvas.toBlob(resolve, 'image/jpeg', 0.95)
+                );
+                logger.info(`Captured photo: ${video.videoWidth}x${video.videoHeight}, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
             }
 
-            // JPEG at 0.95 quality gives excellent results with smaller file sizes
-            // than PNG, and avoids lossy-to-lossless re-encoding artifacts
-            canvas.toBlob(blob => {
-                currentPhotoBlob = blob;
-                originalPhotoBlob = blob;
-                logger.info(`Captured photo: ${video.videoWidth}x${video.videoHeight}, ${(blob.size / 1024).toFixed(0)} KB`);
-                stopCapture();
-                showPreview(blob);
-            }, 'image/jpeg', 0.95);
+            // Add to gallery (camera stays open)
+            const thumbUrl = URL.createObjectURL(capturedBlob);
+            galleryPhotos.push({ blob: capturedBlob, thumbUrl, originalBlob: capturedBlob });
+            updateGalleryBadge();
+
+            // Brief visual feedback: flash the screen white
+            const container = document.getElementById('capture-camera-container');
+            container.style.boxShadow = 'inset 0 0 0 1000px rgba(255,255,255,0.5)';
+            setTimeout(() => { container.style.boxShadow = ''; }, 120);
+
+            logger.info(`Photo added to gallery (${galleryPhotos.length} total)`);
+        }
+
+        // ============ Gallery (Genius Scan-like) ============
+
+        /** Update the badge counter on the gallery button */
+        function updateGalleryBadge() {
+            const badge = document.getElementById('gallery-badge');
+            const count = galleryPhotos.length;
+            badge.textContent = count;
+            if (count > 0) {
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+
+        /** Open the gallery modal */
+        function openGallery() {
+            if (galleryPhotos.length === 0) {
+                showToast(i18n.t('send.noPhotos'));
+                return;
+            }
+            document.getElementById('gallery-modal').classList.remove('hidden');
+            renderGalleryGrid();
+        }
+
+        /** Close the gallery modal */
+        function closeGallery() {
+            document.getElementById('gallery-modal').classList.add('hidden');
+            document.getElementById('gallery-edit-view').classList.add('hidden');
+            galleryEditIndex = -1;
+        }
+
+        /** Render the thumbnail grid in the gallery modal */
+        function renderGalleryGrid() {
+            const grid = document.getElementById('gallery-grid');
+            grid.innerHTML = '';
+
+            galleryPhotos.forEach((photo, idx) => {
+                const thumb = document.createElement('div');
+                thumb.className = 'gallery-thumb';
+                thumb.draggable = true;
+                thumb.dataset.index = idx;
+
+                const img = document.createElement('img');
+                img.src = photo.thumbUrl;
+                img.alt = `Photo ${idx + 1}`;
+
+                const indexBadge = document.createElement('span');
+                indexBadge.className = 'gallery-thumb-index';
+                indexBadge.textContent = idx + 1;
+
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'gallery-thumb-delete';
+                deleteBtn.textContent = '✕';
+                deleteBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    deleteGalleryPhoto(idx);
+                });
+
+                thumb.appendChild(img);
+                thumb.appendChild(indexBadge);
+                thumb.appendChild(deleteBtn);
+
+                // Tap to edit
+                thumb.addEventListener('click', () => openGalleryEdit(idx));
+
+                // Drag-and-drop reorder
+                thumb.addEventListener('dragstart', (e) => {
+                    e.dataTransfer.setData('text/plain', idx);
+                    thumb.classList.add('dragging');
+                });
+                thumb.addEventListener('dragend', () => thumb.classList.remove('dragging'));
+                thumb.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    thumb.classList.add('drag-over');
+                });
+                thumb.addEventListener('dragleave', () => thumb.classList.remove('drag-over'));
+                thumb.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    thumb.classList.remove('drag-over');
+                    const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
+                    const toIdx = idx;
+                    if (fromIdx !== toIdx) {
+                        const [moved] = galleryPhotos.splice(fromIdx, 1);
+                        galleryPhotos.splice(toIdx, 0, moved);
+                        renderGalleryGrid();
+                    }
+                });
+
+                // Touch-based reorder: long press to drag
+                let touchTimer = null;
+                let touchDragging = false;
+                let touchFromIdx = -1;
+                thumb.addEventListener('touchstart', (e) => {
+                    touchTimer = setTimeout(() => {
+                        touchDragging = true;
+                        touchFromIdx = idx;
+                        thumb.classList.add('dragging');
+                    }, 400);
+                }, { passive: true });
+                thumb.addEventListener('touchmove', () => {
+                    if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
+                });
+                thumb.addEventListener('touchend', (e) => {
+                    if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
+                    if (touchDragging) {
+                        // Find element under touch
+                        const touch = e.changedTouches[0];
+                        const target = document.elementFromPoint(touch.clientX, touch.clientY);
+                        const targetThumb = target ? target.closest('.gallery-thumb') : null;
+                        if (targetThumb && targetThumb.dataset.index !== undefined) {
+                            const toIdx = parseInt(targetThumb.dataset.index);
+                            if (touchFromIdx !== toIdx) {
+                                const [moved] = galleryPhotos.splice(touchFromIdx, 1);
+                                galleryPhotos.splice(toIdx, 0, moved);
+                            }
+                        }
+                        touchDragging = false;
+                        touchFromIdx = -1;
+                        renderGalleryGrid();
+                    }
+                });
+
+                grid.appendChild(thumb);
+            });
+
+            // Update send button label
+            const label = document.getElementById('gallery-send-label');
+            label.textContent = i18n.t('send.sendAll').replace('{n}', galleryPhotos.length);
+        }
+
+        /** Delete a photo from the gallery */
+        function deleteGalleryPhoto(idx) {
+            const photo = galleryPhotos[idx];
+            if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+            galleryPhotos.splice(idx, 1);
+            updateGalleryBadge();
+            if (galleryPhotos.length === 0) {
+                closeGallery();
+            } else {
+                renderGalleryGrid();
+            }
+        }
+
+        /** Clear all gallery photos */
+        function clearGallery() {
+            galleryPhotos.forEach(p => { if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl); });
+            galleryPhotos = [];
+            updateGalleryBadge();
+            closeGallery();
+        }
+
+        /** Open the edit view for a single gallery photo */
+        function openGalleryEdit(idx) {
+            galleryEditIndex = idx;
+            const photo = galleryPhotos[idx];
+            const editView = document.getElementById('gallery-edit-view');
+            const editImg = document.getElementById('gallery-edit-image');
+
+            if (editImg.src && editImg.src.startsWith('blob:')) {
+                URL.revokeObjectURL(editImg.src);
+            }
+            editImg.src = URL.createObjectURL(photo.blob);
+            editView.classList.remove('hidden');
+
+            // Reset B&W state
+            document.getElementById('gallery-bw-btn').classList.remove('active');
+        }
+
+        /** Close the gallery edit view and return to grid */
+        function closeGalleryEdit() {
+            document.getElementById('gallery-edit-view').classList.add('hidden');
+            galleryEditIndex = -1;
+            renderGalleryGrid();
+        }
+
+        /** Helper: apply an image transform to the gallery photo at galleryEditIndex */
+        async function applyGalleryTransform(transformFn) {
+            if (galleryEditIndex < 0 || galleryEditIndex >= galleryPhotos.length) return;
+            const photo = galleryPhotos[galleryEditIndex];
+
+            const img = new Image();
+            const url = URL.createObjectURL(photo.blob);
+            await new Promise((resolve, reject) => {
+                img.onload = resolve;
+                img.onerror = reject;
+                img.src = url;
+            });
+            URL.revokeObjectURL(url);
+
+            const resultBlob = await transformFn(img);
+
+            // Update gallery entry
+            if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+            photo.blob = resultBlob;
+            photo.originalBlob = resultBlob;
+            photo.thumbUrl = URL.createObjectURL(resultBlob);
+
+            // Refresh edit view
+            const editImg = document.getElementById('gallery-edit-image');
+            if (editImg.src && editImg.src.startsWith('blob:')) URL.revokeObjectURL(editImg.src);
+            editImg.src = URL.createObjectURL(resultBlob);
+        }
+
+        /** Rotate gallery photo 90° CW */
+        async function galleryRotateCW() {
+            await applyGalleryTransform(async (img) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.height;
+                canvas.height = img.width;
+                const ctx = canvas.getContext('2d');
+                ctx.translate(canvas.width / 2, canvas.height / 2);
+                ctx.rotate(Math.PI / 2);
+                ctx.drawImage(img, -img.width / 2, -img.height / 2);
+                return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+            });
+        }
+
+        /** Flip gallery photo horizontally */
+        async function galleryFlipH() {
+            await applyGalleryTransform(async (img) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.translate(canvas.width, 0);
+                ctx.scale(-1, 1);
+                ctx.drawImage(img, 0, 0);
+                return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+            });
+        }
+
+        /** Apply B&W to gallery photo */
+        async function galleryApplyBW() {
+            await applyGalleryTransform(async (img) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                applyOtsu(imageData);
+                ctx.putImageData(imageData, 0, 0);
+                return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+            });
+            document.getElementById('gallery-bw-btn').classList.add('active');
+        }
+
+        /** Open crop modal for gallery photo */
+        function galleryOpenCrop() {
+            if (galleryEditIndex < 0) return;
+            const photo = galleryPhotos[galleryEditIndex];
+            // Temporarily set currentPhotoBlob/originalPhotoBlob for the crop modal
+            currentPhotoBlob = photo.blob;
+            originalPhotoBlob = photo.originalBlob;
+            openCropModal();
+            // After crop, we need to update the gallery entry.
+            // We override applyCrop completion via a flag.
+            galleryPhotos._cropReturnToGallery = true;
+        }
+
+        /** Send all gallery photos through the queue */
+        function sendGalleryPhotos() {
+            if (galleryPhotos.length === 0) return;
+            if (!sharedKey) {
+                showToast(i18n.t('send.sendFailed'));
+                return;
+            }
+
+            galleryPhotos.forEach(photo => {
+                sendQueue.push(photo.blob);
+            });
+            logger.info(`Queued ${galleryPhotos.length} gallery photos for sending`);
+
+            // Clear gallery
+            galleryPhotos.forEach(p => { if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl); });
+            galleryPhotos = [];
+            updateGalleryBadge();
+            closeGallery();
+
+            // Stop camera and return to choose step
+            stopCapture();
+            showStep(stepChoose);
+            updateQueueBanner();
+            drainQueue();
         }
 
         /** Strip metadata from a single file and return a processed File, or null on failure */
@@ -2063,6 +2423,20 @@
                 currentPhotoBlob = new File([resultBlob], currentPhotoBlob.name || `websend_${Date.now()}.jpg`, {
                     type: 'image/jpeg'
                 });
+
+                // If cropping from gallery edit, update gallery entry and return
+                if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
+                    const photo = galleryPhotos[galleryEditIndex];
+                    if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+                    photo.blob = currentPhotoBlob;
+                    photo.originalBlob = currentPhotoBlob;
+                    photo.thumbUrl = URL.createObjectURL(currentPhotoBlob);
+                    logger.success(`Cropped gallery image: ${dstW}x${dstH}px`);
+                    closeCropModal();
+                    // Refresh gallery edit view
+                    openGalleryEdit(galleryEditIndex);
+                    return;
+                }
 
                 // Update the preview image
                 const preview = document.getElementById('preview-image');

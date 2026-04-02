@@ -103,6 +103,13 @@ const i18n = (function() {
             'send.applyBW': 'B&W',
             'send.queueSending': '📤 Sending {n} photo(s) in background…',
             'send.allSent': 'All {n} photos sent!',
+            'send.done': '✓',
+            'send.gallery': 'Gallery',
+            'send.clearAll': 'Clear',
+            'send.sendAll': 'Send All ({n})',
+            'send.editPhoto': 'Edit',
+            'send.noPhotos': 'No photos yet. Take some photos first!',
+            'send.galleryEmpty': 'Gallery is empty',
 
             // Receive page
             'receive.title': 'Receive Photos',
@@ -296,6 +303,13 @@ const i18n = (function() {
             'send.applyBW': 'N&B',
             'send.queueSending': '📤 Envoi de {n} photo(s) en arrière-plan…',
             'send.allSent': '{n} photos envoyées !',
+            'send.done': '✓',
+            'send.gallery': 'Galerie',
+            'send.clearAll': 'Vider',
+            'send.sendAll': 'Tout envoyer ({n})',
+            'send.editPhoto': 'Modifier',
+            'send.noPhotos': 'Aucune photo. Prenez des photos d\'abord !',
+            'send.galleryEmpty': 'La galerie est vide',
 
             // Receive page
             'receive.title': 'Recevoir des Photos',

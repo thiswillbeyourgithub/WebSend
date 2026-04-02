@@ -233,10 +233,10 @@ h1 {
     touch-action: pan-y;
 }
 
-/* Flash toggle button - top-right corner of camera view */
+/* Flash toggle button - top-left corner of camera view */
 .flash-toggle-btn {
     position: absolute;
-    bottom: 20px;
+    top: 12px;
     left: 12px;
     z-index: 11;
     display: flex;
@@ -263,10 +263,10 @@ h1 {
     border-color: rgba(255, 193, 7, 0.8);
 }
 
-/* Document detection toggle button - right side of camera view, mirrors flash button */
+/* Document detection toggle button - top-right corner of camera view */
 .detect-toggle-btn {
     position: absolute;
-    bottom: 20px;
+    top: 12px;
     right: 12px;
     z-index: 11;
     display: flex;
@@ -309,12 +309,70 @@ h1 {
     stroke-dasharray: 8 4;
 }
 
-/* Floating capture button overlay - positioned inside the camera container */
-.capture-btn-floating {
+/* Bottom bar inside camera view: gallery | capture | done */
+.camera-bottom-bar {
     position: absolute;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+
+.camera-bar-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    width: 48px;
+    height: 48px;
+    font-size: 1.4rem;
+    color: #fff;
+    background: rgba(255, 255, 255, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.camera-bar-btn:active {
+    background: rgba(255, 255, 255, 0.35);
+}
+
+.camera-done-btn {
+    font-size: 1.5rem;
+    font-weight: bold;
+    background: rgba(40, 167, 69, 0.6);
+    border-color: rgba(40, 167, 69, 0.8);
+}
+.camera-done-btn:active {
+    background: rgba(40, 167, 69, 0.9);
+}
+
+.gallery-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 5px;
+    font-size: 0.7rem;
+    font-weight: bold;
+    line-height: 20px;
+    text-align: center;
+    color: #fff;
+    background: #e94560;
+    border-radius: 10px;
+}
+
+/* Floating capture button overlay - centered in bottom bar */
+.capture-btn-floating {
     padding: 10px 24px;
     font-size: 0.95rem;
     min-height: auto;
@@ -324,7 +382,155 @@ h1 {
     -webkit-backdrop-filter: blur(5px);
     border-radius: 50px;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
-    z-index: 10;
+}
+
+/* ============ Gallery Modal ============ */
+.gallery-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1000;
+    background: #1a1a2e;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+.gallery-modal.hidden {
+    display: none !important;
+}
+.gallery-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: #16213e;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+.gallery-modal-header h2 {
+    color: #fff;
+    font-size: 1.1rem;
+    margin: 0;
+}
+.gallery-back-btn, .gallery-clear-btn, .gallery-delete-btn {
+    background: none;
+    border: none;
+    color: #90caf9;
+    font-size: 1.1rem;
+    cursor: pointer;
+    padding: 6px 10px;
+    border-radius: 8px;
+}
+.gallery-back-btn:active, .gallery-clear-btn:active, .gallery-delete-btn:active {
+    background: rgba(255, 255, 255, 0.1);
+}
+.gallery-grid {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    align-content: start;
+}
+.gallery-thumb {
+    position: relative;
+    aspect-ratio: 1;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 2px solid transparent;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.gallery-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.gallery-thumb .gallery-thumb-index {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 5px;
+    font-size: 0.7rem;
+    font-weight: bold;
+    line-height: 22px;
+    text-align: center;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.6);
+    border-radius: 11px;
+}
+.gallery-thumb .gallery-thumb-delete {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 24px;
+    height: 24px;
+    font-size: 0.75rem;
+    line-height: 24px;
+    text-align: center;
+    color: #fff;
+    background: rgba(220, 53, 69, 0.8);
+    border: none;
+    border-radius: 50%;
+    cursor: pointer;
+}
+.gallery-thumb.dragging {
+    opacity: 0.5;
+    border-color: #90caf9;
+}
+.gallery-thumb.drag-over {
+    border-color: #e94560;
+}
+.gallery-modal-footer {
+    padding: 12px 16px;
+    background: #16213e;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Gallery edit view */
+.gallery-edit-view {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: #1a1a2e;
+    display: flex;
+    flex-direction: column;
+    z-index: 1;
+}
+.gallery-edit-view.hidden {
+    display: none !important;
+}
+.gallery-edit-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: #16213e;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+.gallery-edit-header h2 {
+    color: #fff;
+    font-size: 1.1rem;
+    margin: 0;
+}
+.gallery-edit-view .image-preview {
+    flex: 1;
+    object-fit: contain;
+    max-height: none;
+    margin: 0;
+    border-radius: 0;
+}
+.gallery-edit-view .edit-toolbar {
+    padding: 12px 16px;
+    background: #16213e;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 /* Status messages */
