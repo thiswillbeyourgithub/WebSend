@@ -37,8 +37,8 @@ const STUN_GOOGLE_FALLBACK = process.env.STUN_GOOGLE_FALLBACK !== 'false';
 const TURN_SERVER = process.env.TURN_SERVER || '';
 // TURN_SECRET: shared secret for time-based TURN credentials
 const TURN_SECRET = process.env.TURN_SECRET || '';
-// TURN_CREDENTIAL_TTL: how long TURN credentials are valid (default: 24 hours)
-const TURN_CREDENTIAL_TTL = parseInt(process.env.TURN_CREDENTIAL_TTL, 10) || 86400;
+// TURN_CREDENTIAL_TTL: how long TURN credentials are valid (default: 1 hour)
+const TURN_CREDENTIAL_TTL = parseInt(process.env.TURN_CREDENTIAL_TTL, 10) || 3600;
 // TURN_TIMEOUT: WebRTC connection timeout in seconds (default: 15s)
 const TURN_TIMEOUT = parseInt(process.env.TURN_TIMEOUT, 10) || 15;
 // TURNS_PORT: if set, a turns: (TURN-over-TLS) URL is added to ICE candidates,

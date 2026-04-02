@@ -187,7 +187,7 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `STUN_GOOGLE_FALLBACK` | Use Google's public STUN as fallback | `true` |
 | `TURN_SERVER` | TURN relay server (`host:port`) | _(empty -- no relay)_ |
 | `TURN_SECRET` | Shared secret for TURN time-based credentials | _(empty)_ |
-| `TURN_CREDENTIAL_TTL` | TURN credential validity in seconds | `86400` (24h) |
+| `TURN_CREDENTIAL_TTL` | TURN credential validity in seconds | `3600` (1h) |
 | `TURNS_PORT` | TURN-over-TLS (TURNS) port; enables `turns:` ICE candidates | _(empty -- TURNS disabled)_ |
 | `UMAMI_URL` | Base URL of your [Umami](https://umami.is/) analytics instance | _(empty -- analytics disabled)_ |
 | `UMAMI_WEBSITE_ID` | Website ID from your Umami dashboard (UUID) | _(empty)_ |
