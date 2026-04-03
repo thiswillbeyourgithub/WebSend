@@ -10,7 +10,7 @@
     <title>WebSend - Send Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-hZ4Nt7wkK6g5XdCJxy8Iu3a2BxKfCi/E0U/igEbQKiNG0HAxnlOdwVze3c3f0lGg" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-PkbLFlM4Iv6ugKCwaALIf2qBSPyWu9+VeRwU2Ms+jYaRJurBRwjgUdTXWh4KaG8s" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -1294,6 +1294,12 @@
                 showToast(i18n.t('send.noPhotos'));
                 return;
             }
+            // Pause camera to save resources while browsing gallery
+            const video = document.getElementById('capture-video');
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(t => t.enabled = false);
+            }
+            document.body.style.overflow = 'hidden';
             document.getElementById('gallery-modal').classList.remove('hidden');
             renderGalleryGrid();
         }
@@ -1303,6 +1309,12 @@
             document.getElementById('gallery-modal').classList.add('hidden');
             document.getElementById('gallery-edit-view').classList.add('hidden');
             galleryEditIndex = -1;
+            // Resume camera
+            const video = document.getElementById('capture-video');
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(t => t.enabled = true);
+            }
+            document.body.style.overflow = '';
         }
 
         /** Render the thumbnail grid in the gallery modal */
