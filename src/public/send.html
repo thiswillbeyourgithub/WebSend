@@ -2374,24 +2374,16 @@
                 });
 
                 // Re-sort corners into proper tl/tr/br/bl order before applying,
-                // in case the user dragged handles into a crossed/flipped arrangement
-                const rawCorners = [
-                    cropState.corners.tl, cropState.corners.tr,
-                    cropState.corners.br, cropState.corners.bl
-                ];
-                const cx = rawCorners.reduce((s, p) => s + p.x, 0) / 4;
-                const cy = rawCorners.reduce((s, p) => s + p.y, 0) / 4;
-                const sorted = rawCorners.slice().sort((a, b) =>
-                    Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx)
-                );
-                // Find tl (smallest x+y) and rotate
-                let tlIdx = 0, minSum = Infinity;
-                for (let i = 0; i < 4; i++) {
-                    const s = sorted[i].x + sorted[i].y;
-                    if (s < minSum) { minSum = s; tlIdx = i; }
+                // in case the user dragged handles into a crossed/flipped arrangement.
+                // Sort by Y to get top/bottom pairs, then by X within each pair.
+                function normalizeCorners(corners) {
+                    const pts = [corners.tl, corners.tr, corners.br, corners.bl];
+                    pts.sort((a, b) => a.y - b.y || a.x - b.x);
+                    const top = pts.slice(0, 2).sort((a, b) => a.x - b.x);
+                    const bottom = pts.slice(2, 4).sort((a, b) => a.x - b.x);
+                    return { tl: top[0], tr: top[1], bl: bottom[0], br: bottom[1] };
                 }
-                const r = i => sorted[(tlIdx + i) % 4];
-                const c = { tl: r(0), bl: r(1), br: r(2), tr: r(3) };
+                const c = normalizeCorners(cropState.corners);
 
                 // Scale corner percentages to actual image pixels
                 const srcW = img.width;

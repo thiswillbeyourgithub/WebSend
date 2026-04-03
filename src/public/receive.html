@@ -2438,10 +2438,20 @@
                 });
                 URL.revokeObjectURL(originalUrl);
 
+                // Re-sort corners into proper tl/tr/br/bl order before applying,
+                // in case the user dragged handles into a crossed/flipped arrangement.
+                function normalizeCorners(corners) {
+                    const pts = [corners.tl, corners.tr, corners.br, corners.bl];
+                    pts.sort((a, b) => a.y - b.y || a.x - b.x);
+                    const top = pts.slice(0, 2).sort((a, b) => a.x - b.x);
+                    const bottom = pts.slice(2, 4).sort((a, b) => a.x - b.x);
+                    return { tl: top[0], tr: top[1], bl: bottom[0], br: bottom[1] };
+                }
+
                 // Scale corner percentages to actual image pixels
                 const srcW = img.width;
                 const srcH = img.height;
-                const c = cropState.corners;
+                const c = normalizeCorners(cropState.corners);
 
                 const srcCorners = [
                     { x: c.tl.x * srcW, y: c.tl.y * srcH },
