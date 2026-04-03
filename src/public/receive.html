@@ -468,9 +468,15 @@
             const pad = n => String(n).padStart(2, '0');
             connectionTimestamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 
-            // Hide QR step, show connected step
+            // Hide QR step, show connected step, hide reconnect banner if any
             document.getElementById('step-qr').classList.add('hidden');
             document.getElementById('step-connected').classList.remove('hidden');
+            hideReconnectBanner();
+            const statusEl = document.querySelector('#step-connected .status');
+            if (statusEl) {
+                statusEl.textContent = i18n.t('receive.connectedWaiting');
+                statusEl.className = 'status status-connected';
+            }
 
             // Wait for data channel to be open before sending public key
             // The data channel might not be ready immediately after peer connection is established
@@ -519,8 +525,50 @@
         function onDisconnected() {
             logger.warn('Disconnected from sender');
             releaseWakeLock();
-            // Auto-reconnect: restart the receiver so a new QR code is shown
-            reconnectReceiver();
+
+            // If we already have images, keep them visible and show a reconnect banner
+            // instead of jumping back to the QR code screen
+            if (receivedImages.filter(img => img !== null).length > 0) {
+                showReconnectBanner();
+            } else {
+                reconnectReceiver();
+            }
+        }
+
+        /** Show a disconnect banner within step-connected so images remain accessible */
+        function showReconnectBanner() {
+            // Update connection status
+            const statusEl = document.querySelector('#step-connected .status');
+            if (statusEl) {
+                statusEl.textContent = i18n.t('receive.senderDisconnected');
+                statusEl.className = 'status status-error';
+            }
+
+            // Create banner if it doesn't exist
+            let banner = document.getElementById('reconnect-banner');
+            if (!banner) {
+                banner = document.createElement('div');
+                banner.id = 'reconnect-banner';
+                banner.style.cssText = 'padding: 15px; background: #fff3e0; border-radius: 10px; border: 1px solid #ffcc80; text-align: center; margin: 15px 0;';
+                const stepConnected = document.getElementById('step-connected');
+                const sectionTitle = stepConnected.querySelector('.section-title');
+                stepConnected.insertBefore(banner, sectionTitle);
+            }
+            banner.innerHTML = `
+                <p style="margin: 0 0 10px; color: #e65100; font-weight: bold;">
+                    ${i18n.t('receive.senderDisconnected')}
+                </p>
+                <button class="btn btn-action btn-primary" onclick="reconnectReceiver()" style="width: 100%;">
+                    ${i18n.t('receive.showQRCode')}
+                </button>
+            `;
+            banner.classList.remove('hidden');
+        }
+
+        /** Hide the reconnect banner (called when a new sender connects) */
+        function hideReconnectBanner() {
+            const banner = document.getElementById('reconnect-banner');
+            if (banner) banner.classList.add('hidden');
         }
 
         async function reconnectReceiver() {
@@ -545,8 +593,11 @@
             weConfirmed = false;
             theyConfirmed = false;
 
-            // Restart from scratch: show QR step, hide connected step
-            document.getElementById('step-connected').classList.add('hidden');
+            // If we have images, keep step-connected visible and show QR inline
+            const hasImages = receivedImages.filter(img => img !== null).length > 0;
+            if (!hasImages) {
+                document.getElementById('step-connected').classList.add('hidden');
+            }
             document.getElementById('step-qr').classList.remove('hidden');
 
             try {
