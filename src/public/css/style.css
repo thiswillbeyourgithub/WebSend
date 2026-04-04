@@ -886,16 +886,16 @@ h1 {
 
 /* Received images list */
 .received-images {
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
     margin: 20px 0;
 }
 
 .received-image-item {
     background: rgba(255, 255, 255, 0.1);
-    border-radius: 15px;
-    padding: 15px;
+    border-radius: 12px;
+    padding: 10px;
     transition: opacity 0.2s;
 }
 
@@ -938,10 +938,8 @@ h1 {
 /* Horizontal compact layout for wide screens */
 @media (min-width: 900px) {
     .received-images {
-        flex-direction: row;
-        flex-wrap: wrap;
+        grid-template-columns: repeat(2, 1fr);
         gap: 12px;
-        overflow-x: auto;
     }
 
     .received-image-item {
@@ -950,8 +948,6 @@ h1 {
         align-items: flex-start;
         gap: 12px;
         padding: 10px;
-        min-width: 300px;
-        flex: 1;
     }
 
     .drag-handle {
