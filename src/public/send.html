@@ -1070,11 +1070,15 @@
         /** Configure the flash toggle button visibility and click handler */
         function setupFlashButton(track) {
             const btn = document.getElementById('flash-toggle-btn');
+            btn.classList.remove('hidden');
             if (!torchSupported && !fillLightSupported) {
-                btn.classList.add('hidden');
+                btn.disabled = true;
+                btn.style.opacity = '0.4';
+                btn.title = i18n.t('send.flashUnsupported');
+                document.getElementById('flash-icon').textContent = '⚡';
+                document.getElementById('flash-label').textContent = i18n.t('send.flashUnsupported');
                 return;
             }
-            btn.classList.remove('hidden');
             // If only fillLightMode (no torch), reset to a compatible mode
             if (!torchSupported && flashMode === 'torch') {
                 flashMode = 'flash';
