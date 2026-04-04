@@ -10,7 +10,7 @@
     <title>WebSend - Send Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-ptTKwsw9G8lEtYcY10o8m8a5PA/TpwUyA0Vft/sgRdMnclM1dpVvv5dAP1rD7kwX" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-LZim0hLuXtaS6diHIATMmJAXe0tfCgQrLVQcu/lZUNQsJnPU1xuNSPFEDMXMD67v" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -1776,6 +1776,7 @@
             updateQueueBanner();
 
             let successCount = 0;
+            rtc.sendMessage({ type: 'batch-start' });
             while (sendQueue.length > 0) {
                 const blob = sendQueue[0];
                 try {
@@ -1799,6 +1800,7 @@
                 updateQueueBanner();
             }
 
+            rtc.sendMessage({ type: 'batch-end' });
             isSendingQueue = false;
             updateQueueBanner();
 

@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-ptTKwsw9G8lEtYcY10o8m8a5PA/TpwUyA0Vft/sgRdMnclM1dpVvv5dAP1rD7kwX" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-LZim0hLuXtaS6diHIATMmJAXe0tfCgQrLVQcu/lZUNQsJnPU1xuNSPFEDMXMD67v" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -259,6 +259,59 @@
         let weConfirmed = false;  // Track if we confirmed fingerprints
         let theyConfirmed = false; // Track if sender confirmed fingerprints
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string}
+
+        // Collections: each batch from sender = one collection (displayed as "Document")
+        let collections = []; // [{id, name, images: [{data, mimeType, name}]}]
+        let nextCollectionId = 0;
+        let activeCollectionId = null; // id of the collection currently receiving images
+
+        /** Create a new collection for an incoming batch */
+        function createNewCollection() {
+            const now = new Date();
+            const pad = n => String(n).padStart(2, '0');
+            const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+            const id = nextCollectionId++;
+            const name = `Document ${id + 1}`;
+            collections.push({ id, name, timeStr, images: [] });
+            activeCollectionId = id;
+            renderCollectionHeader(id, name, timeStr);
+            return id;
+        }
+
+        /** Get the active collection, creating one if needed (backwards compat) */
+        function getActiveCollection() {
+            if (activeCollectionId === null || !collections.find(c => c.id === activeCollectionId)) {
+                createNewCollection();
+            }
+            return collections.find(c => c.id === activeCollectionId);
+        }
+
+        /** Get collection by id */
+        function getCollection(id) {
+            return collections.find(c => c.id === id);
+        }
+
+        /** Get all non-null images across all collections, in collection order */
+        function getAllImages() {
+            const result = [];
+            for (const col of collections) {
+                for (const img of col.images) {
+                    if (img !== null) result.push(img);
+                }
+            }
+            return result;
+        }
+
+        /** Get total count of non-null images across all collections */
+        function getTotalImageCount() {
+            let count = 0;
+            for (const col of collections) {
+                for (const img of col.images) {
+                    if (img !== null) count++;
+                }
+            }
+            return count;
+        }
 
         // Wake lock state
         let wakeLock = null;
@@ -654,6 +707,9 @@
                 receivedImages[i] = null;
             }
             receivedImages = [];
+            collections = [];
+            nextCollectionId = 0;
+            activeCollectionId = null;
             // Close WebRTC connection
             if (rtc) {
                 rtc.receiveBuffer = [];
@@ -768,6 +824,11 @@
                     const statsEl = document.getElementById('transfer-stats');
                     if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);
                 }
+            } else if (msg.type === 'batch-start') {
+                logger.info('Batch start received — creating new collection');
+                createNewCollection();
+            } else if (msg.type === 'batch-end') {
+                logger.info('Batch end received');
             } else if (msg.type === 'encrypted-file') {
                 // Received encrypted file with bundled metadata, decrypt it
                 logger.info('Received encrypted file, decrypting with metadata...');
@@ -810,17 +871,22 @@
                     const ext = (metadata.mimeType || 'image/png').split('/')[1] || 'png';
                     const imageName = `websend_${connectionTimestamp}_${photoCount + 1}.${ext}`;
 
-                    // Add to received images with original filename
-                    // Store first so we have the index, then add to UI
+                    // Add to received images and active collection
                     const imageIndex = receivedImages.length;
-                    receivedImages.push({
+                    const imgObj = {
                         data: imageData,
                         mimeType: imageMimeType,
                         name: imageName
-                    });
+                    };
+                    receivedImages.push(imgObj);
+
+                    // Also store in active collection
+                    const col = getActiveCollection();
+                    col.images.push(imgObj);
+
                     photoCount++;
                     const filename = receivedImages[imageIndex].name;
-                    addReceivedImage(imageUrl, filename, imageIndex);
+                    addReceivedImage(imageUrl, filename, imageIndex, col.id);
 
                     updateExportButton();
 
@@ -846,25 +912,145 @@
             }
         }
 
+        /** Render a collection header + image grid container in the DOM */
+        function renderCollectionHeader(collectionId, name, timeStr) {
+            const mainContainer = document.getElementById('received-images');
+
+            // Remove placeholder text on first collection
+            if (collections.length === 1) {
+                mainContainer.innerHTML = '';
+            }
+
+            const section = document.createElement('div');
+            section.className = 'collection-section';
+            section.setAttribute('data-collection-id', collectionId);
+            section.innerHTML = `
+                <div class="collection-header" data-collection-id="${collectionId}">
+                    <div class="collection-header-left">
+                        <button class="collection-collapse-btn" onclick="toggleCollectionCollapse(${collectionId})" title="Collapse/Expand">▼</button>
+                        <span class="collection-name" contenteditable="true" spellcheck="false"
+                              onblur="renameCollection(${collectionId}, this.textContent)"
+                              onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
+                              >${name}</span>
+                        <span class="collection-time">(${timeStr})</span>
+                        <span class="collection-count" id="col-count-${collectionId}">0</span>
+                    </div>
+                    <div class="collection-header-right">
+                        <button class="btn btn-action collection-select-all-btn" onclick="toggleCollectionSelectAll(${collectionId})" title="${i18n.t('receive.selectAll') || 'Select all'}">${i18n.t('receive.selectAll') || 'Select all'}</button>
+                        <button class="btn btn-action collection-export-btn" onclick="openExportModalForCollection(${collectionId})" title="Export">📦 Export</button>
+                    </div>
+                </div>
+                <div class="collection-images" id="collection-images-${collectionId}" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
+                </div>
+            `;
+            mainContainer.appendChild(section);
+
+            // Make collection header a drop target for inter-collection drag
+            const header = section.querySelector('.collection-header');
+            header.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                header.classList.add('collection-drop-target');
+            });
+            header.addEventListener('dragleave', () => {
+                header.classList.remove('collection-drop-target');
+            });
+            header.addEventListener('drop', (e) => {
+                e.preventDefault();
+                header.classList.remove('collection-drop-target');
+                const imageIndex = parseInt(e.dataTransfer.getData('text/plain'));
+                if (!isNaN(imageIndex)) {
+                    moveImageToCollection(imageIndex, collectionId);
+                }
+            });
+        }
+
+        /** Update the image count badge on a collection header */
+        function updateCollectionCount(collectionId) {
+            const col = getCollection(collectionId);
+            if (!col) return;
+            const count = col.images.filter(img => img !== null).length;
+            const el = document.getElementById(`col-count-${collectionId}`);
+            if (el) el.textContent = count;
+        }
+
+        /** Rename a collection */
+        function renameCollection(collectionId, newName) {
+            const col = getCollection(collectionId);
+            if (col) col.name = newName.trim() || col.name;
+        }
+
+        /** Toggle collapse/expand of a collection */
+        function toggleCollectionCollapse(collectionId) {
+            const section = document.querySelector(`.collection-section[data-collection-id="${collectionId}"]`);
+            if (!section) return;
+            const grid = section.querySelector('.collection-images');
+            const btn = section.querySelector('.collection-collapse-btn');
+            const collapsed = grid.style.display === 'none';
+            grid.style.display = collapsed ? 'grid' : 'none';
+            btn.textContent = collapsed ? '▼' : '▶';
+        }
+
+        /** Toggle select all / deselect all within a collection */
+        function toggleCollectionSelectAll(collectionId) {
+            const grid = document.getElementById(`collection-images-${collectionId}`);
+            if (!grid) return;
+            const checkboxes = grid.querySelectorAll('input[type="checkbox"][id^="select-"]');
+            const allChecked = [...checkboxes].every(cb => cb.checked);
+            checkboxes.forEach(cb => { cb.checked = !allChecked; });
+            onSelectionChange();
+        }
+
+        /** Move an image from its current collection to a target collection */
+        function moveImageToCollection(imageIndex, targetCollectionId) {
+            const img = receivedImages[imageIndex];
+            if (!img) return;
+
+            // Find source collection
+            let srcCol = null;
+            for (const col of collections) {
+                const idx = col.images.indexOf(img);
+                if (idx !== -1) {
+                    col.images.splice(idx, 1);
+                    srcCol = col;
+                    break;
+                }
+            }
+
+            // Add to target collection
+            const targetCol = getCollection(targetCollectionId);
+            if (!targetCol) return;
+            targetCol.images.push(img);
+
+            // Move DOM element
+            const card = document.querySelector(`.received-image-item[data-image-index="${imageIndex}"]`);
+            const targetGrid = document.getElementById(`collection-images-${targetCollectionId}`);
+            if (card && targetGrid) {
+                card.setAttribute('data-collection-id', targetCollectionId);
+                targetGrid.appendChild(card);
+            }
+
+            // Update counts
+            if (srcCol) updateCollectionCount(srcCol.id);
+            updateCollectionCount(targetCollectionId);
+            updateBadgeNumbers();
+        }
+
         /**
          * Add a decrypted image to the received images gallery.
-         * Inserts at top (newest first) with crop and download buttons.
          * @param {string} url - Object URL of the decrypted image blob
          * @param {string} filename - Original filename from encrypted metadata
-         * @param {number} imageIndex - Index in receivedImages array, used for crop/download targeting
+         * @param {number} imageIndex - Index in receivedImages array
+         * @param {number} collectionId - Collection to add the image to
          */
-        function addReceivedImage(url, filename, imageIndex) {
-            const container = document.getElementById('received-images');
-
-            // Remove placeholder text on first image
-            if (photoCount === 1) {
-                container.innerHTML = '';
-            }
+        function addReceivedImage(url, filename, imageIndex, collectionId) {
+            const container = document.getElementById(`collection-images-${collectionId}`);
+            if (!container) return;
 
             const item = document.createElement('div');
             item.className = 'received-image-item';
-            // Each image has a crop button and download link, identified by index
             item.setAttribute('data-image-index', imageIndex);
+            item.setAttribute('data-collection-id', collectionId);
             item.setAttribute('draggable', 'true');
             item.innerHTML = `
                 <div class="drag-handle" title="Drag to reorder">☰</div>
@@ -886,7 +1072,6 @@
                             ${i18n.t('receive.download')}
                         </a>
                     </div>
-                    <!-- Single-click shows inline confirmation before discarding -->
                     <div class="discard-btn" style="margin-top: 8px;">
                         <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
                             ${i18n.t('receive.discard')}
@@ -907,6 +1092,7 @@
             `;
             container.appendChild(item);
             setupDragEvents(item);
+            updateCollectionCount(collectionId);
         }
 
         // ============ Image preview lightbox ============
@@ -1087,6 +1273,18 @@
                 // Only revoke if different from img src (after crop they may differ)
                 if (!img || downloadLink.href !== img.src) {
                     URL.revokeObjectURL(downloadLink.href);
+                }
+            }
+            // Remove from collection
+            const imgObj = receivedImages[imageIndex];
+            if (imgObj) {
+                for (const col of collections) {
+                    const idx = col.images.indexOf(imgObj);
+                    if (idx !== -1) {
+                        col.images[idx] = null;
+                        updateCollectionCount(col.id);
+                        break;
+                    }
                 }
             }
             receivedImages[imageIndex] = null;
@@ -1271,12 +1469,17 @@
         // ============ PDF Generation (no external dependencies) ============
 
         /** Get indices of images currently selected via checkboxes, in DOM order (respects drag reorder) */
-        function getSelectedImageIndices() {
+        function getSelectedImageIndices(collectionId) {
             const indices = [];
-            const container = document.getElementById('received-images');
+            let container;
+            if (collectionId !== undefined) {
+                container = document.getElementById(`collection-images-${collectionId}`);
+            } else {
+                container = document.getElementById('received-images');
+            }
+            if (!container) return indices;
             const items = container.querySelectorAll('.received-image-item');
-            // Iterate in reverse DOM order since newest is first in DOM but we want ascending visual order
-            for (let j = items.length - 1; j >= 0; j--) {
+            for (let j = 0; j < items.length; j++) {
                 const i = parseInt(items[j].getAttribute('data-image-index'));
                 if (receivedImages[i] === null) continue;
                 const cb = document.getElementById(`select-${i}`);
@@ -1390,7 +1593,16 @@
             e.preventDefault();
             if (dragSrcEl === this) return;
             this.classList.remove('drag-over');
-            reorderImages(dragSrcEl, this);
+
+            // Check if cross-collection move
+            const srcColId = dragSrcEl.getAttribute('data-collection-id');
+            const targetColId = this.getAttribute('data-collection-id');
+            if (srcColId !== targetColId) {
+                const imageIndex = parseInt(dragSrcEl.getAttribute('data-image-index'));
+                moveImageToCollection(imageIndex, parseInt(targetColId));
+            } else {
+                reorderImages(dragSrcEl, this);
+            }
         }
 
         function handleDragEnd() {
@@ -1429,10 +1641,14 @@
             }
             // Highlight drop target
             document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
+            document.querySelectorAll('.collection-header').forEach(el => el.classList.remove('collection-drop-target'));
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
             if (target) {
                 const targetItem = target.closest('.received-image-item');
-                if (targetItem && targetItem !== touchDragEl) {
+                const targetHeader = target.closest('.collection-header');
+                if (targetHeader) {
+                    targetHeader.classList.add('collection-drop-target');
+                } else if (targetItem && targetItem !== touchDragEl) {
                     targetItem.classList.add('drag-over');
                 }
             }
@@ -1450,19 +1666,35 @@
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
             const targetItem = target ? target.closest('.received-image-item') : null;
 
-            if (targetItem && targetItem !== touchDragEl) {
-                reorderImages(touchDragEl, targetItem);
+            // Also check if dropped on a collection header
+            const targetHeader = target ? target.closest('.collection-header') : null;
+
+            if (targetHeader && touchDragEl) {
+                const targetColId = parseInt(targetHeader.getAttribute('data-collection-id'));
+                const imageIndex = parseInt(touchDragEl.getAttribute('data-image-index'));
+                moveImageToCollection(imageIndex, targetColId);
+            } else if (targetItem && targetItem !== touchDragEl) {
+                const srcColId = touchDragEl.getAttribute('data-collection-id');
+                const tgtColId = targetItem.getAttribute('data-collection-id');
+                if (srcColId !== tgtColId) {
+                    const imageIndex = parseInt(touchDragEl.getAttribute('data-image-index'));
+                    moveImageToCollection(imageIndex, parseInt(tgtColId));
+                } else {
+                    reorderImages(touchDragEl, targetItem);
+                }
             }
 
             // Cleanup
             touchDragEl.classList.remove('dragging');
             document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
+            document.querySelectorAll('.collection-header').forEach(el => el.classList.remove('collection-drop-target'));
             if (touchClone) { touchClone.remove(); touchClone = null; }
             touchDragEl = null;
         }
 
         function reorderImages(srcEl, targetEl) {
-            const container = document.getElementById('received-images');
+            // Use the parent collection grid as container
+            const container = srcEl.closest('.collection-images') || document.getElementById('received-images');
             const items = [...container.querySelectorAll('.received-image-item')];
             const srcIdx = items.indexOf(srcEl);
             const targetIdx = items.indexOf(targetEl);
@@ -1475,6 +1707,23 @@
             const tmp = receivedImages[srcDataIdx];
             receivedImages[srcDataIdx] = receivedImages[targetDataIdx];
             receivedImages[targetDataIdx] = tmp;
+
+            // Also swap in collection images array
+            const colId = srcEl.getAttribute('data-collection-id');
+            if (colId !== null) {
+                const col = getCollection(parseInt(colId));
+                if (col) {
+                    const srcImg = receivedImages[srcDataIdx];
+                    const targetImg = receivedImages[targetDataIdx];
+                    const si = col.images.indexOf(targetImg); // after swap in receivedImages
+                    const ti = col.images.indexOf(srcImg);
+                    if (si !== -1 && ti !== -1) {
+                        const t = col.images[si];
+                        col.images[si] = col.images[ti];
+                        col.images[ti] = t;
+                    }
+                }
+            }
 
             // Swap data-image-index attributes
             srcEl.setAttribute('data-image-index', targetDataIdx);
@@ -1533,7 +1782,28 @@
         }
 
         /** Open the export modal */
+        let exportCollectionId = null; // null = export all, number = specific collection
+
+        /** Get export filename prefix based on whether we're exporting a specific collection */
+        function getExportPrefix() {
+            if (exportCollectionId !== null) {
+                const col = getCollection(exportCollectionId);
+                if (col) {
+                    // Sanitize collection name for filename
+                    const safeName = col.name.replace(/[^a-zA-Z0-9_\- ]/g, '').replace(/\s+/g, '_').toLowerCase();
+                    return safeName || 'document';
+                }
+            }
+            return 'websend';
+        }
+
         function openExportModal() {
+            exportCollectionId = null;
+            document.getElementById('export-modal').classList.remove('hidden');
+        }
+
+        function openExportModalForCollection(collectionId) {
+            exportCollectionId = collectionId;
             document.getElementById('export-modal').classList.remove('hidden');
         }
 
@@ -1619,7 +1889,7 @@
                 const { downloadZip } = clientZipModule;
 
                 const bw = isToggleActive('export-bw');
-                const selectedIndices = getSelectedImageIndices();
+                const selectedIndices = getSelectedImageIndices(exportCollectionId !== null ? exportCollectionId : undefined);
                 const activeImages = selectedIndices.map(i => receivedImages[i]);
 
                 // Build file entries for client-zip
@@ -1648,7 +1918,7 @@
                 const datePart = i18n.getLocale() === 'fr'
                     ? `${pad(now.getDate())}-${pad(now.getMonth()+1)}-${now.getFullYear()}`
                     : `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
-                a.download = `websend_${datePart}.zip`;
+                a.download = `${getExportPrefix()}_${datePart}.zip`;
                 a.click();
                 URL.revokeObjectURL(url);
 
@@ -1717,7 +1987,7 @@
             try {
                 // Convert selected images to JPEG for consistent PDF embedding
                 const bw = isToggleActive('export-bw');
-                const selectedIndices = getSelectedImageIndices();
+                const selectedIndices = getSelectedImageIndices(exportCollectionId !== null ? exportCollectionId : undefined);
                 const activeImages = selectedIndices.map(i => receivedImages[i]);
                 const jpegs = await Promise.all(activeImages.map(img => toJpegData(img.data, img.mimeType, { bw })));
 
@@ -1730,7 +2000,7 @@
                 const a = document.createElement('a');
                 a.href = url;
                 const datePart = formatDateForFilename();
-                a.download = `websend_${datePart}.pdf`;
+                a.download = `${getExportPrefix()}_${datePart}.pdf`;
                 a.click();
                 URL.revokeObjectURL(url);
 
@@ -1975,7 +2245,7 @@
                 const a = document.createElement('a');
                 a.href = url;
                 const datePart = formatDateForFilename();
-                a.download = `websend_ocr_${datePart}.pdf`;
+                a.download = `${getExportPrefix()}_ocr_${datePart}.pdf`;
                 a.click();
                 URL.revokeObjectURL(url);
 

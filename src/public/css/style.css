@@ -886,10 +886,104 @@ h1 {
 
 /* Received images list */
 .received-images {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
     margin: 20px 0;
+}
+
+/* Collection sections */
+.collection-section {
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.collection-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.08);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.collection-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+}
+
+.collection-header-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.collection-collapse-btn {
+    background: none;
+    border: none;
+    color: #ccc;
+    font-size: 0.9rem;
+    cursor: pointer;
+    padding: 2px 6px;
+}
+
+.collection-name {
+    color: #fff;
+    font-weight: bold;
+    font-size: 1rem;
+    cursor: text;
+    padding: 2px 6px;
+    border-radius: 4px;
+    min-width: 60px;
+    outline: none;
+}
+
+.collection-name:focus {
+    background: rgba(255, 255, 255, 0.15);
+    outline: 1px solid #1565c0;
+}
+
+.collection-time {
+    color: #999;
+    font-size: 0.85rem;
+}
+
+.collection-count {
+    background: #1565c0;
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: bold;
+    padding: 2px 8px;
+    border-radius: 10px;
+    min-width: 20px;
+    text-align: center;
+}
+
+.collection-select-all-btn {
+    font-size: 0.75rem !important;
+    padding: 4px 8px !important;
+}
+
+.collection-export-btn {
+    font-size: 0.75rem !important;
+    padding: 4px 10px !important;
+    background: #1565c0 !important;
+    color: white !important;
+}
+
+.collection-images {
+    padding: 12px;
+}
+
+.collection-drop-target {
+    background: rgba(21, 101, 192, 0.3) !important;
+    outline: 2px dashed #1565c0;
 }
 
 .received-image-item {
@@ -937,8 +1031,8 @@ h1 {
 
 /* Horizontal compact layout for wide screens */
 @media (min-width: 900px) {
-    .received-images {
-        grid-template-columns: repeat(2, 1fr);
+    .collection-images {
+        grid-template-columns: repeat(2, 1fr) !important;
         gap: 12px;
     }
 
