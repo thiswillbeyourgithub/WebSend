@@ -875,6 +875,15 @@ h1 {
     background: #3a3a6a;
 }
 
+.edit-tool-btn-compact {
+    flex: 0;
+    min-height: 36px;
+    min-width: 36px;
+    padding: 6px;
+    font-size: 1.1rem;
+    border-radius: 8px;
+}
+
 /* Received images list */
 .received-images {
     display: flex;
