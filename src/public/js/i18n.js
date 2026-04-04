@@ -485,7 +485,9 @@ const i18n = (function() {
         });
 
         // Apply to elements with data-i18n-title for title attributes
+        // Skip <html> element — its title is handled below via document.title
         document.querySelectorAll('[data-i18n-title]').forEach(el => {
+            if (el === document.documentElement) return;
             const key = el.getAttribute('data-i18n-title');
             el.title = t(key);
         });
