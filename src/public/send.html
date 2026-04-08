@@ -1594,6 +1594,7 @@
             stopCapture();
             showStep(stepChoose);
             updateQueueBanner();
+            rtc.sendMessage({ type: 'batch-start' });
             drainQueue();
         }
 
@@ -1667,6 +1668,7 @@
             if (queued > 0) {
                 showToast(`${queued} photo(s) queued for sending`);
                 updateQueueBanner();
+                rtc.sendMessage({ type: 'batch-start' });
                 drainQueue();
             }
 
@@ -1771,6 +1773,7 @@
 
             showStep(stepChoose);
             updateQueueBanner();
+            rtc.sendMessage({ type: 'batch-start' });
             drainQueue();
         }
 
@@ -1797,7 +1800,6 @@
             updateQueueBanner();
 
             let successCount = 0;
-            rtc.sendMessage({ type: 'batch-start' });
             while (sendQueue.length > 0) {
                 const blob = sendQueue[0];
                 try {
