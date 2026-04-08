@@ -943,7 +943,7 @@
                 <div class="collection-images" id="collection-images-${collectionId}" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
                 </div>
             `;
-            mainContainer.appendChild(section);
+            mainContainer.prepend(section);
 
             // Make collection header a drop target for inter-collection drag
             const header = section.querySelector('.collection-header');
