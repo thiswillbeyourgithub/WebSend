@@ -512,9 +512,21 @@ const DocDetect = (function () {
             const len2 = Math.sqrt(v2x * v2x + v2y * v2y);
             if (len1 < 0.001 || len2 < 0.001) return null;
             const cosAngle = dot / (len1 * len2);
-            // Reject if any angle < ~15° or > ~165° (cos > 0.966 or cos < -0.966)
-            if (Math.abs(cosAngle) > 0.966) return null;
+            // Reject if any angle < ~30° or > ~150° (cos > 0.866 or cos < -0.866)
+            // A4 paper in perspective still keeps interior angles within this range
+            if (Math.abs(cosAngle) > 0.866) return null;
         }
+
+        // Validate: opposite side length ratio — reject if one side is >4x its opposite
+        // (a perspective-transformed rectangle keeps opposite sides within a reasonable ratio)
+        const dist = (a, b) => Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+        const sideTop = dist(result.tl, result.tr);
+        const sideBottom = dist(result.bl, result.br);
+        const sideLeft = dist(result.tl, result.bl);
+        const sideRight = dist(result.tr, result.br);
+        const ratioH = Math.max(sideTop, sideBottom) / (Math.min(sideTop, sideBottom) || 0.001);
+        const ratioV = Math.max(sideLeft, sideRight) / (Math.min(sideLeft, sideRight) || 0.001);
+        if (ratioH > 4 || ratioV > 4) return null;
 
         return result;
     }
