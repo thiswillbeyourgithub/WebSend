@@ -390,6 +390,7 @@
         let flashMode = 'off';
         let torchSupported = false;
         let fillLightSupported = false; // ImageCapture fillLightMode support
+        let cachedImageCapture = null; // Cached ImageCapture instance
         // Document detection state
         let detectEnabled = localStorage.getItem('docDetectEnabled') === 'true';
         let detectInterval = null;
@@ -428,7 +429,23 @@
 
         // Re-acquire wake lock and auto-reconnect when screen wakes up
         document.addEventListener('visibilitychange', async () => {
-            if (document.visibilityState !== 'visible') return;
+            // Turn off torch when page goes to background to save battery
+            if (document.visibilityState !== 'visible') {
+                if (flashMode === 'torch' && captureStream) {
+                    const track = captureStream.getVideoTracks()[0];
+                    if (track) {
+                        track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {});
+                    }
+                }
+                return;
+            }
+            // Re-enable torch when coming back if it was on
+            if (flashMode === 'torch' && captureStream) {
+                const track = captureStream.getVideoTracks()[0];
+                if (track) {
+                    track.applyConstraints({ advanced: [{ torch: true }] }).catch(() => {});
+                }
+            }
             if (wakeLockDesired && !wakeLock) {
                 await acquireWakeLock();
             }
@@ -1034,14 +1051,17 @@
                     fillLightSupported = false;
                     if (!torchSupported && typeof ImageCapture !== 'undefined') {
                         try {
-                            const imgCapture = new ImageCapture(track);
-                            const photoCaps = await imgCapture.getPhotoCapabilities();
+                            cachedImageCapture = new ImageCapture(track);
+                            const photoCaps = await cachedImageCapture.getPhotoCapabilities();
                             if (photoCaps.fillLightMode && photoCaps.fillLightMode.length > 1) {
                                 fillLightSupported = true;
                                 logger.info('Flash via ImageCapture fillLightMode: ' + JSON.stringify(photoCaps.fillLightMode));
+                            } else {
+                                cachedImageCapture = null;
                             }
                         } catch (icErr) {
                             logger.info('ImageCapture flash probe failed: ' + icErr.message);
+                            cachedImageCapture = null;
                         }
                     }
 
@@ -1074,7 +1094,7 @@
             if (!torchSupported && !fillLightSupported) {
                 btn.disabled = true;
                 btn.style.opacity = '0.4';
-                btn.title = i18n.t('send.flashUnsupported');
+                btn.title = i18n.t('send.flashUnsupportedReason');
                 document.getElementById('flash-icon').textContent = '⚡';
                 document.getElementById('flash-label').textContent = i18n.t('send.flashUnsupported');
                 return;
@@ -1232,17 +1252,18 @@
                 if (torchSupported) {
                     try {
                         await track.applyConstraints({ advanced: [{ torch: true }] });
-                        await new Promise(resolve => setTimeout(resolve, 300));
+                        await new Promise(resolve => setTimeout(resolve, 500));
                     } catch (e) {
                         logger.warn('Flash fire failed: ' + e.message);
+                        showToast(i18n.t('send.flashFallbackNoFlash'), { duration: 3000 });
                     }
-                } else if (fillLightSupported) {
+                } else if (fillLightSupported && cachedImageCapture) {
                     try {
-                        const imgCapture = new ImageCapture(track);
-                        capturedBlob = await imgCapture.takePhoto({ fillLightMode: 'flash' });
+                        capturedBlob = await cachedImageCapture.takePhoto({ fillLightMode: 'flash' });
                         logger.info(`Captured photo via ImageCapture with flash, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
                     } catch (e) {
                         logger.warn('ImageCapture flash failed, falling back to canvas: ' + e.message);
+                        showToast(i18n.t('send.flashFallbackNoFlash'), { duration: 3000 });
                     }
                 }
             }
