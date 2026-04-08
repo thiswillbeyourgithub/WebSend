@@ -159,6 +159,33 @@
             }
         });
 
+        // 5-tap on "Production mode" badge to load eruda in production
+        (function() {
+            const badge = document.getElementById('sidebar-dev-badge');
+            if (!badge) return;
+            let tapCount = 0;
+            let tapTimer = null;
+            function loadEruda() {
+                return new Promise((resolve) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/eruda';
+                    script.onload = () => { eruda.init(); resolve(); };
+                    script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
+                    document.head.appendChild(script);
+                });
+            }
+            badge.addEventListener('click', () => {
+                tapCount++;
+                clearTimeout(tapTimer);
+                tapTimer = setTimeout(() => { tapCount = 0; }, 1500);
+                if (tapCount >= 5) {
+                    tapCount = 0;
+                    if (typeof eruda !== 'undefined') return;
+                    loadEruda().then(() => console.info('Eruda loaded via 5-tap'));
+                }
+            });
+        })();
+
         // Fetch server config to show DEV mode status in sidebar
         fetch('/api/config').then(r => r.json()).then(config => {
             const badge = document.getElementById('sidebar-dev-badge');

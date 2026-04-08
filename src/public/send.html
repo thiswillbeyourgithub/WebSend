@@ -2683,6 +2683,24 @@
          * Update the DEV mode badge in the sidebar.
          * Called after fetching /api/config to reflect server-side DEV=1 setting.
          */
+        // 5-tap on "Production mode" badge to load eruda in production
+        (function() {
+            const badge = document.getElementById('sidebar-dev-badge');
+            if (!badge) return;
+            let tapCount = 0;
+            let tapTimer = null;
+            badge.addEventListener('click', () => {
+                tapCount++;
+                clearTimeout(tapTimer);
+                tapTimer = setTimeout(() => { tapCount = 0; }, 1500);
+                if (tapCount >= 5) {
+                    tapCount = 0;
+                    if (typeof eruda !== 'undefined') return; // already loaded
+                    loadEruda().then(() => logger.info('Eruda loaded via 5-tap'));
+                }
+            });
+        })();
+
         function updateDevBadge(isDev) {
             const badge = document.getElementById('sidebar-dev-badge');
             if (!badge) return;
