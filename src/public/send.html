@@ -398,7 +398,9 @@
         let sendQueue = [];       // Pending photo blobs awaiting transmission
         let isSendingQueue = false; // Whether the queue drain loop is running
         // Gallery: photos captured in continuous camera mode (Genius Scan-like)
-        let galleryPhotos = [];    // Array of { blob, thumbUrl, originalBlob }
+        let galleryPhotos = [];    // Array of { blob, thumbUrl, originalBlob, id, sentHash, sendStatus }
+        let photoIdCounter = 0;    // Unique ID counter for gallery photos
+        let pendingBatchEnd = false; // Whether to send batch-end when queue drains
         let galleryEditIndex = -1; // Index of photo being edited in gallery
 
         // Wake lock state
@@ -579,10 +581,10 @@
             document.getElementById('file-input').addEventListener('change', handleFileSelect);
             document.getElementById('capture-btn').addEventListener('click', capturePhoto);
             document.getElementById('gallery-btn').addEventListener('click', openGallery);
-            document.getElementById('camera-done-btn').addEventListener('click', sendGalleryPhotos);
+            document.getElementById('camera-done-btn').addEventListener('click', finalizeBatch);
             document.getElementById('gallery-back-btn').addEventListener('click', closeGallery);
             document.getElementById('gallery-clear-btn').addEventListener('click', clearGallery);
-            document.getElementById('gallery-send-btn').addEventListener('click', sendGalleryPhotos);
+            document.getElementById('gallery-send-btn').addEventListener('click', finalizeBatch);
             document.getElementById('gallery-edit-back-btn').addEventListener('click', closeGalleryEdit);
             document.getElementById('gallery-edit-delete-btn').addEventListener('click', () => {
                 if (galleryEditIndex >= 0) {
@@ -591,14 +593,17 @@
                     deleteGalleryPhoto(idx);
                 }
             });
-            document.getElementById('gallery-rotate-btn').addEventListener('click', galleryRotateCW);
-            document.getElementById('gallery-crop-btn').addEventListener('click', galleryOpenCrop);
-            document.getElementById('gallery-flip-btn').addEventListener('click', galleryFlipH);
-            document.getElementById('gallery-bw-btn').addEventListener('click', galleryApplyBW);
+            // Gallery edit buttons disabled — photos are sent immediately on capture
+            // document.getElementById('gallery-rotate-btn').addEventListener('click', galleryRotateCW);
+            // document.getElementById('gallery-crop-btn').addEventListener('click', galleryOpenCrop);
+            // document.getElementById('gallery-flip-btn').addEventListener('click', galleryFlipH);
+            // document.getElementById('gallery-bw-btn').addEventListener('click', galleryApplyBW);
             document.getElementById('back-to-choose-btn').addEventListener('click', () => {
                 // Warn if gallery has photos
                 if (galleryPhotos.length > 0 && !confirm(i18n.t('send.galleryEmpty') + '?')) return;
                 clearGallery();
+                // Finalize the batch on the receiver side
+                rtc.sendMessage({ type: 'batch-end' });
                 stopCapture();
                 showStep(stepChoose);
             });
@@ -1022,6 +1027,9 @@
                 container.classList.add('active');
                 video.play();
 
+                // Create a new collection on the receiver when camera opens
+                rtc.sendMessage({ type: 'batch-start' });
+
                 // Apply advanced constraints (AF, AE, AWB) if supported.
                 // These are applied after getUserMedia because some devices
                 // only report capabilities once the stream is active.
@@ -1286,10 +1294,15 @@
                 logger.info(`Captured photo: ${video.videoWidth}x${video.videoHeight}, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
             }
 
-            // Add to gallery (camera stays open)
+            // Add to gallery (camera stays open) and queue for immediate send
             const thumbUrl = URL.createObjectURL(capturedBlob);
-            galleryPhotos.push({ blob: capturedBlob, thumbUrl, originalBlob: capturedBlob });
+            const photo = { blob: capturedBlob, thumbUrl, originalBlob: capturedBlob, id: ++photoIdCounter, sentHash: null, sendStatus: 'queuing' };
+            galleryPhotos.push(photo);
             updateGalleryBadge();
+
+            // Queue for immediate background send
+            sendQueue.push({ blob: capturedBlob, photoId: photo.id });
+            drainQueue();
 
             // Brief visual feedback: flash the screen white
             const container = document.getElementById('capture-camera-container');
@@ -1373,8 +1386,8 @@
                 thumb.appendChild(indexBadge);
                 thumb.appendChild(deleteBtn);
 
-                // Tap to edit
-                thumb.addEventListener('click', () => openGalleryEdit(idx));
+                // Tap to edit disabled — photos are sent immediately
+                // thumb.addEventListener('click', () => openGalleryEdit(idx));
 
                 // Drag-and-drop reorder
                 thumb.addEventListener('dragstart', (e) => {
@@ -1445,6 +1458,16 @@
         function deleteGalleryPhoto(idx) {
             const photo = galleryPhotos[idx];
             if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+
+            // If already sent to receiver, tell receiver to delete it
+            if (photo.sentHash) {
+                rtc.sendMessage({ type: 'delete-image', hash: photo.sentHash });
+            } else {
+                // If still in sendQueue, remove it
+                const qIdx = sendQueue.findIndex(item => item.photoId === photo.id);
+                if (qIdx !== -1) sendQueue.splice(qIdx, 1);
+            }
+
             galleryPhotos.splice(idx, 1);
             updateGalleryBadge();
             if (galleryPhotos.length === 0) {
@@ -1456,7 +1479,17 @@
 
         /** Clear all gallery photos */
         function clearGallery() {
-            galleryPhotos.forEach(p => { if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl); });
+            galleryPhotos.forEach(p => {
+                if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
+                // If already sent, tell receiver to delete
+                if (p.sentHash) {
+                    rtc.sendMessage({ type: 'delete-image', hash: p.sentHash });
+                } else {
+                    // Remove from sendQueue if pending
+                    const qIdx = sendQueue.findIndex(item => item.photoId === p.id);
+                    if (qIdx !== -1) sendQueue.splice(qIdx, 1);
+                }
+            });
             galleryPhotos = [];
             updateGalleryBadge();
             closeGallery();
@@ -1571,20 +1604,13 @@
             galleryPhotos._cropReturnToGallery = true;
         }
 
-        /** Send all gallery photos through the queue */
-        function sendGalleryPhotos() {
-            if (galleryPhotos.length === 0) return;
-            if (!sharedKey) {
-                showToast(i18n.t('send.sendFailed'));
-                return;
-            }
+        /** Finalize the current batch — photos were already sent on capture */
+        function finalizeBatch() {
+            // Send batch-end to finalize the collection on the receiver
+            rtc.sendMessage({ type: 'batch-end' });
+            logger.info('Batch finalized');
 
-            galleryPhotos.forEach(photo => {
-                sendQueue.push(photo.blob);
-            });
-            logger.info(`Queued ${galleryPhotos.length} gallery photos for sending`);
-
-            // Clear gallery
+            // Clear gallery thumbnails (photos already sent)
             galleryPhotos.forEach(p => { if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl); });
             galleryPhotos = [];
             updateGalleryBadge();
@@ -1593,9 +1619,6 @@
             // Stop camera and return to choose step
             stopCapture();
             showStep(stepChoose);
-            updateQueueBanner();
-            rtc.sendMessage({ type: 'batch-start' });
-            drainQueue();
         }
 
         /** Strip metadata from a single file and return a processed File, or null on failure */
@@ -1654,7 +1677,7 @@
             for (const file of files) {
                 const processed = await stripFileMetadata(file);
                 if (processed) {
-                    sendQueue.push(processed);
+                    sendQueue.push({ blob: processed, photoId: null });
                     queued++;
                 } else {
                     failed++;
@@ -1669,6 +1692,7 @@
                 showToast(`${queued} photo(s) queued for sending`);
                 updateQueueBanner();
                 rtc.sendMessage({ type: 'batch-start' });
+                pendingBatchEnd = true;
                 drainQueue();
             }
 
@@ -1756,7 +1780,7 @@
                 return;
             }
 
-            sendQueue.push(currentPhotoBlob);
+            sendQueue.push({ blob: currentPhotoBlob, photoId: null });
             logger.info(`Photo queued for background send (${sendQueue.length} in queue)`);
 
             // Clear preview state immediately so user can take the next shot
@@ -1774,6 +1798,7 @@
             showStep(stepChoose);
             updateQueueBanner();
             rtc.sendMessage({ type: 'batch-start' });
+            pendingBatchEnd = true;
             drainQueue();
         }
 
@@ -1801,14 +1826,27 @@
 
             let successCount = 0;
             while (sendQueue.length > 0) {
-                const blob = sendQueue[0];
+                const item = sendQueue[0];
                 try {
-                    await sendOnePhoto(blob);
+                    const localHash = await sendOnePhoto(item.blob);
                     sendQueue.shift();
                     successCount++;
+                    // Update gallery photo with sent hash if it came from the camera flow
+                    if (item.photoId != null) {
+                        const gPhoto = galleryPhotos.find(p => p.id === item.photoId);
+                        if (gPhoto) {
+                            gPhoto.sentHash = localHash;
+                            gPhoto.sendStatus = 'sent';
+                        }
+                    }
                     logger.success('Queued photo sent and verified by receiver');
                 } catch (e) {
                     sendQueue.shift();
+                    // Mark as failed in gallery
+                    if (item.photoId != null) {
+                        const gPhoto = galleryPhotos.find(p => p.id === item.photoId);
+                        if (gPhoto) gPhoto.sendStatus = 'failed';
+                    }
                     logger.error('Queued photo failed: ' + e.message);
                     const isTimeout = e.message.includes('timeout');
                     const isNack = e.message.includes('Receiver decryption failed');
@@ -1823,7 +1861,10 @@
                 updateQueueBanner();
             }
 
-            rtc.sendMessage({ type: 'batch-end' });
+            if (pendingBatchEnd) {
+                rtc.sendMessage({ type: 'batch-end' });
+                pendingBatchEnd = false;
+            }
             isSendingQueue = false;
             updateQueueBanner();
 
@@ -1893,6 +1934,7 @@
                 const statsEl = document.getElementById('queue-transfer-stats');
                 if (statsEl) statsEl.textContent = '';
             }
+            return localHash;
         }
 
         // ============ Fingerprint Verification ============

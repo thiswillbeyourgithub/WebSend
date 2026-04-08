@@ -824,6 +824,9 @@
                     const statsEl = document.getElementById('transfer-stats');
                     if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);
                 }
+            } else if (msg.type === 'delete-image') {
+                logger.info('Received delete-image request for hash: ' + msg.hash);
+                deleteReceivedImageByHash(msg.hash);
             } else if (msg.type === 'batch-start') {
                 logger.info('Batch start received — creating new collection');
                 createNewCollection();
@@ -876,7 +879,8 @@
                     const imgObj = {
                         data: imageData,
                         mimeType: imageMimeType,
-                        name: imageName
+                        name: imageName,
+                        hash: null
                     };
                     receivedImages.push(imgObj);
 
@@ -900,6 +904,7 @@
                     // file-ack back to the sender for end-to-end integrity verification.
                     // The sender compares this hash against its pre-encryption hash.
                     const decryptedHash = await WebSendCrypto.sha256Hex(data);
+                    imgObj.hash = decryptedHash;
                     logger.info(`Decrypted SHA-256: ${decryptedHash}`);
                     rtc.sendMessage({ type: 'file-ack', sha256: decryptedHash });
                     logger.success('Photo decrypted, displayed, and ack sent');
@@ -966,6 +971,44 @@
         }
 
         /** Update the image count badge on a collection header */
+        /** Delete a received image by its SHA-256 hash (sent by sender on delete) */
+        function deleteReceivedImageByHash(hash) {
+            const idx = receivedImages.findIndex(img => img && img.hash === hash);
+            if (idx === -1) {
+                logger.warn('delete-image: no image found with hash ' + hash);
+                return;
+            }
+
+            // Revoke object URLs
+            const card = document.querySelector(`.received-image-item[data-image-index="${idx}"]`);
+            if (card) {
+                const img = card.querySelector('img');
+                if (img && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+                const dl = card.querySelector(`#download-${idx}`);
+                if (dl && dl.href && dl.href.startsWith('blob:') && (!img || dl.href !== img.src)) {
+                    URL.revokeObjectURL(dl.href);
+                }
+            }
+
+            // Remove from collection
+            const imgObj = receivedImages[idx];
+            if (imgObj) {
+                for (const col of collections) {
+                    const colIdx = col.images.indexOf(imgObj);
+                    if (colIdx !== -1) {
+                        col.images[colIdx] = null;
+                        updateCollectionCount(col.id);
+                        break;
+                    }
+                }
+            }
+
+            receivedImages[idx] = null;
+            if (card) card.remove();
+            updateExportButton();
+            logger.success('Deleted image with hash ' + hash.substring(0, 8) + '...');
+        }
+
         function updateCollectionCount(collectionId) {
             const col = getCollection(collectionId);
             if (!col) return;
