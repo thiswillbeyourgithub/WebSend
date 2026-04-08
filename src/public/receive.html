@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-LZim0hLuXtaS6diHIATMmJAXe0tfCgQrLVQcu/lZUNQsJnPU1xuNSPFEDMXMD67v" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-YDhg7jS/yGGkzcaHS3HcffVRsTeOGeOVptkdoaSXbUBTGYxFfA2nzraHS4BfFmx0" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -1105,17 +1105,15 @@
                     </label>
                 </div>
                 <div class="image-actions">
-                    <div style="display: flex; gap: 6px; flex-wrap: wrap; align-items: center;">
-                        <div class="edit-toolbar" id="edit-toolbar-${imageIndex}">
-                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.rotate')}" onclick="rotateReceivedImage(${imageIndex})">🔄</button>
-                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('receive.crop')}" onclick="openCropModal(${imageIndex})">✂️</button>
-                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.applyBW')}" onclick="applyBWToImage(${imageIndex})">⬛</button>
-                        </div>
-                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="flex: 1; min-width: 120px;" id="download-${imageIndex}">
-                            ${i18n.t('receive.download')}
-                        </a>
+                    <div class="edit-toolbar" id="edit-toolbar-${imageIndex}" style="display: flex; gap: 6px; flex-wrap: wrap;">
+                        <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.rotate')}" onclick="rotateReceivedImage(${imageIndex})">🔄</button>
+                        <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('receive.crop')}" onclick="openCropModal(${imageIndex})">✂️</button>
+                        <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.applyBW')}" onclick="applyBWToImage(${imageIndex})">⬛</button>
                     </div>
-                    <div class="discard-btn" style="margin-top: 8px;">
+                    <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
+                        ${i18n.t('receive.download')}
+                    </a>
+                    <div class="discard-btn">
                         <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
                             ${i18n.t('receive.discard')}
                         </button>
