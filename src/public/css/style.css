@@ -986,6 +986,28 @@ h1 {
     outline: 2px dashed #1565c0;
 }
 
+.new-document-drop-zone {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    margin: 12px;
+    border: 2px dashed #888;
+    border-radius: 12px;
+    color: #aaa;
+    font-size: 1.1em;
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.05);
+    transition: background 0.2s, border-color 0.2s, color 0.2s;
+    cursor: default;
+}
+
+.new-document-drop-zone-active {
+    background: rgba(21, 101, 192, 0.3);
+    border-color: #1565c0;
+    color: #fff;
+}
+
 .received-image-item {
     background: rgba(255, 255, 255, 0.1);
     border-radius: 12px;

@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-YDhg7jS/yGGkzcaHS3HcffVRsTeOGeOVptkdoaSXbUBTGYxFfA2nzraHS4BfFmx0" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-PD3WTe2l/KclAwkJqyPDg7RFZyxu84fAtvCPJxDCiWs4ZR9gmlLlqY1fgnvJdV7a" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -1608,11 +1608,50 @@
             handle.addEventListener('touchend', handleTouchEnd);
         }
 
+        function showNewDocumentDropZone() {
+            let zone = document.getElementById('new-document-drop-zone');
+            if (!zone) {
+                zone = document.createElement('div');
+                zone.id = 'new-document-drop-zone';
+                zone.className = 'new-document-drop-zone';
+                zone.innerHTML = '＋ New Document';
+                zone.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    zone.classList.add('new-document-drop-zone-active');
+                });
+                zone.addEventListener('dragleave', () => {
+                    zone.classList.remove('new-document-drop-zone-active');
+                });
+                zone.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    zone.classList.remove('new-document-drop-zone-active');
+                    const imageIndex = parseInt(e.dataTransfer.getData('text/plain'));
+                    if (!isNaN(imageIndex)) {
+                        moveImageToNewCollection(imageIndex);
+                    }
+                });
+                document.getElementById('received-images').appendChild(zone);
+            }
+            zone.style.display = 'flex';
+        }
+
+        function hideNewDocumentDropZone() {
+            const zone = document.getElementById('new-document-drop-zone');
+            if (zone) zone.style.display = 'none';
+        }
+
+        function moveImageToNewCollection(imageIndex) {
+            const newColId = createNewCollection();
+            moveImageToCollection(imageIndex, newColId);
+        }
+
         function handleDragStart(e) {
             dragSrcEl = this;
             this.classList.add('dragging');
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData('text/plain', this.getAttribute('data-image-index'));
+            showNewDocumentDropZone();
         }
 
         function handleDragOver(e) {
@@ -1649,6 +1688,7 @@
         function handleDragEnd() {
             this.classList.remove('dragging');
             document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
+            hideNewDocumentDropZone();
         }
 
         // Touch-based drag for mobile
@@ -1658,6 +1698,7 @@
                 e.preventDefault();
                 touchDragEl = item;
                 item.classList.add('dragging');
+                showNewDocumentDropZone();
 
                 // Create a floating clone
                 touchClone = item.cloneNode(true);
@@ -1683,11 +1724,16 @@
             // Highlight drop target
             document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
             document.querySelectorAll('.collection-header').forEach(el => el.classList.remove('collection-drop-target'));
+            const newDocZone = document.getElementById('new-document-drop-zone');
+            if (newDocZone) newDocZone.classList.remove('new-document-drop-zone-active');
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
             if (target) {
                 const targetItem = target.closest('.received-image-item');
                 const targetHeader = target.closest('.collection-header');
-                if (targetHeader) {
+                const targetNewDoc = target.closest('#new-document-drop-zone');
+                if (targetNewDoc) {
+                    targetNewDoc.classList.add('new-document-drop-zone-active');
+                } else if (targetHeader) {
                     targetHeader.classList.add('collection-drop-target');
                 } else if (targetItem && targetItem !== touchDragEl) {
                     targetItem.classList.add('drag-over');
@@ -1707,10 +1753,15 @@
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
             const targetItem = target ? target.closest('.received-image-item') : null;
 
+            // Check if dropped on new document zone
+            const targetNewDoc = target ? target.closest('#new-document-drop-zone') : null;
             // Also check if dropped on a collection header
             const targetHeader = target ? target.closest('.collection-header') : null;
 
-            if (targetHeader && touchDragEl) {
+            if (targetNewDoc && touchDragEl) {
+                const imageIndex = parseInt(touchDragEl.getAttribute('data-image-index'));
+                moveImageToNewCollection(imageIndex);
+            } else if (targetHeader && touchDragEl) {
                 const targetColId = parseInt(targetHeader.getAttribute('data-collection-id'));
                 const imageIndex = parseInt(touchDragEl.getAttribute('data-image-index'));
                 moveImageToCollection(imageIndex, targetColId);
@@ -1729,6 +1780,7 @@
             touchDragEl.classList.remove('dragging');
             document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
             document.querySelectorAll('.collection-header').forEach(el => el.classList.remove('collection-drop-target'));
+            hideNewDocumentDropZone();
             if (touchClone) { touchClone.remove(); touchClone = null; }
             touchDragEl = null;
         }
