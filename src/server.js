@@ -28,6 +28,12 @@ const UMAMI_DNT = process.env.UMAMI_DNT || 'true';
 const OCR_LANGS = process.env.OCR_LANGS || 'eng,fra';
 const OCR_PSM = process.env.OCR_PSM || '12';
 
+// ALLOWED_FILE_TYPES: controls which file types can be sent.
+// ONLY_IMAGES = only image/* files (original behavior)
+// IMAGE_OR_PDF = image/* plus application/pdf
+// ANY = any file type (default)
+const ALLOWED_FILE_TYPES = (process.env.ALLOWED_FILE_TYPES || 'ANY').toUpperCase();
+
 // ============ ICE Server Configuration ============
 // STUN_SERVER: optional self-hosted STUN server (host:port)
 const STUN_SERVER = process.env.STUN_SERVER || '';
@@ -513,7 +519,8 @@ app.get('/api/config', (req, res) => {
         turnTimeout: TURN_TIMEOUT,
         version: APP_VERSION,
         ocrLangs: OCR_LANGS.split(',').map(l => l.trim()),
-        ocrPsm: OCR_PSM
+        ocrPsm: OCR_PSM,
+        allowedFileTypes: ALLOWED_FILE_TYPES
     });
 });
 
