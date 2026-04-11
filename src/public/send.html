@@ -168,9 +168,15 @@
                     <span class="btn-icon">🖼️</span>
                     <span data-i18n="send.choosePhoto">Choose Existing Photo</span>
                 </button>
+
+                <button class="btn btn-action btn-secondary" id="use-dir-btn">
+                    <span class="btn-icon">📂</span>
+                    <span data-i18n="send.chooseDir">Upload Directory</span>
+                </button>
             </div>
 
             <input type="file" id="file-input" accept="image/*" multiple class="hidden">
+            <input type="file" id="dir-input" webkitdirectory multiple class="hidden">
         </div>
 
         <!-- Step 4: Camera capture (Genius Scan-like continuous mode) -->
@@ -547,9 +553,32 @@
             try {
                 const configResponse = await fetch('/api/config');
                 const config = await configResponse.json();
+                window.__wsConfig = config;
                 if (config.dev) { await loadEruda(); }
                 // Show DEV mode status in sidebar
                 updateDevBadge(config.dev);
+                // Configure file input accept attribute based on allowed file types
+                const fileInput = document.getElementById('file-input');
+                const dirInput = document.getElementById('dir-input');
+                const aft = (config.allowedFileTypes || 'ANY').toUpperCase();
+                if (aft === 'ONLY_IMAGES') {
+                    fileInput.setAttribute('accept', 'image/*');
+                    if (dirInput) dirInput.setAttribute('accept', 'image/*');
+                } else if (aft === 'IMAGE_OR_PDF') {
+                    fileInput.setAttribute('accept', 'image/*,.pdf,application/pdf');
+                    if (dirInput) dirInput.setAttribute('accept', 'image/*,.pdf,application/pdf');
+                } else {
+                    fileInput.removeAttribute('accept');
+                    if (dirInput) dirInput.removeAttribute('accept');
+                }
+                // Update button labels if non-image files allowed
+                if (aft !== 'ONLY_IMAGES') {
+                    const chooseBtn = document.getElementById('use-file-btn');
+                    if (chooseBtn) {
+                        chooseBtn.querySelector('.btn-icon').textContent = '📁';
+                        chooseBtn.querySelector('[data-i18n]').textContent = i18n.t('send.chooseFile');
+                    }
+                }
             } catch (e) {
                 // Non-fatal: continue without eruda if config fetch fails
                 logger.warn('Could not fetch server config: ' + e.message);
@@ -579,6 +608,8 @@
             document.getElementById('use-camera-btn').addEventListener('click', startCapture);
             document.getElementById('use-file-btn').addEventListener('click', () => document.getElementById('file-input').click());
             document.getElementById('file-input').addEventListener('change', handleFileSelect);
+            document.getElementById('use-dir-btn').addEventListener('click', () => document.getElementById('dir-input').click());
+            document.getElementById('dir-input').addEventListener('change', handleFileSelect);
             document.getElementById('capture-btn').addEventListener('click', capturePhoto);
             document.getElementById('gallery-btn').addEventListener('click', openGallery);
             document.getElementById('camera-done-btn').addEventListener('click', finalizeBatch);
@@ -1621,11 +1652,23 @@
             showStep(stepChoose);
         }
 
-        /** Strip metadata from a single file and return a processed File, or null on failure */
+        /** Strip metadata from a single file and return a processed File, or null on failure.
+         *  Non-image files are returned as-is (no metadata stripping possible). */
         async function stripFileMetadata(file) {
             if (!file.type.startsWith('image/')) {
-                logger.warn(`Skipping non-image file: ${file.name}`);
-                return null;
+                // Non-image file: check if allowed by config
+                const aft = (window.__wsConfig?.allowedFileTypes || 'ANY').toUpperCase();
+                if (aft === 'ONLY_IMAGES') {
+                    logger.warn(`Skipping non-image file: ${file.name}`);
+                    return null;
+                }
+                if (aft === 'IMAGE_OR_PDF' && file.type !== 'application/pdf') {
+                    logger.warn(`Skipping non-image/non-PDF file: ${file.name}`);
+                    return null;
+                }
+                // Pass through non-image files without stripping
+                logger.info(`Non-image file, sending as-is: ${file.name} (${file.type || 'unknown type'})`);
+                return file;
             }
             try {
                 const rawData = new Uint8Array(await file.arrayBuffer());
@@ -1646,22 +1689,34 @@
             const files = Array.from(event.target.files);
             if (!files.length) return;
 
-            // Single file: keep existing behavior (preview + optional edit before send)
+            // Single file: images get preview + optional edit; non-images go straight to queue
             if (files.length === 1) {
                 const file = files[0];
-                if (!file.type.startsWith('image/')) {
-                    showToast(i18n.t('error.selectImage'), { type: 'warn' });
+                const processed = await stripFileMetadata(file);
+                if (!processed) {
+                    showToast(i18n.t('error.fileNotAllowed'), { type: 'warn' });
                     return;
                 }
                 logger.info(`Selected file: ${file.name} (${file.size} bytes)`);
-                const processed = await stripFileMetadata(file);
-                if (!processed) {
-                    showToast('Could not process image. Please try another file.');
-                    return;
+                if (processed.type.startsWith('image/')) {
+                    // Image: show preview for editing
+                    currentPhotoBlob = processed;
+                    originalPhotoBlob = currentPhotoBlob;
+                    showPreview(currentPhotoBlob);
+                } else {
+                    // Non-image: queue directly for sending
+                    if (!sharedKey) {
+                        showToast(i18n.t('error.noPhotoOrKey'), { type: 'warn' });
+                        return;
+                    }
+                    sendQueue.push({ blob: processed, photoId: null });
+                    showToast(`${processed.name} queued for sending`);
+                    updateQueueBanner();
+                    rtc.sendMessage({ type: 'batch-start' });
+                    pendingBatchEnd = true;
+                    drainQueue();
                 }
-                currentPhotoBlob = processed;
-                originalPhotoBlob = currentPhotoBlob;
-                showPreview(currentPhotoBlob);
+                event.target.value = '';
                 return;
             }
 

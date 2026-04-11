@@ -68,6 +68,8 @@ const i18n = (function() {
             'send.howToSend': 'How would you like to send photos?',
             'send.takePhoto': 'Take New Photo',
             'send.choosePhoto': 'Choose Existing Photo',
+            'send.chooseFile': 'Choose File(s)',
+            'send.chooseDir': 'Upload Directory',
             'send.capture': '📸',
             'send.backToOptions': '← Back',
             'send.backToScan': '← Back to Scan',
@@ -217,7 +219,8 @@ const i18n = (function() {
 
             // Errors
             'error.noPhotoOrKey': 'No photo or key exchange not complete',
-            'error.selectImage': 'Please select an image file'
+            'error.selectImage': 'Please select an image file',
+            'error.fileNotAllowed': 'This file type is not allowed'
         },
 
         fr: {
@@ -274,6 +277,8 @@ const i18n = (function() {
             'send.howToSend': 'Comment souhaitez-vous envoyer des photos ?',
             'send.takePhoto': 'Prendre une nouvelle photo',
             'send.choosePhoto': 'Choisir une photo existante',
+            'send.chooseFile': 'Choisir fichier(s)',
+            'send.chooseDir': 'Envoyer un dossier',
             'send.capture': '📸',
             'send.backToOptions': '← Retour',
             'send.backToScan': '← Retour au scan',
@@ -423,7 +428,8 @@ const i18n = (function() {
 
             // Errors
             'error.noPhotoOrKey': 'Pas de photo ou échange de clés incomplet',
-            'error.selectImage': 'Veuillez sélectionner un fichier image'
+            'error.selectImage': 'Veuillez sélectionner un fichier image',
+            'error.fileNotAllowed': 'Ce type de fichier n\'est pas autorisé'
         }
     };
 
