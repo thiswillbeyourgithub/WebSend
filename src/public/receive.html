@@ -860,27 +860,30 @@
 
                     logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${metadata.originalSize} bytes)`);
 
-                    // Metadata is already stripped by the sender, so we use the
-                    // decrypted data directly without re-encoding (which would cause
-                    // additional lossy JPEG compression and degrade image quality).
-                    const imageData = new Uint8Array(data);
-                    const imageMimeType = metadata.mimeType;
+                    const fileData = new Uint8Array(data);
+                    const fileMimeType = metadata.mimeType;
 
-                    // Create blob from data for display
-                    const imageBlob = new Blob([imageData], { type: imageMimeType });
-                    const imageUrl = URL.createObjectURL(imageBlob);
+                    // Create blob from data for display/download
+                    const fileBlob = new Blob([fileData], { type: fileMimeType });
+                    const fileUrl = URL.createObjectURL(fileBlob);
 
-                    // Name: websend_<connection-timestamp>_<1-based-index>.<ext>
-                    const ext = (metadata.mimeType || 'image/png').split('/')[1] || 'png';
-                    const imageName = `websend_${connectionTimestamp}_${photoCount + 1}.${ext}`;
+                    // Determine file type category
+                    const isImage = fileMimeType.startsWith('image/');
+                    const isPdf = fileMimeType === 'application/pdf';
+                    const fileType = isImage ? 'image' : isPdf ? 'pdf' : 'other';
 
-                    // Add to received images and active collection
+                    // Use original filename from sender, fallback to generated name
+                    const ext = fileMimeType.split('/').pop().split('+')[0] || 'bin';
+                    const fileName = metadata.name || `websend_${connectionTimestamp}_${photoCount + 1}.${ext}`;
+
+                    // Add to received files and active collection
                     const imageIndex = receivedImages.length;
                     const imgObj = {
-                        data: imageData,
-                        mimeType: imageMimeType,
-                        name: imageName,
-                        hash: null
+                        data: fileData,
+                        mimeType: fileMimeType,
+                        name: fileName,
+                        hash: null,
+                        fileType: fileType
                     };
                     receivedImages.push(imgObj);
 
@@ -889,25 +892,23 @@
                     col.images.push(imgObj);
 
                     photoCount++;
-                    const filename = receivedImages[imageIndex].name;
-                    addReceivedImage(imageUrl, filename, imageIndex, col.id);
+                    addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileData.byteLength);
 
                     updateExportButton();
 
                     // Preload OCR engine after first image arrives
-                    if (receivedImages.filter(img => img !== null).length === 1) {
+                    if (receivedImages.filter(img => img !== null && img.fileType === 'image').length === 1) {
                         preloadClientZip();
-                preloadScribe();
+                        preloadScribe();
                     }
 
                     // Compute SHA-256 of the decrypted plaintext data and send
                     // file-ack back to the sender for end-to-end integrity verification.
-                    // The sender compares this hash against its pre-encryption hash.
                     const decryptedHash = await WebSendCrypto.sha256Hex(data);
                     imgObj.hash = decryptedHash;
                     logger.info(`Decrypted SHA-256: ${decryptedHash}`);
                     rtc.sendMessage({ type: 'file-ack', sha256: decryptedHash });
-                    logger.success('Photo decrypted, displayed, and ack sent');
+                    logger.success('File decrypted, displayed, and ack sent');
                 } catch (e) {
                     logger.error('Failed to decrypt photo: ' + e.message);
                     // Send file-nack so the sender knows decryption failed
@@ -1086,7 +1087,24 @@
          * @param {number} imageIndex - Index in receivedImages array
          * @param {number} collectionId - Collection to add the image to
          */
-        function addReceivedImage(url, filename, imageIndex, collectionId) {
+        /** Format bytes as human-readable string */
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        /** Get an icon for a file based on MIME type */
+        function getFileIcon(mimeType) {
+            if (mimeType === 'application/pdf') return '📄';
+            if (mimeType.startsWith('text/')) return '📝';
+            if (mimeType.startsWith('audio/')) return '🎵';
+            if (mimeType.startsWith('video/')) return '🎬';
+            if (mimeType.includes('zip') || mimeType.includes('archive') || mimeType.includes('compressed')) return '📦';
+            return '📎';
+        }
+
+        function addReceivedFile(url, filename, imageIndex, collectionId, fileType, fileSize) {
             const container = document.getElementById(`collection-images-${collectionId}`);
             if (!container) return;
 
@@ -1095,42 +1113,124 @@
             item.setAttribute('data-image-index', imageIndex);
             item.setAttribute('data-collection-id', collectionId);
             item.setAttribute('draggable', 'true');
-            item.innerHTML = `
-                <div class="drag-handle" title="Drag to reorder">☰</div>
-                <div class="image-thumb-container" style="position: relative; display: block;">
-                    <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block; cursor: pointer;" onclick="openLightbox(${imageIndex})">
-                    <span class="image-badge" style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
-                    <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
-                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
-                    </label>
-                </div>
-                <div class="image-actions">
-                    <div class="edit-toolbar" id="edit-toolbar-${imageIndex}" style="display: flex; gap: 6px; flex-wrap: wrap;">
-                        <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.rotate')}" onclick="rotateReceivedImage(${imageIndex})">🔄</button>
-                        <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('receive.crop')}" onclick="openCropModal(${imageIndex})">✂️</button>
-                        <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.applyBW')}" onclick="applyBWToImage(${imageIndex})">⬛</button>
+
+            if (fileType === 'image') {
+                // Image card: thumbnail + edit tools (original behavior)
+                item.innerHTML = `
+                    <div class="drag-handle" title="Drag to reorder">☰</div>
+                    <div class="image-thumb-container" style="position: relative; display: block;">
+                        <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block; cursor: pointer;" onclick="openLightbox(${imageIndex})">
+                        <span class="image-badge" style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
+                        <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
+                            <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
+                        </label>
                     </div>
-                    <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
-                        ${i18n.t('receive.download')}
-                    </a>
-                    <div class="discard-btn">
-                        <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
-                            ${i18n.t('receive.discard')}
-                        </button>
-                    </div>
-                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                        <div style="display: flex; gap: 10px;">
-                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardYes')}
-                            </button>
-                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardNo')}
+                    <div class="image-actions">
+                        <div class="edit-toolbar" id="edit-toolbar-${imageIndex}" style="display: flex; gap: 6px; flex-wrap: wrap;">
+                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.rotate')}" onclick="rotateReceivedImage(${imageIndex})">🔄</button>
+                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('receive.crop')}" onclick="openCropModal(${imageIndex})">✂️</button>
+                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.applyBW')}" onclick="applyBWToImage(${imageIndex})">⬛</button>
+                        </div>
+                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
+                            ${i18n.t('receive.download')}
+                        </a>
+                        <div class="discard-btn">
+                            <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
+                                ${i18n.t('receive.discard')}
                             </button>
                         </div>
+                        <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
+                            <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
+                            <div style="display: flex; gap: 10px;">
+                                <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
+                                    ${i18n.t('receive.discardYes')}
+                                </button>
+                                <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
+                                    ${i18n.t('receive.discardNo')}
+                                </button>
+                            </div>
+                        </div>
                     </div>
-                </div>
-            `;
+                `;
+            } else if (fileType === 'pdf') {
+                // PDF card: icon + filename + size + download + export actions
+                const mimeType = receivedImages[imageIndex].mimeType;
+                item.innerHTML = `
+                    <div class="drag-handle" title="Drag to reorder">☰</div>
+                    <div class="file-card" style="display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px;">
+                        <span style="font-size: 3em;">📄</span>
+                        <span class="image-badge" style="background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;">#${imageIndex + 1}</span>
+                        <p style="margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;">${filename}</p>
+                        <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
+                        <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
+                            <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
+                        </label>
+                    </div>
+                    <div class="image-actions">
+                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
+                            ${i18n.t('receive.download')}
+                        </a>
+                        <button class="btn btn-action" style="width: 100%; background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9;" onclick="exportPdfAsImages(${imageIndex})">
+                            ${i18n.t('receive.pdfToImages')}
+                        </button>
+                        <button class="btn btn-action" style="width: 100%; background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7;" onclick="exportPdfAsOcr(${imageIndex})">
+                            ${i18n.t('receive.pdfToOcr')}
+                        </button>
+                        <div class="discard-btn">
+                            <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
+                                ${i18n.t('receive.discard')}
+                            </button>
+                        </div>
+                        <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
+                            <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
+                            <div style="display: flex; gap: 10px;">
+                                <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
+                                    ${i18n.t('receive.discardYes')}
+                                </button>
+                                <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
+                                    ${i18n.t('receive.discardNo')}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            } else {
+                // Generic file card: icon + filename + size + download only
+                const icon = getFileIcon(receivedImages[imageIndex].mimeType);
+                item.innerHTML = `
+                    <div class="drag-handle" title="Drag to reorder">☰</div>
+                    <div class="file-card" style="display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px; position: relative;">
+                        <span style="font-size: 3em;">${icon}</span>
+                        <span class="image-badge" style="background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;">#${imageIndex + 1}</span>
+                        <p style="margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;">${filename}</p>
+                        <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
+                        <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
+                            <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
+                        </label>
+                    </div>
+                    <div class="image-actions">
+                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
+                            ${i18n.t('receive.download')}
+                        </a>
+                        <div class="discard-btn">
+                            <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
+                                ${i18n.t('receive.discard')}
+                            </button>
+                        </div>
+                        <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
+                            <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
+                            <div style="display: flex; gap: 10px;">
+                                <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
+                                    ${i18n.t('receive.discardYes')}
+                                </button>
+                                <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
+                                    ${i18n.t('receive.discardNo')}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
             container.appendChild(item);
             setupDragEvents(item);
             updateCollectionCount(collectionId);
