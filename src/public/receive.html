@@ -2262,7 +2262,13 @@
             btn.onclick = () => { ocrCancelled = true; };
 
             const selectedIndices = getSelectedImageIndices();
-            const activeImages = selectedIndices.map(i => receivedImages[i]);
+            const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
+            if (activeImages.length === 0) {
+                showToast('No images selected for OCR PDF export', { type: 'warn' });
+                btn.disabled = false;
+                updateExportButton();
+                return;
+            }
             const imageCount = activeImages.length;
             const timeoutMs = imageCount * 3 * 60000; // 3 min per image
             const timeoutMinutes = imageCount * 3;
