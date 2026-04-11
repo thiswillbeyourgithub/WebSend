@@ -14,10 +14,13 @@
 
 ## Overview
 
-WebSend is a webapp for securely transferring photos from a phone (sender) to a
-computer (receiver). It uses WebRTC for peer-to-peer data transfer and ECDH + AES-GCM
-for end-to-end encryption. The server's only role is signaling (SDP relay) and serving
-static files — it never sees photo data or encryption keys.
+WebSend is a webapp for securely transferring files (photos, PDFs, and other documents)
+from a phone (sender) to a computer (receiver). It uses WebRTC for peer-to-peer data
+transfer and ECDH + AES-GCM for end-to-end encryption. The server's only role is
+signaling (SDP relay) and serving static files — it never sees file data or encryption
+keys. The `ALLOWED_FILE_TYPES` env var controls which file types are accepted
+(`ONLY_IMAGES`, `IMAGE_OR_PDF`, or `ANY` — default: `ANY`). PDFs can be exported as
+a ZIP of page images or as a searchable OCR PDF using the bundled scribe.js/MuPDF engine.
 
 ## Directory Structure
 
@@ -33,7 +36,7 @@ WebSend/
 │   ├── docker-compose.yml  # Service definition with security hardening (read-only FS,
 │   │                       #   dropped capabilities, resource limits, health check)
 │   │                       #   Also contains commented-out coturn TURN relay service
-│   └── env.example         # Documented env vars: DOMAIN, ICE servers, TURN credentials
+│   └── env.example         # Documented env vars: DOMAIN, ICE servers, TURN credentials, ALLOWED_FILE_TYPES
 │
 └── src/
     ├── server.js           # Express server: signaling API, ICE config, static serving,
