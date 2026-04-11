@@ -2087,14 +2087,13 @@
 
                 // Build file entries for client-zip
                 const files = await Promise.all(activeImages.map(async (img) => {
-                    if (bw) {
-                        // Binarize via canvas and export as PNG
+                    if (bw && img.fileType === 'image') {
+                        // Binarize via canvas and export as PNG (images only)
                         const pngBlob = await toBWPng(img.data, img.mimeType);
-                        // Replace extension with .png for B&W output
                         const name = img.name.replace(/\.[^.]+$/, '.png');
                         return { name, input: pngBlob };
                     } else {
-                        // Use original data as-is
+                        // Use original data as-is (all file types)
                         return { name: img.name, input: new Blob([img.data], { type: img.mimeType }) };
                     }
                 }));
@@ -2181,7 +2180,11 @@
                 // Convert selected images to JPEG for consistent PDF embedding
                 const bw = isToggleActive('export-bw');
                 const selectedIndices = getSelectedImageIndices(exportCollectionId !== null ? exportCollectionId : undefined);
-                const activeImages = selectedIndices.map(i => receivedImages[i]);
+                const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
+                if (activeImages.length === 0) {
+                    showToast('No images selected for PDF export', { type: 'warn' });
+                    return;
+                }
                 const jpegs = await Promise.all(activeImages.map(img => toJpegData(img.data, img.mimeType, { bw })));
 
                 // Build PDF
@@ -2661,6 +2664,157 @@
          */
         function byteLength(parts, currentText) {
             return parts.reduce((sum, p) => sum + p.length, 0) + currentText.length;
+        }
+
+        // ============ Per-PDF Export Functions ============
+        // These handle the per-card "Export as images" and "Export as OCR PDF" buttons
+        // for individual PDF files received via WebRTC.
+
+        /** Lazy-load MuPDF worker for PDF rendering */
+        let mupdfInstance = null;
+        async function getMuPDF() {
+            if (mupdfInstance) return mupdfInstance;
+            const { initMuPDFWorker } = await import('/scribe/mupdf/mupdf-async.js');
+            mupdfInstance = await initMuPDFWorker();
+            return mupdfInstance;
+        }
+
+        /**
+         * Render all pages of a PDF to PNG data URLs using MuPDF.
+         * @param {Uint8Array} pdfData - Raw PDF bytes
+         * @param {number} dpi - Render DPI (default 150)
+         * @returns {Promise<string[]>} Array of data:image/png;base64,... URLs
+         */
+        async function renderPdfPages(pdfData, dpi = 150) {
+            const mupdf = await getMuPDF();
+            const doc = await mupdf.openDocument(pdfData.buffer);
+            const pageCount = await mupdf.countPages(doc);
+            const pages = [];
+            for (let i = 1; i <= pageCount; i++) {
+                const dataUrl = await mupdf.drawPageAsPNG(doc, { page: i, dpi });
+                pages.push(dataUrl);
+            }
+            await mupdf.freeDocument(doc);
+            return pages;
+        }
+
+        /**
+         * Export a received PDF as a ZIP of page images.
+         * @param {number} imageIndex - Index in receivedImages array
+         */
+        async function exportPdfAsImages(imageIndex) {
+            const file = receivedImages[imageIndex];
+            if (!file || file.fileType !== 'pdf') return;
+
+            const btn = event.target;
+            const origText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = i18n.t('receive.pdfExporting');
+
+            try {
+                const pages = await renderPdfPages(file.data);
+                // Convert data URLs to blobs for zipping
+                const zipFiles = [];
+                const baseName = file.name.replace(/\.pdf$/i, '');
+                for (let i = 0; i < pages.length; i++) {
+                    const resp = await fetch(pages[i]);
+                    const blob = await resp.blob();
+                    const buf = await blob.arrayBuffer();
+                    zipFiles.push({
+                        name: `${baseName}_page_${i + 1}.png`,
+                        input: new Uint8Array(buf)
+                    });
+                }
+
+                const clientZipModule = await import('/vendor/client-zip.js');
+                const { downloadZip } = clientZipModule;
+                const zipBlob = await downloadZip(zipFiles).blob();
+                const dateStr = formatDateForFilename();
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(zipBlob);
+                a.download = `${baseName}_pages_${dateStr}.zip`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+                logger.success(`Exported ${pages.length} pages as ZIP`);
+            } catch (e) {
+                logger.error('PDF to images export failed: ' + e.message);
+                showToast('Export failed: ' + e.message, { type: 'error' });
+            } finally {
+                btn.disabled = false;
+                btn.textContent = origText;
+            }
+        }
+
+        /**
+         * Export a received PDF as a searchable OCR PDF using scribe.js.
+         * @param {number} imageIndex - Index in receivedImages array
+         */
+        async function exportPdfAsOcr(imageIndex) {
+            const file = receivedImages[imageIndex];
+            if (!file || file.fileType !== 'pdf') return;
+
+            const btn = event.target;
+            const origText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = i18n.t('receive.pdfExporting');
+
+            try {
+                // Render PDF pages to images first
+                const pages = await renderPdfPages(file.data, 300); // Higher DPI for OCR
+
+                // Convert data URLs to File objects for scribe
+                const ocrFiles = [];
+                for (let i = 0; i < pages.length; i++) {
+                    const resp = await fetch(pages[i]);
+                    const blob = await resp.blob();
+                    ocrFiles.push(new File([blob], `page_${i + 1}.png`, { type: 'image/png' }));
+                }
+
+                // Load or reuse scribe.js
+                let scribe;
+                if (scribePreloaded) {
+                    scribe = await scribePreloaded;
+                }
+                if (!scribe) {
+                    const scribeModule = await import('/scribe/scribe.js');
+                    scribe = scribeModule.default;
+                    await scribe.init({ ocr: true, font: true });
+                    scribe.opt.displayMode = 'invis';
+                }
+
+                const config = window.__wsConfig || {};
+                const ocrLangs = (config.ocrLangs || ['eng']).slice(0, 3);
+                const ocrPsm = config.ocrPsm || '12';
+
+                await scribe.importFiles(ocrFiles);
+                await scribe.recognize({ langs: ocrLangs, modeAdv: 'lstm', config: { tessedit_pageseg_mode: ocrPsm } });
+
+                const pdfResult = await scribe.exportData('pdf');
+
+                // Download result
+                const baseName = file.name.replace(/\.pdf$/i, '');
+                const dateStr = formatDateForFilename();
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(new Blob([pdfResult], { type: 'application/pdf' }));
+                a.download = `${baseName}_ocr_${dateStr}.pdf`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+
+                if (typeof scribe.clear === 'function') {
+                    await scribe.clear();
+                }
+                logger.success(`Exported OCR PDF (${pages.length} pages)`);
+            } catch (e) {
+                logger.error('PDF OCR export failed: ' + e.message);
+                showToast('OCR export failed: ' + e.message, { type: 'error' });
+            } finally {
+                btn.disabled = false;
+                btn.textContent = origText;
+            }
         }
 
         // ============ Image Cropping (Perspective Transform) ============
