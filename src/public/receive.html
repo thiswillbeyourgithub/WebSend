@@ -2298,7 +2298,7 @@
             btn.textContent = i18n.t('receive.ocrCancel');
             btn.onclick = () => { ocrCancelled = true; };
 
-            const selectedIndices = getSelectedImageIndices();
+            const selectedIndices = getSelectedImageIndices(exportCollectionId !== null ? exportCollectionId : undefined);
             const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
             if (activeImages.length === 0) {
                 showToast('No images selected for OCR PDF export', { type: 'warn' });
