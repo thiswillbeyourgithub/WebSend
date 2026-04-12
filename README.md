@@ -2,6 +2,8 @@
 
 **Use your regular smartphone as a secure document scanner** -- even for sensitive documents.
 
+**Try it now: [websend.olicorne.org](https://websend.olicorne.org/)**
+
 ## Table of Contents
 
 - [Disclaimer](#disclaimer)
@@ -22,7 +24,6 @@
 - [Non-Security Features](#non-security-features)
 - [Keycloak SSO (Experimental)](#keycloak-sso-experimental)
 - [Future Ideas](#future-ideas)
-- [Public Instance](#public-instance)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -142,10 +143,6 @@ A commented-out oauth2-proxy service is included in `docker-compose.yml` along w
 ## Future Ideas
 
 Ideally, the WebRTC signaling server would be replaced by [iroh](https://iroh.computer/) in the future, which would eliminate the need for a signaling server entirely. However, iroh is not yet easy to embed in phone browsers.
-
-## Public Instance
-
-A small public instance is available at **https://websend.olicorne.org/** for anyone to use.
 
 ## Requirements
 
