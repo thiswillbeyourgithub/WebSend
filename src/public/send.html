@@ -1058,8 +1058,9 @@
                 container.classList.add('active');
                 video.play();
 
-                // Create a new collection on the receiver when camera opens
-                rtc.sendMessage({ type: 'batch-start' });
+                // Create a new collection on the receiver when camera opens,
+                // but only if the current batch already has images (avoid empty documents)
+                rtc.sendMessage({ type: 'batch-start-if-nonempty' });
 
                 // Apply advanced constraints (AF, AE, AWB) if supported.
                 // These are applied after getUserMedia because some devices

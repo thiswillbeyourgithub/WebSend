@@ -830,6 +830,15 @@
             } else if (msg.type === 'batch-start') {
                 logger.info('Batch start received — creating new collection');
                 createNewCollection();
+            } else if (msg.type === 'batch-start-if-nonempty') {
+                // Only create a new collection if the active one already has images
+                const active = collections.find(c => c.id === activeCollectionId);
+                if (active && active.images.length > 0) {
+                    logger.info('Batch start (if-nonempty) received — active collection has images, creating new collection');
+                    createNewCollection();
+                } else {
+                    logger.info('Batch start (if-nonempty) received — active collection is empty, reusing it');
+                }
             } else if (msg.type === 'batch-end') {
                 logger.info('Batch end received');
             } else if (msg.type === 'encrypted-file') {
