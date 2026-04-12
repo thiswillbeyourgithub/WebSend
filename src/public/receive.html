@@ -1039,10 +1039,25 @@
             if (el) el.textContent = count;
         }
 
-        /** Rename a collection */
+        /** Rename a collection and update download filenames for its files */
         function renameCollection(collectionId, newName) {
             const col = getCollection(collectionId);
-            if (col) col.name = newName.trim() || col.name;
+            if (!col) return;
+            const trimmed = newName.trim();
+            if (!trimmed) return;
+            col.name = trimmed;
+            col.renamed = true;
+            // Update download filenames for all files in this collection
+            const safeName = trimmed.replace(/[^a-zA-Z0-9_\- ]/g, '').replace(/\s+/g, '_').toLowerCase() || 'document';
+            col.images.forEach((img, idx) => {
+                const globalIdx = receivedImages.indexOf(img);
+                if (globalIdx < 0) return;
+                const dlLink = document.getElementById(`download-${globalIdx}`);
+                if (!dlLink) return;
+                const ext = img.name ? img.name.split('.').pop() : (img.mimeType.split('/').pop().split('+')[0] || 'bin');
+                const suffix = col.images.length > 1 ? `_${idx + 1}` : '';
+                dlLink.setAttribute('download', `${safeName}${suffix}.${ext}`);
+            });
         }
 
         /** Toggle collapse/expand of a collection */
