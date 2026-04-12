@@ -875,15 +875,6 @@ h1 {
     background: #3a3a6a;
 }
 
-.edit-tool-btn-compact {
-    flex: 0;
-    min-height: 36px;
-    min-width: 36px;
-    padding: 6px;
-    font-size: 1.1rem;
-    border-radius: 8px;
-}
-
 /* Received images list */
 .received-images {
     display: flex;
@@ -1084,31 +1075,75 @@ h1 {
         cursor: pointer;
     }
 
-    .received-image-item .image-actions {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
+    .received-image-item .card-menu {
         flex: 3;
         min-width: 0;
     }
+}
 
-    .received-image-item .image-actions .btn {
-        font-size: 0.85rem;
-        padding: 6px 10px;
-    }
+/* Card kebab menu */
+.card-kebab-btn {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    width: 32px;
+    height: 32px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    font-size: 1.3rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2;
+    transition: background 0.15s;
+    line-height: 1;
+}
 
-    .received-image-item .edit-toolbar {
-        flex-direction: column;
-        gap: 6px;
-    }
+.card-kebab-btn:hover {
+    background: rgba(0, 0, 0, 0.75);
+}
 
-    .received-image-item .edit-tool-btn {
-        min-height: 40px;
-        font-size: 0.85rem;
-        flex-direction: row;
-        gap: 6px;
-        padding: 6px 10px;
-    }
+.card-menu {
+    display: flex;
+    flex-direction: column;
+    background: #1e1e3a;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-top: 6px;
+}
+
+.card-menu.hidden {
+    display: none;
+}
+
+.card-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: none;
+    border: none;
+    color: #e0e0e0;
+    font-size: 0.95rem;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.12s;
+}
+
+.card-menu-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.card-menu-item-danger {
+    color: #ef5350;
+}
+
+.card-menu-item-danger:hover {
+    background: rgba(239, 83, 80, 0.15);
 }
 
 /* Image preview lightbox */

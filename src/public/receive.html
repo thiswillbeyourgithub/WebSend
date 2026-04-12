@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-PD3WTe2l/KclAwkJqyPDg7RFZyxu84fAtvCPJxDCiWs4ZR9gmlLlqY1fgnvJdV7a" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-kXFTJrWRB/5kD5dGToDuHLhc2axdS3PItgahb82JYEB2MVIPlvPxz53yT+BsWlyD" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -1160,31 +1160,24 @@
                         <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
                             <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
                         </label>
+                        <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
                     </div>
-                    <div class="image-actions">
-                        <div class="edit-toolbar" id="edit-toolbar-${imageIndex}" style="display: flex; gap: 6px; flex-wrap: wrap;">
-                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.rotate')}" onclick="rotateReceivedImage(${imageIndex})">🔄</button>
-                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('receive.crop')}" onclick="openCropModal(${imageIndex})">✂️</button>
-                            <button class="edit-tool-btn edit-tool-btn-compact" title="${i18n.t('send.applyBW')}" onclick="applyBWToImage(${imageIndex})">⬛</button>
-                        </div>
-                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
-                            ${i18n.t('receive.download')}
-                        </a>
-                        <div class="discard-btn">
-                            <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
-                                ${i18n.t('receive.discard')}
+                    <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                        <button class="card-menu-item" onclick="rotateReceivedImage(${imageIndex}); closeCardMenu(${imageIndex})">🔄 ${i18n.t('send.rotate')}</button>
+                        <button class="card-menu-item" onclick="openCropModal(${imageIndex}); closeCardMenu(${imageIndex})">✂️ ${i18n.t('receive.crop')}</button>
+                        <button class="card-menu-item" onclick="applyBWToImage(${imageIndex}); closeCardMenu(${imageIndex})">⬛ ${i18n.t('send.applyBW')}</button>
+                        <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
+                        <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                    </div>
+                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
+                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
+                        <div style="display: flex; gap: 10px;">
+                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardYes')}
                             </button>
-                        </div>
-                        <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                            <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                            <div style="display: flex; gap: 10px;">
-                                <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                                    ${i18n.t('receive.discardYes')}
-                                </button>
-                                <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                                    ${i18n.t('receive.discardNo')}
-                                </button>
-                            </div>
+                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardNo')}
+                            </button>
                         </div>
                     </div>
                 `;
@@ -1193,7 +1186,7 @@
                 const mimeType = receivedImages[imageIndex].mimeType;
                 item.innerHTML = `
                     <div class="drag-handle" title="Drag to reorder">☰</div>
-                    <div class="file-card" style="display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px;">
+                    <div class="file-card" style="display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px; position: relative;">
                         <span style="font-size: 3em;">📄</span>
                         <span class="image-badge" style="background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;">#${imageIndex + 1}</span>
                         <p style="margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;">${filename}</p>
@@ -1201,32 +1194,23 @@
                         <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
                             <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
                         </label>
+                        <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
                     </div>
-                    <div class="image-actions">
-                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
-                            ${i18n.t('receive.download')}
-                        </a>
-                        <button class="btn btn-action" style="width: 100%; background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9;" onclick="exportPdfAsImages(${imageIndex})">
-                            ${i18n.t('receive.pdfToImages')}
-                        </button>
-                        <button class="btn btn-action" style="width: 100%; background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7;" onclick="exportPdfAsOcr(${imageIndex})">
-                            ${i18n.t('receive.pdfToOcr')}
-                        </button>
-                        <div class="discard-btn">
-                            <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
-                                ${i18n.t('receive.discard')}
+                    <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                        <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
+                        <button class="card-menu-item" onclick="exportPdfAsImages(${imageIndex}); closeCardMenu(${imageIndex})">📸 ${i18n.t('receive.pdfToImages')}</button>
+                        <button class="card-menu-item" onclick="exportPdfAsOcr(${imageIndex}); closeCardMenu(${imageIndex})">📝 ${i18n.t('receive.pdfToOcr')}</button>
+                        <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                    </div>
+                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
+                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
+                        <div style="display: flex; gap: 10px;">
+                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardYes')}
                             </button>
-                        </div>
-                        <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                            <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                            <div style="display: flex; gap: 10px;">
-                                <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                                    ${i18n.t('receive.discardYes')}
-                                </button>
-                                <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                                    ${i18n.t('receive.discardNo')}
-                                </button>
-                            </div>
+                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardNo')}
+                            </button>
                         </div>
                     </div>
                 `;
@@ -1243,26 +1227,21 @@
                         <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
                             <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
                         </label>
+                        <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
                     </div>
-                    <div class="image-actions">
-                        <a href="${url}" download="${filename}" class="btn btn-action btn-success" style="width: 100%;" id="download-${imageIndex}">
-                            ${i18n.t('receive.download')}
-                        </a>
-                        <div class="discard-btn">
-                            <button class="btn btn-action" style="width: 100%; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" onclick="discardImage(${imageIndex})">
-                                ${i18n.t('receive.discard')}
+                    <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                        <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
+                        <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                    </div>
+                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
+                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
+                        <div style="display: flex; gap: 10px;">
+                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardYes')}
                             </button>
-                        </div>
-                        <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                            <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                            <div style="display: flex; gap: 10px;">
-                                <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                                    ${i18n.t('receive.discardYes')}
-                                </button>
-                                <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                                    ${i18n.t('receive.discardNo')}
-                                </button>
-                            </div>
+                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
+                                ${i18n.t('receive.discardNo')}
+                            </button>
                         </div>
                     </div>
                 `;
@@ -1271,6 +1250,30 @@
             setupDragEvents(item);
             updateCollectionCount(collectionId);
         }
+
+        // ============ Image preview lightbox ============
+
+        // ============ Card kebab menu ============
+
+        function toggleCardMenu(event, imageIndex) {
+            event.stopPropagation();
+            const menu = document.getElementById(`card-menu-${imageIndex}`);
+            const wasHidden = menu.classList.contains('hidden');
+            // Close all open menus first
+            document.querySelectorAll('.card-menu').forEach(m => m.classList.add('hidden'));
+            if (wasHidden) {
+                menu.classList.remove('hidden');
+            }
+        }
+
+        function closeCardMenu(imageIndex) {
+            document.getElementById(`card-menu-${imageIndex}`).classList.add('hidden');
+        }
+
+        // Close card menu when clicking outside
+        document.addEventListener('click', function() {
+            document.querySelectorAll('.card-menu').forEach(m => m.classList.add('hidden'));
+        });
 
         // ============ Image preview lightbox ============
 
@@ -1292,7 +1295,7 @@
         // ============ Per-image editing ============
 
         function toggleEditToolbar(imageIndex) {
-            document.getElementById(`edit-toolbar-${imageIndex}`).classList.toggle('hidden');
+            // Legacy stub — edit tools are now in the kebab menu
         }
 
         /**
@@ -1342,7 +1345,7 @@
             const img = receivedImages[imageIndex];
             if (!img) return;
 
-            const btn = document.querySelector(`[data-image-index="${imageIndex}"] .edit-tool-btn[onclick*="applyBW"]`);
+            const btn = document.querySelector(`[data-image-index="${imageIndex}"] .card-menu-item[onclick*="applyBW"]`);
 
             // If already B&W, undo it
             if (preBWData[imageIndex]) {
@@ -1419,16 +1422,14 @@
          */
         function discardImage(imageIndex) {
             const card = document.querySelector(`[data-image-index="${imageIndex}"]`);
-            card.querySelector('.discard-btn').classList.add('hidden');
             card.querySelector('.discard-confirm').classList.remove('hidden');
         }
 
         /**
-         * Cancel the discard confirmation - restore the discard button.
+         * Cancel the discard confirmation.
          */
         function cancelDiscard(imageIndex) {
             const card = document.querySelector(`[data-image-index="${imageIndex}"]`);
-            card.querySelector('.discard-btn').classList.remove('hidden');
             card.querySelector('.discard-confirm').classList.add('hidden');
         }
 
@@ -1986,12 +1987,12 @@
             // Update download link
             const dl = card.querySelector('a[id^="download-"]');
             if (dl) dl.id = `download-${newIndex}`;
-            // Update edit toolbar
-            const toolbar = card.querySelector('[id^="edit-toolbar-"]');
-            if (toolbar) toolbar.id = `edit-toolbar-${newIndex}`;
-            // Update button onclicks
-            card.querySelectorAll('button[onclick]').forEach(btn => {
-                btn.setAttribute('onclick', btn.getAttribute('onclick').replace(/\(\d+\)/, `(${newIndex})`));
+            // Update card menu
+            const menu = card.querySelector('[id^="card-menu-"]');
+            if (menu) menu.id = `card-menu-${newIndex}`;
+            // Update button and link onclicks
+            card.querySelectorAll('[onclick]').forEach(el => {
+                el.setAttribute('onclick', el.getAttribute('onclick').replace(/\(\d+\)/g, `(${newIndex})`));
             });
             // Update download filename
             if (dl && receivedImages[newIndex]) {
