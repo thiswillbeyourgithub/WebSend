@@ -1136,7 +1136,20 @@
                 btn.style.opacity = '0.4';
                 btn.title = i18n.t('send.flashUnsupportedReason');
                 document.getElementById('flash-icon').textContent = '⚡';
-                document.getElementById('flash-label').textContent = i18n.t('send.flashUnsupported');
+                document.getElementById('flash-label').textContent = i18n.t('send.flashOff');
+                // Log detailed device info to help diagnose flash support issues
+                try {
+                    const caps = track.getCapabilities ? track.getCapabilities() : {};
+                    const settings = track.getSettings();
+                    logger.info('Flash unavailable — device diagnostics:');
+                    logger.info('  Track label: ' + track.label);
+                    logger.info('  Facing mode: ' + (settings.facingMode || 'unknown'));
+                    logger.info('  Torch capability: ' + JSON.stringify(caps.torch));
+                    logger.info('  ImageCapture API: ' + (typeof ImageCapture !== 'undefined' ? 'available' : 'not available'));
+                    logger.info('  All capabilities: ' + JSON.stringify(caps));
+                } catch (diagErr) {
+                    logger.info('Flash diagnostics failed: ' + diagErr.message);
+                }
                 return;
             }
             // If only fillLightMode (no torch), reset to a compatible mode
