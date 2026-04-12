@@ -900,6 +900,18 @@
                     const col = getActiveCollection();
                     col.images.push(imgObj);
 
+                    // For non-image files, use the original filename as the
+                    // collection name instead of generic "Document N"
+                    if (fileType !== 'image' && col.images.length === 1 && metadata.name) {
+                        col.name = metadata.name;
+                        const section = document.querySelector(`.collection-section[data-collection-id="${col.id}"]`);
+                        if (section) {
+                            const nameEl = section.querySelector('.collection-name');
+                            if (nameEl) nameEl.textContent = metadata.name;
+                        }
+                        logger.info(`Collection renamed to file name: ${metadata.name}`);
+                    }
+
                     photoCount++;
                     addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileData.byteLength);
 
