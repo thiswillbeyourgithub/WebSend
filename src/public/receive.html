@@ -2377,6 +2377,7 @@
             img.ocrPageData = null; // reset any previous result
             if (!ocrQueue.includes(imageIndex)) {
                 ocrQueue.push(imageIndex);
+                logger.info(`[BG-OCR] Queued image #${imageIndex + 1} (queue length: ${ocrQueue.length})`);
             }
             updateOcrBadge(imageIndex);
             processOcrQueue();
@@ -2386,15 +2387,21 @@
          * Cancel background OCR for a specific image (e.g. when replaced or discarded).
          */
         function cancelImageOcr(imageIndex) {
+            const wasQueued = ocrQueue.includes(imageIndex);
+            const wasProcessing = currentOcrIndex === imageIndex;
             // Remove from queue if pending
             ocrQueue = ocrQueue.filter(i => i !== imageIndex);
             // Abort if currently processing
-            if (currentOcrIndex === imageIndex) {
+            if (wasProcessing) {
                 ocrAbortFlag = true;
             }
             const img = receivedImages[imageIndex];
+            const hadCachedData = img && img.ocrPageData;
             if (img) img.ocrPageData = null;
             updateOcrBadge(imageIndex);
+            if (wasQueued || wasProcessing || hadCachedData) {
+                logger.info(`[BG-OCR] Cancelled OCR for image #${imageIndex + 1} (was: ${wasProcessing ? 'processing' : wasQueued ? 'queued' : 'cached'})`);
+            }
         }
 
         /**
@@ -2436,17 +2443,25 @@
         async function processOcrQueue() {
             if (ocrProcessing) return;
             ocrProcessing = true;
+            logger.info(`[BG-OCR] Queue processing started (${ocrQueue.length} item(s))`);
 
             try {
                 while (ocrQueue.length > 0) {
                     const idx = ocrQueue.shift();
                     const img = receivedImages[idx];
-                    if (!img || img.fileType !== 'image' || img.ocrPageData) continue;
+                    if (!img || img.fileType !== 'image') {
+                        logger.info(`[BG-OCR] Skipping image #${idx + 1}: ${!img ? 'null/discarded' : 'not an image (type=' + img.fileType + ')'}`);
+                        continue;
+                    }
+                    if (img.ocrPageData) {
+                        logger.info(`[BG-OCR] Skipping image #${idx + 1}: already has cached OCR data`);
+                        continue;
+                    }
 
                     currentOcrIndex = idx;
                     ocrAbortFlag = false;
                     updateOcrBadge(idx);
-                    logger.info(`Background OCR starting for image #${idx + 1}`);
+                    logger.info(`[BG-OCR] Starting OCR for image #${idx + 1} (${ocrQueue.length} remaining in queue)`);
 
                     try {
                         // Get or init scribe
@@ -2463,7 +2478,7 @@
                             }
                         }
 
-                        if (ocrAbortFlag) { logger.info(`Background OCR aborted for image #${idx + 1}`); continue; }
+                        if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
 
                         // Downscale for OCR
                         const OCR_MAX_PX = 2000;
@@ -2487,17 +2502,17 @@
                             ocrFile = new File([scaledBlob], img.name || 'image.jpg', { type: 'image/jpeg' });
                         }
 
-                        if (ocrAbortFlag) { logger.info(`Background OCR aborted for image #${idx + 1}`); continue; }
+                        if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
 
                         await bgOcrScribe.importFiles([ocrFile]);
 
-                        if (ocrAbortFlag) { logger.info(`Background OCR aborted for image #${idx + 1}`); continue; }
+                        if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
 
                         const ocrLangs = window.__wsConfig?.ocrLangs || ['eng', 'fra'];
                         const ocrPsm = window.__wsConfig?.ocrPsm || '12';
                         await bgOcrScribe.recognize({ langs: ocrLangs, modeAdv: 'lstm', config: { tessedit_pageseg_mode: ocrPsm } });
 
-                        if (ocrAbortFlag) { logger.info(`Background OCR aborted for image #${idx + 1}`); continue; }
+                        if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
 
                         // Clone OCR result data (plain objects with bbox coords and text)
                         const pageData = bgOcrScribe.data.ocr.active[0];
@@ -2508,7 +2523,7 @@
                         // Store on the image object
                         img.ocrPageData = { page: clonedPage, metrics: clonedMetrics };
 
-                        logger.info(`Background OCR done for image #${idx + 1}`);
+                        logger.success(`[BG-OCR] Completed for image #${idx + 1}`);
 
                         // Clear scribe state for next image
                         // Re-init scribe for next image since clear() may not fully reset
@@ -2520,10 +2535,9 @@
                         }
                     } catch (e) {
                         if (ocrAbortFlag) {
-                            logger.info(`Background OCR aborted for image #${idx + 1}`);
+                            logger.info(`[BG-OCR] Aborted for image #${idx + 1} (edit/discard/replace)`);
                         } else {
-                            logger.warn(`Background OCR failed for image #${idx + 1}: ${e.message}`);
-                            // Don't store result, will fall back to on-demand OCR at export
+                            logger.warn(`[BG-OCR] Failed for image #${idx + 1}: ${e.message} — will fall back to on-demand OCR at export`);
                         }
                         // Try to reset scribe for next image
                         try {
@@ -2539,6 +2553,7 @@
                 }
             } finally {
                 ocrProcessing = false;
+                logger.info('[BG-OCR] Queue processing finished');
             }
         }
 
@@ -2550,14 +2565,129 @@
          * Offers a cancel button that falls back to plain (non-OCR) PDF export.
          */
         let ocrCancelled = false;
+        /**
+         * Full on-demand OCR: import images into scribe, recognize, scale, export.
+         * Used as fallback when cached assembly fails.
+         * @param {object} scribe - initialized scribe instance
+         * @param {Array} activeImages - images to OCR
+         * @param {HTMLElement} btn - export button for status updates
+         * @returns {Promise<Blob|ArrayBuffer>} PDF result
+         */
+        async function ocrRecognizeAndExport(scribe, activeImages, btn) {
+            logger.info('[OCR fallback] Starting full on-demand OCR for ' + activeImages.length + ' images');
+
+            if (ocrCancelled) throw new Error('OCR_CANCELLED');
+
+            const bw = isToggleActive('export-bw');
+            const origFiles = await Promise.all(activeImages.map(async (img, i) => {
+                let blob;
+                if (bw) {
+                    blob = await toBWPng(img.data, img.mimeType);
+                } else {
+                    blob = new Blob([img.data], { type: img.mimeType });
+                }
+                return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
+            }));
+            logger.info('[OCR fallback] Built ' + origFiles.length + ' original-quality files');
+
+            // Downscale for OCR
+            const OCR_MAX_PX = 2000;
+            const ocrFiles = await Promise.all(origFiles.map(async (file) => {
+                const bmp = await createImageBitmap(file);
+                const { width, height } = bmp;
+                const longest = Math.max(width, height);
+                if (longest <= OCR_MAX_PX) { bmp.close(); return file; }
+                const scale = OCR_MAX_PX / longest;
+                const nw = Math.round(width * scale);
+                const nh = Math.round(height * scale);
+                const cv = new OffscreenCanvas(nw, nh);
+                const ctx = cv.getContext('2d');
+                ctx.drawImage(bmp, 0, 0, nw, nh);
+                bmp.close();
+                const blob = await cv.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
+                return new File([blob], file.name, { type: 'image/jpeg' });
+            }));
+
+            if (ocrCancelled) throw new Error('OCR_CANCELLED');
+
+            btn.textContent = i18n.t('receive.ocrProcessing', { count: activeImages.length });
+            logger.info('[OCR fallback] Importing downscaled images into scribe');
+            await scribe.importFiles(ocrFiles);
+
+            if (ocrCancelled) throw new Error('OCR_CANCELLED');
+
+            const ocrLangs = window.__wsConfig?.ocrLangs || ['eng', 'fra'];
+            const ocrPsm = window.__wsConfig?.ocrPsm || '12';
+            logger.info('[OCR fallback] Running recognition (langs=' + ocrLangs.join(',') + ', psm=' + ocrPsm + ')');
+            await scribe.recognize({ langs: ocrLangs, modeAdv: 'lstm', config: { tessedit_pageseg_mode: ocrPsm } });
+
+            if (ocrCancelled) throw new Error('OCR_CANCELLED');
+
+            // Scale OCR coordinates back to original image dimensions
+            const ImageCache = scribe.data.image;
+            const pageMetrics = scribe.data.pageMetrics;
+            const ocrPages = scribe.data.ocr.active;
+            for (let i = 0; i < origFiles.length; i++) {
+                const origBmp = await createImageBitmap(origFiles[i]);
+                const origW = origBmp.width;
+                const origH = origBmp.height;
+                origBmp.close();
+
+                const ocrDims = pageMetrics[i].dims;
+                const scaleX = origW / ocrDims.width;
+                const scaleY = origH / ocrDims.height;
+                const s = (scaleX + scaleY) / 2;
+
+                if (Math.abs(s - 1) > 0.01) {
+                    const page = ocrPages[i];
+                    if (page && page.lines) {
+                        for (const line of page.lines) {
+                            line.bbox.left *= s; line.bbox.top *= s;
+                            line.bbox.right *= s; line.bbox.bottom *= s;
+                            if (line.ascHeight) line.ascHeight *= s;
+                            if (line.xHeight) line.xHeight *= s;
+                            line.baseline[1] *= s;
+                            for (const word of line.words) {
+                                word.bbox.left *= s; word.bbox.top *= s;
+                                word.bbox.right *= s; word.bbox.bottom *= s;
+                                if (word.chars) {
+                                    for (const ch of word.chars) {
+                                        ch.bbox.left *= s; ch.bbox.top *= s;
+                                        ch.bbox.right *= s; ch.bbox.bottom *= s;
+                                    }
+                                }
+                            }
+                        }
+                        page.dims.width = origW;
+                        page.dims.height = origH;
+                    }
+                    pageMetrics[i].dims.width = origW;
+                    pageMetrics[i].dims.height = origH;
+                }
+
+                // Swap nativeSrc to original-quality image
+                const reader = new FileReader();
+                const origBase64 = await new Promise((resolve) => {
+                    reader.onload = () => resolve(reader.result);
+                    reader.readAsDataURL(origFiles[i]);
+                });
+                const origWrapper = { src: origBase64, n: i, type: 'native', rotated: false, binarized: false };
+                ImageCache.nativeSrc[i] = Promise.resolve(origWrapper);
+            }
+
+            logger.info('[OCR fallback] Exporting PDF');
+            return await scribe.exportData('pdf');
+        }
+
         async function generateOcrPdf() {
-            logger.info('Generating OCR PDF...');
+            logger.info('=== OCR PDF export started ===');
             ocrCancelled = false;
             const btn = document.getElementById('export-btn');
 
             const selectedIndices = getSelectedImageIndices(exportCollectionId !== null ? exportCollectionId : undefined);
             const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
             if (activeImages.length === 0) {
+                logger.warn('No images selected for OCR PDF export');
                 showToast('No images selected for OCR PDF export', { type: 'warn' });
                 btn.disabled = false;
                 updateExportButton();
@@ -2565,15 +2695,17 @@
             }
 
             // Check how many images still need OCR
+            const cachedCount = activeImages.filter(img => img.ocrPageData).length;
             const needsOcr = activeImages.filter(img => !img.ocrPageData);
             const allCached = needsOcr.length === 0;
+            logger.info(`Selected ${activeImages.length} images: ${cachedCount} cached, ${needsOcr.length} pending`);
 
             if (allCached) {
-                logger.info('All OCR results cached — assembling PDF from cache');
+                logger.info('All OCR results cached — will assemble PDF from cache');
                 btn.textContent = i18n.t('receive.ocrProcessing', { count: activeImages.length });
                 btn.disabled = true;
             } else {
-                logger.info(`${needsOcr.length}/${activeImages.length} images still need OCR — waiting for background OCR`);
+                logger.info(`Waiting for background OCR to finish ${needsOcr.length} remaining images`);
                 btn.disabled = false;
                 btn.style.background = '#c62828';
                 btn.textContent = i18n.t('receive.ocrCancel');
@@ -2590,7 +2722,7 @@
                 timeoutId = setTimeout(() => reject(new Error('OCR_TIMEOUT')), timeoutMs);
             });
 
-            // Cancel guard — polls ocrCancelled flag, cleaned up via ocrDone
+            // Cancel guard
             let ocrDone = false;
             const cancelPromise = new Promise((_, reject) => {
                 const checkCancel = () => {
@@ -2620,15 +2752,20 @@
                         for (const img of needsOcr) {
                             const idx = receivedImages.indexOf(img);
                             if (idx !== -1 && !ocrQueue.includes(idx) && currentOcrIndex !== idx) {
+                                logger.info(`Queuing image #${idx + 1} for background OCR (was not in queue)`);
                                 queueBackgroundOcr(idx);
                             }
                         }
                         // Poll until all are done or cancelled
+                        logger.info('Polling for background OCR completion...');
                         await new Promise((resolve, reject) => {
                             const poll = () => {
                                 if (ocrCancelled) return reject(new Error('OCR_CANCELLED'));
                                 const stillPending = activeImages.filter(img => !img.ocrPageData).length;
-                                if (stillPending === 0) return resolve();
+                                if (stillPending === 0) {
+                                    logger.info('All background OCR completed');
+                                    return resolve();
+                                }
                                 btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount }) + ` (${imageCount - stillPending}/${imageCount})`;
                                 setTimeout(poll, 500);
                             };
@@ -2638,18 +2775,22 @@
 
                     if (ocrCancelled) throw new Error('OCR_CANCELLED');
 
-                    // All images now have cached OCR data — assemble the PDF
+                    // --- Try assembling from cached OCR data ---
+                    logger.info('Assembling PDF from cached OCR data...');
                     btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
 
                     // Get a scribe instance for PDF assembly
                     let scribe;
                     if (bgOcrScribe && !ocrProcessing) {
+                        logger.info('Reusing background OCR scribe instance');
                         scribe = bgOcrScribe;
                         bgOcrScribe = null;
                     } else if (scribePreloaded) {
+                        logger.info('Using preloaded scribe instance');
                         scribe = await scribePreloaded;
                         scribePreloaded = null;
                     } else {
+                        logger.info('Initializing new scribe instance for PDF assembly');
                         const scribeModule = await import('/scribe/scribe.js');
                         scribe = scribeModule.default;
                         await scribe.init({ ocr: true, font: true });
@@ -2658,88 +2799,131 @@
 
                     if (ocrCancelled) throw new Error('OCR_CANCELLED');
 
-                    const bw = isToggleActive('export-bw');
-                    // Build original-quality files for the final PDF
-                    const origFiles = await Promise.all(activeImages.map(async (img, i) => {
-                        let blob;
-                        if (bw) {
-                            blob = await toBWPng(img.data, img.mimeType);
-                        } else {
-                            blob = new Blob([img.data], { type: img.mimeType });
-                        }
-                        return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
-                    }));
+                    try {
+                        // Attempt cached assembly
+                        const bw = isToggleActive('export-bw');
+                        const origFiles = await Promise.all(activeImages.map(async (img, i) => {
+                            let blob;
+                            if (bw) {
+                                blob = await toBWPng(img.data, img.mimeType);
+                            } else {
+                                blob = new Blob([img.data], { type: img.mimeType });
+                            }
+                            return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
+                        }));
 
-                    // Import original images into scribe (for PDF rendering)
-                    await scribe.importFiles(origFiles);
+                        logger.info('Importing ' + origFiles.length + ' original images into scribe');
+                        await scribe.importFiles(origFiles);
 
-                    if (ocrCancelled) throw new Error('OCR_CANCELLED');
+                        if (ocrCancelled) throw new Error('OCR_CANCELLED');
 
-                    // Set cached OCR data on scribe's internal state (skip recognize)
-                    const ImageCache = scribe.data.image;
-                    const pageMetrics = scribe.data.pageMetrics;
-                    for (let i = 0; i < activeImages.length; i++) {
-                        const cached = activeImages[i].ocrPageData;
-                        // Deep clone so we don't mutate the cache when scaling
-                        const cachedPage = JSON.parse(JSON.stringify(cached.page));
-                        const cachedMetrics = JSON.parse(JSON.stringify(cached.metrics));
+                        // Set cached OCR data on scribe's internal state (skip recognize)
+                        const ImageCache = scribe.data.image;
+                        const pageMetrics = scribe.data.pageMetrics;
+                        for (let i = 0; i < activeImages.length; i++) {
+                            const cached = activeImages[i].ocrPageData;
+                            if (!cached || !cached.page) {
+                                throw new Error(`Missing cached OCR data for image ${i + 1}`);
+                            }
+                            // Deep clone so we don't mutate the cache when scaling
+                            const cachedPage = JSON.parse(JSON.stringify(cached.page));
+                            const cachedMetrics = JSON.parse(JSON.stringify(cached.metrics));
 
-                        const origBmp = await createImageBitmap(origFiles[i]);
-                        const origW = origBmp.width;
-                        const origH = origBmp.height;
-                        origBmp.close();
+                            const origBmp = await createImageBitmap(origFiles[i]);
+                            const origW = origBmp.width;
+                            const origH = origBmp.height;
+                            origBmp.close();
 
-                        // Scale OCR coordinates from downscaled dims to original dims
-                        const ocrDims = cachedMetrics.dims;
-                        const scaleX = origW / ocrDims.width;
-                        const scaleY = origH / ocrDims.height;
-                        const s = (scaleX + scaleY) / 2;
+                            // Scale OCR coordinates from downscaled dims to original dims
+                            const ocrDims = cachedMetrics.dims;
+                            const scaleX = origW / ocrDims.width;
+                            const scaleY = origH / ocrDims.height;
+                            const s = (scaleX + scaleY) / 2;
 
-                        if (Math.abs(s - 1) > 0.01 && cachedPage && cachedPage.lines) {
-                            for (const line of cachedPage.lines) {
-                                line.bbox.left *= s; line.bbox.top *= s;
-                                line.bbox.right *= s; line.bbox.bottom *= s;
-                                if (line.ascHeight) line.ascHeight *= s;
-                                if (line.xHeight) line.xHeight *= s;
-                                line.baseline[1] *= s;
-                                for (const word of line.words) {
-                                    word.bbox.left *= s; word.bbox.top *= s;
-                                    word.bbox.right *= s; word.bbox.bottom *= s;
-                                    if (word.chars) {
-                                        for (const ch of word.chars) {
-                                            ch.bbox.left *= s; ch.bbox.top *= s;
-                                            ch.bbox.right *= s; ch.bbox.bottom *= s;
+                            if (Math.abs(s - 1) > 0.01 && cachedPage && cachedPage.lines) {
+                                for (const line of cachedPage.lines) {
+                                    line.bbox.left *= s; line.bbox.top *= s;
+                                    line.bbox.right *= s; line.bbox.bottom *= s;
+                                    if (line.ascHeight) line.ascHeight *= s;
+                                    if (line.xHeight) line.xHeight *= s;
+                                    line.baseline[1] *= s;
+                                    for (const word of line.words) {
+                                        word.bbox.left *= s; word.bbox.top *= s;
+                                        word.bbox.right *= s; word.bbox.bottom *= s;
+                                        if (word.chars) {
+                                            for (const ch of word.chars) {
+                                                ch.bbox.left *= s; ch.bbox.top *= s;
+                                                ch.bbox.right *= s; ch.bbox.bottom *= s;
+                                            }
                                         }
                                     }
                                 }
+                                cachedPage.dims = { width: origW, height: origH };
                             }
-                            cachedPage.dims = { width: origW, height: origH };
+
+                            scribe.data.ocr.active[i] = cachedPage;
+                            pageMetrics[i].dims.width = origW;
+                            pageMetrics[i].dims.height = origH;
+
+                            // Swap nativeSrc to original-quality image
+                            const reader = new FileReader();
+                            const origBase64 = await new Promise((resolve) => {
+                                reader.onload = () => resolve(reader.result);
+                                reader.readAsDataURL(origFiles[i]);
+                            });
+                            const origWrapper = { src: origBase64, n: i, type: 'native', rotated: false, binarized: false };
+                            ImageCache.nativeSrc[i] = Promise.resolve(origWrapper);
                         }
 
-                        // Set cached OCR data into scribe's state
-                        scribe.data.ocr.active[i] = cachedPage;
-                        pageMetrics[i].dims.width = origW;
-                        pageMetrics[i].dims.height = origH;
+                        logger.info('Exporting PDF from cached OCR data');
+                        const pdfResult = await scribe.exportData('pdf');
+                        logger.success('PDF assembled from cached OCR data successfully');
 
-                        // Swap nativeSrc to original-quality image
-                        const reader = new FileReader();
-                        const origBase64 = await new Promise((resolve) => {
-                            reader.onload = () => resolve(reader.result);
-                            reader.readAsDataURL(origFiles[i]);
-                        });
-                        const origWrapper = { src: origBase64, n: i, type: 'native', rotated: false, binarized: false };
-                        ImageCache.nativeSrc[i] = Promise.resolve(origWrapper);
+                        if (typeof scribe.clear === 'function') {
+                            await scribe.clear();
+                        } else if (typeof scribe.terminate === 'function') {
+                            await scribe.terminate();
+                        }
+                        scribePreloaded = null;
+                        return pdfResult;
+
+                    } catch (cacheErr) {
+                        if (cacheErr.message === 'OCR_CANCELLED') throw cacheErr;
+
+                        // --- Cached assembly failed — fall back to full on-demand OCR ---
+                        logger.warn('Cached OCR assembly failed: ' + cacheErr.message + ' — falling back to full on-demand OCR');
+                        showToast('Cached OCR failed, running full OCR...', { type: 'warn' });
+
+                        // Reset scribe for a clean run
+                        try {
+                            if (typeof scribe.clear === 'function') await scribe.clear();
+                            else if (typeof scribe.terminate === 'function') { await scribe.terminate(); scribe = null; }
+                        } catch (_) { scribe = null; }
+
+                        if (!scribe) {
+                            logger.info('[OCR fallback] Re-initializing scribe after cache failure');
+                            const scribeModule = await import('/scribe/scribe.js');
+                            scribe = scribeModule.default;
+                            await scribe.init({ ocr: true, font: true });
+                            scribe.opt.displayMode = 'invis';
+                        }
+
+                        btn.disabled = false;
+                        btn.style.background = '#c62828';
+                        btn.textContent = i18n.t('receive.ocrCancel');
+                        btn.onclick = () => { ocrCancelled = true; };
+
+                        const pdfResult = await ocrRecognizeAndExport(scribe, activeImages, btn);
+                        logger.success('[OCR fallback] PDF generated successfully via on-demand OCR');
+
+                        if (typeof scribe.clear === 'function') {
+                            await scribe.clear();
+                        } else if (typeof scribe.terminate === 'function') {
+                            await scribe.terminate();
+                        }
+                        scribePreloaded = null;
+                        return pdfResult;
                     }
-
-                    const pdfResult = await scribe.exportData('pdf');
-
-                    if (typeof scribe.clear === 'function') {
-                        await scribe.clear();
-                    } else if (typeof scribe.terminate === 'function') {
-                        await scribe.terminate();
-                    }
-                    scribePreloaded = null;
-                    return pdfResult;
                 })();
 
                 const pdfResult = await Promise.race([ocrWork, timeoutPromise, cancelPromise]);
@@ -2763,7 +2947,7 @@
                 a.click();
                 URL.revokeObjectURL(url);
 
-                logger.success('OCR PDF downloaded');
+                logger.success('=== OCR PDF downloaded successfully ===');
             } catch (e) {
                 clearTimeout(timeoutId);
                 if (e.message === 'OCR_CANCELLED') {
@@ -2786,6 +2970,7 @@
                 btn.disabled = false;
                 btn.style.background = '#1565c0';
                 updateExportButton();
+                logger.info('=== OCR PDF export finished ===');
             }
         }
 
