@@ -259,6 +259,7 @@
         let weConfirmed = false;  // Track if we confirmed fingerprints
         let theyConfirmed = false; // Track if sender confirmed fingerprints
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string}
+        let pendingReplaceHash = null; // Hash of image being replaced by an incoming edit
 
         // Collections: each batch from sender = one collection (displayed as "Document")
         let collections = []; // [{id, name, images: [{data, mimeType, name}]}]
@@ -827,6 +828,9 @@
             } else if (msg.type === 'delete-image') {
                 logger.info('Received delete-image request for hash: ' + msg.hash);
                 deleteReceivedImageByHash(msg.hash);
+            } else if (msg.type === 'replace-image') {
+                logger.info('Next incoming file will replace image with hash: ' + msg.oldHash);
+                pendingReplaceHash = msg.oldHash;
             } else if (msg.type === 'batch-start') {
                 logger.info('Batch start received — creating new collection');
                 createNewCollection();
@@ -885,7 +889,53 @@
                     const ext = fileMimeType.split('/').pop().split('+')[0] || 'bin';
                     const fileName = metadata.name || `websend_${connectionTimestamp}_${photoCount + 1}.${ext}`;
 
-                    // Add to received files and active collection
+                    // Check if this is a replacement for an edited image
+                    let wasReplacement = false;
+                    if (pendingReplaceHash) {
+                        const replaceIdx = receivedImages.findIndex(img => img && img.hash === pendingReplaceHash);
+                        pendingReplaceHash = null;
+                        if (replaceIdx !== -1) {
+                            wasReplacement = true;
+                            const oldImg = receivedImages[replaceIdx];
+                            logger.info(`Replacing image at index ${replaceIdx}`);
+
+                            // Update the image data in place
+                            oldImg.data = fileData;
+                            oldImg.mimeType = fileMimeType;
+                            oldImg.name = fileName;
+                            oldImg.fileType = fileType;
+                            oldImg.hash = null;
+
+                            // Update the DOM card
+                            const card = document.querySelector(`.received-image-item[data-image-index="${replaceIdx}"]`);
+                            if (card) {
+                                const imgEl = card.querySelector('img');
+                                if (imgEl) {
+                                    if (imgEl.src.startsWith('blob:')) URL.revokeObjectURL(imgEl.src);
+                                    imgEl.src = fileUrl;
+                                }
+                                const dlLink = card.querySelector(`#download-${replaceIdx}`);
+                                if (dlLink) {
+                                    if (dlLink.href.startsWith('blob:')) URL.revokeObjectURL(dlLink.href);
+                                    dlLink.href = fileUrl;
+                                    dlLink.download = fileName;
+                                }
+                            }
+
+                            // Compute SHA-256 and ack
+                            const decryptedHash = await WebSendCrypto.sha256Hex(data);
+                            oldImg.hash = decryptedHash;
+                            logger.info(`Replacement SHA-256: ${decryptedHash}`);
+                            rtc.sendMessage({ type: 'file-ack', sha256: decryptedHash });
+                            logger.success(`Image replaced (index ${replaceIdx}) and ack sent`);
+                            showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender');
+                        } else {
+                            logger.warn(`replace-image: old hash not found, adding as new image`);
+                        }
+                    }
+
+                    if (!wasReplacement) {
+                    // Add to received files and active collection (normal flow)
                     const imageIndex = receivedImages.length;
                     const imgObj = {
                         data: fileData,
@@ -930,6 +980,7 @@
                     logger.info(`Decrypted SHA-256: ${decryptedHash}`);
                     rtc.sendMessage({ type: 'file-ack', sha256: decryptedHash });
                     logger.success('File decrypted, displayed, and ack sent');
+                    } // end if (!wasReplacement)
                 } catch (e) {
                     logger.error('Failed to decrypt photo: ' + e.message);
                     // Send file-nack so the sender knows decryption failed

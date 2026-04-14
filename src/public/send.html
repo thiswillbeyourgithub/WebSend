@@ -1431,8 +1431,8 @@
                 thumb.appendChild(indexBadge);
                 thumb.appendChild(deleteBtn);
 
-                // Tap to edit disabled — photos are sent immediately
-                // thumb.addEventListener('click', () => openGalleryEdit(idx));
+                // Tap to open edit view
+                thumb.addEventListener('click', () => openGalleryEdit(idx));
 
                 // Drag-and-drop reorder
                 thumb.addEventListener('dragstart', (e) => {
@@ -1590,6 +1590,17 @@
             const editImg = document.getElementById('gallery-edit-image');
             if (editImg.src && editImg.src.startsWith('blob:')) URL.revokeObjectURL(editImg.src);
             editImg.src = URL.createObjectURL(resultBlob);
+
+            // If already sent, resend edited version to replace on receiver
+            if (photo.sentHash) {
+                const oldHash = photo.sentHash;
+                photo.sentHash = null;
+                photo.sendStatus = 'queuing';
+                // Tell receiver to expect a replacement
+                sendQueue.push({ blob: resultBlob, photoId: photo.id, replaceHash: oldHash });
+                drainQueue();
+                logger.info(`Edited photo queued for resend (replacing ${oldHash.substring(0, 8)}...)`);
+            }
         }
 
         /** Rotate gallery photo 90° CW */
@@ -1897,6 +1908,10 @@
             while (sendQueue.length > 0) {
                 const item = sendQueue[0];
                 try {
+                    // If this is a replacement, tell receiver which image to replace
+                    if (item.replaceHash) {
+                        rtc.sendMessage({ type: 'replace-image', oldHash: item.replaceHash });
+                    }
                     const localHash = await sendOnePhoto(item.blob);
                     sendQueue.shift();
                     successCount++;
@@ -2577,6 +2592,17 @@
                     photo.thumbUrl = URL.createObjectURL(currentPhotoBlob);
                     logger.success(`Cropped gallery image: ${dstW}x${dstH}px`);
                     closeCropModal();
+
+                    // If already sent, resend edited version to replace on receiver
+                    if (photo.sentHash) {
+                        const oldHash = photo.sentHash;
+                        photo.sentHash = null;
+                        photo.sendStatus = 'queuing';
+                                sendQueue.push({ blob: currentPhotoBlob, photoId: photo.id, replaceHash: oldHash });
+                        drainQueue();
+                        logger.info(`Cropped photo queued for resend (replacing ${oldHash.substring(0, 8)}...)`);
+                    }
+
                     // Refresh gallery edit view
                     openGalleryEdit(galleryEditIndex);
                     return;
