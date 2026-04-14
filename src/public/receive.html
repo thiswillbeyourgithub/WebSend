@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-GQyUkrdr+/3Ampv/pj1sdWHpCnjti6GcaCUrGEAvjhIncAeQtP9VRYv1MtR/hbo2" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-TDQTChbrP6hEF7n5GhD3p8QWdLzPzIzQtlu5Qrq6QxRpPMuol5TZ1PjV6L95Fytv" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -1155,14 +1155,13 @@
                 item.innerHTML = `
                     <div class="drag-handle" title="Drag to reorder">☰</div>
                     <div class="image-thumb-container" style="position: relative; display: block;">
-                        <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block; cursor: pointer;" onclick="openLightbox(${imageIndex})">
+                        <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block; cursor: pointer;" onclick="if(event.shiftKey){toggleSelectFromMenu(${imageIndex})}else{openLightbox(${imageIndex})}">
                         <span class="image-badge" style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
-                        <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
-                            <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
-                        </label>
+                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
                         <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
                     </div>
                     <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                        <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
                         <button class="card-menu-item" onclick="rotateReceivedImage(${imageIndex}); closeCardMenu(${imageIndex})">🔄 ${i18n.t('send.rotate')}</button>
                         <button class="card-menu-item" onclick="openCropModal(${imageIndex}); closeCardMenu(${imageIndex})">✂️ ${i18n.t('receive.crop')}</button>
                         <button class="card-menu-item" onclick="applyBWToImage(${imageIndex}); closeCardMenu(${imageIndex})">⬛ ${i18n.t('send.applyBW')}</button>
@@ -1191,12 +1190,11 @@
                         <span class="image-badge" style="background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;">#${imageIndex + 1}</span>
                         <p style="margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;">${filename}</p>
                         <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
-                        <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
-                            <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
-                        </label>
+                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
                         <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
                     </div>
                     <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                        <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
                         <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
                         <button class="card-menu-item" onclick="exportPdfAsImages(${imageIndex}); closeCardMenu(${imageIndex})">📸 ${i18n.t('receive.pdfToImages')}</button>
                         <button class="card-menu-item" onclick="exportPdfAsOcr(${imageIndex}); closeCardMenu(${imageIndex})">📝 ${i18n.t('receive.pdfToOcr')}</button>
@@ -1224,12 +1222,11 @@
                         <span class="image-badge" style="background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;">#${imageIndex + 1}</span>
                         <p style="margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;">${filename}</p>
                         <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
-                        <label class="image-select-checkbox" style="position: absolute; top: 8px; right: 8px; cursor: pointer; z-index: 2;">
-                            <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="width: 22px; height: 22px; cursor: pointer; accent-color: #1565c0;">
-                        </label>
+                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
                         <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
                     </div>
                     <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                        <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
                         <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
                         <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
                     </div>
@@ -1268,6 +1265,12 @@
 
         function closeCardMenu(imageIndex) {
             document.getElementById(`card-menu-${imageIndex}`).classList.add('hidden');
+        }
+
+        function toggleSelectFromMenu(imageIndex) {
+            const cb = document.getElementById(`select-${imageIndex}`);
+            cb.checked = !cb.checked;
+            onSelectionChange();
         }
 
         // Close card menu when clicking outside
