@@ -624,11 +624,10 @@
                     deleteGalleryPhoto(idx);
                 }
             });
-            // Gallery edit buttons disabled — photos are sent immediately on capture
-            // document.getElementById('gallery-rotate-btn').addEventListener('click', galleryRotateCW);
-            // document.getElementById('gallery-crop-btn').addEventListener('click', galleryOpenCrop);
-            // document.getElementById('gallery-flip-btn').addEventListener('click', galleryFlipH);
-            // document.getElementById('gallery-bw-btn').addEventListener('click', galleryApplyBW);
+            document.getElementById('gallery-rotate-btn').addEventListener('click', galleryRotateCW);
+            document.getElementById('gallery-crop-btn').addEventListener('click', galleryOpenCrop);
+            document.getElementById('gallery-flip-btn').addEventListener('click', galleryFlipH);
+            document.getElementById('gallery-bw-btn').addEventListener('click', galleryApplyBW);
             document.getElementById('back-to-choose-btn').addEventListener('click', () => {
                 // Warn if gallery has photos
                 if (galleryPhotos.length > 0 && !confirm(i18n.t('send.galleryEmpty') + '?')) return;
