@@ -2514,11 +2514,11 @@
 
                         if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
 
-                        // Clone OCR result data (plain objects with bbox coords and text)
+                        // Clone OCR result data — use structuredClone to handle circular refs
                         const pageData = bgOcrScribe.data.ocr.active[0];
                         const metrics = bgOcrScribe.data.pageMetrics[0];
-                        const clonedPage = JSON.parse(JSON.stringify(pageData));
-                        const clonedMetrics = JSON.parse(JSON.stringify(metrics));
+                        const clonedPage = structuredClone(pageData);
+                        const clonedMetrics = structuredClone(metrics);
 
                         // Store on the image object
                         img.ocrPageData = { page: clonedPage, metrics: clonedMetrics };
