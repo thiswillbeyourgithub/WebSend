@@ -10,7 +10,7 @@
     <title>WebSend - Send Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-shQlm9lbey7fywsqU1YxbOYAQw4N0R3k6fhrzqrszp+P6NFgpOVgquT4eyGLlb0n" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-lZGSEiD+KG6mtsWRX+PVTlp2GqD9RhCtoAfRIyCDG8O/t3rWcWAgYz1uf747qwDl" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -1734,7 +1734,7 @@
                         return;
                     }
                     sendQueue.push({ blob: processed, photoId: null });
-                    showToast(`${processed.name} queued for sending`);
+                    showToast(`${processed.name} queued for sending`, { type: 'success' });
                     updateQueueBanner();
                     rtc.sendMessage({ type: 'batch-start' });
                     pendingBatchEnd = true;
@@ -1768,7 +1768,7 @@
                 showToast(`${failed} image(s) could not be processed`, { type: 'warn' });
             }
             if (queued > 0) {
-                showToast(`${queued} photo(s) queued for sending`);
+                showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
                 updateQueueBanner();
                 rtc.sendMessage({ type: 'batch-start' });
                 pendingBatchEnd = true;
@@ -1952,9 +1952,9 @@
             updateQueueBanner();
 
             if (successCount === 1) {
-                showToast(i18n.t('send.transferVerified'));
+                showToast(i18n.t('send.transferVerified'), { type: 'success' });
             } else if (successCount > 1) {
-                showToast(i18n.t('send.allSent').replace('{n}', successCount));
+                showToast(i18n.t('send.allSent').replace('{n}', successCount), { type: 'success' });
             }
         }
 
