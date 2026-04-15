@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-TDQTChbrP6hEF7n5GhD3p8QWdLzPzIzQtlu5Qrq6QxRpPMuol5TZ1PjV6L95Fytv" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-shQlm9lbey7fywsqU1YxbOYAQw4N0R3k6fhrzqrszp+P6NFgpOVgquT4eyGLlb0n" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -1229,14 +1229,14 @@
                         <span class="image-badge" style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
                         <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
                         <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
-                    </div>
-                    <div class="card-menu hidden" id="card-menu-${imageIndex}">
-                        <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
-                        <button class="card-menu-item" onclick="rotateReceivedImage(${imageIndex}); closeCardMenu(${imageIndex})">🔄 ${i18n.t('send.rotate')}</button>
-                        <button class="card-menu-item" onclick="openCropModal(${imageIndex}); closeCardMenu(${imageIndex})">✂️ ${i18n.t('receive.crop')}</button>
-                        <button class="card-menu-item" onclick="applyBWToImage(${imageIndex}); closeCardMenu(${imageIndex})">⬛ ${i18n.t('send.applyBW')}</button>
-                        <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
-                        <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                        <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                            <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
+                            <button class="card-menu-item" onclick="rotateReceivedImage(${imageIndex}); closeCardMenu(${imageIndex})">🔄 ${i18n.t('send.rotate')}</button>
+                            <button class="card-menu-item" onclick="openCropModal(${imageIndex}); closeCardMenu(${imageIndex})">✂️ ${i18n.t('receive.crop')}</button>
+                            <button class="card-menu-item" onclick="applyBWToImage(${imageIndex}); closeCardMenu(${imageIndex})">⬛ ${i18n.t('send.applyBW')}</button>
+                            <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
+                            <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                        </div>
                     </div>
                     <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
                         <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
@@ -1262,13 +1262,13 @@
                         <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
                         <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
                         <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
-                    </div>
-                    <div class="card-menu hidden" id="card-menu-${imageIndex}">
-                        <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
-                        <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
-                        <button class="card-menu-item" onclick="exportPdfAsImages(${imageIndex}); closeCardMenu(${imageIndex})">📸 ${i18n.t('receive.pdfToImages')}</button>
-                        <button class="card-menu-item" onclick="exportPdfAsOcr(${imageIndex}); closeCardMenu(${imageIndex})">📝 ${i18n.t('receive.pdfToOcr')}</button>
-                        <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                        <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                            <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
+                            <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
+                            <button class="card-menu-item" onclick="exportPdfAsImages(${imageIndex}); closeCardMenu(${imageIndex})">📸 ${i18n.t('receive.pdfToImages')}</button>
+                            <button class="card-menu-item" onclick="exportPdfAsOcr(${imageIndex}); closeCardMenu(${imageIndex})">📝 ${i18n.t('receive.pdfToOcr')}</button>
+                            <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                        </div>
                     </div>
                     <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
                         <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
@@ -1294,11 +1294,11 @@
                         <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
                         <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
                         <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
-                    </div>
-                    <div class="card-menu hidden" id="card-menu-${imageIndex}">
-                        <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
-                        <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
-                        <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                        <div class="card-menu hidden" id="card-menu-${imageIndex}">
+                            <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
+                            <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
+                            <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
+                        </div>
                     </div>
                     <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
                         <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
