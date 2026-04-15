@@ -521,6 +521,7 @@ h1 {
 }
 .gallery-edit-view .image-preview {
     flex: 1;
+    min-height: 0;
     object-fit: contain;
     max-height: none;
     margin: 0;
