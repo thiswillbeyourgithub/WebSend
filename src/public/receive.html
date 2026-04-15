@@ -2826,8 +2826,8 @@
                                 throw new Error(`Missing cached OCR data for image ${i + 1}`);
                             }
                             // Deep clone so we don't mutate the cache when scaling
-                            const cachedPage = JSON.parse(JSON.stringify(cached.page));
-                            const cachedMetrics = JSON.parse(JSON.stringify(cached.metrics));
+                            const cachedPage = structuredClone(cached.page);
+                            const cachedMetrics = structuredClone(cached.metrics);
 
                             const origBmp = await createImageBitmap(origFiles[i]);
                             const origW = origBmp.width;
