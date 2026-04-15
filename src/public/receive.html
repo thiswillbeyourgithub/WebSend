@@ -2438,23 +2438,74 @@
         }
 
         /**
+         * Downscale a single image for OCR (max 2000px on longest side).
+         * Returns a Promise<File> suitable for scribe.importFiles().
+         * Returns null if the image has been discarded or is invalid.
+         */
+        async function downscaleForOcr(idx) {
+            const img = receivedImages[idx];
+            if (!img || img.fileType !== 'image') return null;
+            const OCR_MAX_PX = 2000;
+            const blob = new Blob([img.data], { type: img.mimeType });
+            const bmp = await createImageBitmap(blob);
+            const { width, height } = bmp;
+            const longest = Math.max(width, height);
+            if (longest <= OCR_MAX_PX) {
+                bmp.close();
+                return new File([blob], img.name || 'image.jpg', { type: img.mimeType });
+            }
+            const scale = OCR_MAX_PX / longest;
+            const nw = Math.round(width * scale);
+            const nh = Math.round(height * scale);
+            const cv = new OffscreenCanvas(nw, nh);
+            const ctx = cv.getContext('2d');
+            ctx.drawImage(bmp, 0, 0, nw, nh);
+            bmp.close();
+            const scaledBlob = await cv.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
+            return new File([scaledBlob], img.name || 'image.jpg', { type: 'image/jpeg' });
+        }
+
+        /**
          * Process the background OCR queue one image at a time.
+         * Downscaling of the next image is pipelined concurrently with the
+         * current recognize() call (createImageBitmap / OffscreenCanvas run
+         * off the main thread, so this is genuine parallelism).
          */
         async function processOcrQueue() {
             if (ocrProcessing) return;
             ocrProcessing = true;
             logger.info(`[BG-OCR] Queue processing started (${ocrQueue.length} item(s))`);
 
+            // Map: imageIndex -> Promise<File|null> for pre-downscaled images
+            const pendingDownscale = new Map();
+
+            // Pre-start downscaling the first queued image immediately
+            if (ocrQueue.length > 0) {
+                const firstIdx = ocrQueue[0];
+                pendingDownscale.set(firstIdx, downscaleForOcr(firstIdx));
+            }
+
             try {
                 while (ocrQueue.length > 0) {
                     const idx = ocrQueue.shift();
+
+                    // Pre-start downscaling the next image in queue right away
+                    if (ocrQueue.length > 0) {
+                        const nextIdx = ocrQueue[0];
+                        if (!pendingDownscale.has(nextIdx)) {
+                            pendingDownscale.set(nextIdx, downscaleForOcr(nextIdx));
+                        }
+                    }
+
                     const img = receivedImages[idx];
                     if (!img || img.fileType !== 'image') {
                         logger.info(`[BG-OCR] Skipping image #${idx + 1}: ${!img ? 'null/discarded' : 'not an image (type=' + img.fileType + ')'}`);
+                        pendingDownscale.delete(idx);
                         continue;
                     }
                     if (img.ocrPageData) {
                         logger.info(`[BG-OCR] Skipping image #${idx + 1}: already has cached OCR data`);
+                        pendingDownscale.delete(idx);
                         continue;
                     }
 
@@ -2478,35 +2529,31 @@
                             }
                         }
 
-                        if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
+                        if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); pendingDownscale.delete(idx); continue; }
 
-                        // Downscale for OCR
-                        const OCR_MAX_PX = 2000;
-                        const blob = new Blob([img.data], { type: img.mimeType });
-                        const bmp = await createImageBitmap(blob);
-                        const { width, height } = bmp;
-                        let ocrFile;
-                        const longest = Math.max(width, height);
-                        if (longest <= OCR_MAX_PX) {
-                            bmp.close();
-                            ocrFile = new File([blob], img.name || 'image.jpg', { type: img.mimeType });
-                        } else {
-                            const scale = OCR_MAX_PX / longest;
-                            const nw = Math.round(width * scale);
-                            const nh = Math.round(height * scale);
-                            const cv = new OffscreenCanvas(nw, nh);
-                            const ctx = cv.getContext('2d');
-                            ctx.drawImage(bmp, 0, 0, nw, nh);
-                            bmp.close();
-                            const scaledBlob = await cv.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
-                            ocrFile = new File([scaledBlob], img.name || 'image.jpg', { type: 'image/jpeg' });
-                        }
+                        // Retrieve pre-downscaled file (already running in parallel) or downscale now
+                        const ocrFile = pendingDownscale.has(idx)
+                            ? await pendingDownscale.get(idx)
+                            : await downscaleForOcr(idx);
+                        pendingDownscale.delete(idx);
+
+                        if (!ocrFile) { logger.info(`[BG-OCR] Skipping image #${idx + 1}: discarded during downscale`); continue; }
 
                         if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
 
                         await bgOcrScribe.importFiles([ocrFile]);
 
                         if (ocrAbortFlag) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
+
+                        // Pre-start downscaling the next image while recognize() runs
+                        // (createImageBitmap / OffscreenCanvas are truly async — off-thread)
+                        if (ocrQueue.length > 0) {
+                            const nextIdx = ocrQueue[0];
+                            if (!pendingDownscale.has(nextIdx)) {
+                                pendingDownscale.set(nextIdx, downscaleForOcr(nextIdx));
+                                logger.info(`[BG-OCR] Pre-downscaling image #${nextIdx + 1} while recognizing #${idx + 1}`);
+                            }
+                        }
 
                         const ocrLangs = window.__wsConfig?.ocrLangs || ['eng', 'fra'];
                         const ocrPsm = window.__wsConfig?.ocrPsm || '12';
