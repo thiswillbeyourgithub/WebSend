@@ -838,6 +838,10 @@
             } else if (msg.type === 'delete-image') {
                 logger.info('Received delete-image request for hash: ' + msg.hash);
                 deleteReceivedImageByHash(msg.hash);
+            } else if (msg.type === 'transform-image') {
+                // Sender wants us to replay transforms locally instead of resending full image
+                logger.info(`Received transform-image for hash ${msg.oldHash} (${msg.transforms.length} ops)`);
+                handleTransformImage(msg.oldHash, msg.transforms, msg.expectedHash);
             } else if (msg.type === 'replace-image') {
                 logger.info('Next incoming file will replace image with hash: ' + msg.oldHash);
                 pendingReplaceHash = msg.oldHash;
@@ -915,6 +919,8 @@
                             oldImg.name = fileName;
                             oldImg.fileType = fileType;
                             oldImg.hash = null;
+                            oldImg.originalData = new Uint8Array(fileData);
+                            oldImg.originalMimeType = fileMimeType;
 
                             // Update the DOM card
                             const card = document.querySelector(`.received-image-item[data-image-index="${replaceIdx}"]`);
@@ -956,7 +962,9 @@
                         mimeType: fileMimeType,
                         name: fileName,
                         hash: null,
-                        fileType: fileType
+                        fileType: fileType,
+                        originalData: new Uint8Array(fileData),
+                        originalMimeType: fileMimeType
                     };
                     receivedImages.push(imgObj);
 
@@ -1494,6 +1502,173 @@
 
             cancelImageOcr(imageIndex);
             queueBackgroundOcr(imageIndex);
+        }
+
+        // ============ Remote Transform Replay ============
+
+        /**
+         * Apply a single transform operation to a canvas-loaded image.
+         * Returns a Blob of the result.
+         * @param {Uint8Array} inputData - Image data
+         * @param {string} inputMimeType - MIME type of inputData
+         * @param {Object} transform - { op, corners? }
+         * @returns {Promise<{data: Uint8Array, mimeType: string}>}
+         */
+        async function applyTransformToData(inputData, inputMimeType, transform) {
+            const bitmap = await createImageBitmap(new Blob([inputData], { type: inputMimeType }));
+            const canvas = document.createElement('canvas');
+            let ctx, blob;
+
+            if (transform.op === 'rotateCW') {
+                canvas.width = bitmap.height;
+                canvas.height = bitmap.width;
+                ctx = canvas.getContext('2d');
+                ctx.translate(canvas.width / 2, canvas.height / 2);
+                ctx.rotate(Math.PI / 2);
+                ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+                bitmap.close();
+                blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
+                const arr = new Uint8Array(await blob.arrayBuffer());
+                return { data: arr, mimeType: 'image/jpeg' };
+
+            } else if (transform.op === 'flipH') {
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+                ctx = canvas.getContext('2d');
+                ctx.translate(canvas.width, 0);
+                ctx.scale(-1, 1);
+                ctx.drawImage(bitmap, 0, 0);
+                bitmap.close();
+                blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
+                const arr = new Uint8Array(await blob.arrayBuffer());
+                return { data: arr, mimeType: 'image/jpeg' };
+
+            } else if (transform.op === 'bw') {
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+                ctx = canvas.getContext('2d');
+                ctx.drawImage(bitmap, 0, 0);
+                bitmap.close();
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                applyOtsu(imageData);
+                ctx.putImageData(imageData, 0, 0);
+                blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+                const arr = new Uint8Array(await blob.arrayBuffer());
+                return { data: arr, mimeType: 'image/png' };
+
+            } else if (transform.op === 'crop') {
+                // Need to load as Image for perspectiveTransform
+                bitmap.close();
+                const imgEl = new Image();
+                const imgUrl = URL.createObjectURL(new Blob([inputData], { type: inputMimeType }));
+                await new Promise((resolve, reject) => {
+                    imgEl.onload = resolve;
+                    imgEl.onerror = reject;
+                    imgEl.src = imgUrl;
+                });
+                URL.revokeObjectURL(imgUrl);
+
+                const c = transform.corners;
+                const srcW = imgEl.width;
+                const srcH = imgEl.height;
+                const srcCorners = [
+                    { x: c.tl.x * srcW, y: c.tl.y * srcH },
+                    { x: c.tr.x * srcW, y: c.tr.y * srcH },
+                    { x: c.br.x * srcW, y: c.br.y * srcH },
+                    { x: c.bl.x * srcW, y: c.bl.y * srcH }
+                ];
+                const topWidth = distance(srcCorners[0], srcCorners[1]);
+                const bottomWidth = distance(srcCorners[3], srcCorners[2]);
+                const leftHeight = distance(srcCorners[0], srcCorners[3]);
+                const rightHeight = distance(srcCorners[1], srcCorners[2]);
+                const dstW = Math.round(Math.max(topWidth, bottomWidth));
+                const dstH = Math.round(Math.max(leftHeight, rightHeight));
+                const resultCanvas = perspectiveTransform(imgEl, srcCorners, dstW, dstH);
+                blob = await new Promise(r => resultCanvas.toBlob(r, 'image/jpeg', 0.92));
+                const arr = new Uint8Array(await blob.arrayBuffer());
+                return { data: arr, mimeType: 'image/jpeg' };
+
+            } else {
+                bitmap.close();
+                throw new Error(`Unknown transform op: ${transform.op}`);
+            }
+        }
+
+        /**
+         * Handle a transform-image message from the sender.
+         * Replays transforms on the original image data, verifies hash, updates display.
+         */
+        async function handleTransformImage(oldHash, transforms, expectedHash) {
+            const replaceIdx = receivedImages.findIndex(img => img && img.hash === oldHash);
+            if (replaceIdx === -1) {
+                logger.warn(`transform-image: hash ${oldHash} not found, sending nack`);
+                rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: 'Image not found' });
+                return;
+            }
+
+            const imgObj = receivedImages[replaceIdx];
+            if (!imgObj.originalData) {
+                logger.warn('transform-image: no originalData stored, sending nack');
+                rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: 'No original data' });
+                return;
+            }
+
+            try {
+                // Apply transforms sequentially to the original data
+                let currentData = imgObj.originalData;
+                let currentMimeType = imgObj.originalMimeType;
+
+                for (const t of transforms) {
+                    const result = await applyTransformToData(currentData, currentMimeType, t);
+                    currentData = result.data;
+                    currentMimeType = result.mimeType;
+                }
+
+                // Verify hash
+                const resultHash = await WebSendCrypto.sha256Hex(currentData.buffer);
+                if (resultHash !== expectedHash) {
+                    logger.warn(`transform-image: hash mismatch (got ${resultHash.substring(0, 8)}, expected ${expectedHash.substring(0, 8)}), sending nack`);
+                    rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: 'hash-mismatch' });
+                    return;
+                }
+
+                // Update the image data
+                imgObj.data = currentData;
+                imgObj.mimeType = currentMimeType;
+                imgObj.hash = resultHash;
+                imgObj.ocrPageData = null;
+
+                // Clear BW undo state if any
+                if (preBWData[replaceIdx]) {
+                    delete preBWData[replaceIdx];
+                }
+
+                // Update display
+                const displayImg = document.getElementById(`img-${replaceIdx}`);
+                const dlEl = document.getElementById(`download-${replaceIdx}`);
+                if (displayImg) {
+                    if (displayImg.src.startsWith('blob:')) URL.revokeObjectURL(displayImg.src);
+                    const newUrl = URL.createObjectURL(new Blob([currentData], { type: currentMimeType }));
+                    displayImg.src = newUrl;
+                    if (dlEl) {
+                        if (dlEl.href.startsWith('blob:')) URL.revokeObjectURL(dlEl.href);
+                        dlEl.href = newUrl;
+                    }
+                }
+
+                // Send ack
+                rtc.sendMessage({ type: 'transform-ack', oldHash: oldHash, sha256: resultHash });
+                logger.success(`Transform applied locally (${transforms.length} ops), hash verified`);
+                showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
+
+                // Restart OCR
+                cancelImageOcr(replaceIdx);
+                queueBackgroundOcr(replaceIdx);
+
+            } catch (e) {
+                logger.error(`transform-image failed: ${e.message}`);
+                rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: e.message });
+            }
         }
 
         // ============ Image Discard ============
