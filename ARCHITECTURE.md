@@ -138,6 +138,29 @@ WebSend/
                                                                            Mismatch → error, offer retry
 ```
 
+### Image Edit Protocol (Transform Replay)
+
+When the sender edits an already-sent image (rotate, flip, crop, B&W), instead of
+re-encrypting and resending the full image, lightweight transform commands are sent:
+
+```
+Sender                                                        Receiver
+──────                                                        ────────
+Apply transform(s) locally
+Compute expectedHash of result
+Send {type:'transform-image',                ──────────────▶  Find image by oldHash
+      oldHash, transforms[], expectedHash}                    Replay transforms on stored originalData
+                                                              Compute resultHash
+                                                              If resultHash === expectedHash:
+◀──────────────────────────────────────────  transform-ack      Update image, restart OCR
+                                                              Else:
+◀──────────────────────────────────────────  transform-nack     (sender falls back to full resend)
+```
+
+Transform ops: `rotateCW`, `flipH`, `bw` (Otsu binarization), `crop` (with normalized
+corner coordinates for perspective transform). The receiver stores `originalData` (the
+as-first-received image) so transforms always replay from the pristine source.
+
 ## Server API Endpoints
 
 | Method | Path                         | Purpose                              | Auth        | Rate Limit      |
