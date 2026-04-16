@@ -405,9 +405,6 @@
         let isSendingQueue = false; // Whether the queue drain loop is running
         // Gallery: photos captured in continuous camera mode (Genius Scan-like)
         let galleryPhotos = [];    // Array of { blob, thumbUrl, originalBlob, id, sentHash, sendStatus, transforms }
-        // Pending transform-ack/nack resolve/reject callbacks, keyed by oldHash
-        const pendingTransformAcks = {};
-
         let photoIdCounter = 0;    // Unique ID counter for gallery photos
         let pendingBatchEnd = false; // Whether to send batch-end when queue drains
         let galleryEditIndex = -1; // Index of photo being edited in gallery
@@ -1030,20 +1027,6 @@
                 logger.success('Both parties verified, can now send photos');
                 showVerifiedInSidebar();
                 showStep(stepChoose);
-            } else if (msg.type === 'transform-ack') {
-                // Receiver successfully applied transform commands
-                const oldHash = msg.oldHash;
-                if (pendingTransformAcks[oldHash]) {
-                    pendingTransformAcks[oldHash].resolve({ sha256: msg.sha256 });
-                    delete pendingTransformAcks[oldHash];
-                }
-            } else if (msg.type === 'transform-nack') {
-                // Receiver failed to apply transforms (hash mismatch) — will fallback to full resend
-                const oldHash = msg.oldHash;
-                if (pendingTransformAcks[oldHash]) {
-                    pendingTransformAcks[oldHash].reject(new Error(msg.reason || 'Transform rejected by receiver'));
-                    delete pendingTransformAcks[oldHash];
-                }
             }
         }
 
@@ -1624,37 +1607,13 @@
             // If already sent, send transform commands instead of full resend
             if (photo.sentHash) {
                 const oldHash = photo.sentHash;
-                photo.sentHash = null;
-                photo.sendStatus = 'queuing';
-                const expectedHash = await WebSendCrypto.sha256Hex(await resultBlob.arrayBuffer());
                 logger.info(`Sending transform commands for ${oldHash.substring(0, 8)}... (${photo.transforms.length} ops)`);
-
-                // Send transform command and wait for ack/nack
                 rtc.sendMessage({
                     type: 'transform-image',
                     oldHash: oldHash,
-                    transforms: photo.transforms,
-                    expectedHash: expectedHash
+                    transforms: photo.transforms
                 });
-
-                try {
-                    const ack = await new Promise((resolve, reject) => {
-                        const timeout = setTimeout(() => {
-                            delete pendingTransformAcks[oldHash];
-                            reject(new Error('Transform ack timeout'));
-                        }, 30000);
-                        pendingTransformAcks[oldHash] = { resolve: (v) => { clearTimeout(timeout); resolve(v); }, reject: (e) => { clearTimeout(timeout); reject(e); } };
-                    });
-                    photo.sentHash = ack.sha256;
-                    photo.sendStatus = 'sent';
-                    logger.success('Transform applied by receiver, hash verified');
-                } catch (e) {
-                    // Fallback: send full image
-                    logger.warn(`Transform failed (${e.message}), falling back to full resend`);
-                    photo.transforms = []; // Reset transforms since we're sending the full image
-                    sendQueue.push({ blob: resultBlob, photoId: photo.id, replaceHash: oldHash });
-                    drainQueue();
-                }
+                photo.sentHash = oldHash; // keep tracking (receiver will use same hash lookup)
             }
         }
 
@@ -2662,35 +2621,12 @@
                     // If already sent, send transform commands instead of full resend
                     if (photo.sentHash) {
                         const oldHash = photo.sentHash;
-                        photo.sentHash = null;
-                        photo.sendStatus = 'queuing';
-                        const expectedHash = await WebSendCrypto.sha256Hex(await currentPhotoBlob.arrayBuffer());
                         logger.info(`Sending transform commands for crop (replacing ${oldHash.substring(0, 8)}...)`);
-
                         rtc.sendMessage({
                             type: 'transform-image',
                             oldHash: oldHash,
-                            transforms: photo.transforms,
-                            expectedHash: expectedHash
+                            transforms: photo.transforms
                         });
-
-                        try {
-                            const ack = await new Promise((resolve, reject) => {
-                                const timeout = setTimeout(() => {
-                                    delete pendingTransformAcks[oldHash];
-                                    reject(new Error('Transform ack timeout'));
-                                }, 30000);
-                                pendingTransformAcks[oldHash] = { resolve: (v) => { clearTimeout(timeout); resolve(v); }, reject: (e) => { clearTimeout(timeout); reject(e); } };
-                            });
-                            photo.sentHash = ack.sha256;
-                            photo.sendStatus = 'sent';
-                            logger.success('Crop transform applied by receiver, hash verified');
-                        } catch (e) {
-                            logger.warn(`Crop transform failed (${e.message}), falling back to full resend`);
-                            photo.transforms = [];
-                            sendQueue.push({ blob: currentPhotoBlob, photoId: photo.id, replaceHash: oldHash });
-                            drainQueue();
-                        }
                     }
 
                     // Refresh gallery edit view

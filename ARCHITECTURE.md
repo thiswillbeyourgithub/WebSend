@@ -147,14 +147,9 @@ re-encrypting and resending the full image, lightweight transform commands are s
 Sender                                                        Receiver
 ──────                                                        ────────
 Apply transform(s) locally
-Compute expectedHash of result
 Send {type:'transform-image',                ──────────────▶  Find image by oldHash
-      oldHash, transforms[], expectedHash}                    Replay transforms on stored originalData
-                                                              Compute resultHash
-                                                              If resultHash === expectedHash:
-◀──────────────────────────────────────────  transform-ack      Update image, restart OCR
-                                                              Else:
-◀──────────────────────────────────────────  transform-nack     (sender falls back to full resend)
+      oldHash, transforms[]}                                  Replay transforms on stored originalData
+                                                              Update image, restart OCR
 ```
 
 Transform ops: `rotateCW`, `flipH`, `bw` (Otsu binarization), `crop` (with normalized

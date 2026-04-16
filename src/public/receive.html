@@ -841,7 +841,7 @@
             } else if (msg.type === 'transform-image') {
                 // Sender wants us to replay transforms locally instead of resending full image
                 logger.info(`Received transform-image for hash ${msg.oldHash} (${msg.transforms.length} ops)`);
-                handleTransformImage(msg.oldHash, msg.transforms, msg.expectedHash);
+                handleTransformImage(msg.oldHash, msg.transforms);
             } else if (msg.type === 'replace-image') {
                 logger.info('Next incoming file will replace image with hash: ' + msg.oldHash);
                 pendingReplaceHash = msg.oldHash;
@@ -1598,18 +1598,16 @@
          * Handle a transform-image message from the sender.
          * Replays transforms on the original image data, verifies hash, updates display.
          */
-        async function handleTransformImage(oldHash, transforms, expectedHash) {
+        async function handleTransformImage(oldHash, transforms) {
             const replaceIdx = receivedImages.findIndex(img => img && img.hash === oldHash);
             if (replaceIdx === -1) {
-                logger.warn(`transform-image: hash ${oldHash} not found, sending nack`);
-                rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: 'Image not found' });
+                logger.warn(`transform-image: hash ${oldHash} not found, ignoring`);
                 return;
             }
 
             const imgObj = receivedImages[replaceIdx];
             if (!imgObj.originalData) {
-                logger.warn('transform-image: no originalData stored, sending nack');
-                rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: 'No original data' });
+                logger.warn('transform-image: no originalData stored, ignoring');
                 return;
             }
 
@@ -1624,18 +1622,9 @@
                     currentMimeType = result.mimeType;
                 }
 
-                // Verify hash
-                const resultHash = await WebSendCrypto.sha256Hex(currentData.buffer);
-                if (resultHash !== expectedHash) {
-                    logger.warn(`transform-image: hash mismatch (got ${resultHash.substring(0, 8)}, expected ${expectedHash.substring(0, 8)}), sending nack`);
-                    rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: 'hash-mismatch' });
-                    return;
-                }
-
-                // Update the image data
+                // Update the image data (keep original hash for future lookups)
                 imgObj.data = currentData;
                 imgObj.mimeType = currentMimeType;
-                imgObj.hash = resultHash;
                 imgObj.ocrPageData = null;
 
                 // Clear BW undo state if any
@@ -1656,9 +1645,7 @@
                     }
                 }
 
-                // Send ack
-                rtc.sendMessage({ type: 'transform-ack', oldHash: oldHash, sha256: resultHash });
-                logger.success(`Transform applied locally (${transforms.length} ops), hash verified`);
+                logger.success(`Transform applied locally (${transforms.length} ops)`);
                 showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
 
                 // Restart OCR
@@ -1667,7 +1654,6 @@
 
             } catch (e) {
                 logger.error(`transform-image failed: ${e.message}`);
-                rtc.sendMessage({ type: 'transform-nack', oldHash: oldHash, reason: e.message });
             }
         }
 
