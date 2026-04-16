@@ -17,6 +17,13 @@ RUN npm install --production && \
     # Remove npm cache to reduce image size and attack surface
     npm cache clean --force
 
+# Optional: audit dependencies for known vulnerabilities at build time.
+# Disabled by default because it requires network access and the advisory
+# database changes independently of your code, making builds non-deterministic.
+# Enable with: RUN_NPM_AUDIT=true in your .env (passed as a build arg).
+ARG RUN_NPM_AUDIT=false
+RUN if [ "$RUN_NPM_AUDIT" = "true" ]; then npm audit --audit-level=high; fi
+
 # Copy application files
 COPY server.js ./
 COPY public/ ./public/

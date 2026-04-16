@@ -4,6 +4,8 @@ services:
     build:
       context: ../src
       dockerfile: ../docker/Dockerfile
+      args:
+        - RUN_NPM_AUDIT=${RUN_NPM_AUDIT:-false}
     ports:
       # If using oauth2-proxy, do NOT expose this port directly.
       # Instead, access the app through oauth2-proxy's port (4180).

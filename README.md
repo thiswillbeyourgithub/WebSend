@@ -189,6 +189,7 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `UMAMI_URL` | Base URL of your [Umami](https://umami.is/) analytics instance | _(empty -- analytics disabled)_ |
 | `UMAMI_WEBSITE_ID` | Website ID from your Umami dashboard (UUID) | _(empty)_ |
 | `UMAMI_DNT` | Respect browser Do Not Track setting (`true` or `false`) | `true` |
+| `RUN_NPM_AUDIT` | Run `npm audit --audit-level=high` during `docker build` (build arg) | `false` |
 
 ## Firewall (UFW)
 
