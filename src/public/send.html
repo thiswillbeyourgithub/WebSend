@@ -318,6 +318,7 @@
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/sidebar.js"></script>
+    <script src="/js/transfer-stats.js"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/webrtc.js" integrity="sha384-vsKDAfrCRnQaNvnno8khnPnrUrKB8UdqTrLY9PRR+qYevM9EQkjkCjmuoD1+FPY9"></script>
     <script>
@@ -1943,21 +1944,6 @@
             } else if (successCount > 1) {
                 showToast(i18n.t('send.allSent').replace('{n}', successCount), { type: 'success' });
             }
-        }
-
-        function formatRate(bytesPerSec) {
-            if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / (1024 * 1024)).toFixed(1) + ' MB/s';
-            return (bytesPerSec / 1024).toFixed(0) + ' kB/s';
-        }
-
-        function formatTransferStats(percent, rate, remaining) {
-            let s = percent + '%  ' + formatRate(rate);
-            if (isFinite(remaining) && remaining > 10) {
-                const m = Math.floor(remaining / 60);
-                const sec = Math.round(remaining % 60);
-                s += '  ' + (m > 0 ? m + 'm ' : '') + sec + 's';
-            }
-            return s;
         }
 
         /**
