@@ -5,9 +5,17 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "update-sri": "node update-sri.js"
+    "update-sri": "node update-sri.js",
+    "test": "npm run test:unit && npm run test:http",
+    "test:unit": "node --test --test-reporter=spec test/unit",
+    "test:http": "node --test --test-reporter=spec test/http",
+    "test:e2e": "playwright test -c test/e2e/playwright.config.js",
+    "test:all": "npm run test && npm run test:e2e"
   },
   "dependencies": {
     "express": "^5.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
   }
 }

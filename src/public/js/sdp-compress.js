@@ -10,6 +10,12 @@
  *
  * A full SDP offer is typically 2-3KB. A QR code can hold ~2KB in binary mode.
  * We need to compress aggressively to fit.
+ *
+ * TODO: This module is not yet wired into any HTML entry point or webrtc.js.
+ * It is precached by service-worker.js (line 28) in anticipation of a future
+ * "QR-only signaling" mode where the SDP itself is encoded in the QR code
+ * instead of a server room URL. Until that feature is implemented, this module
+ * is staged-for-future and not part of the active code path.
  */
 
 const SDPCompress = {
