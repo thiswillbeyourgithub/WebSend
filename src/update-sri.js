@@ -60,21 +60,19 @@ function buildHashMap() {
 }
 
 /**
- * Update integrity="..." attributes in an HTML file using the hash map.
+ * Update or add integrity="..." attributes in an HTML file using the hash map.
  *
- * Matches tags like:
- *   <link ... href="/css/style.css" ... integrity="sha384-OLD" ...>
- *   <script ... src="/js/crypto.js" ... integrity="sha384-OLD" ...>
+ * Handles two cases:
+ *   1. Tags that already have integrity="..." — updates the hash in-place.
+ *   2. Tags that have a local src/href but no integrity attribute — injects one.
  *
- * Only updates if the asset path is found in the hash map.
+ * Only acts on paths found in the hash map (i.e. local /js/ and /css/ assets).
  */
 function updateHtmlFile(filePath, hashes) {
   let content = fs.readFileSync(filePath, 'utf-8');
   let updateCount = 0;
 
-  // Match integrity attributes on tags that have a src or href pointing to our assets.
-  // Captures: (1) the src/href value, (2) the old integrity value
-  // Handles both orderings: href before integrity, or integrity before href.
+  // Pass 1: update existing integrity attributes
   content = content.replace(
     /(<(?:script|link)\b[^>]*?(?:src|href)="([^"]*)"[^>]*?)integrity="[^"]*"/g,
     (match, before, assetPath) => {
@@ -83,6 +81,19 @@ function updateHtmlFile(filePath, hashes) {
         return `${before}integrity="${hashes[assetPath]}"`;
       }
       return match;
+    }
+  );
+
+  // Pass 2: inject integrity on tags that have a local asset path but no integrity attr.
+  // Matches <script src="..."> or <link href="..."> without any integrity="..." present.
+  content = content.replace(
+    /<(script|link)\b([^>]*?)(src|href)="([^"]*)"([^>]*?)(?!\s*integrity=)>/g,
+    (match, tag, before, attr, assetPath, after) => {
+      // Skip if integrity already present anywhere in the tag
+      if (/\bintegrity=/.test(match)) return match;
+      if (!hashes[assetPath]) return match;
+      updateCount++;
+      return `<${tag}${before}${attr}="${assetPath}"${after} integrity="${hashes[assetPath]}">`;
     }
   );
 
