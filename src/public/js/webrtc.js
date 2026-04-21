@@ -4,6 +4,14 @@
  * Uses server-based signaling for SDP exchange.
  */
 
+/** Thrown when the room is gone (404) — should not trigger the retry loop. */
+class RoomGoneError extends Error {
+    constructor(msg = 'Room expired or not found') {
+        super(msg);
+        this.name = 'RoomGoneError';
+    }
+}
+
 class WebSendRTC {
     constructor() {
         this.pc = null;
@@ -509,10 +517,12 @@ class WebSendRTC {
                     logger.debug('SIGNALING', 'No answer yet, continuing poll');
                     continue;
                 } else if (response.status === 404) {
-                    throw new Error('Room expired or not found');
+                    throw new RoomGoneError();
                 }
             } catch (e) {
-                if (e.message.includes('Room')) throw e;
+                // RoomGoneError is terminal — stop polling and propagate
+                if (e instanceof RoomGoneError) throw e;
+                // TypeError means a network failure (fetch rejected); retry after backoff
                 logger.warn('Polling error, retrying: ' + e.message);
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
