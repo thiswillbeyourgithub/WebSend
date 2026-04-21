@@ -129,6 +129,12 @@ function checkRateLimit(ip, limitType) {
     const key = `${ip}:${limitType}`;
 
     if (!rateLimiters.has(key)) {
+        // Hard cap: if the map is over-sized (flood scenario), evict stale entries
+        // before adding new ones. New entries are still allowed after eviction so
+        // legitimate users are not locked out during a flood.
+        if (rateLimiters.size >= 10_000) {
+            cleanupRateLimiters();
+        }
         rateLimiters.set(key, { timestamps: [], blockedUntil: null });
     }
 
@@ -190,7 +196,7 @@ function rateLimitMiddleware(limitType) {
  */
 function cleanupRateLimiters() {
     const now = Date.now();
-    const maxAge = 5 * 60 * 1000; // Remove entries older than 5 minutes
+    const maxAge = 2 * 60 * 1000; // Remove entries older than 2 minutes
 
     for (const [key, limiter] of rateLimiters.entries()) {
         // Remove if no recent timestamps and not blocked
@@ -203,8 +209,9 @@ function cleanupRateLimiters() {
     }
 }
 
-// Clean up rate limiters every 2 minutes
-setInterval(cleanupRateLimiters, 2 * 60 * 1000);
+// Clean up rate limiters every 30 seconds (maxAge is 2 min, so entries expire
+// at most 2.5 min after their last request — acceptable memory bound).
+setInterval(cleanupRateLimiters, 30 * 1000);
 
 // ============ Origin Validation ============
 // Validates that requests come from expected origins to prevent malicious sites
