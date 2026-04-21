@@ -123,6 +123,8 @@
 
         // Define loadEruda for the 5-tap gesture handled by sidebar.js.
         // The index page has no logger, so falls back to console.
+        // ⚠️ SOLE EXTERNAL CDN FETCH — see the loadEruda comment in receive.html
+        // for why eruda is intentionally not vendored.
         window.loadEruda = function() {
             return new Promise((resolve) => {
                 const script = document.createElement('script');

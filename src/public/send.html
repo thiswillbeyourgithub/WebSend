@@ -321,7 +321,7 @@
     <script src="/js/transfer-stats.js"></script>
     <script src="/js/wake-lock.js"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
-    <script src="/js/webrtc.js" integrity="sha384-vsKDAfrCRnQaNvnno8khnPnrUrKB8UdqTrLY9PRR+qYevM9EQkjkCjmuoD1+FPY9"></script>
+    <script src="/js/webrtc.js" integrity="sha384-2jA3Y7D7wPCCbtjf+TBBHlgE2fxAmrHBye+c8Tr9vN0kCPDt2G7Li3xihABOUbKb"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -455,7 +455,16 @@
         /**
          * Dynamically load eruda mobile devtools console from CDN.
          * Only called in DEV mode (DEV=1 env var on server) to avoid loading
-         * a ~350KB debug library in production.
+         * a ~500KB debug library in production.
+         *
+         * ⚠️  SOLE EXTERNAL CDN FETCH IN THIS PROJECT.
+         * All other third-party libraries are vendored locally (jsQR, qrcode.js,
+         * client-zip, scribe.js-ocr). Eruda is intentionally not vendored because
+         * it is ~500KB of debug-only tooling — committing it to git would bloat
+         * the repository for zero production benefit. It is never loaded unless
+         * the server is started with DEV=1, so production deployments stay fully
+         * CDN-free. If an air-gapped DEV environment is ever needed, download
+         * eruda.js and serve it from /vendor/eruda/eruda.js instead.
          * @returns {Promise<void>}
          */
         function loadEruda() {
