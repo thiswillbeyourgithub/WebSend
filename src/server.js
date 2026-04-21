@@ -630,7 +630,14 @@ app.get('/api/rooms/:id/answer', validateRoomSecret, async (req, res) => {
         const pollInterval = 500; // Check every 500ms
         const roomId = req.params.id;
 
+        let timer = null;
+        let aborted = false;
+        // Stop polling as soon as the client disconnects, so closed TCP
+        // connections don't keep driving setTimeout chains until TTL.
+        req.on('close', () => { aborted = true; if (timer) clearTimeout(timer); });
+
         const checkAnswer = () => {
+            if (aborted) return;
             const currentRoom = rooms.get(roomId);
             if (!currentRoom) {
                 return res.status(404).json({ error: 'Room not found' });
@@ -644,7 +651,7 @@ app.get('/api/rooms/:id/answer', validateRoomSecret, async (req, res) => {
                 return res.status(204).send(); // No content yet
             }
 
-            setTimeout(checkAnswer, pollInterval);
+            timer = setTimeout(checkAnswer, pollInterval);
         };
 
         checkAnswer();
