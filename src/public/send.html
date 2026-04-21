@@ -319,6 +319,7 @@
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/sidebar.js"></script>
     <script src="/js/transfer-stats.js"></script>
+    <script src="/js/wake-lock.js"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/webrtc.js" integrity="sha384-vsKDAfrCRnQaNvnno8khnPnrUrKB8UdqTrLY9PRR+qYevM9EQkjkCjmuoD1+FPY9"></script>
     <script>
@@ -373,32 +374,6 @@
         let pendingBatchEnd = false; // Whether to send batch-end when queue drains
         let galleryEditIndex = -1; // Index of photo being edited in gallery
 
-        // Wake lock state
-        let wakeLock = null;
-        let wakeLockDesired = false;
-
-        async function acquireWakeLock() {
-            if (!('wakeLock' in navigator)) return;
-            try {
-                wakeLock = await navigator.wakeLock.request('screen');
-                logger.info('Wake lock acquired');
-                wakeLock.addEventListener('release', () => {
-                    wakeLock = null;
-                    logger.info('Wake lock released');
-                });
-            } catch (e) {
-                logger.warn('Wake lock request failed: ' + e.message);
-            }
-        }
-
-        function releaseWakeLock() {
-            wakeLockDesired = false;
-            if (wakeLock) {
-                wakeLock.release();
-                wakeLock = null;
-            }
-        }
-
         // Re-acquire wake lock and auto-reconnect when screen wakes up
         document.addEventListener('visibilitychange', async () => {
             // Turn off torch when page goes to background to save battery
@@ -418,8 +393,8 @@
                     track.applyConstraints({ advanced: [{ torch: true }] }).catch(() => {});
                 }
             }
-            if (wakeLockDesired && !wakeLock) {
-                await acquireWakeLock();
+            if (wakeLockMgr.desired && !wakeLockMgr.held) {
+                await wakeLockMgr.acquire();
             }
             // If we have a room in the URL and the connection dropped, reconnect
             const roomId = getRoomIdFromUrl();
@@ -814,13 +789,13 @@
         async function onConnected() {
             logger.success('Connected to receiver!');
             // Keep screen awake while connected
-            wakeLockDesired = true;
-            await acquireWakeLock();
+            wakeLockMgr.desired = true;
+            await wakeLockMgr.acquire();
         }
 
         function onDisconnected() {
             logger.warn('Disconnected from receiver');
-            releaseWakeLock();
+            wakeLockMgr.release();
             showToast(i18n.t('send.disconnectedHint'), { duration: 0 });
         }
 
@@ -890,7 +865,7 @@
             keyPair = null;
             sharedKey = null;
             // Release wake lock
-            releaseWakeLock();
+            wakeLockMgr.release();
         }
 
         window.addEventListener('beforeunload', cleanupAllData);

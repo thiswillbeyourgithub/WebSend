@@ -175,6 +175,7 @@
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/sidebar.js"></script>
     <script src="/js/transfer-stats.js"></script>
+    <script src="/js/wake-lock.js"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/webrtc.js" integrity="sha384-vsKDAfrCRnQaNvnno8khnPnrUrKB8UdqTrLY9PRR+qYevM9EQkjkCjmuoD1+FPY9"></script>
     <script>
@@ -271,37 +272,11 @@
             return count;
         }
 
-        // Wake lock state
-        let wakeLock = null;
-        let wakeLockDesired = false; // true when we want to hold the wake lock
-
-        async function acquireWakeLock() {
-            if (!('wakeLock' in navigator)) return;
-            try {
-                wakeLock = await navigator.wakeLock.request('screen');
-                logger.info('Wake lock acquired');
-                wakeLock.addEventListener('release', () => {
-                    wakeLock = null;
-                    logger.info('Wake lock released');
-                });
-            } catch (e) {
-                logger.warn('Wake lock request failed: ' + e.message);
-            }
-        }
-
-        function releaseWakeLock() {
-            wakeLockDesired = false;
-            if (wakeLock) {
-                wakeLock.release();
-                wakeLock = null;
-            }
-        }
-
         // Re-acquire wake lock after the screen wakes up (browsers release it on hide)
         document.addEventListener('visibilitychange', async () => {
             if (document.visibilityState !== 'visible') return;
-            if (wakeLockDesired && !wakeLock) {
-                await acquireWakeLock();
+            if (wakeLockMgr.desired && !wakeLockMgr.held) {
+                await wakeLockMgr.acquire();
             }
             // If connection dropped while page was hidden, reconnect
             if (rtc && rtc.pc) {
@@ -367,8 +342,8 @@
                 await generateQRCode();
 
                 // Keep screen awake while waiting for sender to scan QR
-                wakeLockDesired = true;
-                await acquireWakeLock();
+                wakeLockMgr.desired = true;
+                await wakeLockMgr.acquire();
 
                 // Start waiting for answer
                 rtc.waitForAnswer().catch(e => {
@@ -472,8 +447,8 @@
         async function onConnected() {
             logger.success('Connected to sender!');
             // Keep screen awake while connected
-            wakeLockDesired = true;
-            await acquireWakeLock();
+            wakeLockMgr.desired = true;
+            await wakeLockMgr.acquire();
             // Record connection time for image naming
             const now = new Date();
             const pad = n => String(n).padStart(2, '0');
@@ -535,7 +510,7 @@
 
         function onDisconnected() {
             logger.warn('Disconnected from sender');
-            releaseWakeLock();
+            wakeLockMgr.release();
 
             // If we already have images, keep them visible and show a reconnect banner
             // instead of jumping back to the QR code screen
@@ -627,8 +602,8 @@
                 await generateQRCode();
 
                 // Acquire wake lock while waiting for new sender
-                wakeLockDesired = true;
-                await acquireWakeLock();
+                wakeLockMgr.desired = true;
+                await wakeLockMgr.acquire();
 
                 rtc.waitForAnswer().catch(e => {
                     logger.error('Failed waiting for answer: ' + e.message);
@@ -680,7 +655,7 @@
             keyPair = null;
             sharedKey = null;
             // Release wake lock
-            releaseWakeLock();
+            wakeLockMgr.release();
         }
 
         window.addEventListener('beforeunload', cleanupAllData);
