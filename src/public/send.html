@@ -15,47 +15,7 @@
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
 <body>
-    <div id="maintenance-banner" class="maintenance-banner" data-i18n="maintenance.banner"></div>
-    <!-- Settings button: opens sidebar with settings, logs, about -->
-    <button class="kebab-btn" id="kebab-btn" aria-label="Settings"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
-
-    <!-- Sidebar overlay (dark background) -->
-    <div class="sidebar-overlay" id="sidebar-overlay"></div>
-
-    <!-- Sidebar -->
-    <div class="sidebar" id="sidebar">
-        <button class="sidebar-close" id="sidebar-close">✕</button>
-
-        <!-- Language section -->
-        <div class="sidebar-section">
-            <div class="sidebar-section-title" data-i18n="menu.language">Language</div>
-            <button class="lang-option" data-lang="en">🇬🇧 English</button>
-            <button class="lang-option" data-lang="fr">🇫🇷 Français</button>
-        </div>
-
-        <!-- Connection info (only visible when connected) -->
-        <div class="sidebar-section hidden" id="sidebar-connection-section">
-            <div class="sidebar-section-title" data-i18n="menu.connection">Connection</div>
-            <div class="sidebar-connection-info" id="sidebar-connection-info"></div>
-        </div>
-
-        <!-- Actions -->
-        <div class="sidebar-section">
-            <button class="sidebar-action" id="sidebar-logs-btn">
-                <span>📋</span>
-                <span data-i18n="menu.logs">Logs</span>
-            </button>
-            <button class="sidebar-action" id="sidebar-about-btn">
-                <span>ℹ️</span>
-                <span data-i18n="menu.about">About</span>
-            </button>
-        </div>
-
-        <!-- DEV mode indicator (updated after fetching /api/config) -->
-        <div class="sidebar-section" id="sidebar-dev-section">
-            <div class="sidebar-dev-badge" id="sidebar-dev-badge" data-i18n="menu.prodMode">Production mode</div>
-        </div>
-    </div>
+    <!-- Sidebar markup and wiring injected by sidebar.js (shared with index/receive pages) -->
 
     <!-- Queue status banner: shown when photos are sending in background -->
     <div id="queue-banner" class="hidden" style="position: sticky; top: 0; z-index: 100; background: #e3f2fd; border-bottom: 2px solid #90caf9; padding: 10px 15px; text-align: center; color: #1565c0; font-size: 0.9rem;">
@@ -357,11 +317,14 @@
     <script src="/js/doc-detect.js" integrity="sha384-8rCl4Ur/XlTrbcOQjCJbbNZM4QQgJMluQ7Qk65VFgmxye8y7dr+Lq55MOswV8kMo" crossorigin="anonymous"></script>
     <script src="/js/i18n.js"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
+    <script src="/js/sidebar.js"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/webrtc.js" integrity="sha384-vsKDAfrCRnQaNvnno8khnPnrUrKB8UdqTrLY9PRR+qYevM9EQkjkCjmuoD1+FPY9"></script>
     <script>
-        // Initialize i18n first
+        // Initialize i18n first, then build the shared sidebar
         i18n.init();
+        buildSidebar({ showLogs: true });
+        initSidebar();
     </script>
     <script>
         /**
@@ -2847,102 +2810,8 @@
         /**
          * Update the DEV mode badge in the sidebar.
          * Called after fetching /api/config to reflect server-side DEV=1 setting.
+         * updateDevBadge() is defined in sidebar.js and exposed on window.
          */
-        // 5-tap on "Production mode" badge to load eruda in production
-        (function() {
-            const badge = document.getElementById('sidebar-dev-badge');
-            if (!badge) return;
-            let tapCount = 0;
-            let tapTimer = null;
-            badge.addEventListener('click', () => {
-                tapCount++;
-                clearTimeout(tapTimer);
-                tapTimer = setTimeout(() => { tapCount = 0; }, 1500);
-                if (tapCount >= 5) {
-                    tapCount = 0;
-                    if (typeof eruda !== 'undefined') return; // already loaded
-                    loadEruda().then(() => logger.info('Eruda loaded via 5-tap'));
-                }
-            });
-        })();
-
-        function updateDevBadge(isDev) {
-            const badge = document.getElementById('sidebar-dev-badge');
-            if (!badge) return;
-            if (isDev) {
-                badge.textContent = i18n.t('menu.devMode');
-                badge.setAttribute('data-i18n', 'menu.devMode');
-                badge.classList.add('dev-active');
-                const banner = document.getElementById('maintenance-banner');
-                if (banner) {
-                    banner.textContent = i18n.t('maintenance.banner');
-                    banner.classList.add('visible');
-                    banner.addEventListener('click', () => { banner.style.opacity = '0'; setTimeout(() => banner.classList.remove('visible'), 300); });
-                }
-            } else {
-                badge.textContent = i18n.t('menu.prodMode');
-                badge.setAttribute('data-i18n', 'menu.prodMode');
-                badge.classList.remove('dev-active');
-            }
-        }
-
-        // Sidebar menu logic (kebab button opens sidebar with lang, logs, about)
-        (function() {
-            const kebabBtn = document.getElementById('kebab-btn');
-            const sidebar = document.getElementById('sidebar');
-            const overlay = document.getElementById('sidebar-overlay');
-            const closeBtn = document.getElementById('sidebar-close');
-
-            function openSidebar() {
-                sidebar.classList.add('visible');
-                overlay.classList.add('visible');
-            }
-            function closeSidebar() {
-                sidebar.classList.remove('visible');
-                overlay.classList.remove('visible');
-            }
-
-            kebabBtn.addEventListener('click', openSidebar);
-            closeBtn.addEventListener('click', closeSidebar);
-            overlay.addEventListener('click', closeSidebar);
-
-            // Language options
-            const options = sidebar.querySelectorAll('.lang-option');
-            function updateLangUI() {
-                const locale = i18n.getLocale();
-                options.forEach(opt => opt.classList.toggle('active', opt.dataset.lang === locale));
-            }
-            options.forEach(opt => {
-                opt.addEventListener('click', () => {
-                    i18n.setLocale(opt.dataset.lang);
-                    updateLangUI();
-                    // Update logs toolbar button text after language change
-                    const closeLogsBtn = document.getElementById('logs-close-btn');
-                    const copyLogsBtn = document.getElementById('logs-copy-btn');
-                    if (closeLogsBtn) closeLogsBtn.textContent = i18n.t('menu.closeLogs');
-                    if (copyLogsBtn) copyLogsBtn.textContent = i18n.t('menu.copyLogs');
-                });
-            });
-            updateLangUI();
-
-            // Logs button
-            document.getElementById('sidebar-logs-btn').addEventListener('click', () => {
-                closeSidebar();
-                if (window.openLogsPanel) window.openLogsPanel();
-            });
-
-            // About button - navigate to index or open modal
-            document.getElementById('sidebar-about-btn').addEventListener('click', () => {
-                closeSidebar();
-                const aboutModal = document.getElementById('about-modal');
-                if (aboutModal) {
-                    aboutModal.classList.remove('hidden');
-                    aboutModal.style.display = 'flex';
-                } else {
-                    window.location.href = '/#about';
-                }
-            });
-        })();
     </script>
 </body>
 </html>
