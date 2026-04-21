@@ -187,6 +187,22 @@ const SDPCompress = {
      * @returns {RTCSessionDescription}
      */
     reconstructSDP(essentials) {
+        // ── Hidden assumptions in this reconstruction ──────────────────────────
+        // 1. Data-channel only: no audio/video m-sections. Adding media to the
+        //    session would require additional m-sections not generated here.
+        // 2. SCTP port 5000 and max-message-size 262144 are hard-coded. These
+        //    match Chrome/Firefox/Safari defaults as of 2024; if browsers change
+        //    their defaults the reconstructed SDP would still work for existing
+        //    peers but not advertise updated capabilities.
+        // 3. `a=setup:actpass` (offerer) / `a=setup:active` (answerer) follows
+        //    RFC 5763 §5; swapping these breaks the DTLS handshake.
+        // 4. The ICE candidate priorities (2130706431 / 1694498815 / 16777215)
+        //    are synthetic approximations of the values Chrome emits.  They do
+        //    not affect connectivity but will differ from a real offer's values.
+        // 5. extmap, rtcp-mux, and codec negotiation lines are intentionally
+        //    omitted — they are irrelevant for data-channel-only sessions.
+        // ──────────────────────────────────────────────────────────────────────
+
         // Expand fingerprint by re-inserting colons between hex pairs (AA -> AA:BB:...)
         const fp = essentials.f.match(/.{2}/g).join(':');
 
