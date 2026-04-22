@@ -10,7 +10,7 @@ const path = require('path');
 const { version: APP_VERSION } = require('./package.json');
 
 const app = express();
-const PORT = 8080;
+const PORT = parseInt(process.env.PORT, 10) || 8080;
 const DOMAIN = process.env.DOMAIN || 'localhost';
 // DEV mode: when 1, enables verbose debug logging for handshake/connection troubleshooting
 const DEV = process.env.DEV === '1';
