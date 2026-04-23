@@ -247,6 +247,18 @@ sudo ufw-docker allow coturn 49161/udp
 
 Built with assistance from [Claude Code](https://claude.ai/claude-code) (AI-assisted development).
 
+### Testing
+
+The project uses a three-tier test suite:
+
+| Tier | Command | What it covers | Speed |
+|------|---------|----------------|-------|
+| Unit | `npm run test:unit` | Pure JS modules: crypto, SDP compression, image transforms, server helpers, transfer stats, SRI updater | ~0.5s |
+| HTTP integration | `npm run test:http` | Real `server.js` spawned per file via child_process — config, origin validation, rate limiting, room/ICE/SDP signaling, long-poll edge cases, static asset mounts, env-var propagation | ~2s |
+| End-to-end | `npm run test:e2e` | Two real browsers via Playwright (sender + receiver round-trip) | ~30s |
+
+Run `npm test` (= unit + HTTP) for the fast inner loop, or `npm run test:all` for everything. A pre-push git hook (in `.githooks/pre-push`, auto-wired by `npm install` via the `prepare` script) runs `npm test` before every push.
+
 ## Third-Party Libraries
 
 All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.

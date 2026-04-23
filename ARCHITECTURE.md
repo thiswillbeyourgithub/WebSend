@@ -10,6 +10,7 @@
 - [Server API Endpoints](#server-api-endpoints)
 - [Security Layers](#security-layers)
 - [SSO (Experimental)](#sso-experimental)
+- [Testing](#testing)
 - [Deployment](#deployment)
 
 ## Overview
@@ -242,6 +243,16 @@ Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend
 
 This feature is experimental and was added with assistance from
 [Claude Code](https://claude.ai/claude-code).
+
+## Testing
+
+Three tiers, layered from fast/cheap to slow/realistic:
+
+- **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `sdp-compress.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed.
+- **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, and the `/vendor` `/scribe` `/tessdata` static mounts. A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
+- **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer.
+
+A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and aborts the push on failure. The hook is auto-wired by the `prepare` script in `src/package.json` (sets `core.hooksPath=.githooks` on `npm install`). Healthcheck (`src/healthcheck.js`) and SSO endpoints are not yet covered.
 
 ## Deployment
 
