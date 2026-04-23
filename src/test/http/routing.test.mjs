@@ -10,15 +10,16 @@ test('/send/:roomId serves send.html', async () => {
     const res = await fetch(`${srv.baseUrl}/send/ABC123`);
     assert.equal(res.status, 200);
     const html = await res.text();
-    assert.ok(html.includes('<!DOCTYPE html') || html.includes('<html'), 'Not an HTML response');
-    assert.ok(html.toLowerCase().includes('send') || html.includes('WebSend'), 'Expected send.html content');
+    assert.match(html, /<!DOCTYPE html/i, 'Not an HTML response');
+    assert.match(html, /<title>WebSend - Send Photos<\/title>/, 'Expected send.html title');
 });
 
 test('/receive.html serves receive.html', async () => {
     const res = await fetch(`${srv.baseUrl}/receive.html`);
     assert.equal(res.status, 200);
     const html = await res.text();
-    assert.ok(html.includes('<!DOCTYPE html') || html.includes('<html'), 'Not an HTML response');
+    assert.match(html, /<!DOCTYPE html/i, 'Not an HTML response');
+    assert.match(html, /<title>WebSend - Receive Photos<\/title>/, 'Expected receive.html title');
 });
 
 test('static file /js/transfer-stats.js is served', async () => {
