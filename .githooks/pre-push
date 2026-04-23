@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-push hook: run Tier 1 (unit) + Tier 2 (HTTP integration) tests.
+# Tier 3 (Playwright E2E) is intentionally skipped — too slow for pre-push.
+# Bypass with `git push --no-verify` if you must.
+#
+# Activated via: git config core.hooksPath .githooks
+set -e
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root/src"
+
+echo "[pre-push] Running npm test (unit + http)..."
+if ! npm test --silent; then
+  echo "[pre-push] Tests failed — push aborted." >&2
+  exit 1
+fi
+echo "[pre-push] All tests passed."
