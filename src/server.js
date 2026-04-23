@@ -174,8 +174,13 @@ function checkRateLimit(ip, limitType) {
  * @param {string} limitType - Rate limit type to apply
  * @returns {Function} Express middleware
  */
+// Test-only escape hatch: bypass rate limits when TEST_DISABLE_RATE_LIMIT=1.
+// Not documented in env.example because it weakens DoS protection — tests only.
+const RATE_LIMIT_DISABLED = process.env.TEST_DISABLE_RATE_LIMIT === '1';
+
 function rateLimitMiddleware(limitType) {
     return (req, res, next) => {
+        if (RATE_LIMIT_DISABLED) return next();
         const ip = getClientIp(req);
         const result = checkRateLimit(ip, limitType);
 
