@@ -8,3 +8,6 @@ node_modules/
 .aider.*
 deploy.sh
 TODO.md
+
+# test artifacts
+src/test-results/
