@@ -1168,6 +1168,9 @@
             return '📎';
         }
 
+        // Peer-controlled strings (filename, mimeType) reach this function via
+        // encrypted metadata. Cards are built with createElement + textContent so
+        // a crafted filename like `<img src=x onerror=...>` cannot execute.
         function addReceivedFile(url, filename, imageIndex, collectionId, fileType, fileSize) {
             const container = document.getElementById(`collection-images-${collectionId}`);
             if (!container) return;
@@ -1178,99 +1181,177 @@
             item.setAttribute('data-collection-id', collectionId);
             item.setAttribute('draggable', 'true');
 
-            if (fileType === 'image') {
-                // Image card: thumbnail + edit tools (original behavior)
-                item.innerHTML = `
-                    <div class="drag-handle" title="Drag to reorder">☰</div>
-                    <div class="image-thumb-container" style="position: relative; display: block;">
-                        <img src="${url}" alt="Received photo" id="img-${imageIndex}" style="width: 100%; display: block; cursor: pointer;" onclick="if(event.shiftKey){toggleSelectFromMenu(${imageIndex})}else{openLightbox(${imageIndex})}">
-                        <span class="image-badge" style="position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;">#${imageIndex + 1}</span>
-                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
-                        <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
-                        <div class="card-menu hidden" id="card-menu-${imageIndex}">
-                            <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
-                            <button class="card-menu-item" onclick="rotateReceivedImage(${imageIndex}); closeCardMenu(${imageIndex})">🔄 ${i18n.t('send.rotate')}</button>
-                            <button class="card-menu-item" onclick="openCropModal(${imageIndex}); closeCardMenu(${imageIndex})">✂️ ${i18n.t('receive.crop')}</button>
-                            <button class="card-menu-item" onclick="applyBWToImage(${imageIndex}); closeCardMenu(${imageIndex})">⬛ ${i18n.t('send.applyBW')}</button>
-                            <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
-                            <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
-                        </div>
-                    </div>
-                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                        <div style="display: flex; gap: 10px;">
-                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardYes')}
-                            </button>
-                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardNo')}
-                            </button>
-                        </div>
-                    </div>
-                `;
-            } else if (fileType === 'pdf') {
-                // PDF card: icon + filename + size + download + export actions
-                const mimeType = receivedImages[imageIndex].mimeType;
-                item.innerHTML = `
-                    <div class="drag-handle" title="Drag to reorder">☰</div>
-                    <div class="file-card" style="display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px; position: relative;">
-                        <span style="font-size: 3em;">📄</span>
-                        <span class="image-badge" style="background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;">#${imageIndex + 1}</span>
-                        <p style="margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;">${filename}</p>
-                        <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
-                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
-                        <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
-                        <div class="card-menu hidden" id="card-menu-${imageIndex}">
-                            <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
-                            <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
-                            <button class="card-menu-item" onclick="exportPdfAsImages(${imageIndex}); closeCardMenu(${imageIndex})">📸 ${i18n.t('receive.pdfToImages')}</button>
-                            <button class="card-menu-item" onclick="exportPdfAsOcr(${imageIndex}); closeCardMenu(${imageIndex})">📝 ${i18n.t('receive.pdfToOcr')}</button>
-                            <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
-                        </div>
-                    </div>
-                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                        <div style="display: flex; gap: 10px;">
-                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardYes')}
-                            </button>
-                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardNo')}
-                            </button>
-                        </div>
-                    </div>
-                `;
-            } else {
-                // Generic file card: icon + filename + size + download only
-                const icon = getFileIcon(receivedImages[imageIndex].mimeType);
-                item.innerHTML = `
-                    <div class="drag-handle" title="Drag to reorder">☰</div>
-                    <div class="file-card" style="display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px; position: relative;">
-                        <span style="font-size: 3em;">${icon}</span>
-                        <span class="image-badge" style="background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;">#${imageIndex + 1}</span>
-                        <p style="margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;">${filename}</p>
-                        <p style="margin: 0; color: #666; font-size: 0.85em;">${formatFileSize(fileSize)}</p>
-                        <input type="checkbox" checked id="select-${imageIndex}" onchange="onSelectionChange()" style="display:none;">
-                        <button class="card-kebab-btn" onclick="toggleCardMenu(event, ${imageIndex})" title="Actions">⋮</button>
-                        <div class="card-menu hidden" id="card-menu-${imageIndex}">
-                            <button class="card-menu-item" onclick="toggleSelectFromMenu(${imageIndex}); closeCardMenu(${imageIndex})"><span id="select-icon-${imageIndex}">☑️</span> <span id="select-label-${imageIndex}">${i18n.t('receive.toggleSelect')}</span></button>
-                            <a href="${url}" download="${filename}" class="card-menu-item" id="download-${imageIndex}" onclick="closeCardMenu(${imageIndex})">📥 ${i18n.t('receive.download')}</a>
-                            <button class="card-menu-item card-menu-item-danger" onclick="discardImage(${imageIndex}); closeCardMenu(${imageIndex})">🗑️ ${i18n.t('receive.discard')}</button>
-                        </div>
-                    </div>
-                    <div class="discard-confirm hidden" style="margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;">
-                        <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">${i18n.t('receive.discardConfirm')}</p>
-                        <div style="display: flex; gap: 10px;">
-                            <button class="btn btn-action" style="flex: 1; background: #c62828; color: white;" onclick="doDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardYes')}
-                            </button>
-                            <button class="btn btn-action btn-secondary" style="flex: 1;" onclick="cancelDiscard(${imageIndex})">
-                                ${i18n.t('receive.discardNo')}
-                            </button>
-                        </div>
-                    </div>
-                `;
+            const dragHandle = document.createElement('div');
+            dragHandle.className = 'drag-handle';
+            dragHandle.title = 'Drag to reorder';
+            dragHandle.textContent = '☰';
+            item.appendChild(dragHandle);
+
+            // Build the common discard-confirm panel (identical across fileTypes)
+            const discardConfirm = document.createElement('div');
+            discardConfirm.className = 'discard-confirm hidden';
+            discardConfirm.style.cssText = 'margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;';
+            const discardMsg = document.createElement('p');
+            discardMsg.style.cssText = 'margin: 0 0 10px 0; color: #e65100; font-weight: bold;';
+            discardMsg.textContent = i18n.t('receive.discardConfirm');
+            discardConfirm.appendChild(discardMsg);
+            const discardBtnRow = document.createElement('div');
+            discardBtnRow.style.cssText = 'display: flex; gap: 10px;';
+            const yesBtn = document.createElement('button');
+            yesBtn.className = 'btn btn-action';
+            yesBtn.style.cssText = 'flex: 1; background: #c62828; color: white;';
+            yesBtn.textContent = i18n.t('receive.discardYes');
+            yesBtn.addEventListener('click', () => doDiscard(imageIndex));
+            const noBtn = document.createElement('button');
+            noBtn.className = 'btn btn-action btn-secondary';
+            noBtn.style.cssText = 'flex: 1;';
+            noBtn.textContent = i18n.t('receive.discardNo');
+            noBtn.addEventListener('click', () => cancelDiscard(imageIndex));
+            discardBtnRow.append(yesBtn, noBtn);
+            discardConfirm.appendChild(discardBtnRow);
+
+            // Shared: hidden selection checkbox
+            const selectCheckbox = document.createElement('input');
+            selectCheckbox.type = 'checkbox';
+            selectCheckbox.checked = true;
+            selectCheckbox.id = `select-${imageIndex}`;
+            selectCheckbox.style.display = 'none';
+            selectCheckbox.addEventListener('change', () => onSelectionChange());
+
+            // Shared: kebab button
+            const kebabBtn = document.createElement('button');
+            kebabBtn.className = 'card-kebab-btn';
+            kebabBtn.title = 'Actions';
+            kebabBtn.textContent = '⋮';
+            kebabBtn.addEventListener('click', (e) => toggleCardMenu(e, imageIndex));
+
+            // Shared: build the kebab menu from a list of entries
+            function buildCardMenu(entries) {
+                const menu = document.createElement('div');
+                menu.className = 'card-menu hidden';
+                menu.id = `card-menu-${imageIndex}`;
+                for (const entry of entries) {
+                    const el = document.createElement(entry.tag || 'button');
+                    el.className = 'card-menu-item' + (entry.danger ? ' card-menu-item-danger' : '');
+                    if (entry.id) el.id = entry.id;
+                    if (entry.href) el.href = entry.href;
+                    if (entry.download !== undefined) el.download = entry.download;
+                    // Use children if provided (for icon + label spans); otherwise textContent
+                    if (entry.children) {
+                        for (const c of entry.children) el.appendChild(c);
+                    } else {
+                        el.textContent = entry.label;
+                    }
+                    el.addEventListener('click', () => {
+                        if (entry.onClick) entry.onClick();
+                        closeCardMenu(imageIndex);
+                    });
+                    menu.appendChild(el);
+                }
+                return menu;
             }
+
+            // Shared: #N badge
+            function makeBadge(extraStyle) {
+                const badge = document.createElement('span');
+                badge.className = 'image-badge';
+                badge.style.cssText = extraStyle;
+                badge.textContent = `#${imageIndex + 1}`;
+                return badge;
+            }
+
+            // Shared: select menu-item has two spans with IDs (icon, label) so other
+            // code can toggle them via getElementById.
+            function makeSelectMenuItem() {
+                const iconSpan = document.createElement('span');
+                iconSpan.id = `select-icon-${imageIndex}`;
+                iconSpan.textContent = '☑️';
+                const labelSpan = document.createElement('span');
+                labelSpan.id = `select-label-${imageIndex}`;
+                labelSpan.textContent = i18n.t('receive.toggleSelect');
+                const space = document.createTextNode(' ');
+                return {
+                    tag: 'button',
+                    children: [iconSpan, space, labelSpan],
+                    onClick: () => toggleSelectFromMenu(imageIndex),
+                };
+            }
+
+            if (fileType === 'image') {
+                const thumb = document.createElement('div');
+                thumb.className = 'image-thumb-container';
+                thumb.style.cssText = 'position: relative; display: block;';
+
+                const img = document.createElement('img');
+                img.src = url;
+                img.alt = 'Received photo';
+                img.id = `img-${imageIndex}`;
+                img.style.cssText = 'width: 100%; display: block; cursor: pointer;';
+                img.addEventListener('click', (event) => {
+                    if (event.shiftKey) toggleSelectFromMenu(imageIndex);
+                    else openLightbox(imageIndex);
+                });
+                thumb.appendChild(img);
+                thumb.appendChild(makeBadge('position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;'));
+                thumb.appendChild(selectCheckbox);
+                thumb.appendChild(kebabBtn);
+
+                const menu = buildCardMenu([
+                    makeSelectMenuItem(),
+                    { label: `🔄 ${i18n.t('send.rotate')}`, onClick: () => rotateReceivedImage(imageIndex) },
+                    { label: `✂️ ${i18n.t('receive.crop')}`, onClick: () => openCropModal(imageIndex) },
+                    { label: `⬛ ${i18n.t('send.applyBW')}`, onClick: () => applyBWToImage(imageIndex) },
+                    { tag: 'a', href: url, download: filename, id: `download-${imageIndex}`, label: `📥 ${i18n.t('receive.download')}` },
+                    { label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => discardImage(imageIndex) },
+                ]);
+                thumb.appendChild(menu);
+
+                item.appendChild(thumb);
+                item.appendChild(discardConfirm);
+            } else if (fileType === 'pdf' || fileType === 'other') {
+                const card = document.createElement('div');
+                card.className = 'file-card';
+                card.style.cssText = 'display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px; position: relative;';
+
+                const iconSpan = document.createElement('span');
+                iconSpan.style.fontSize = '3em';
+                iconSpan.textContent = fileType === 'pdf'
+                    ? '📄'
+                    : getFileIcon(receivedImages[imageIndex].mimeType);
+                card.appendChild(iconSpan);
+
+                card.appendChild(makeBadge('background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;'));
+
+                const nameP = document.createElement('p');
+                nameP.style.cssText = 'margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;';
+                nameP.textContent = filename;
+                card.appendChild(nameP);
+
+                const sizeP = document.createElement('p');
+                sizeP.style.cssText = 'margin: 0; color: #666; font-size: 0.85em;';
+                sizeP.textContent = formatFileSize(fileSize);
+                card.appendChild(sizeP);
+
+                card.appendChild(selectCheckbox);
+                card.appendChild(kebabBtn);
+
+                const entries = [
+                    makeSelectMenuItem(),
+                    { tag: 'a', href: url, download: filename, id: `download-${imageIndex}`, label: `📥 ${i18n.t('receive.download')}` },
+                ];
+                if (fileType === 'pdf') {
+                    entries.push(
+                        { label: `📸 ${i18n.t('receive.pdfToImages')}`, onClick: () => exportPdfAsImages(imageIndex) },
+                        { label: `📝 ${i18n.t('receive.pdfToOcr')}`, onClick: () => exportPdfAsOcr(imageIndex) },
+                    );
+                }
+                entries.push({ label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => discardImage(imageIndex) });
+                card.appendChild(buildCardMenu(entries));
+
+                item.appendChild(card);
+                item.appendChild(discardConfirm);
+            }
+
             container.appendChild(item);
             setupDragEvents(item);
             updateCollectionCount(collectionId);
