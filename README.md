@@ -259,6 +259,8 @@ The project uses a three-tier test suite:
 
 Run `npm test` (= unit + HTTP) for the fast inner loop, or `npm run test:all` for everything. A pre-push git hook (in `.githooks/pre-push`, auto-wired by `npm install` via the `prepare` script) runs `npm test` before every push.
 
+Known testing gaps (frontend modules like `webrtc.js`/`logger.js`/`i18n.js`, the export modal, crop tool, transform-replay protocol, fingerprint-mismatch / integrity-retry paths, the service worker, healthcheck, and SSO) are listed in [ARCHITECTURE.md](ARCHITECTURE.md#testing).
+
 ## Third-Party Libraries
 
 All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.
