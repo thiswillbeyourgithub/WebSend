@@ -358,6 +358,10 @@ class WebSendRTC {
             return false;
         }
 
+        if (this._fileAckResolve) {
+            throw new Error('sendFile already in progress — wait for the previous transfer to finish');
+        }
+
         const CHUNK_SIZE = 16384; // 16KB chunks
         const totalSize = encryptedData.byteLength;
         let offset = 0;
@@ -731,17 +735,25 @@ class WebSendRTC {
                 return;
             }
 
+            let done = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                clearTimeout(timeout);
+                this.pc.removeEventListener('icegatheringstatechange', onChange);
+                resolve();
+            };
+
+            const onChange = () => {
+                if (this.pc.iceGatheringState === 'complete') finish();
+            };
+
             const timeout = setTimeout(() => {
                 logger.warn('ICE gathering timeout, proceeding with available candidates');
-                resolve();
+                finish();
             }, 5000);
 
-            this.pc.onicegatheringstatechange = () => {
-                if (this.pc.iceGatheringState === 'complete') {
-                    clearTimeout(timeout);
-                    resolve();
-                }
-            };
+            this.pc.addEventListener('icegatheringstatechange', onChange);
         });
     }
 
@@ -1015,6 +1027,19 @@ class WebSendRTC {
      */
     close() {
         this.stopIceCandidatePolling();
+        if (this._disconnectTimer) {
+            clearTimeout(this._disconnectTimer);
+            this._disconnectTimer = null;
+        }
+        if (this._fileAckTimeout) {
+            clearTimeout(this._fileAckTimeout);
+            this._fileAckTimeout = null;
+        }
+        if (this._fileAckReject) {
+            this._fileAckReject(new Error('Connection closed before receiver acknowledged transfer'));
+            this._fileAckResolve = null;
+            this._fileAckReject = null;
+        }
         // Clear any in-progress receive buffers
         this.receiveBuffer = [];
         this.receivedSize = 0;
