@@ -5,7 +5,7 @@
  *
  * Exposes window.ImageTransforms = { applyOtsu, perspectiveTransform }
  */
-
+(function () {
 /**
  * Apply Otsu's method to binarize an ImageData in place.
  * Converts to grayscale, finds optimal threshold, then sets each pixel
@@ -204,3 +204,4 @@ function _bilinearSample(imgData, x, y) {
 }
 
 window.ImageTransforms = { applyOtsu, perspectiveTransform, distance };
+})();
