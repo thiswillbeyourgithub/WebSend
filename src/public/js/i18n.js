@@ -28,6 +28,7 @@ const i18n = (function() {
             'index.send.hint': 'Scan QR & send photos',
             'index.footer': 'Your photos are encrypted end-to-end.<br>They never pass unencrypted through any server.',
             'index.about': 'About',
+            'index.firefoxAndroidFlashWarning': 'Heads up: Firefox on Android does not support camera flash/torch. If you need flash while taking photos, use Chrome or another Chromium-based browser instead. Tap OK to continue anyway.',
 
             // About modal
             'about.title': 'About WebSend',
@@ -241,6 +242,7 @@ const i18n = (function() {
             'index.send.hint': 'Scanner le QR et envoyer des photos',
             'index.footer': 'Vos photos sont chiffrées de bout en bout.<br>Elles ne transitent jamais en clair par aucun serveur.',
             'index.about': 'À propos',
+            'index.firefoxAndroidFlashWarning': 'Attention : Firefox sur Android ne supporte pas le flash/torche de l\'appareil photo. Si vous avez besoin du flash pour prendre des photos, utilisez Chrome ou un autre navigateur basé sur Chromium. Appuyez sur OK pour continuer quand même.',
 
             // About modal
             'about.title': 'À propos de WebSend',
