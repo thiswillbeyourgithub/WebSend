@@ -141,34 +141,7 @@
             <img id="lightbox-img" src="" alt="Preview">
         </div>
 
-        <!-- Crop modal (hidden until user clicks Crop on an image) -->
-        <div id="crop-modal" class="crop-modal hidden">
-            <div class="crop-modal-header">
-                <h2 data-i18n="crop.title">Crop Document</h2>
-                <p data-i18n="crop.instructions">Drag the corners to mark the document edges</p>
-            </div>
-            <div class="crop-canvas-container" id="crop-container">
-                <img id="crop-image" src="" alt="Image to crop">
-                <!-- SVG overlay for the quadrilateral outline -->
-                <svg class="crop-overlay" id="crop-overlay">
-                    <polygon id="crop-polygon" points="0,0 0,0 0,0 0,0"/>
-                </svg>
-                <!-- Four corner handles, positioned by JS -->
-                <div class="crop-handle" id="handle-tl" data-corner="tl"></div>
-                <div class="crop-handle" id="handle-tr" data-corner="tr"></div>
-                <div class="crop-handle" id="handle-br" data-corner="br"></div>
-                <div class="crop-handle" id="handle-bl" data-corner="bl"></div>
-                <!-- Magnifier loupe: shows zoomed view under the dragged handle -->
-                <div class="crop-magnifier hidden" id="crop-magnifier">
-                    <canvas id="crop-magnifier-canvas" width="120" height="120"></canvas>
-                    <div class="crop-magnifier-crosshair"></div>
-                </div>
-            </div>
-            <div class="crop-buttons">
-                <button class="crop-btn-cancel" onclick="closeCropModal()" data-i18n="crop.cancel">Cancel</button>
-                <button class="crop-btn-apply" onclick="applyCrop()" data-i18n="crop.apply">Apply Crop</button>
-            </div>
-        </div>
+        <!-- Crop modal is injected at runtime by /js/crop-modal.js -->
     </div>
 
     <script src="/js/i18n.js" integrity="sha384-HbRY7s7IhQV86XALbpn3g9Ldwsh1KcniozGrG9x97T5IbPTCDlTWLHnxtktcBUUB"></script>
@@ -179,6 +152,7 @@
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/webrtc.js" integrity="sha384-5NUj++FlRTLr9SHWSIIVZ1XzQZQnpPlUdQKT+ePNSfgTLnU1TXBWkzptP7XxuAuj"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-531l7cDBCA5mQdwGDYQl9X2tKu9r4DBFqodsBxtyKt07W8NqGt/b0tc+PlI62j5Z"></script>
+    <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -3493,354 +3467,47 @@
         }
 
         // ============ Image Cropping (Perspective Transform) ============
-        // Minimal document cropping with 4-corner perspective correction.
-        // Pure vanilla JS, no external dependencies.
+        // Thin wrapper around window.CropModal (public/js/crop-modal.js).
 
-        let cropState = {
-            imageIndex: null,       // Index in receivedImages array
-            originalUrl: null,      // Object URL of the image being cropped
-            imgWidth: 0,            // Displayed image width in pixels
-            imgHeight: 0,           // Displayed image height in pixels
-            // Corner positions as percentages (0-1) of image dimensions
-            // Order: top-left, top-right, bottom-right, bottom-left
-            corners: {
-                tl: { x: 0.05, y: 0.05 },
-                tr: { x: 0.95, y: 0.05 },
-                br: { x: 0.95, y: 0.95 },
-                bl: { x: 0.05, y: 0.95 }
-            },
-            dragging: null,         // Currently dragged handle ID or null
-            // Full-resolution image element for magnifier sampling
-            fullResImg: null
-        };
-
-        /**
-         * Open the crop modal for a specific image
-         */
         function openCropModal(imageIndex) {
             logger.info(`Opening crop modal for image ${imageIndex}`);
-            cropState.imageIndex = imageIndex;
+            const imgData = receivedImages[imageIndex];
+            if (!imgData) return;
+            const sourceBlob = new Blob([imgData.data], { type: imgData.mimeType });
 
-            const imgEl = document.getElementById(`img-${imageIndex}`);
-            cropState.originalUrl = imgEl.src;
+            CropModal.open({
+                sourceBlob,
+                onCancel: () => logger.info('Crop cancelled'),
+                onApply: async (resultBlob, _corners, { dstW, dstH }) => {
+                    const resultData = new Uint8Array(await resultBlob.arrayBuffer());
 
-            // Reset corners to near-edge defaults
-            cropState.corners = {
-                tl: { x: 0.05, y: 0.05 },
-                tr: { x: 0.95, y: 0.05 },
-                br: { x: 0.95, y: 0.95 },
-                bl: { x: 0.05, y: 0.95 }
-            };
+                    // Update receivedImages in place to preserve hash, fileType, collection refs, etc.
+                    imgData.data = resultData;
+                    imgData.mimeType = 'image/jpeg';
+                    imgData.ocrPageData = null;
 
-            // Load image into crop modal
-            const cropImg = document.getElementById('crop-image');
-            cropImg.src = cropState.originalUrl;
-
-            cropImg.onload = () => {
-                // Store displayed dimensions for coordinate calculations
-                cropState.imgWidth = cropImg.clientWidth;
-                cropState.imgHeight = cropImg.clientHeight;
-                updateCropOverlay();
-
-                // Preload full-resolution image for magnifier sampling
-                const fullImg = new Image();
-                fullImg.src = cropState.originalUrl;
-                cropState.fullResImg = fullImg;
-            };
-
-            // Show modal
-            document.getElementById('crop-modal').classList.remove('hidden');
-
-            // Set up handle drag listeners
-            setupCropHandles();
-        }
-
-        /**
-         * Close the crop modal without applying changes
-         */
-        function closeCropModal() {
-            logger.info('Crop cancelled');
-            document.getElementById('crop-modal').classList.add('hidden');
-            cropState.imageIndex = null;
-            cropState.dragging = null;
-        }
-
-        /**
-         * Set up touch/mouse drag listeners for corner handles
-         */
-        function setupCropHandles() {
-            const handles = ['tl', 'tr', 'br', 'bl'];
-            const container = document.getElementById('crop-container');
-
-            handles.forEach(corner => {
-                const handle = document.getElementById(`handle-${corner}`);
-
-                // Mouse events
-                handle.addEventListener('mousedown', (e) => {
-                    e.preventDefault();
-                    cropState.dragging = corner;
-                    // Show magnifier immediately at current handle position
-                    updateCropMagnifier(cropState.corners[corner].x, cropState.corners[corner].y);
-                });
-
-                // Touch events (mobile)
-                handle.addEventListener('touchstart', (e) => {
-                    e.preventDefault();
-                    cropState.dragging = corner;
-                    updateCropMagnifier(cropState.corners[corner].x, cropState.corners[corner].y);
-                }, { passive: false });
-            });
-
-            // Clicking anywhere on the container starts dragging the nearest corner
-            function startNearestCorner(e) {
-                if (e.target.classList.contains('crop-handle')) return;
-                e.preventDefault();
-                const rect = container.getBoundingClientRect();
-                const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-                const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-                const x = (clientX - rect.left) / rect.width;
-                const y = (clientY - rect.top) / rect.height;
-                let closest = null, minDist = Infinity;
-                for (const c of handles) {
-                    const dx = cropState.corners[c].x - x;
-                    const dy = cropState.corners[c].y - y;
-                    const d = dx * dx + dy * dy;
-                    if (d < minDist) { minDist = d; closest = c; }
-                }
-                cropState.dragging = closest;
-                cropState.corners[closest] = {
-                    x: Math.max(0, Math.min(1, x)),
-                    y: Math.max(0, Math.min(1, y))
-                };
-                updateCropOverlay();
-                updateCropMagnifier(x, y);
-            }
-            container.addEventListener('mousedown', startNearestCorner);
-            container.addEventListener('touchstart', startNearestCorner, { passive: false });
-
-            // Global move/up handlers
-            document.addEventListener('mousemove', onCropDrag);
-            document.addEventListener('mouseup', onCropDragEnd);
-            document.addEventListener('touchmove', onCropDrag, { passive: false });
-            document.addEventListener('touchend', onCropDragEnd);
-        }
-
-        /**
-         * Handle drag movement - update corner position
-         */
-        function onCropDrag(e) {
-            if (!cropState.dragging) return;
-            e.preventDefault();
-
-            const container = document.getElementById('crop-container');
-            const rect = container.getBoundingClientRect();
-
-            // Get coordinates (mouse or touch)
-            let clientX, clientY;
-            if (e.touches) {
-                clientX = e.touches[0].clientX;
-                clientY = e.touches[0].clientY;
-            } else {
-                clientX = e.clientX;
-                clientY = e.clientY;
-            }
-
-            // Convert to percentage of image dimensions (clamped to 0-1)
-            const x = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-            const y = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
-
-            cropState.corners[cropState.dragging] = { x, y };
-            updateCropOverlay();
-            updateCropMagnifier(x, y);
-        }
-
-        /**
-         * Handle drag end
-         */
-        function onCropDragEnd() {
-            cropState.dragging = null;
-            // Hide magnifier when not dragging
-            document.getElementById('crop-magnifier').classList.add('hidden');
-        }
-
-        /**
-         * Update the visual overlay (polygon and handle positions)
-         */
-        function updateCropOverlay() {
-            const w = cropState.imgWidth;
-            const h = cropState.imgHeight;
-            const c = cropState.corners;
-
-            // Update handle positions (CSS absolute positioning)
-            document.getElementById('handle-tl').style.left = (c.tl.x * 100) + '%';
-            document.getElementById('handle-tl').style.top = (c.tl.y * 100) + '%';
-            document.getElementById('handle-tr').style.left = (c.tr.x * 100) + '%';
-            document.getElementById('handle-tr').style.top = (c.tr.y * 100) + '%';
-            document.getElementById('handle-br').style.left = (c.br.x * 100) + '%';
-            document.getElementById('handle-br').style.top = (c.br.y * 100) + '%';
-            document.getElementById('handle-bl').style.left = (c.bl.x * 100) + '%';
-            document.getElementById('handle-bl').style.top = (c.bl.y * 100) + '%';
-
-            // Update SVG polygon points (in pixel coordinates relative to container)
-            const polygon = document.getElementById('crop-polygon');
-            const points = [
-                `${c.tl.x * w},${c.tl.y * h}`,
-                `${c.tr.x * w},${c.tr.y * h}`,
-                `${c.br.x * w},${c.br.y * h}`,
-                `${c.bl.x * w},${c.bl.y * h}`
-            ].join(' ');
-            polygon.setAttribute('points', points);
-        }
-
-        /**
-         * Show and update the magnifier loupe during handle dragging.
-         * Renders a zoomed-in portion of the full-resolution image centered on
-         * the current handle position. Positioned offset from the handle so
-         * it's not hidden under the user's thumb.
-         * @param {number} x - Handle x position as fraction (0-1) of image width
-         * @param {number} y - Handle y position as fraction (0-1) of image height
-         */
-        function updateCropMagnifier(x, y) {
-            const magnifier = document.getElementById('crop-magnifier');
-            const canvas = document.getElementById('crop-magnifier-canvas');
-            const ctx = canvas.getContext('2d');
-            const img = cropState.fullResImg;
-
-            if (!img || !img.naturalWidth) {
-                magnifier.classList.add('hidden');
-                return;
-            }
-
-            magnifier.classList.remove('hidden');
-
-            // Position the magnifier offset from the handle (above and to the left
-            // by default, but flip direction near edges to stay within the container)
-            const magnifierSize = 124; // matches CSS width/height
-            const offset = 70; // distance from handle center to magnifier center
-
-            // Place magnifier above the handle by default; flip below if near top
-            let magX = x * 100; // percentage
-            let magY = y * 100;
-
-            // Offset upward; flip down if handle is in the top 20%
-            const yOffsetPx = y < 0.2 ? offset : -offset;
-            // Offset left; flip right if handle is in the left 20%
-            const xOffsetPx = x < 0.2 ? offset : -offset;
-
-            // Convert pixel offset to percentage of container dimensions
-            magnifier.style.left = `calc(${magX}% + ${xOffsetPx}px)`;
-            magnifier.style.top = `calc(${magY}% + ${yOffsetPx}px)`;
-
-            // Draw zoomed section of the full-resolution image onto the canvas.
-            // The zoom factor determines how many source pixels map to the loupe.
-            const zoomFactor = 1.2;
-            const canvasSize = canvas.width; // 120px
-            // Number of source pixels visible in the loupe
-            const srcSize = canvasSize / zoomFactor;
-            // Source coordinates centered on the handle position
-            const srcX = x * img.naturalWidth - srcSize / 2;
-            const srcY = y * img.naturalHeight - srcSize / 2;
-
-            ctx.clearRect(0, 0, canvasSize, canvasSize);
-            ctx.drawImage(
-                img,
-                srcX, srcY, srcSize, srcSize,  // source rectangle
-                0, 0, canvasSize, canvasSize    // destination (full canvas)
-            );
-        }
-
-        /**
-         * Apply the perspective crop and update the image
-         */
-        async function applyCrop() {
-            logger.info('Applying perspective crop...');
-
-            try {
-                // Load the original full-resolution image
-                const imgData = receivedImages[cropState.imageIndex];
-                const originalBlob = new Blob([imgData.data], { type: imgData.mimeType });
-                const originalUrl = URL.createObjectURL(originalBlob);
-
-                const img = new Image();
-                await new Promise((resolve, reject) => {
-                    img.onload = resolve;
-                    img.onerror = reject;
-                    img.src = originalUrl;
-                });
-                URL.revokeObjectURL(originalUrl);
-
-                // Re-sort corners into proper tl/tr/br/bl order before applying,
-                // in case the user dragged handles into a crossed/flipped arrangement.
-                function normalizeCorners(corners) {
-                    const pts = [corners.tl, corners.tr, corners.br, corners.bl];
-                    pts.sort((a, b) => a.y - b.y || a.x - b.x);
-                    const top = pts.slice(0, 2).sort((a, b) => a.x - b.x);
-                    const bottom = pts.slice(2, 4).sort((a, b) => a.x - b.x);
-                    return { tl: top[0], tr: top[1], bl: bottom[0], br: bottom[1] };
-                }
-
-                // Scale corner percentages to actual image pixels
-                const srcW = img.width;
-                const srcH = img.height;
-                const c = normalizeCorners(cropState.corners);
-
-                const srcCorners = [
-                    { x: c.tl.x * srcW, y: c.tl.y * srcH },
-                    { x: c.tr.x * srcW, y: c.tr.y * srcH },
-                    { x: c.br.x * srcW, y: c.br.y * srcH },
-                    { x: c.bl.x * srcW, y: c.bl.y * srcH }
-                ];
-
-                // Calculate output dimensions based on the longest edges
-                const topWidth = distance(srcCorners[0], srcCorners[1]);
-                const bottomWidth = distance(srcCorners[3], srcCorners[2]);
-                const leftHeight = distance(srcCorners[0], srcCorners[3]);
-                const rightHeight = distance(srcCorners[1], srcCorners[2]);
-
-                const dstW = Math.round(Math.max(topWidth, bottomWidth));
-                const dstH = Math.round(Math.max(leftHeight, rightHeight));
-
-                // Perform perspective transform
-                const resultCanvas = perspectiveTransform(img, srcCorners, dstW, dstH);
-
-                // Convert to blob and update storage
-                const resultBlob = await new Promise(resolve => {
-                    resultCanvas.toBlob(resolve, 'image/jpeg', 0.92);
-                });
-                const resultData = new Uint8Array(await resultBlob.arrayBuffer());
-
-                // Update receivedImages array
-                // Update in place to preserve hash, fileType, collection refs, etc.
-                imgData.data = resultData;
-                imgData.mimeType = 'image/jpeg';
-                imgData.ocrPageData = null;
-
-                // Update the displayed image, revoking old object URLs
-                const imgEl = document.getElementById(`img-${cropState.imageIndex}`);
-                const dlEl = document.getElementById(`download-${cropState.imageIndex}`);
-                if (imgEl.src.startsWith('blob:')) {
-                    const oldImgUrl = imgEl.src;
-                    const oldDlUrl = dlEl.href;
-                    URL.revokeObjectURL(oldImgUrl);
-                    if (oldDlUrl !== oldImgUrl && oldDlUrl.startsWith('blob:')) {
-                        URL.revokeObjectURL(oldDlUrl);
+                    const imgEl = document.getElementById(`img-${imageIndex}`);
+                    const dlEl = document.getElementById(`download-${imageIndex}`);
+                    if (imgEl && imgEl.src.startsWith('blob:')) {
+                        const oldImgUrl = imgEl.src;
+                        const oldDlUrl = dlEl ? dlEl.href : oldImgUrl;
+                        URL.revokeObjectURL(oldImgUrl);
+                        if (oldDlUrl !== oldImgUrl && oldDlUrl.startsWith('blob:')) {
+                            URL.revokeObjectURL(oldDlUrl);
+                        }
                     }
+                    const newUrl = URL.createObjectURL(resultBlob);
+                    if (imgEl) imgEl.src = newUrl;
+                    if (dlEl) dlEl.href = newUrl;
+
+                    cancelImageOcr(imageIndex);
+                    queueBackgroundOcr(imageIndex);
+
+                    logger.success(`Cropped image: ${dstW}x${dstH}px`);
                 }
-                const newUrl = URL.createObjectURL(resultBlob);
-                imgEl.src = newUrl;
-                dlEl.href = newUrl;
-
-                // Restart background OCR for the cropped image
-                cancelImageOcr(cropState.imageIndex);
-                queueBackgroundOcr(cropState.imageIndex);
-
-                logger.success(`Cropped image: ${dstW}x${dstH}px`);
-                closeCropModal();
-            } catch (e) {
-                logger.error('Crop failed: ' + e.message);
-                showToast('Crop failed: ' + e.message);
-            }
+            });
         }
+
 
         // Register service worker for PWA functionality
         if ('serviceWorker' in navigator) {

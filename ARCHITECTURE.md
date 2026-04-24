@@ -82,6 +82,10 @@ WebSend/
         │   ├── sdp-compress.js # SDP compression utilities (extracts essential SDP fields,
         │   │               #   compresses with deflate, reconstructs minimal valid SDP).
         │   │               #   Used to keep QR codes small
+        │   ├── crop-modal.js # Shared perspective-crop modal (injects its own DOM).
+        │   │               #   Exposes window.CropModal.open({ sourceBlob, initialCorners,
+        │   │               #   detectCorners, onApply, onCancel }); used by both send.html
+        │   │               #   and receive.html so the ~450 LOC crop logic is not duplicated
         │   ├── qrcode.min.js # QR code generator library (vendored, used by receiver)
         │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
         │
