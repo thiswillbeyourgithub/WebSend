@@ -123,12 +123,11 @@
 
         // Define loadEruda for the 5-tap gesture handled by sidebar.js.
         // The index page has no logger, so falls back to console.
-        // ⚠️ SOLE EXTERNAL CDN FETCH — see the loadEruda comment in receive.html
-        // for why eruda is intentionally not vendored.
+        // Eruda is vendored at /vendor/eruda/eruda.js — no external network calls.
         window.loadEruda = function() {
             return new Promise((resolve) => {
                 const script = document.createElement('script');
-                script.src = 'https://cdn.jsdelivr.net/npm/eruda';
+                script.src = '/vendor/eruda/eruda.js';
                 script.onload = () => { eruda.init(); resolve(); };
                 script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
                 document.head.appendChild(script);

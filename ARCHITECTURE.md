@@ -89,8 +89,10 @@ WebSend/
         │   ├── client-zip.js   # ZIP generator (ESM, ~6KB, preloaded in background)
         │   ├── scribe.js-ocr/  # OCR engine (AGPL-3.0): scribe.js + Tesseract WASM,
         │   │                   #   fonts, and mupdf — preloaded in background
-        │   └── tessdata/       # Tesseract language models (eng + fra .traineddata),
-        │                       #   served locally to avoid CDN dependency
+        │   ├── tessdata/       # Tesseract language models (eng + fra .traineddata),
+        │   │                   #   served locally to avoid CDN dependency
+        │   └── eruda/          # Mobile devtools console (loaded in DEV mode or via
+        │                       #   5-tap on the DEV badge — served locally, no CDN)
         │
         └── icons/
             ├── icon-192.png # PWA icon (192x192)
@@ -205,7 +207,7 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
 9. **Supply chain attack resistance**: No frameworks, bundlers, or build tools — the frontend
    is vanilla HTML/CSS/JS with zero `node_modules` in the browser. All third-party
    client-side libraries (jsQR, qrcode.js, client-zip, scribe.js-ocr, Tesseract WASM +
-   language models) are vendored directly in the repository — no CDN fetches at runtime.
+   language models, eruda) are vendored directly in the repository — no CDN fetches at runtime.
    The server-side dependency footprint is minimal (Express.js only).
 10. **SRI**: All `<script>` and `<link>` tags use `integrity` attributes (Subresource
    Integrity), ensuring even a compromised server cannot silently swap in tampered files.

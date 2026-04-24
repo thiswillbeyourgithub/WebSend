@@ -291,24 +291,16 @@
         });
 
         /**
-         * Dynamically load eruda mobile devtools console from CDN.
-         * Only called in DEV mode (DEV=1 env var on server) to avoid loading
-         * a ~500KB debug library in production.
-         *
-         * ⚠️  SOLE EXTERNAL CDN FETCH IN THIS PROJECT.
-         * All other third-party libraries are vendored locally (jsQR, qrcode.js,
-         * client-zip, scribe.js-ocr). Eruda is intentionally not vendored because
-         * it is ~500KB of debug-only tooling — committing it to git would bloat
-         * the repository for zero production benefit. It is never loaded unless
-         * the server is started with DEV=1, so production deployments stay fully
-         * CDN-free. If an air-gapped DEV environment is ever needed, download
-         * eruda.js and serve it from /vendor/eruda/eruda.js instead.
+         * Dynamically load the vendored eruda mobile devtools console.
+         * Only called in DEV mode (or via the 5-tap gesture) to avoid loading
+         * a ~500KB debug library on every page view. Served from /vendor/eruda/
+         * so the app makes zero external network requests.
          * @returns {Promise<void>}
          */
         function loadEruda() {
             return new Promise((resolve) => {
                 const script = document.createElement('script');
-                script.src = 'https://cdn.jsdelivr.net/npm/eruda';
+                script.src = '/vendor/eruda/eruda.js';
                 script.onload = () => { eruda.init(); resolve(); };
                 script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
                 document.head.appendChild(script);
