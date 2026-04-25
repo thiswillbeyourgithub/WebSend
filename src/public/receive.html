@@ -2788,6 +2788,31 @@
             return await scribe.exportData('pdf');
         }
 
+        // Keeps a near-silent oscillator running so the browser doesn't
+        // throttle this tab during long-running OCR. Owns its own ctx + osc
+        // so failure paths don't leak audio nodes.
+        function makeKeepAlive() {
+            let ctx = null, osc = null;
+            return {
+                start() {
+                    try {
+                        ctx = new (window.AudioContext || window.webkitAudioContext)();
+                        osc = ctx.createOscillator();
+                        const gain = ctx.createGain();
+                        gain.gain.value = 0;
+                        osc.connect(gain);
+                        gain.connect(ctx.destination);
+                        osc.start();
+                    } catch (_) { /* best effort */ }
+                },
+                stop() {
+                    try { if (osc) osc.stop(); } catch (_) {}
+                    try { if (ctx) ctx.close(); } catch (_) {}
+                    osc = null; ctx = null;
+                },
+            };
+        }
+
         async function generateOcrPdf() {
             logger.info('=== OCR PDF export started ===');
             const exportAbort = new AbortController();
@@ -2841,16 +2866,8 @@
             });
 
             // Prevent browser from throttling this tab
-            let keepaliveCtx = null;
-            try {
-                keepaliveCtx = new (window.AudioContext || window.webkitAudioContext)();
-                const osc = keepaliveCtx.createOscillator();
-                const gain = keepaliveCtx.createGain();
-                gain.gain.value = 0;
-                osc.connect(gain);
-                gain.connect(keepaliveCtx.destination);
-                osc.start();
-            } catch (_) { /* best effort */ }
+            const keepalive = makeKeepAlive();
+            keepalive.start();
 
             try {
                 const ocrWork = (async () => {
@@ -3040,7 +3057,7 @@
                 }
             } finally {
                 exportAbort.abort(); // unblock any lingering listeners
-                if (keepaliveCtx) keepaliveCtx.close().catch(() => {});
+                keepalive.stop();
                 btn.disabled = false;
                 btn.style.background = '#1565c0';
                 updateExportButton();
