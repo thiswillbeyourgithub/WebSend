@@ -153,6 +153,7 @@
     <script src="/js/webrtc.js" integrity="sha384-5NUj++FlRTLr9SHWSIIVZ1XzQZQnpPlUdQKT+ePNSfgTLnU1TXBWkzptP7XxuAuj"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-531l7cDBCA5mQdwGDYQl9X2tKu9r4DBFqodsBxtyKt07W8NqGt/b0tc+PlI62j5Z"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
+    <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -2780,37 +2781,7 @@
                 const origH = origBmp.height;
                 origBmp.close();
 
-                const ocrDims = pageMetrics[i].dims;
-                const scaleX = origW / ocrDims.width;
-                const scaleY = origH / ocrDims.height;
-                const s = (scaleX + scaleY) / 2;
-
-                if (Math.abs(s - 1) > 0.01) {
-                    const page = ocrPages[i];
-                    if (page && page.lines) {
-                        for (const line of page.lines) {
-                            line.bbox.left *= s; line.bbox.top *= s;
-                            line.bbox.right *= s; line.bbox.bottom *= s;
-                            if (line.ascHeight) line.ascHeight *= s;
-                            if (line.xHeight) line.xHeight *= s;
-                            line.baseline[1] *= s;
-                            for (const word of line.words) {
-                                word.bbox.left *= s; word.bbox.top *= s;
-                                word.bbox.right *= s; word.bbox.bottom *= s;
-                                if (word.chars) {
-                                    for (const ch of word.chars) {
-                                        ch.bbox.left *= s; ch.bbox.top *= s;
-                                        ch.bbox.right *= s; ch.bbox.bottom *= s;
-                                    }
-                                }
-                            }
-                        }
-                        page.dims.width = origW;
-                        page.dims.height = origH;
-                    }
-                    pageMetrics[i].dims.width = origW;
-                    pageMetrics[i].dims.height = origH;
-                }
+                window.OcrRescale.rescaleOcrPage(ocrPages[i], pageMetrics[i], origW, origH);
 
                 // Swap nativeSrc to original-quality image
                 const reader = new FileReader();
@@ -2982,31 +2953,7 @@
                             origBmp.close();
 
                             // Scale OCR coordinates from downscaled dims to original dims
-                            const ocrDims = cachedMetrics.dims;
-                            const scaleX = origW / ocrDims.width;
-                            const scaleY = origH / ocrDims.height;
-                            const s = (scaleX + scaleY) / 2;
-
-                            if (Math.abs(s - 1) > 0.01 && cachedPage && cachedPage.lines) {
-                                for (const line of cachedPage.lines) {
-                                    line.bbox.left *= s; line.bbox.top *= s;
-                                    line.bbox.right *= s; line.bbox.bottom *= s;
-                                    if (line.ascHeight) line.ascHeight *= s;
-                                    if (line.xHeight) line.xHeight *= s;
-                                    line.baseline[1] *= s;
-                                    for (const word of line.words) {
-                                        word.bbox.left *= s; word.bbox.top *= s;
-                                        word.bbox.right *= s; word.bbox.bottom *= s;
-                                        if (word.chars) {
-                                            for (const ch of word.chars) {
-                                                ch.bbox.left *= s; ch.bbox.top *= s;
-                                                ch.bbox.right *= s; ch.bbox.bottom *= s;
-                                            }
-                                        }
-                                    }
-                                }
-                                cachedPage.dims = { width: origW, height: origH };
-                            }
+                            window.OcrRescale.rescaleOcrPage(cachedPage, cachedMetrics, origW, origH);
 
                             scribe.data.ocr.active[i] = cachedPage;
                             pageMetrics[i].dims.width = origW;

@@ -6,6 +6,7 @@
   "/js/image-transforms.js": "sha384-531l7cDBCA5mQdwGDYQl9X2tKu9r4DBFqodsBxtyKt07W8NqGt/b0tc+PlI62j5Z",
   "/js/jsqr.min.js": "sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV",
   "/js/logger.js": "sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL",
+  "/js/ocr-rescale.js": "sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn",
   "/js/qrcode.min.js": "sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi",
   "/js/sdp-compress.js": "sha384-xnGco4VPFnSwj5HZd9N0LG5EJjl3OqJYDYpoU0yq00HVu5mFTj+c6J+mIP+rGynO",
   "/js/sidebar.js": "sha384-YYv3EJsq5peZLCCbUs1/+SfW9SUNYbeFFy7Tb8v/qP3T/UTQToYHz6Fj06IYzIss",
