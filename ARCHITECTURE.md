@@ -86,6 +86,15 @@ WebSend/
         │   │               #   Exposes window.CropModal.open({ sourceBlob, initialCorners,
         │   │               #   detectCorners, onApply, onCancel }); used by both send.html
         │   │               #   and receive.html so the ~450 LOC crop logic is not duplicated
+        │   ├── ocr-rescale.js # Pure helper: rescales scribe-OCR coordinates from the
+        │   │               #   downscaled OCR-input dims back to the original image dims.
+        │   │               #   Used by both the cached-assembly path and the on-demand
+        │   │               #   fallback in receive.html (single source of truth)
+        │   ├── scribe-handle.js # ScribeHandle class: owns one scribe.js instance and
+        │   │               #   exposes init/import/recognize/export plus reset()/dispose()
+        │   │               #   that hide the clear-vs-terminate API fork. Receive.html
+        │   │               #   uses it for preloaded, background-queue, and per-export
+        │   │               #   scribe lifecycles
         │   ├── qrcode.min.js # QR code generator library (vendored, used by receiver)
         │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
         │
