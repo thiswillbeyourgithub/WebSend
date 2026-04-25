@@ -154,6 +154,7 @@
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-531l7cDBCA5mQdwGDYQl9X2tKu9r4DBFqodsBxtyKt07W8NqGt/b0tc+PlI62j5Z"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
+    <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -2446,18 +2447,15 @@
             });
         }
 
-        let scribePreloaded = null; // Promise<scribe module> or null
+        let scribePreloaded = null; // Promise<ScribeHandle|null> or null
         function preloadScribe() {
             if (scribePreloaded) return;
             scribePreloaded = (async () => {
                 try {
                     logger.info('Preloading OCR engine...');
-                    const scribeModule = await import('/scribe/scribe.js');
-                    const scribe = scribeModule.default;
-                    await scribe.init({ ocr: true, font: true });
-                    scribe.opt.displayMode = 'invis';
+                    const handle = await window.ScribeHandle.create();
                     logger.info('OCR engine preloaded');
-                    return scribe;
+                    return handle;
                 } catch (e) {
                     logger.warn('OCR preload failed (will retry on export): ' + e.message);
                     scribePreloaded = null;
@@ -2616,17 +2614,14 @@
                     logger.info(`[BG-OCR] Starting OCR for image #${idx + 1} (${ocrQueue.length} remaining in queue)`);
 
                     try {
-                        // Get or init scribe
-                        if (!bgOcrScribe) {
+                        // Get or init scribe handle
+                        if (!bgOcrScribe || !bgOcrScribe.isAlive) {
                             if (scribePreloaded) {
                                 bgOcrScribe = await scribePreloaded;
                                 scribePreloaded = null; // take ownership
                             }
-                            if (!bgOcrScribe) {
-                                const scribeModule = await import('/scribe/scribe.js');
-                                bgOcrScribe = scribeModule.default;
-                                await bgOcrScribe.init({ ocr: true, font: true });
-                                bgOcrScribe.opt.displayMode = 'invis';
+                            if (!bgOcrScribe || !bgOcrScribe.isAlive) {
+                                bgOcrScribe = await window.ScribeHandle.create();
                             }
                         }
 
@@ -2673,14 +2668,9 @@
 
                         logger.success(`[BG-OCR] Completed for image #${idx + 1}`);
 
-                        // Clear scribe state for next image
-                        // Re-init scribe for next image since clear() may not fully reset
-                        if (typeof bgOcrScribe.clear === 'function') {
-                            await bgOcrScribe.clear();
-                        } else if (typeof bgOcrScribe.terminate === 'function') {
-                            await bgOcrScribe.terminate();
-                            bgOcrScribe = null;
-                        }
+                        // Reset scribe state for next image (drops handle if scribe only supports terminate)
+                        const stillAlive = await bgOcrScribe.reset();
+                        if (!stillAlive) bgOcrScribe = null;
                     } catch (e) {
                         if (ocrAbortFlag) {
                             logger.info(`[BG-OCR] Aborted for image #${idx + 1} (edit/discard/replace)`);
@@ -2690,8 +2680,8 @@
                         // Try to reset scribe for next image
                         try {
                             if (bgOcrScribe) {
-                                if (typeof bgOcrScribe.clear === 'function') await bgOcrScribe.clear();
-                                else if (typeof bgOcrScribe.terminate === 'function') { await bgOcrScribe.terminate(); bgOcrScribe = null; }
+                                const stillAlive = await bgOcrScribe.reset();
+                                if (!stillAlive) bgOcrScribe = null;
                             }
                         } catch (_) { bgOcrScribe = null; }
                     } finally {
@@ -2897,9 +2887,9 @@
                     logger.info('Assembling PDF from cached OCR data...');
                     btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
 
-                    // Get a scribe instance for PDF assembly
+                    // Get a scribe handle for PDF assembly
                     let scribe;
-                    if (bgOcrScribe && !ocrProcessing) {
+                    if (bgOcrScribe && bgOcrScribe.isAlive && !ocrProcessing) {
                         logger.info('Reusing background OCR scribe instance');
                         scribe = bgOcrScribe;
                         bgOcrScribe = null;
@@ -2907,12 +2897,10 @@
                         logger.info('Using preloaded scribe instance');
                         scribe = await scribePreloaded;
                         scribePreloaded = null;
-                    } else {
+                    }
+                    if (!scribe || !scribe.isAlive) {
                         logger.info('Initializing new scribe instance for PDF assembly');
-                        const scribeModule = await import('/scribe/scribe.js');
-                        scribe = scribeModule.default;
-                        await scribe.init({ ocr: true, font: true });
-                        scribe.opt.displayMode = 'invis';
+                        scribe = await window.ScribeHandle.create();
                     }
 
                     if (ocrCancelled) throw new Error('OCR_CANCELLED');
@@ -2973,11 +2961,7 @@
                         const pdfResult = await scribe.exportData('pdf');
                         logger.success('PDF assembled from cached OCR data successfully');
 
-                        if (typeof scribe.clear === 'function') {
-                            await scribe.clear();
-                        } else if (typeof scribe.terminate === 'function') {
-                            await scribe.terminate();
-                        }
+                        await scribe.dispose();
                         scribePreloaded = null;
                         return pdfResult;
 
@@ -2990,16 +2974,13 @@
 
                         // Reset scribe for a clean run
                         try {
-                            if (typeof scribe.clear === 'function') await scribe.clear();
-                            else if (typeof scribe.terminate === 'function') { await scribe.terminate(); scribe = null; }
+                            const stillAlive = await scribe.reset();
+                            if (!stillAlive) scribe = null;
                         } catch (_) { scribe = null; }
 
-                        if (!scribe) {
+                        if (!scribe || !scribe.isAlive) {
                             logger.info('[OCR fallback] Re-initializing scribe after cache failure');
-                            const scribeModule = await import('/scribe/scribe.js');
-                            scribe = scribeModule.default;
-                            await scribe.init({ ocr: true, font: true });
-                            scribe.opt.displayMode = 'invis';
+                            scribe = await window.ScribeHandle.create();
                         }
 
                         btn.disabled = false;
@@ -3010,11 +2991,7 @@
                         const pdfResult = await ocrRecognizeAndExport(scribe, activeImages, btn);
                         logger.success('[OCR fallback] PDF generated successfully via on-demand OCR');
 
-                        if (typeof scribe.clear === 'function') {
-                            await scribe.clear();
-                        } else if (typeof scribe.terminate === 'function') {
-                            await scribe.terminate();
-                        }
+                        await scribe.dispose();
                         scribePreloaded = null;
                         return pdfResult;
                     }
