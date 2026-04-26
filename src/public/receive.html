@@ -157,6 +157,7 @@
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
+    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-U3uN/GufXxFg7QEGmrhlFDEMRIVoVmWft0Xjs9iIXraKTxqmC5vnfj9aO1krfQmy"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -1137,182 +1138,35 @@
             return '📎';
         }
 
-        // Peer-controlled strings (filename, mimeType) reach this function via
-        // encrypted metadata. Cards are built with createElement + textContent so
-        // a crafted filename like `<img src=x onerror=...>` cannot execute.
+        // Thin wrapper around window.ReceiveCard.renderCard (public/js/receive-card.js).
+        // The module owns the createElement + textContent construction so a crafted
+        // peer filename like `<img src=x onerror=...>` cannot execute. This function
+        // only resolves the parent container and wires page-scoped side effects
+        // (drag setup, count update).
         function addReceivedFile(url, filename, imageIndex, collectionId, fileType, fileSize) {
             const container = document.getElementById(`collection-images-${collectionId}`);
             if (!container) return;
 
-            const item = document.createElement('div');
-            item.className = 'received-image-item';
-            item.setAttribute('data-image-index', imageIndex);
-            item.setAttribute('data-collection-id', collectionId);
-            item.setAttribute('draggable', 'true');
-
-            const dragHandle = document.createElement('div');
-            dragHandle.className = 'drag-handle';
-            dragHandle.title = 'Drag to reorder';
-            dragHandle.textContent = '☰';
-            item.appendChild(dragHandle);
-
-            // Build the common discard-confirm panel (identical across fileTypes)
-            const discardConfirm = document.createElement('div');
-            discardConfirm.className = 'discard-confirm hidden';
-            const discardMsg = document.createElement('p');
-            discardMsg.className = 'discard-confirm-msg';
-            discardMsg.textContent = i18n.t('receive.discardConfirm');
-            discardConfirm.appendChild(discardMsg);
-            const discardBtnRow = document.createElement('div');
-            discardBtnRow.className = 'discard-confirm-row';
-            const yesBtn = document.createElement('button');
-            yesBtn.className = 'btn btn-action discard-confirm-yes';
-            yesBtn.textContent = i18n.t('receive.discardYes');
-            yesBtn.addEventListener('click', () => doDiscard(imageIndex));
-            const noBtn = document.createElement('button');
-            noBtn.className = 'btn btn-action btn-secondary';
-            noBtn.textContent = i18n.t('receive.discardNo');
-            noBtn.addEventListener('click', () => cancelDiscard(imageIndex));
-            discardBtnRow.append(yesBtn, noBtn);
-            discardConfirm.appendChild(discardBtnRow);
-
-            // Shared: hidden selection checkbox
-            const selectCheckbox = document.createElement('input');
-            selectCheckbox.type = 'checkbox';
-            selectCheckbox.checked = true;
-            selectCheckbox.id = `select-${imageIndex}`;
-            selectCheckbox.className = 'card-select-checkbox';
-            selectCheckbox.addEventListener('change', () => onSelectionChange());
-
-            // Shared: kebab button
-            const kebabBtn = document.createElement('button');
-            kebabBtn.className = 'card-kebab-btn';
-            kebabBtn.title = 'Actions';
-            kebabBtn.textContent = '⋮';
-            kebabBtn.addEventListener('click', (e) => toggleCardMenu(e, imageIndex));
-
-            // Shared: build the kebab menu from a list of entries
-            function buildCardMenu(entries) {
-                const menu = document.createElement('div');
-                menu.className = 'card-menu hidden';
-                menu.id = `card-menu-${imageIndex}`;
-                for (const entry of entries) {
-                    const el = document.createElement(entry.tag || 'button');
-                    el.className = 'card-menu-item' + (entry.danger ? ' card-menu-item-danger' : '');
-                    if (entry.id) el.id = entry.id;
-                    if (entry.href) el.href = entry.href;
-                    if (entry.download !== undefined) el.download = entry.download;
-                    // Use children if provided (for icon + label spans); otherwise textContent
-                    if (entry.children) {
-                        for (const c of entry.children) el.appendChild(c);
-                    } else {
-                        el.textContent = entry.label;
-                    }
-                    el.addEventListener('click', () => {
-                        if (entry.onClick) entry.onClick();
-                        closeCardMenu(imageIndex);
-                    });
-                    menu.appendChild(el);
-                }
-                return menu;
-            }
-
-            // Shared: #N badge
-            function makeBadge(variantClass) {
-                const badge = document.createElement('span');
-                badge.className = `image-badge ${variantClass}`;
-                badge.textContent = `#${imageIndex + 1}`;
-                return badge;
-            }
-
-            // Shared: select menu-item has two spans with IDs (icon, label) so other
-            // code can toggle them via getElementById.
-            function makeSelectMenuItem() {
-                const iconSpan = document.createElement('span');
-                iconSpan.id = `select-icon-${imageIndex}`;
-                iconSpan.textContent = '☑️';
-                const labelSpan = document.createElement('span');
-                labelSpan.id = `select-label-${imageIndex}`;
-                labelSpan.textContent = i18n.t('receive.toggleSelect');
-                const space = document.createTextNode(' ');
-                return {
-                    tag: 'button',
-                    children: [iconSpan, space, labelSpan],
-                    onClick: () => toggleSelectFromMenu(imageIndex),
-                };
-            }
-
-            if (fileType === 'image') {
-                const thumb = document.createElement('div');
-                thumb.className = 'image-thumb-container';
-
-                const img = document.createElement('img');
-                img.src = url;
-                img.alt = 'Received photo';
-                img.id = `img-${imageIndex}`;
-                img.addEventListener('click', (event) => {
-                    if (event.shiftKey) toggleSelectFromMenu(imageIndex);
-                    else openLightbox(imageIndex);
-                });
-                thumb.appendChild(img);
-                thumb.appendChild(makeBadge('image-badge-overlay'));
-                thumb.appendChild(selectCheckbox);
-                thumb.appendChild(kebabBtn);
-
-                const menu = buildCardMenu([
-                    makeSelectMenuItem(),
-                    { label: `🔄 ${i18n.t('send.rotate')}`, onClick: () => rotateReceivedImage(imageIndex) },
-                    { label: `✂️ ${i18n.t('receive.crop')}`, onClick: () => openCropModal(imageIndex) },
-                    { label: `⬛ ${i18n.t('send.applyBW')}`, onClick: () => applyBWToImage(imageIndex) },
-                    { tag: 'a', href: url, download: filename, id: `download-${imageIndex}`, label: `📥 ${i18n.t('receive.download')}` },
-                    { label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => discardImage(imageIndex) },
-                ]);
-                thumb.appendChild(menu);
-
-                item.appendChild(thumb);
-                item.appendChild(discardConfirm);
-            } else if (fileType === 'pdf' || fileType === 'other') {
-                const card = document.createElement('div');
-                card.className = 'file-card';
-
-                const iconSpan = document.createElement('span');
-                iconSpan.className = 'file-card-icon';
-                iconSpan.textContent = fileType === 'pdf'
-                    ? '📄'
-                    : getFileIcon(receivedImages[imageIndex].mimeType);
-                card.appendChild(iconSpan);
-
-                card.appendChild(makeBadge('image-badge-stacked'));
-
-                const nameP = document.createElement('p');
-                nameP.className = 'file-card-name';
-                nameP.textContent = filename;
-                card.appendChild(nameP);
-
-                const sizeP = document.createElement('p');
-                sizeP.className = 'file-card-size';
-                sizeP.textContent = formatFileSize(fileSize);
-                card.appendChild(sizeP);
-
-                card.appendChild(selectCheckbox);
-                card.appendChild(kebabBtn);
-
-                const entries = [
-                    makeSelectMenuItem(),
-                    { tag: 'a', href: url, download: filename, id: `download-${imageIndex}`, label: `📥 ${i18n.t('receive.download')}` },
-                ];
-                if (fileType === 'pdf') {
-                    entries.push(
-                        { label: `📸 ${i18n.t('receive.pdfToImages')}`, onClick: () => exportPdfAsImages(imageIndex) },
-                        { label: `📝 ${i18n.t('receive.pdfToOcr')}`, onClick: () => exportPdfAsOcr(imageIndex) },
-                    );
-                }
-                entries.push({ label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => discardImage(imageIndex) });
-                card.appendChild(buildCardMenu(entries));
-
-                item.appendChild(card);
-                item.appendChild(discardConfirm);
-            }
+            const item = ReceiveCard.renderCard({
+                url, filename, imageIndex, collectionId, fileType, fileSize,
+                mimeType: receivedImages[imageIndex] && receivedImages[imageIndex].mimeType,
+                i18n, getFileIcon, formatFileSize,
+                handlers: {
+                    onDiscardConfirm: doDiscard,
+                    onDiscardCancel: cancelDiscard,
+                    onSelectionChange,
+                    onToggleCardMenu: toggleCardMenu,
+                    onCloseCardMenu: closeCardMenu,
+                    onToggleSelectFromMenu: toggleSelectFromMenu,
+                    onOpenLightbox: openLightbox,
+                    onRotate: rotateReceivedImage,
+                    onCrop: openCropModal,
+                    onBW: applyBWToImage,
+                    onDiscard: discardImage,
+                    onPdfToImages: exportPdfAsImages,
+                    onPdfToOcr: exportPdfAsOcr,
+                },
+            });
 
             container.appendChild(item);
             setupDragEvents(item);

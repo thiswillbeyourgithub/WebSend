@@ -102,6 +102,13 @@ WebSend/
         │   ├── peer-ui.js  # Shared sidebar helpers (loadEruda, onConnectionTypeDetected,
         │   │               #   showVerifiedInSidebar) used identically by send.html and
         │   │               #   receive.html. Exposes window.PeerUI
+        │   ├── receive-card.js # Builds the per-file card DOM (image / pdf / other)
+        │   │               #   shown in the receiver's gallery. Pure DOM construction
+        │   │               #   via createElement + textContent so peer-controlled
+        │   │               #   filenames cannot execute. Exposes
+        │   │               #   window.ReceiveCard.renderCard(opts) → HTMLElement.
+        │   │               #   Caller (receive.html#addReceivedFile) owns parent
+        │   │               #   lookup, appendChild, drag-event setup
         │   ├── qrcode.min.js # QR code generator library (vendored, used by receiver)
         │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
         │
