@@ -60,6 +60,27 @@ const TURNS_PORT = process.env.TURNS_PORT || '';
 // ALL or unset = normal behavior (all configured servers)
 const DEV_FORCE_CONNECTION = (process.env.DEV_FORCE_CONNECTION || 'DEFAULT').toUpperCase();
 
+// DEV_FORCE_CONNECTION filter table: each mode picks a subset of the configured
+// iceServers for transport-isolation debugging. `forceRelay: true` triggers
+// iceTransportPolicy:'relay' on the response so STUN discovery is skipped.
+function filterStunString(predicate) {
+    return (servers) => servers.filter(s => typeof s.urls === 'string' && predicate(s.urls));
+}
+function filterTurnArray(predicate) {
+    return (servers) => servers
+        .filter(s => Array.isArray(s.urls))
+        .map(s => ({ ...s, urls: s.urls.filter(predicate) }))
+        .filter(s => s.urls.length > 0);
+}
+const FORCE_FILTERS = {
+    DIRECT:      { filter: () => [],                                                                forceRelay: false },
+    STUN:        { filter: filterStunString(u => u.startsWith('stun:') && !u.includes('google')),   forceRelay: false },
+    GOOGLE_STUN: { filter: filterStunString(u => u.includes('stun.l.google.com')),                  forceRelay: false },
+    TURN:        { filter: filterTurnArray(u => u.startsWith('turn:')),                             forceRelay: true  },
+    TURNS:       { filter: filterTurnArray(u => u.startsWith('turns:')),                            forceRelay: true  },
+};
+FORCE_FILTERS.TURN_TLS = FORCE_FILTERS.TURNS;
+
 /**
  * Debug logging helper - only logs when DEV=1
  * @param {string} context - Log context (e.g., 'ROOM', 'ICE', 'SIGNALING')
@@ -451,54 +472,12 @@ app.get('/api/config', (req, res) => {
     if (DEV_FORCE_CONNECTION !== 'DEFAULT') {
         debugLog('CONFIG', `DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION}: filtering ICE servers`);
 
-        switch (DEV_FORCE_CONNECTION) {
-            case 'DIRECT':
-                // No ICE servers at all — only host candidates (LAN only)
-                filteredServers = [];
-                break;
-
-            case 'STUN':
-                // Self-hosted STUN only (no Google, no TURN)
-                filteredServers = iceServers.filter(s =>
-                    typeof s.urls === 'string' && s.urls.startsWith('stun:') && !s.urls.includes('google')
-                );
-                break;
-
-            case 'GOOGLE_STUN':
-                // Google's public STUN only
-                filteredServers = iceServers.filter(s =>
-                    typeof s.urls === 'string' && s.urls.includes('stun.l.google.com')
-                );
-                break;
-
-            case 'TURN':
-                // TURN UDP+TCP only (no TURNS, no STUN) — force relay so STUN discovery is skipped
-                filteredServers = iceServers
-                    .filter(s => Array.isArray(s.urls))
-                    .map(s => ({
-                        ...s,
-                        urls: s.urls.filter(u => u.startsWith('turn:'))
-                    }))
-                    .filter(s => s.urls.length > 0);
-                forceRelay = true;
-                break;
-
-            case 'TURNS':
-            case 'TURN_TLS':
-                // TURNS (TURN-over-TLS) only — force relay
-                filteredServers = iceServers
-                    .filter(s => Array.isArray(s.urls))
-                    .map(s => ({
-                        ...s,
-                        urls: s.urls.filter(u => u.startsWith('turns:'))
-                    }))
-                    .filter(s => s.urls.length > 0);
-                forceRelay = true;
-                break;
-
-            default:
-                console.warn(`Unknown DEV_FORCE_CONNECTION value: "${DEV_FORCE_CONNECTION}", using ALL`);
-                break;
+        const entry = FORCE_FILTERS[DEV_FORCE_CONNECTION];
+        if (entry) {
+            filteredServers = entry.filter(iceServers);
+            forceRelay = entry.forceRelay;
+        } else {
+            console.warn(`Unknown DEV_FORCE_CONNECTION value: "${DEV_FORCE_CONNECTION}", using ALL`);
         }
 
         debugLog('CONFIG', `Filtered ICE servers (${DEV_FORCE_CONNECTION}):`, filteredServers);
