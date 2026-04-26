@@ -698,95 +698,114 @@
             infoDiv.appendChild(verifiedEl);
         }
 
-        async function onMessage(msg) {
-            if (msg.type === 'sender-public-key') {
-                // Sender sent their ECDH public key - derive shared secret
-                logger.info('Received sender public key, deriving shared secret...');
+        async function handleSenderPublicKey(msg) {
+            // Sender sent their ECDH public key - derive shared secret
+            logger.info('Received sender public key, deriving shared secret...');
+            try {
+                const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);
+                sharedKey = await WebSendCrypto.deriveSharedKey(keyPair.privateKey, senderPublicKey);
+
+                // Fetch active room count to adapt fingerprint length:
+                // fewer rooms = shorter key (easier to compare), more = longer (collision resistance)
+                let fpLength = 12; // fallback to max if stats unavailable
                 try {
-                    const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);
-                    sharedKey = await WebSendCrypto.deriveSharedKey(keyPair.privateKey, senderPublicKey);
-
-                    // Fetch active room count to adapt fingerprint length:
-                    // fewer rooms = shorter key (easier to compare), more = longer (collision resistance)
-                    let fpLength = 12; // fallback to max if stats unavailable
-                    try {
-                        const statsRes = await fetch('/api/stats');
-                        if (statsRes.ok) {
-                            const stats = await statsRes.json();
-                            fpLength = WebSendCrypto.computeFingerprintLength(stats.activeRooms);
-                        }
-                    } catch (e) {
-                        logger.warn('Could not fetch room stats, using max fingerprint length');
+                    const statsRes = await fetch('/api/stats');
+                    if (statsRes.ok) {
+                        const stats = await statsRes.json();
+                        fpLength = WebSendCrypto.computeFingerprintLength(stats.activeRooms);
                     }
-
-                    // Get fingerprints for verification display (length adapts to server load)
-                    const ourFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey, fpLength);
-                    const theirFingerprint = await WebSendCrypto.getKeyFingerprint(senderPublicKey, fpLength);
-
-                    // Display fingerprints in verification modal
-                    // Sender key at top, receiver key at bottom (consistent on both devices)
-                    document.getElementById('sender-fingerprint').textContent = theirFingerprint;
-                    document.getElementById('receiver-fingerprint').textContent = ourFingerprint;
-
-                    logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
-
-                    // Show blocking verification modal
-                    showVerificationModal();
                 } catch (e) {
-                    logger.error('Failed to derive shared key: ' + e.message);
+                    logger.warn('Could not fetch room stats, using max fingerprint length');
                 }
-            } else if (msg.type === 'fingerprint-confirmed') {
-                // Sender confirmed the fingerprints match
-                logger.info('Sender confirmed fingerprint match');
-                theyConfirmed = true;
-                checkBothConfirmed();
-            } else if (msg.type === 'fingerprint-denied') {
-                // Sender denied - abort connection
-                logger.error('Sender denied fingerprint match - possible MITM attack!');
-                showToast(i18n.t('verify.deniedBySender'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
-            } else if (msg.type === 'progress') {
-                // Show progress bar
-                const progressBar = document.getElementById('progress-bar');
-                const progressFill = document.getElementById('progress-fill');
-                progressBar.classList.remove('hidden');
-                const percent = Math.round((msg.received / msg.total) * 100);
-                progressFill.style.width = percent + '%';
-                if (!receiveXferStart) receiveXferStart = Date.now();
-                receiveLastTotal = msg.total;
-                const now = Date.now();
-                if (now - receiveLastStatsUpdate >= 200) {
-                    receiveLastStatsUpdate = now;
-                    const elapsed = (now - receiveXferStart) / 1000;
-                    const rate = elapsed > 0 ? msg.received / elapsed : 0;
-                    const remaining = rate > 0 ? (msg.total - msg.received) / rate : Infinity;
-                    const statsEl = document.getElementById('transfer-stats');
-                    if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);
-                }
-            } else if (msg.type === 'delete-image') {
-                logger.info('Received delete-image request for hash: ' + msg.hash);
-                deleteReceivedImageByHash(msg.hash);
-            } else if (msg.type === 'transform-image') {
-                // Sender wants us to replay transforms locally instead of resending full image
-                logger.info(`Received transform-image for hash ${msg.oldHash} (${msg.transforms.length} ops)`);
-                handleTransformImage(msg.oldHash, msg.transforms);
-            } else if (msg.type === 'replace-image') {
-                logger.info('Next incoming file will replace image with hash: ' + msg.oldHash);
-                pendingReplaceHash = msg.oldHash;
-            } else if (msg.type === 'batch-start') {
-                logger.info('Batch start received — creating new collection');
+
+                // Get fingerprints for verification display (length adapts to server load)
+                const ourFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey, fpLength);
+                const theirFingerprint = await WebSendCrypto.getKeyFingerprint(senderPublicKey, fpLength);
+
+                // Display fingerprints in verification modal
+                // Sender key at top, receiver key at bottom (consistent on both devices)
+                document.getElementById('sender-fingerprint').textContent = theirFingerprint;
+                document.getElementById('receiver-fingerprint').textContent = ourFingerprint;
+
+                logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
+
+                // Show blocking verification modal
+                showVerificationModal();
+            } catch (e) {
+                logger.error('Failed to derive shared key: ' + e.message);
+            }
+        }
+
+        function handleFingerprintConfirmed(msg) {
+            // Sender confirmed the fingerprints match
+            logger.info('Sender confirmed fingerprint match');
+            theyConfirmed = true;
+            checkBothConfirmed();
+        }
+
+        function handleFingerprintDenied(msg) {
+            // Sender denied - abort connection
+            logger.error('Sender denied fingerprint match - possible MITM attack!');
+            showToast(i18n.t('verify.deniedBySender'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
+        }
+
+        function handleProgress(msg) {
+            // Show progress bar
+            const progressBar = document.getElementById('progress-bar');
+            const progressFill = document.getElementById('progress-fill');
+            progressBar.classList.remove('hidden');
+            const percent = Math.round((msg.received / msg.total) * 100);
+            progressFill.style.width = percent + '%';
+            if (!receiveXferStart) receiveXferStart = Date.now();
+            receiveLastTotal = msg.total;
+            const now = Date.now();
+            if (now - receiveLastStatsUpdate >= 200) {
+                receiveLastStatsUpdate = now;
+                const elapsed = (now - receiveXferStart) / 1000;
+                const rate = elapsed > 0 ? msg.received / elapsed : 0;
+                const remaining = rate > 0 ? (msg.total - msg.received) / rate : Infinity;
+                const statsEl = document.getElementById('transfer-stats');
+                if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);
+            }
+        }
+
+        function handleDeleteImage(msg) {
+            logger.info('Received delete-image request for hash: ' + msg.hash);
+            deleteReceivedImageByHash(msg.hash);
+        }
+
+        function handleTransformImageMsg(msg) {
+            // Sender wants us to replay transforms locally instead of resending full image
+            logger.info(`Received transform-image for hash ${msg.oldHash} (${msg.transforms.length} ops)`);
+            handleTransformImage(msg.oldHash, msg.transforms);
+        }
+
+        function handleReplaceImage(msg) {
+            logger.info('Next incoming file will replace image with hash: ' + msg.oldHash);
+            pendingReplaceHash = msg.oldHash;
+        }
+
+        function handleBatchStart(msg) {
+            logger.info('Batch start received — creating new collection');
+            createNewCollection();
+        }
+
+        function handleBatchStartIfNonempty(msg) {
+            // Only create a new collection if the active one already has images
+            const active = collections.find(c => c.id === activeCollectionId);
+            if (active && active.images.length > 0) {
+                logger.info('Batch start (if-nonempty) received — active collection has images, creating new collection');
                 createNewCollection();
-            } else if (msg.type === 'batch-start-if-nonempty') {
-                // Only create a new collection if the active one already has images
-                const active = collections.find(c => c.id === activeCollectionId);
-                if (active && active.images.length > 0) {
-                    logger.info('Batch start (if-nonempty) received — active collection has images, creating new collection');
-                    createNewCollection();
-                } else {
-                    logger.info('Batch start (if-nonempty) received — active collection is empty, reusing it');
-                }
-            } else if (msg.type === 'batch-end') {
-                logger.info('Batch end received');
-            } else if (msg.type === 'encrypted-file') {
+            } else {
+                logger.info('Batch start (if-nonempty) received — active collection is empty, reusing it');
+            }
+        }
+
+        function handleBatchEnd(msg) {
+            logger.info('Batch end received');
+        }
+
+        async function handleEncryptedFile(msg) {
                 // Received encrypted file with bundled metadata, decrypt it
                 logger.info('Received encrypted file, decrypting with metadata...');
                 {
@@ -938,7 +957,31 @@
                     // and can offer a retry instead of waiting for timeout
                     rtc.sendMessage({ type: 'file-nack', error: e.message });
                 }
+        }
+
+        // file-ack / file-nack are intercepted by webrtc.js (resolved via
+        // _fileAckResolve / _fileAckReject) and never reach onMessage.
+        const messageHandlers = {
+            'sender-public-key': handleSenderPublicKey,
+            'fingerprint-confirmed': handleFingerprintConfirmed,
+            'fingerprint-denied': handleFingerprintDenied,
+            'progress': handleProgress,
+            'delete-image': handleDeleteImage,
+            'transform-image': handleTransformImageMsg,
+            'replace-image': handleReplaceImage,
+            'batch-start': handleBatchStart,
+            'batch-start-if-nonempty': handleBatchStartIfNonempty,
+            'batch-end': handleBatchEnd,
+            'encrypted-file': handleEncryptedFile,
+        };
+
+        async function onMessage(msg) {
+            const handler = messageHandlers[msg.type];
+            if (!handler) {
+                logger.warn(`Unknown message type: ${msg.type}`);
+                return;
             }
+            await handler(msg);
         }
 
         /** Render a collection header + image grid container in the DOM */
