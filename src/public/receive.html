@@ -10,7 +10,7 @@
     <title>WebSend - Receive Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-n7VZoQdUI9ajCkU8v02xDgGE68RTDBy9sd/4uGCAoUcOQ1pfj3PtKqhfdYNP70mH" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-cfpwLDjCKuHffq8Ure5+TtxfeKESX3XPrlkC9bgng9y4Y7O6MSNJvmhl+MqHvIy6" crossorigin="anonymous">
     <!-- QR Code library - lightweight, no dependencies (local copy to avoid CDN issues) -->
     <script src="/js/qrcode.min.js" integrity="sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi" crossorigin="anonymous"></script>
 </head>
@@ -1159,21 +1159,18 @@
             // Build the common discard-confirm panel (identical across fileTypes)
             const discardConfirm = document.createElement('div');
             discardConfirm.className = 'discard-confirm hidden';
-            discardConfirm.style.cssText = 'margin-top: 8px; padding: 12px; background: #fff3e0; border-radius: 8px; border: 1px solid #ffcc80; text-align: center;';
             const discardMsg = document.createElement('p');
-            discardMsg.style.cssText = 'margin: 0 0 10px 0; color: #e65100; font-weight: bold;';
+            discardMsg.className = 'discard-confirm-msg';
             discardMsg.textContent = i18n.t('receive.discardConfirm');
             discardConfirm.appendChild(discardMsg);
             const discardBtnRow = document.createElement('div');
-            discardBtnRow.style.cssText = 'display: flex; gap: 10px;';
+            discardBtnRow.className = 'discard-confirm-row';
             const yesBtn = document.createElement('button');
-            yesBtn.className = 'btn btn-action';
-            yesBtn.style.cssText = 'flex: 1; background: #c62828; color: white;';
+            yesBtn.className = 'btn btn-action discard-confirm-yes';
             yesBtn.textContent = i18n.t('receive.discardYes');
             yesBtn.addEventListener('click', () => doDiscard(imageIndex));
             const noBtn = document.createElement('button');
             noBtn.className = 'btn btn-action btn-secondary';
-            noBtn.style.cssText = 'flex: 1;';
             noBtn.textContent = i18n.t('receive.discardNo');
             noBtn.addEventListener('click', () => cancelDiscard(imageIndex));
             discardBtnRow.append(yesBtn, noBtn);
@@ -1184,7 +1181,7 @@
             selectCheckbox.type = 'checkbox';
             selectCheckbox.checked = true;
             selectCheckbox.id = `select-${imageIndex}`;
-            selectCheckbox.style.display = 'none';
+            selectCheckbox.className = 'card-select-checkbox';
             selectCheckbox.addEventListener('change', () => onSelectionChange());
 
             // Shared: kebab button
@@ -1221,10 +1218,9 @@
             }
 
             // Shared: #N badge
-            function makeBadge(extraStyle) {
+            function makeBadge(variantClass) {
                 const badge = document.createElement('span');
-                badge.className = 'image-badge';
-                badge.style.cssText = extraStyle;
+                badge.className = `image-badge ${variantClass}`;
                 badge.textContent = `#${imageIndex + 1}`;
                 return badge;
             }
@@ -1249,19 +1245,17 @@
             if (fileType === 'image') {
                 const thumb = document.createElement('div');
                 thumb.className = 'image-thumb-container';
-                thumb.style.cssText = 'position: relative; display: block;';
 
                 const img = document.createElement('img');
                 img.src = url;
                 img.alt = 'Received photo';
                 img.id = `img-${imageIndex}`;
-                img.style.cssText = 'width: 100%; display: block; cursor: pointer;';
                 img.addEventListener('click', (event) => {
                     if (event.shiftKey) toggleSelectFromMenu(imageIndex);
                     else openLightbox(imageIndex);
                 });
                 thumb.appendChild(img);
-                thumb.appendChild(makeBadge('position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; pointer-events: none;'));
+                thumb.appendChild(makeBadge('image-badge-overlay'));
                 thumb.appendChild(selectCheckbox);
                 thumb.appendChild(kebabBtn);
 
@@ -1280,24 +1274,23 @@
             } else if (fileType === 'pdf' || fileType === 'other') {
                 const card = document.createElement('div');
                 card.className = 'file-card';
-                card.style.cssText = 'display: flex; flex-direction: column; align-items: center; padding: 20px 10px; background: #f5f5f5; border-radius: 8px; position: relative;';
 
                 const iconSpan = document.createElement('span');
-                iconSpan.style.fontSize = '3em';
+                iconSpan.className = 'file-card-icon';
                 iconSpan.textContent = fileType === 'pdf'
                     ? '📄'
                     : getFileIcon(receivedImages[imageIndex].mimeType);
                 card.appendChild(iconSpan);
 
-                card.appendChild(makeBadge('background: rgba(0,0,0,0.55); color: #fff; font-size: 1.05em; font-weight: bold; padding: 3px 10px; border-radius: 6px; margin-top: 4px;'));
+                card.appendChild(makeBadge('image-badge-stacked'));
 
                 const nameP = document.createElement('p');
-                nameP.style.cssText = 'margin: 8px 0 4px; font-weight: bold; word-break: break-all; text-align: center; font-size: 0.9em;';
+                nameP.className = 'file-card-name';
                 nameP.textContent = filename;
                 card.appendChild(nameP);
 
                 const sizeP = document.createElement('p');
-                sizeP.style.cssText = 'margin: 0; color: #666; font-size: 0.85em;';
+                sizeP.className = 'file-card-size';
                 sizeP.textContent = formatFileSize(fileSize);
                 card.appendChild(sizeP);
 

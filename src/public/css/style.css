@@ -1080,6 +1080,84 @@ h1 {
     }
 }
 
+/* ===== Receiver cards ===== */
+
+.discard-confirm {
+    margin-top: 8px;
+    padding: 12px;
+    background: #fff3e0;
+    border-radius: 8px;
+    border: 1px solid #ffcc80;
+    text-align: center;
+}
+.discard-confirm-msg {
+    margin: 0 0 10px 0;
+    color: #e65100;
+    font-weight: bold;
+}
+.discard-confirm-row {
+    display: flex;
+    gap: 10px;
+}
+.discard-confirm-row .btn { flex: 1; }
+.discard-confirm-yes {
+    background: #c62828;
+    color: white;
+}
+
+.card-select-checkbox { display: none; }
+
+.image-badge {
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    font-size: 1.05em;
+    font-weight: bold;
+    padding: 3px 10px;
+    border-radius: 6px;
+}
+.image-badge-overlay {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    pointer-events: none;
+}
+.image-badge-stacked {
+    margin-top: 4px;
+}
+
+.image-thumb-container {
+    position: relative;
+    display: block;
+}
+.image-thumb-container img {
+    width: 100%;
+    display: block;
+    cursor: pointer;
+}
+
+.file-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 10px;
+    background: #f5f5f5;
+    border-radius: 8px;
+    position: relative;
+}
+.file-card-icon { font-size: 3em; }
+.file-card-name {
+    margin: 8px 0 4px;
+    font-weight: bold;
+    word-break: break-all;
+    text-align: center;
+    font-size: 0.9em;
+}
+.file-card-size {
+    margin: 0;
+    color: #666;
+    font-size: 0.85em;
+}
+
 /* Card kebab menu */
 .card-kebab-btn {
     position: absolute;
