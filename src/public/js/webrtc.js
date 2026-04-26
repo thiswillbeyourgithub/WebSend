@@ -32,7 +32,6 @@ class WebSendRTC {
         this.receiveBuffer = [];
         this.receivedSize = 0;
         this.expectedSize = 0;
-        this.currentFileMetadata = null;
 
         // ICE candidate handling
         this.pendingIceCandidates = [];
@@ -1044,7 +1043,6 @@ class WebSendRTC {
         this.receiveBuffer = [];
         this.receivedSize = 0;
         this.expectedSize = 0;
-        this.currentFileMetadata = null;
         this.pendingIceCandidates = [];
         if (this.dataChannel) {
             this.dataChannel.close();
