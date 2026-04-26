@@ -293,12 +293,11 @@ function secureCompare(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     // Hash both inputs to a fixed-length digest before comparing, so
     // timingSafeEqual always operates on equal-length buffers regardless of
-    // the submitted string's length. The length check after the hash compare
-    // catches genuine mismatches without leaking the secret's length via an
-    // early-exit branch.
+    // the submitted string's length (avoids leaking secret length via an
+    // early-exit branch).
     const ha = crypto.createHash('sha256').update(a).digest();
     const hb = crypto.createHash('sha256').update(b).digest();
-    return crypto.timingSafeEqual(ha, hb) && a.length === b.length;
+    return crypto.timingSafeEqual(ha, hb);
 }
 
 /**
