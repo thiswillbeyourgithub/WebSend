@@ -10,7 +10,7 @@
     <title>WebSend - Send Photos</title>
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-cfpwLDjCKuHffq8Ure5+TtxfeKESX3XPrlkC9bgng9y4Y7O6MSNJvmhl+MqHvIy6" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-eeLL3wQ4I+JvUUmpYyhQJq1tQYc3f1TBOmrF7UoxTksq3X5ng289Kv8g+nuER/hn" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -18,12 +18,12 @@
     <!-- Sidebar markup and wiring injected by sidebar.js (shared with index/receive pages) -->
 
     <!-- Queue status banner: shown when photos are sending in background -->
-    <div id="queue-banner" class="hidden" style="position: sticky; top: 0; z-index: 100; background: #e3f2fd; border-bottom: 2px solid #90caf9; padding: 10px 15px; text-align: center; color: #1565c0; font-size: 0.9rem;">
+    <div id="queue-banner" class="hidden">
         <span id="queue-banner-text"></span>
-        <div class="progress-bar" id="queue-progress-bar" style="margin: 6px 0 0 0; height: 4px;">
-            <div class="progress-bar-fill" id="queue-progress-fill" style="width: 0%; transition: width 0.3s;"></div>
+        <div class="progress-bar" id="queue-progress-bar">
+            <div class="progress-bar-fill" id="queue-progress-fill"></div>
         </div>
-        <div id="queue-transfer-stats" style="font-size: 0.75rem; color: #1565c0; margin-top: 3px; opacity: 0.85;"></div>
+        <div id="queue-transfer-stats"></div>
     </div>
 
     <div class="container">
@@ -45,15 +45,13 @@
             </button>
 
             <!-- Manual URL paste as alternative to camera scanning -->
-            <div style="margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 10px;">
-                <p style="text-align: center; color: #666; margin: 0 0 10px 0;" data-i18n="send.orPasteLink">
+            <div class="link-paste-wrapper">
+                <p class="link-paste-label" data-i18n="send.orPasteLink">
                     <strong>No camera?</strong> Paste the link from the receiver's screen:
                 </p>
-                <div style="display: flex; gap: 6px; align-items: center;">
-                    <input type="text" id="manual-url-input" placeholder="https://..."
-                        style="flex: 1; padding: 10px; font-size: 0.85rem; border-radius: 5px; border: 1px solid #ccc; font-family: monospace;">
-                    <button id="manual-url-btn"
-                        style="padding: 10px 16px; border: none; border-radius: 5px; background: #1565c0; color: white; cursor: pointer; font-size: 0.85rem;">
+                <div class="link-paste-row">
+                    <input type="text" id="manual-url-input" placeholder="https://..." class="link-paste-input">
+                    <button id="manual-url-btn" class="link-paste-btn">
                         Go
                     </button>
                 </div>
@@ -69,32 +67,32 @@
 
         <!-- Security verification modal (blocking) -->
         <div id="verification-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
-            <div style="background: white; border-radius: 15px; padding: 25px; max-width: 350px; margin: 20px; text-align: center;">
-                <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="verify.title">🔒 Verify Connection</h2>
-                <p style="margin: 0 0 20px 0; color: #555; font-size: 0.95rem;" data-i18n="verify.instruction.sender">
+            <div class="verify-card">
+                <h2 class="verify-title" data-i18n="verify.title">🔒 Verify Connection</h2>
+                <p class="verify-instruction" data-i18n="verify.instruction.sender">
                     Read these codes aloud to the receiver. Do they match what they see?
                 </p>
 
-                <div style="background: #f5f5f5; border-radius: 10px; padding: 15px; margin-bottom: 20px;">
+                <div class="verify-codes">
                     <!-- Sender key always at top for consistent display on both devices -->
-                    <div style="margin-bottom: 15px;">
-                        <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.senderKey.yours">Sender's key (yours)</span>
-                        <p id="sender-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1b5e20; margin: 5px 0; letter-spacing: 2px;">----</p>
+                    <div class="verify-code-block">
+                        <span class="verify-code-label" data-i18n="verify.senderKey.yours">Sender's key (yours)</span>
+                        <p id="sender-fingerprint" class="verify-fingerprint verify-fingerprint-sender">----</p>
                     </div>
-                    <div style="border-top: 1px solid #ddd; padding-top: 15px;">
-                        <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.receiverKey.theirs">Receiver's key (theirs)</span>
-                        <p id="receiver-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1565c0; margin: 5px 0; letter-spacing: 2px;">----</p>
+                    <div class="verify-code-block-divided">
+                        <span class="verify-code-label" data-i18n="verify.receiverKey.theirs">Receiver's key (theirs)</span>
+                        <p id="receiver-fingerprint" class="verify-fingerprint verify-fingerprint-receiver">----</p>
                     </div>
                 </div>
 
-                <p style="margin: 0 0 20px 0; color: #d32f2f; font-size: 0.85rem;" data-i18n="verify.warning">
+                <p class="verify-warning" data-i18n="verify.warning">
                     ⚠️ If codes don't match, someone may be intercepting the connection!
                 </p>
 
-                <button id="confirm-match-btn" class="btn btn-action btn-success" style="width: 100%; margin-bottom: 20px; padding: 20px; font-size: 1.15rem;" data-i18n="verify.confirm">
+                <button id="confirm-match-btn" class="btn btn-action btn-success verify-confirm-btn" data-i18n="verify.confirm">
                     ✓ Yes, codes match
                 </button>
-                <button id="deny-match-btn" class="btn btn-action btn-secondary" style="width: 100%; padding: 20px; font-size: 1.15rem; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" data-i18n="verify.deny">
+                <button id="deny-match-btn" class="btn btn-action btn-secondary verify-deny-btn" data-i18n="verify.deny">
                     ✗ No, cancel connection
                 </button>
             </div>
@@ -102,8 +100,8 @@
 
         <!-- Waiting for receiver confirmation -->
         <div id="step-waiting-confirmation" class="hidden">
-            <div style="margin: 15px 0; padding: 20px; background: #e3f2fd; border-radius: 10px; border: 1px solid #90caf9; text-align: center;">
-                <p style="margin: 0; color: #1565c0; font-weight: bold;" data-i18n="send.waitingConfirmation">
+            <div class="send-confirm-banner">
+                <p class="send-confirm-msg" data-i18n="send.waitingConfirmation">
                     ⏳ Waiting for receiver to confirm...
                 </p>
             </div>
@@ -257,16 +255,16 @@
             </div>
 
             <!-- Action buttons row: Edit, Send, Cancel side by side -->
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <button class="btn btn-action btn-secondary edit-toggle-btn" id="edit-toggle-btn" style="flex: 1; min-width: 80px;">
+            <div class="send-controls">
+                <button class="btn btn-action btn-secondary edit-toggle-btn send-control-btn" id="edit-toggle-btn">
                     <span class="btn-icon">✏️</span>
                     <span data-i18n="send.edit">Edit</span>
                 </button>
-                <button class="btn btn-action btn-success btn-large" id="send-btn" style="flex: 2; min-width: 120px;">
+                <button class="btn btn-action btn-success btn-large send-control-btn-primary" id="send-btn">
                     <span class="btn-icon">📤</span>
                     <span data-i18n="send.sendPhoto">Send Photo</span>
                 </button>
-                <button class="btn btn-action btn-secondary" id="retake-btn" style="flex: 1; min-width: 80px;" data-i18n="send.cancel">
+                <button class="btn btn-action btn-secondary send-control-btn" id="retake-btn" data-i18n="send.cancel">
                     Cancel
                 </button>
             </div>
@@ -722,15 +720,14 @@
                 }
                 statusEl.textContent = detail;
                 statusEl.className = 'status status-error';
-                statusEl.style.whiteSpace = 'pre-line';
+                statusEl.classList.add('status-pre-line');
                 // Add a retry button so the user can easily go back to scanning
                 // instead of relying on the small back-link at the top
                 if (!document.getElementById('error-retry-btn')) {
                     const retryBtn = document.createElement('button');
                     retryBtn.id = 'error-retry-btn';
                     retryBtn.textContent = i18n.t('send.backToScan') || 'Back to scan';
-                    retryBtn.className = 'btn btn-action';
-                    retryBtn.style.marginTop = '15px';
+                    retryBtn.className = 'btn btn-action retry-btn';
                     retryBtn.addEventListener('click', () => {
                         retryBtn.remove();
                         showStep(stepScan);
@@ -1046,7 +1043,6 @@
             btn.classList.remove('hidden');
             if (!torchSupported && !fillLightSupported) {
                 btn.disabled = true;
-                btn.style.opacity = '0.4';
                 btn.title = i18n.t('send.flashUnsupportedReason');
                 document.getElementById('flash-icon').textContent = '⚡';
                 document.getElementById('flash-label').textContent = i18n.t('send.flashOff');
