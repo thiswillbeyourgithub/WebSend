@@ -352,6 +352,11 @@ function cleanupRooms() {
     const now = Date.now();
     for (const [id, room] of rooms.entries()) {
         if (now - room.created > ROOM_TTL) {
+            // Drain pending long-pollers with 404 before deleting the room.
+            if (room.answerWaiters && room.answerWaiters.length) {
+                const waiters = room.answerWaiters.splice(0);
+                for (const w of waiters) w.roomGone();
+            }
             rooms.delete(id);
             console.log(`Room ${id} expired and removed`);
         }
@@ -545,7 +550,10 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
         offer: null,
         answer: null,
         iceCandidatesOffer: [],
-        iceCandidatesAnswer: []
+        iceCandidatesAnswer: [],
+        // Pending long-poll resolvers waiting for `answer` to arrive.
+        // Each entry: { send: (room) => void, timer: Timeout|null }.
+        answerWaiters: []
     });
 
     console.log(`Room ${roomId} created`);
@@ -603,6 +611,16 @@ app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSe
         sdpLength: req.body.sdp?.length,
         type: req.body.type
     });
+    // Wake any pending long-pollers immediately rather than letting them
+    // discover the new answer on the next setTimeout tick.
+    const waiters = req.room.answerWaiters;
+    if (waiters && waiters.length) {
+        req.room.answerWaiters = [];
+        for (const w of waiters) {
+            if (w.timer) clearTimeout(w.timer);
+            w.send(req.room);
+        }
+    }
     res.json({ success: true });
 });
 
@@ -612,47 +630,39 @@ app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSe
  * Headers: X-Room-Secret required
  * Query: ?wait=true for long-polling (up to 30 seconds)
  */
-app.get('/api/rooms/:id/answer', validateRoomSecret, async (req, res) => {
-    // If answer is ready, return immediately
+app.get('/api/rooms/:id/answer', validateRoomSecret, (req, res) => {
+    // Fast path: answer already available, or caller didn't ask to wait.
     if (req.room.answer) {
         return res.json(req.room.answer);
     }
-
-    // Long-polling: wait for answer up to 30 seconds
-    if (req.query.wait === 'true') {
-        const startTime = Date.now();
-        const timeout = 30000; // 30 seconds
-        const pollInterval = 500; // Check every 500ms
-        const roomId = req.params.id;
-
-        let timer = null;
-        let aborted = false;
-        // Stop polling as soon as the client disconnects, so closed TCP
-        // connections don't keep driving setTimeout chains until TTL.
-        req.on('close', () => { aborted = true; if (timer) clearTimeout(timer); });
-
-        const checkAnswer = () => {
-            if (aborted) return;
-            const currentRoom = rooms.get(roomId);
-            if (!currentRoom) {
-                return res.status(404).json({ error: 'Room not found' });
-            }
-
-            if (currentRoom.answer) {
-                return res.json(currentRoom.answer);
-            }
-
-            if (Date.now() - startTime >= timeout) {
-                return res.status(204).send(); // No content yet
-            }
-
-            timer = setTimeout(checkAnswer, pollInterval);
-        };
-
-        checkAnswer();
-    } else {
-        res.status(204).send(); // No content yet
+    if (req.query.wait !== 'true') {
+        return res.status(204).send();
     }
+
+    // Long-polling: register a one-shot waiter on the room. POST /answer
+    // drains the queue immediately; cleanupRooms drains with 404 on
+    // expiry. A 30s timer is the upper bound.
+    const TIMEOUT_MS = 30000;
+    let settled = false;
+    const settle = (fn) => {
+        if (settled) return;
+        settled = true;
+        const idx = req.room.answerWaiters.indexOf(waiter);
+        if (idx !== -1) req.room.answerWaiters.splice(idx, 1);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        fn();
+    };
+    const waiter = {
+        timer: null,
+        send: (room) => settle(() => res.json(room.answer)),
+        timeout: () => settle(() => res.status(204).send()),
+        roomGone: () => settle(() => res.status(404).json({ error: 'Room not found' })),
+    };
+    waiter.timer = setTimeout(waiter.timeout, TIMEOUT_MS);
+    req.room.answerWaiters.push(waiter);
+
+    // If the client disconnects, drop the waiter without writing a response.
+    req.on('close', () => settle(() => {}));
 });
 
 /**
