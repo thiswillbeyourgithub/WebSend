@@ -116,7 +116,40 @@ const ROOM_TTL = 10 * 60 * 1000; // 10 minutes TTL
 // Simple sliding window rate limiter to prevent DoS and room enumeration attacks.
 // Uses in-memory storage; in production, use Redis for distributed rate limiting.
 
-const rateLimiters = new Map(); // IP -> { timestamps: [], blockedUntil: null }
+// LRU-bounded rate limiter store. Uses Map insertion order: get() touches a key
+// (delete + re-set) so it becomes most-recently-used; set() evicts the oldest
+// key when at cap. O(1) per touch/insert/evict, vs. the previous O(n) scan that
+// fired on every new key once the map saturated under a wide-source flood.
+const RATE_LIMITERS_MAX = 10_000;
+
+class LruMap {
+    constructor(max) {
+        this.max = max;
+        this.map = new Map();
+    }
+    get size() { return this.map.size; }
+    has(key) { return this.map.has(key); }
+    get(key) {
+        const value = this.map.get(key);
+        if (value === undefined && !this.map.has(key)) return undefined;
+        this.map.delete(key);
+        this.map.set(key, value);
+        return value;
+    }
+    set(key, value) {
+        if (this.map.has(key)) {
+            this.map.delete(key);
+        } else if (this.map.size >= this.max) {
+            const oldestKey = this.map.keys().next().value;
+            this.map.delete(oldestKey);
+        }
+        this.map.set(key, value);
+    }
+    delete(key) { return this.map.delete(key); }
+    entries() { return this.map.entries(); }
+}
+
+const rateLimiters = new LruMap(RATE_LIMITERS_MAX); // key=`${ip}:${limitType}` -> { timestamps: [], blockedUntil: null }
 
 const RATE_LIMIT_CONFIG = {
     // Room creation: 5 rooms per minute per IP (prevents room flooding)
@@ -150,12 +183,6 @@ function checkRateLimit(ip, limitType) {
     const key = `${ip}:${limitType}`;
 
     if (!rateLimiters.has(key)) {
-        // Hard cap: if the map is over-sized (flood scenario), evict stale entries
-        // before adding new ones. New entries are still allowed after eviction so
-        // legitimate users are not locked out during a flood.
-        if (rateLimiters.size >= 10_000) {
-            cleanupRateLimiters();
-        }
         rateLimiters.set(key, { timestamps: [], blockedUntil: null });
     }
 
