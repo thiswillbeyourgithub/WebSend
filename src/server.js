@@ -349,25 +349,30 @@ const fs = require('fs');
 if (UMAMI_URL && UMAMI_WEBSITE_ID) {
     const umamiScript = `    <script defer src="${UMAMI_URL}/getinfo" data-website-id="${UMAMI_WEBSITE_ID}" data-do-not-track="${UMAMI_DNT}"></script>\n`;
 
-    // Intercept requests for HTML pages and inject the analytics script
+    // Read each HTML file once at startup, inject the analytics snippet,
+    // and serve the cached string. Avoids a disk read per request.
+    const htmlSources = {
+        'index.html': path.join(__dirname, 'public', 'index.html'),
+        'send.html': path.join(__dirname, 'public', 'send.html'),
+        'receive.html': path.join(__dirname, 'public', 'receive.html'),
+    };
+    const cachedHtml = new Map();
+    for (const [name, filePath] of Object.entries(htmlSources)) {
+        const html = fs.readFileSync(filePath, 'utf8').replace('</head>', umamiScript + '</head>');
+        cachedHtml.set(name, html);
+    }
+
+    const routeToFile = {
+        '/': 'index.html',
+        '/index.html': 'index.html',
+        '/send.html': 'send.html',
+        '/receive.html': 'receive.html',
+    };
+
     app.use((req, res, next) => {
-        // Determine which HTML file to serve (if any)
-        let htmlFile = null;
-        if (req.path === '/' || req.path === '/index.html') {
-            htmlFile = path.join(__dirname, 'public', 'index.html');
-        } else if (req.path === '/send.html') {
-            htmlFile = path.join(__dirname, 'public', 'send.html');
-        } else if (req.path === '/receive.html') {
-            htmlFile = path.join(__dirname, 'public', 'receive.html');
-        }
-
-        if (!htmlFile) return next();
-
-        fs.readFile(htmlFile, 'utf8', (err, html) => {
-            if (err) return next();
-            html = html.replace('</head>', umamiScript + '</head>');
-            res.type('html').send(html);
-        });
+        const file = routeToFile[req.path];
+        if (!file) return next();
+        res.type('html').send(cachedHtml.get(file));
     });
 }
 
