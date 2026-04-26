@@ -176,6 +176,14 @@ Transform ops: `rotateCW`, `flipH`, `bw` (Otsu binarization), `crop` (with norma
 corner coordinates for perspective transform). The receiver stores `originalData` (the
 as-first-received image) so transforms always replay from the pristine source.
 
+The happy path is fire-and-forget (no positive ack). On failure (unknown `oldHash`,
+missing `originalData`, or replay exception) the receiver sends `{type:'transform-nack',
+oldHash, reason}`. The sender recovers by re-queueing the already-transformed bytes
+through the existing `replace-image` / `encrypted-file` flow (`drainQueue` with
+`replaceHash`), and resets the photo's local `transforms` array since the receiver's
+new `originalData` baseline is the post-transform image. If the sender no longer has
+the matching photo, it surfaces an error toast and gives up.
+
 ## Server API Endpoints
 
 | Method | Path                         | Purpose                              | Auth        | Rate Limit      |

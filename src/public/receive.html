@@ -144,7 +144,7 @@
         <!-- Crop modal is injected at runtime by /js/crop-modal.js -->
     </div>
 
-    <script src="/js/i18n.js" integrity="sha384-HbRY7s7IhQV86XALbpn3g9Ldwsh1KcniozGrG9x97T5IbPTCDlTWLHnxtktcBUUB"></script>
+    <script src="/js/i18n.js" integrity="sha384-pMfGwN75diCMcVlLsbsYts04ixMJPdmQDcEfyavRblKFMjZhB2iKJzFJJEDvXCU+"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/sidebar.js" integrity="sha384-YYv3EJsq5peZLCCbUs1/+SfW9SUNYbeFFy7Tb8v/qP3T/UTQToYHz6Fj06IYzIss"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-/gzZ7L0lKHe10PNpEnyyj/UyaNEl2woHG4WQz11dIRiPcWpbspO25nS1aCJl0FYd"></script>
@@ -1649,16 +1649,26 @@
          * Handle a transform-image message from the sender.
          * Replays transforms on the original image data, verifies hash, updates display.
          */
+        function sendTransformNack(oldHash, reason) {
+            try {
+                rtc.sendMessage({ type: 'transform-nack', oldHash, reason });
+            } catch (e) {
+                logger.error('failed to send transform-nack: ' + e.message);
+            }
+        }
+
         async function handleTransformImage(oldHash, transforms) {
             const replaceIdx = receivedImages.findIndex(img => img && img.hash === oldHash);
             if (replaceIdx === -1) {
                 logger.warn(`transform-image: hash ${oldHash} not found, ignoring`);
+                sendTransformNack(oldHash, 'unknown-hash');
                 return;
             }
 
             const imgObj = receivedImages[replaceIdx];
             if (!imgObj.originalData) {
                 logger.warn('transform-image: no originalData stored, ignoring');
+                sendTransformNack(oldHash, 'missing-original');
                 return;
             }
 
@@ -1705,6 +1715,7 @@
 
             } catch (e) {
                 logger.error(`transform-image failed: ${e.message}`);
+                sendTransformNack(oldHash, e?.message || 'transform-replay-failed');
             }
         }
 

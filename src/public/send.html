@@ -288,7 +288,7 @@
     </div>
 
     <script src="/js/doc-detect.js" integrity="sha384-8rCl4Ur/XlTrbcOQjCJbbNZM4QQgJMluQ7Qk65VFgmxye8y7dr+Lq55MOswV8kMo" crossorigin="anonymous"></script>
-    <script src="/js/i18n.js" integrity="sha384-HbRY7s7IhQV86XALbpn3g9Ldwsh1KcniozGrG9x97T5IbPTCDlTWLHnxtktcBUUB"></script>
+    <script src="/js/i18n.js" integrity="sha384-pMfGwN75diCMcVlLsbsYts04ixMJPdmQDcEfyavRblKFMjZhB2iKJzFJJEDvXCU+"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/sidebar.js" integrity="sha384-YYv3EJsq5peZLCCbUs1/+SfW9SUNYbeFFy7Tb8v/qP3T/UTQToYHz6Fj06IYzIss"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-/gzZ7L0lKHe10PNpEnyyj/UyaNEl2woHG4WQz11dIRiPcWpbspO25nS1aCJl0FYd"></script>
@@ -950,11 +950,39 @@
             showStep(stepChoose);
         }
 
+        function handleTransformNack(msg) {
+            // Receiver could not apply a transform-image. Recover by re-sending
+            // the already-transformed bytes via the replace-image flow.
+            const reason = msg.reason || 'unknown';
+            logger.warn(`transform-nack received for ${msg.oldHash?.substring(0, 8)}... (${reason})`);
+
+            const photo = galleryPhotos.find(p => p && p.sentHash === msg.oldHash);
+            if (!photo) {
+                logger.warn('transform-nack: no local photo matches oldHash, cannot recover');
+                showToast(i18n.t('send.transformFailedUnknown'), { type: 'error' });
+                return;
+            }
+
+            // Receiver will rebuild from the replacement bytes, so future
+            // transforms must start fresh from that new baseline.
+            photo.transforms = [];
+            photo.sendStatus = 'queuing';
+
+            sendQueue.push({ blob: photo.blob, photoId: photo.id, replaceHash: msg.oldHash });
+            logger.info(`Re-queued photo for replace-image fallback (${sendQueue.length} in queue)`);
+
+            showToast(i18n.t('send.transformRetrying'), { type: 'warn' });
+
+            updateQueueBanner();
+            drainQueue();
+        }
+
         const messageHandlers = {
             'public-key': handlePublicKey,
             'fingerprint-confirmed': handleFingerprintConfirmed,
             'fingerprint-denied': handleFingerprintDenied,
             'ready': handleReady,
+            'transform-nack': handleTransformNack,
         };
 
         async function onMessage(msg) {
