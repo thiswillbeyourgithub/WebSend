@@ -663,7 +663,14 @@
             video.srcObject = null;
             container.classList.remove('active');
             resetCameraZoom(video);
-            document.getElementById('start-scan-btn').innerHTML = '<span class="btn-icon">📷</span> <span data-i18n="send.startCamera">' + i18n.t('send.startCamera') + '</span>';
+            const startBtn = document.getElementById('start-scan-btn');
+            const iconSpan = document.createElement('span');
+            iconSpan.className = 'btn-icon';
+            iconSpan.textContent = '📷';
+            const labelSpan = document.createElement('span');
+            labelSpan.setAttribute('data-i18n', 'send.startCamera');
+            labelSpan.textContent = i18n.t('send.startCamera');
+            startBtn.replaceChildren(iconSpan, document.createTextNode(' '), labelSpan);
             document.getElementById('start-scan-btn').disabled = false;
         }
 

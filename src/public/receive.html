@@ -319,8 +319,10 @@
 
             } catch (e) {
                 logger.error('Initialization failed: ' + e.message);
-                document.getElementById('qr-container').innerHTML =
-                    '<p style="color: red;">' + i18n.t('receive.initFailed') + '</p>';
+                const errMsg = document.createElement('p');
+                errMsg.style.color = 'red';
+                errMsg.textContent = i18n.t('receive.initFailed');
+                document.getElementById('qr-container').replaceChildren(errMsg);
             }
         }
 
@@ -388,14 +390,20 @@
                 preloadScribe();
             } catch (e) {
                 logger.error('QR code generation failed: ' + e.message);
-                container.innerHTML = `
-                    <div style="padding: 20px; text-align: center;">
-                        <p style="color: red; margin-bottom: 10px;">${i18n.t('receive.qrFailed')}</p>
-                        <input type="text" value="${url}" readonly
-                            style="width: 100%; padding: 10px; font-size: 0.8rem; border-radius: 5px; border: 1px solid #ccc;"
-                            onclick="this.select()">
-                    </div>
-                `;
+                const fallbackWrap = document.createElement('div');
+                fallbackWrap.style.cssText = 'padding: 20px; text-align: center;';
+                const fallbackMsg = document.createElement('p');
+                fallbackMsg.style.cssText = 'color: red; margin-bottom: 10px;';
+                fallbackMsg.textContent = i18n.t('receive.qrFailed');
+                const fallbackInput = document.createElement('input');
+                fallbackInput.type = 'text';
+                fallbackInput.value = url;
+                fallbackInput.readOnly = true;
+                fallbackInput.style.cssText = 'width: 100%; padding: 10px; font-size: 0.8rem; border-radius: 5px; border: 1px solid #ccc;';
+                fallbackInput.addEventListener('click', () => fallbackInput.select());
+                fallbackWrap.appendChild(fallbackMsg);
+                fallbackWrap.appendChild(fallbackInput);
+                container.replaceChildren(fallbackWrap);
                 document.getElementById('status-waiting').classList.remove('hidden');
                 preloadClientZip();
                 preloadScribe();
@@ -527,14 +535,15 @@
                 const sectionTitle = stepConnected.querySelector('.section-title');
                 stepConnected.insertBefore(banner, sectionTitle);
             }
-            banner.innerHTML = `
-                <p style="margin: 0 0 10px; color: #e65100; font-weight: bold;">
-                    ${i18n.t('receive.senderDisconnected')}
-                </p>
-                <button class="btn btn-action btn-primary" onclick="reconnectReceiver()" style="width: 100%;">
-                    ${i18n.t('receive.showQRCode')}
-                </button>
-            `;
+            const bannerMsg = document.createElement('p');
+            bannerMsg.style.cssText = 'margin: 0 0 10px; color: #e65100; font-weight: bold;';
+            bannerMsg.textContent = i18n.t('receive.senderDisconnected');
+            const bannerBtn = document.createElement('button');
+            bannerBtn.className = 'btn btn-action btn-primary';
+            bannerBtn.style.width = '100%';
+            bannerBtn.textContent = i18n.t('receive.showQRCode');
+            bannerBtn.addEventListener('click', reconnectReceiver);
+            banner.replaceChildren(bannerMsg, bannerBtn);
             banner.classList.remove('hidden');
         }
 
@@ -946,25 +955,67 @@
             const section = document.createElement('div');
             section.className = 'collection-section';
             section.setAttribute('data-collection-id', collectionId);
-            section.innerHTML = `
-                <div class="collection-header" data-collection-id="${collectionId}">
-                    <div class="collection-header-left">
-                        <button class="collection-collapse-btn" onclick="toggleCollectionCollapse(${collectionId})" title="Collapse/Expand">▼</button>
-                        <span class="collection-name" contenteditable="true" spellcheck="false"
-                              onblur="renameCollection(${collectionId}, this.textContent)"
-                              onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
-                              >${name}</span>
-                        <span class="collection-time">(${timeStr})</span>
-                        <span class="collection-count" id="col-count-${collectionId}">0</span>
-                    </div>
-                    <div class="collection-header-right">
-                        <button class="btn btn-action collection-select-all-btn" onclick="toggleCollectionSelectAll(${collectionId})" title="${i18n.t('receive.selectAll') || 'Select all'}">${i18n.t('receive.selectAll') || 'Select all'}</button>
-                        <button class="btn btn-action collection-export-btn" onclick="openExportModalForCollection(${collectionId})" title="Export">📦 Export</button>
-                    </div>
-                </div>
-                <div class="collection-images" id="collection-images-${collectionId}" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
-                </div>
-            `;
+            const headerDiv = document.createElement('div');
+            headerDiv.className = 'collection-header';
+            headerDiv.setAttribute('data-collection-id', collectionId);
+
+            const headerLeft = document.createElement('div');
+            headerLeft.className = 'collection-header-left';
+
+            const collapseBtn = document.createElement('button');
+            collapseBtn.className = 'collection-collapse-btn';
+            collapseBtn.title = 'Collapse/Expand';
+            collapseBtn.textContent = '▼';
+            collapseBtn.addEventListener('click', () => toggleCollectionCollapse(collectionId));
+
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'collection-name';
+            nameSpan.contentEditable = 'true';
+            nameSpan.spellcheck = false;
+            nameSpan.textContent = name;
+            nameSpan.addEventListener('blur', () => renameCollection(collectionId, nameSpan.textContent));
+            nameSpan.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); nameSpan.blur(); }
+            });
+
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'collection-time';
+            timeSpan.textContent = `(${timeStr})`;
+
+            const countSpan = document.createElement('span');
+            countSpan.className = 'collection-count';
+            countSpan.id = `col-count-${collectionId}`;
+            countSpan.textContent = '0';
+
+            headerLeft.append(collapseBtn, nameSpan, timeSpan, countSpan);
+
+            const headerRight = document.createElement('div');
+            headerRight.className = 'collection-header-right';
+
+            const selectAllLabel = i18n.t('receive.selectAll') || 'Select all';
+            const selectAllBtn = document.createElement('button');
+            selectAllBtn.className = 'btn btn-action collection-select-all-btn';
+            selectAllBtn.title = selectAllLabel;
+            selectAllBtn.textContent = selectAllLabel;
+            selectAllBtn.addEventListener('click', () => toggleCollectionSelectAll(collectionId));
+
+            const exportBtn = document.createElement('button');
+            exportBtn.className = 'btn btn-action collection-export-btn';
+            exportBtn.title = 'Export';
+            exportBtn.textContent = '📦 Export';
+            exportBtn.addEventListener('click', () => openExportModalForCollection(collectionId));
+
+            headerRight.append(selectAllBtn, exportBtn);
+            headerDiv.append(headerLeft, headerRight);
+
+            const imagesGrid = document.createElement('div');
+            imagesGrid.className = 'collection-images';
+            imagesGrid.id = `collection-images-${collectionId}`;
+            imagesGrid.style.display = 'grid';
+            imagesGrid.style.gridTemplateColumns = 'repeat(2, 1fr)';
+            imagesGrid.style.gap = '15px';
+
+            section.append(headerDiv, imagesGrid);
             mainContainer.prepend(section);
 
             // Make collection header a drop target for inter-collection drag
