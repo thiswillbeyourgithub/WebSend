@@ -8,6 +8,7 @@
   "/js/logger.js": "sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL",
   "/js/ocr-rescale.js": "sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn",
   "/js/pdf-builder.js": "sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/",
+  "/js/peer-ui.js": "sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A",
   "/js/qrcode.min.js": "sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi",
   "/js/scribe-handle.js": "sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG",
   "/js/sdp-compress.js": "sha384-xnGco4VPFnSwj5HZd9N0LG5EJjl3OqJYDYpoU0yq00HVu5mFTj+c6J+mIP+rGynO",

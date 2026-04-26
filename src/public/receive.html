@@ -156,6 +156,7 @@
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
+    <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -267,23 +268,6 @@
             }
         });
 
-        /**
-         * Dynamically load the vendored eruda mobile devtools console.
-         * Only called in DEV mode (or via the 5-tap gesture) to avoid loading
-         * a ~500KB debug library on every page view. Served from /vendor/eruda/
-         * so the app makes zero external network requests.
-         * @returns {Promise<void>}
-         */
-        function loadEruda() {
-            return new Promise((resolve) => {
-                const script = document.createElement('script');
-                script.src = '/vendor/eruda/eruda.js';
-                script.onload = () => { eruda.init(); resolve(); };
-                script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
-                document.head.appendChild(script);
-            });
-        }
-
         async function init() {
             logger.info('Initializing receiver...');
 
@@ -294,7 +278,7 @@
                 window.__wsConfig = config;
 
                 // Enable eruda mobile console asap when server is in DEV mode
-                if (config.dev) { await loadEruda(); }
+                if (config.dev) { await PeerUI.loadEruda(); }
 
                 // Show DEV mode status in sidebar
                 updateDevBadge(config.dev);
@@ -311,7 +295,7 @@
                 rtc.onDisconnected = onDisconnected;
                 rtc.onMessage = onMessage;
                 rtc.onStateChange = onStateChange;
-                rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+                rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
                 // Create room and offer
                 const roomInfo = await rtc.createRoom();
@@ -596,7 +580,7 @@
                 rtc.onDisconnected = onDisconnected;
                 rtc.onMessage = onMessage;
                 rtc.onStateChange = onStateChange;
-                rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+                rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
                 const roomInfo = await rtc.createRoom();
                 roomSecret = roomInfo.secret;
@@ -662,41 +646,6 @@
 
         window.addEventListener('beforeunload', cleanupAllData);
 
-        /**
-         * Display a badge showing whether the connection is direct (P2P) or relayed (TURN).
-         * Relay connections work fine (data is E2E encrypted anyway) but direct is faster.
-         */
-        function onConnectionTypeDetected(info) {
-            // Show connection type in sidebar instead of inline badge
-            const section = document.getElementById('sidebar-connection-section');
-            const infoDiv = document.getElementById('sidebar-connection-info');
-            if (!section || !infoDiv) return;
-            section.classList.remove('hidden');
-
-            if (info.type === 'relay') {
-                infoDiv.style.background = '#fff3e0';
-                infoDiv.style.border = '1px solid #ffcc80';
-                infoDiv.innerHTML = `🔄 ${info.details}`;
-                infoDiv.style.color = '#e65100';
-            } else {
-                infoDiv.style.background = '#e3f2fd';
-                infoDiv.style.border = '1px solid #90caf9';
-                infoDiv.innerHTML = `⚡ ${info.details}`;
-                infoDiv.style.color = '#1565c0';
-            }
-        }
-
-        /** Show "verified" status inside the sidebar CONNECTION section */
-        function showVerifiedInSidebar() {
-            const section = document.getElementById('sidebar-connection-section');
-            const infoDiv = document.getElementById('sidebar-connection-info');
-            if (!section || !infoDiv) return;
-            section.classList.remove('hidden');
-            const verifiedEl = document.createElement('div');
-            verifiedEl.style.cssText = 'margin-top: 6px; color: #2e7d32; font-weight: bold;';
-            verifiedEl.textContent = i18n.t('connection.verified');
-            infoDiv.appendChild(verifiedEl);
-        }
 
         async function handleSenderPublicKey(msg) {
             // Sender sent their ECDH public key - derive shared secret
@@ -1857,7 +1806,7 @@
 
                 // Hide waiting, show verified badge
                 document.getElementById('waiting-confirmation').classList.add('hidden');
-                showVerifiedInSidebar();
+                PeerUI.showVerifiedInSidebar();
 
                 // Tell sender both parties verified, so they can show the photo send UI
                 rtc.sendMessage({ type: 'ready' });

@@ -297,6 +297,7 @@
     <script src="/js/webrtc.js" integrity="sha384-5NUj++FlRTLr9SHWSIIVZ1XzQZQnpPlUdQKT+ePNSfgTLnU1TXBWkzptP7XxuAuj"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-531l7cDBCA5mQdwGDYQl9X2tKu9r4DBFqodsBxtyKt07W8NqGt/b0tc+PlI62j5Z"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
+    <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -428,23 +429,6 @@
             return null;
         }
 
-        /**
-         * Dynamically load the vendored eruda mobile devtools console.
-         * Only called in DEV mode (or via the 5-tap gesture) to avoid loading
-         * a ~500KB debug library on every page view. Served from /vendor/eruda/
-         * so the app makes zero external network requests.
-         * @returns {Promise<void>}
-         */
-        function loadEruda() {
-            return new Promise((resolve) => {
-                const script = document.createElement('script');
-                script.src = '/vendor/eruda/eruda.js';
-                script.onload = () => { eruda.init(); resolve(); };
-                script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
-                document.head.appendChild(script);
-            });
-        }
-
         async function init() {
             logger.info('Initializing sender...');
 
@@ -470,7 +454,7 @@
                 const configResponse = await fetch('/api/config');
                 const config = await configResponse.json();
                 window.__wsConfig = config;
-                if (config.dev) { await loadEruda(); }
+                if (config.dev) { await PeerUI.loadEruda(); }
                 // Show DEV mode status in sidebar
                 updateDevBadge(config.dev);
                 // Configure file input accept attribute based on allowed file types
@@ -510,7 +494,7 @@
             rtc.onDisconnected = onDisconnected;
             rtc.onMessage = onMessage;
             rtc.onStateChange = onStateChange;
-            rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+            rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
             // Set up button handlers
             document.getElementById('start-scan-btn').addEventListener('click', startScanner);
@@ -799,7 +783,7 @@
             rtc.onDisconnected = onDisconnected;
             rtc.onMessage = onMessage;
             rtc.onStateChange = onStateChange;
-            rtc.onConnectionTypeDetected = onConnectionTypeDetected;
+            rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
             try {
                 await joinRoom(roomId, secret);
@@ -846,40 +830,6 @@
         }
 
         window.addEventListener('beforeunload', cleanupAllData);
-
-        /** Display connection type in sidebar instead of inline badge */
-        function onConnectionTypeDetected(info) {
-            // Show connection type in sidebar instead of inline badge
-            const section = document.getElementById('sidebar-connection-section');
-            const infoDiv = document.getElementById('sidebar-connection-info');
-            if (!section || !infoDiv) return;
-            section.classList.remove('hidden');
-
-            if (info.type === 'relay') {
-                infoDiv.style.background = '#fff3e0';
-                infoDiv.style.border = '1px solid #ffcc80';
-                infoDiv.innerHTML = `🔄 ${info.details}`;
-                infoDiv.style.color = '#e65100';
-            } else {
-                infoDiv.style.background = '#e3f2fd';
-                infoDiv.style.border = '1px solid #90caf9';
-                infoDiv.innerHTML = `⚡ ${info.details}`;
-                infoDiv.style.color = '#1565c0';
-            }
-        }
-
-        /** Show "verified" status inside the sidebar CONNECTION section */
-        function showVerifiedInSidebar() {
-            const section = document.getElementById('sidebar-connection-section');
-            const infoDiv = document.getElementById('sidebar-connection-info');
-            if (!section || !infoDiv) return;
-            section.classList.remove('hidden');
-            // Append verified line below connection type
-            const verifiedEl = document.createElement('div');
-            verifiedEl.style.cssText = 'margin-top: 6px; color: #2e7d32; font-weight: bold;';
-            verifiedEl.textContent = i18n.t('connection.verified');
-            infoDiv.appendChild(verifiedEl);
-        }
 
         async function handlePublicKey(msg) {
             // Receiver sent their ECDH public key
@@ -946,7 +896,7 @@
         function handleReady(msg) {
             // Receiver confirmed both parties verified - can now send photos
             logger.success('Both parties verified, can now send photos');
-            showVerifiedInSidebar();
+            PeerUI.showVerifiedInSidebar();
             showStep(stepChoose);
         }
 

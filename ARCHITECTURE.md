@@ -99,6 +99,9 @@ WebSend/
         │   │               #   that hide the clear-vs-terminate API fork. Receive.html
         │   │               #   uses it for preloaded, background-queue, and per-export
         │   │               #   scribe lifecycles
+        │   ├── peer-ui.js  # Shared sidebar helpers (loadEruda, onConnectionTypeDetected,
+        │   │               #   showVerifiedInSidebar) used identically by send.html and
+        │   │               #   receive.html. Exposes window.PeerUI
         │   ├── qrcode.min.js # QR code generator library (vendored, used by receiver)
         │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
         │
