@@ -8,6 +8,7 @@ const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
 const { version: APP_VERSION } = require('./package.json');
+const helpers = require('./server-helpers');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 8080;
@@ -305,50 +306,6 @@ function validateOrigin(req, res, next) {
 app.use('/api', validateOrigin);
 
 /**
- * Generate a short room ID (6 alphanumeric characters).
- * Uses crypto.randomBytes() for cryptographically secure randomness.
- * @returns {string} 6-character room ID from a 32-character alphabet (~30 bits entropy)
- */
-function generateRoomId() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No ambiguous chars (0,O,1,I,l)
-    const randomBytes = crypto.randomBytes(6);
-    let id = '';
-    for (let i = 0; i < 6; i++) {
-        // Use modulo to map random byte to alphabet index
-        // Slight bias is acceptable for room IDs (not a security-critical secret)
-        id += chars[randomBytes[i] % chars.length];
-    }
-    return id;
-}
-
-/**
- * Generate a cryptographically secure room secret (16 bytes, base64url encoded).
- * This secret must be presented to access room data, preventing room ID enumeration
- * and unauthorized room access.
- * @returns {string} 22-character base64url-encoded secret
- */
-function generateRoomSecret() {
-    return crypto.randomBytes(16).toString('base64url');
-}
-
-/**
- * Constant-time string comparison to prevent timing attacks on secret validation.
- * @param {string} a - First string
- * @param {string} b - Second string
- * @returns {boolean} True if strings are equal
- */
-function secureCompare(a, b) {
-    if (typeof a !== 'string' || typeof b !== 'string') return false;
-    // Hash both inputs to a fixed-length digest before comparing, so
-    // timingSafeEqual always operates on equal-length buffers regardless of
-    // the submitted string's length (avoids leaking secret length via an
-    // early-exit branch).
-    const ha = crypto.createHash('sha256').update(a).digest();
-    const hb = crypto.createHash('sha256').update(b).digest();
-    return crypto.timingSafeEqual(ha, hb);
-}
-
-/**
  * Middleware to validate room secret from X-Room-Secret header.
  * Returns 401 if secret is missing or invalid.
  */
@@ -363,7 +320,7 @@ function validateRoomSecret(req, res, next) {
         return res.status(401).json({ error: 'Room secret required' });
     }
 
-    if (!secureCompare(providedSecret, room.secret)) {
+    if (!helpers.secureCompare(providedSecret, room.secret)) {
         return res.status(401).json({ error: 'Invalid room secret' });
     }
 
@@ -437,26 +394,6 @@ app.use('/vendor', express.static(path.join(__dirname, 'public', 'vendor')));
 app.use('/scribe', express.static(path.join(__dirname, 'public', 'vendor', 'scribe.js-ocr')));
 app.use('/tessdata', express.static(path.join(__dirname, 'public', 'vendor', 'tessdata')));
 
-/**
- * Generate time-based TURN credentials using HMAC-SHA1.
- * This follows the TURN REST API / coturn ephemeral credentials standard.
- * Username format: expiry_timestamp:random_id
- * Credential: Base64(HMAC-SHA1(secret, username))
- *
- * @returns {{ username: string, credential: string }} Time-based credentials
- */
-function generateTurnCredentials() {
-    const expiryTime = Math.floor(Date.now() / 1000) + TURN_CREDENTIAL_TTL;
-    // Include a random component to make each credential unique
-    const randomId = crypto.randomBytes(4).toString('hex');
-    const username = `${expiryTime}:${randomId}`;
-    const credential = crypto
-        .createHmac('sha1', TURN_SECRET)
-        .update(username)
-        .digest('base64');
-    return { username, credential };
-}
-
 // Endpoint to get ICE server configuration
 app.get('/api/config', (req, res) => {
     const iceServers = [];
@@ -475,7 +412,7 @@ app.get('/api/config', (req, res) => {
 
     // Add TURN server if configured (requires TURN_SECRET for credentials)
     if (TURN_SERVER && TURN_SECRET) {
-        const { username, credential } = generateTurnCredentials();
+        const { username, credential } = helpers.generateTurnCredentials(TURN_SECRET, TURN_CREDENTIAL_TTL);
         iceServers.push({
             urls: [
                 `turn:${TURN_SERVER}?transport=udp`,
@@ -565,11 +502,11 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
     let roomId;
     // Ensure unique room ID
     do {
-        roomId = generateRoomId();
+        roomId = helpers.generateRoomId();
     } while (rooms.has(roomId));
 
     // Generate cryptographic secret for room access authorization
-    const secret = generateRoomSecret();
+    const secret = helpers.generateRoomSecret();
 
     rooms.set(roomId, {
         created: Date.now(),

@@ -5,7 +5,6 @@ import {
     generateRoomSecret,
     secureCompare,
     generateTurnCredentials,
-    checkRateLimit,
     isOriginAllowed,
     ROOM_ID_CHARS,
 } from '../../server-helpers.js';
@@ -88,42 +87,6 @@ test('generateTurnCredentials: username format is "expiry:randomHex"', () => {
 test('generateTurnCredentials: credential is base64', () => {
     const { credential } = generateTurnCredentials('mysecret', 3600);
     assert.ok(/^[A-Za-z0-9+/=]+$/.test(credential));
-});
-
-// ---- checkRateLimit ----
-
-test('checkRateLimit: allows first request', () => {
-    const map = new Map();
-    const cfg = { test: { windowMs: 60_000, maxRequests: 5 } };
-    const result = checkRateLimit(map, '1.2.3.4', 'test', cfg);
-    assert.ok(result.allowed);
-});
-
-test('checkRateLimit: blocks when limit exceeded', () => {
-    const map = new Map();
-    const cfg = { test: { windowMs: 60_000, maxRequests: 3 } };
-    let now = Date.now();
-    for (let i = 0; i < 3; i++) {
-        checkRateLimit(map, '1.2.3.4', 'test', cfg, () => now + i);
-    }
-    const result = checkRateLimit(map, '1.2.3.4', 'test', cfg, () => now + 3);
-    assert.ok(!result.allowed);
-    assert.ok(result.retryAfter > 0);
-});
-
-test('checkRateLimit: unblocks after window expires', () => {
-    const map = new Map();
-    const cfg = { test: { windowMs: 1000, maxRequests: 2 } };
-    let t = 0;
-    checkRateLimit(map, '10.0.0.1', 'test', cfg, () => t);
-    checkRateLimit(map, '10.0.0.1', 'test', cfg, () => t + 1);
-    // Exceed limit
-    const blocked = checkRateLimit(map, '10.0.0.1', 'test', cfg, () => t + 2);
-    assert.ok(!blocked.allowed);
-
-    // Advance past blockedUntil (windowMs = 1000ms ahead of t+2 = t+1002)
-    const afterExpiry = checkRateLimit(map, '10.0.0.1', 'test', cfg, () => t + 3000);
-    assert.ok(afterExpiry.allowed);
 });
 
 // ---- isOriginAllowed ----

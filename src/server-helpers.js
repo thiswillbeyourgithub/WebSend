@@ -3,7 +3,8 @@
  * These functions have no side-effects beyond their return values and
  * depend only on Node's built-in `crypto` module.
  *
- * server.js requires this file and re-uses these functions directly.
+ * server.js requires this module and uses these functions directly — there is
+ * no separate copy in server.js.
  */
 
 'use strict';
@@ -46,7 +47,7 @@ function secureCompare(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     const ha = crypto.createHash('sha256').update(a).digest();
     const hb = crypto.createHash('sha256').update(b).digest();
-    return crypto.timingSafeEqual(ha, hb) && a.length === b.length;
+    return crypto.timingSafeEqual(ha, hb);
 }
 
 /**
@@ -71,48 +72,6 @@ function generateTurnCredentials(turnSecret, ttlSeconds, nowFn = Date.now) {
 }
 
 /**
- * Check and update a sliding-window rate limit entry.
- *
- * @param {Map} rateLimiters - Shared rate-limiter state map
- * @param {string} ip - Client IP address
- * @param {string} limitType - Key into rateLimitConfig
- * @param {object} rateLimitConfig - Map of limitType -> { windowMs, maxRequests }
- * @param {function} [nowFn=Date.now] - Injectable clock for testing
- * @returns {{ allowed: boolean, retryAfter: number }}
- */
-function checkRateLimit(rateLimiters, ip, limitType, rateLimitConfig, nowFn = Date.now) {
-    const config = rateLimitConfig[limitType];
-    const now = nowFn();
-    const key = `${ip}:${limitType}`;
-
-    if (!rateLimiters.has(key)) {
-        rateLimiters.set(key, { timestamps: [], blockedUntil: null });
-    }
-
-    const limiter = rateLimiters.get(key);
-
-    if (limiter.blockedUntil && now < limiter.blockedUntil) {
-        return { allowed: false, retryAfter: Math.ceil((limiter.blockedUntil - now) / 1000) };
-    }
-
-    if (limiter.blockedUntil && now >= limiter.blockedUntil) {
-        limiter.blockedUntil = null;
-        limiter.timestamps = [];
-    }
-
-    const windowStart = now - config.windowMs;
-    limiter.timestamps = limiter.timestamps.filter(ts => ts > windowStart);
-
-    if (limiter.timestamps.length >= config.maxRequests) {
-        limiter.blockedUntil = now + config.windowMs;
-        return { allowed: false, retryAfter: Math.ceil(config.windowMs / 1000) };
-    }
-
-    limiter.timestamps.push(now);
-    return { allowed: true, retryAfter: 0 };
-}
-
-/**
  * Check whether an origin is allowed.
  * Returns true if no origin (non-browser request) or if origin is in allowedOrigins.
  * @param {string|undefined} origin
@@ -129,7 +88,6 @@ module.exports = {
     generateRoomSecret,
     secureCompare,
     generateTurnCredentials,
-    checkRateLimit,
     isOriginAllowed,
     ROOM_ID_CHARS,
 };
