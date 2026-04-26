@@ -881,69 +881,89 @@
             infoDiv.appendChild(verifiedEl);
         }
 
-        async function onMessage(msg) {
-            if (msg.type === 'public-key') {
-                // Receiver sent their ECDH public key
-                logger.info('Received receiver public key, performing key exchange...');
+        async function handlePublicKey(msg) {
+            // Receiver sent their ECDH public key
+            logger.info('Received receiver public key, performing key exchange...');
+            try {
+                // Import receiver's public key
+                const receiverPublicKey = await WebSendCrypto.importPublicKey(msg.key);
+
+                // Derive shared secret using ECDH
+                sharedKey = await WebSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
+
+                // Fetch active room count to adapt fingerprint length:
+                // fewer rooms = shorter key (easier to compare), more = longer (collision resistance)
+                let fpLength = 12; // fallback to max if stats unavailable
                 try {
-                    // Import receiver's public key
-                    const receiverPublicKey = await WebSendCrypto.importPublicKey(msg.key);
-
-                    // Derive shared secret using ECDH
-                    sharedKey = await WebSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
-
-                    // Fetch active room count to adapt fingerprint length:
-                    // fewer rooms = shorter key (easier to compare), more = longer (collision resistance)
-                    let fpLength = 12; // fallback to max if stats unavailable
-                    try {
-                        const statsRes = await fetch('/api/stats');
-                        if (statsRes.ok) {
-                            const stats = await statsRes.json();
-                            fpLength = WebSendCrypto.computeFingerprintLength(stats.activeRooms);
-                        }
-                    } catch (e) {
-                        logger.warn('Could not fetch room stats, using max fingerprint length');
+                    const statsRes = await fetch('/api/stats');
+                    if (statsRes.ok) {
+                        const stats = await statsRes.json();
+                        fpLength = WebSendCrypto.computeFingerprintLength(stats.activeRooms);
                     }
-
-                    // Get fingerprints for verification (length adapts to server load)
-                    const ourFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey, fpLength);
-                    const theirFingerprint = await WebSendCrypto.getKeyFingerprint(receiverPublicKey, fpLength);
-
-                    // Display fingerprints in verification modal
-                    // Sender key at top, receiver key at bottom (consistent on both devices)
-                    document.getElementById('sender-fingerprint').textContent = ourFingerprint;
-                    document.getElementById('receiver-fingerprint').textContent = theirFingerprint;
-
-                    logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
-
-                    // Send our public key to receiver so they can derive the same shared secret
-                    const ourPublicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
-                    rtc.sendMessage({
-                        type: 'sender-public-key',
-                        key: ourPublicKeyB64
-                    });
-                    logger.info('Sent our public key to receiver');
-
-                    // Show blocking verification modal
-                    showVerificationModal();
                 } catch (e) {
-                    logger.error('Failed to complete key exchange: ' + e.message);
+                    logger.warn('Could not fetch room stats, using max fingerprint length');
                 }
-            } else if (msg.type === 'fingerprint-confirmed') {
-                // Receiver confirmed the fingerprints match
-                logger.info('Receiver confirmed fingerprint match');
-                theyConfirmed = true;
-                checkBothConfirmed();
-            } else if (msg.type === 'fingerprint-denied') {
-                // Receiver denied - abort connection
-                logger.error('Receiver denied fingerprint match - possible MITM attack!');
-                showToast(i18n.t('verify.deniedByReceiver'), { duration: 5000 });
-            } else if (msg.type === 'ready') {
-                // Receiver confirmed both parties verified - can now send photos
-                logger.success('Both parties verified, can now send photos');
-                showVerifiedInSidebar();
-                showStep(stepChoose);
+
+                // Get fingerprints for verification (length adapts to server load)
+                const ourFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey, fpLength);
+                const theirFingerprint = await WebSendCrypto.getKeyFingerprint(receiverPublicKey, fpLength);
+
+                // Display fingerprints in verification modal
+                // Sender key at top, receiver key at bottom (consistent on both devices)
+                document.getElementById('sender-fingerprint').textContent = ourFingerprint;
+                document.getElementById('receiver-fingerprint').textContent = theirFingerprint;
+
+                logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
+
+                // Send our public key to receiver so they can derive the same shared secret
+                const ourPublicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
+                rtc.sendMessage({
+                    type: 'sender-public-key',
+                    key: ourPublicKeyB64
+                });
+                logger.info('Sent our public key to receiver');
+
+                // Show blocking verification modal
+                showVerificationModal();
+            } catch (e) {
+                logger.error('Failed to complete key exchange: ' + e.message);
             }
+        }
+
+        function handleFingerprintConfirmed(msg) {
+            // Receiver confirmed the fingerprints match
+            logger.info('Receiver confirmed fingerprint match');
+            theyConfirmed = true;
+            checkBothConfirmed();
+        }
+
+        function handleFingerprintDenied(msg) {
+            // Receiver denied - abort connection
+            logger.error('Receiver denied fingerprint match - possible MITM attack!');
+            showToast(i18n.t('verify.deniedByReceiver'), { duration: 5000 });
+        }
+
+        function handleReady(msg) {
+            // Receiver confirmed both parties verified - can now send photos
+            logger.success('Both parties verified, can now send photos');
+            showVerifiedInSidebar();
+            showStep(stepChoose);
+        }
+
+        const messageHandlers = {
+            'public-key': handlePublicKey,
+            'fingerprint-confirmed': handleFingerprintConfirmed,
+            'fingerprint-denied': handleFingerprintDenied,
+            'ready': handleReady,
+        };
+
+        async function onMessage(msg) {
+            const handler = messageHandlers[msg.type];
+            if (!handler) {
+                logger.warn(`Unknown message type: ${msg.type}`);
+                return;
+            }
+            await handler(msg);
         }
 
         // ============ Photo Capture ============
