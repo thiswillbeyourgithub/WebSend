@@ -159,6 +159,7 @@
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-U3uN/GufXxFg7QEGmrhlFDEMRIVoVmWft0Xjs9iIXraKTxqmC5vnfj9aO1krfQmy"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-Jsg+a3xnj4NcIcrrw1HtC9Nnkpz9lW1XvD739ArCQ2X3246EOrpez7hgvmFANsAw"></script>
+    <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-fzEmHjLzTWKrjkJI4bozuob2VT9l1vjdHXgSgeI2m8fR3LgicoqHEinkouXksQvL"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -195,12 +196,12 @@
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string, ocrPageData: object|null}
         let pendingReplaceHash = null; // Hash of image being replaced by an incoming edit
 
-        // Background OCR state
-        let ocrQueue = []; // indices into receivedImages waiting for background OCR
-        let ocrProcessing = false; // whether background OCR worker is running
-        let currentOcrIndex = null; // index of image currently being OCR'd
-        let bgOcrAbortController = null; // per-iteration AbortController for background OCR
-        let bgOcrScribe = null; // reusable scribe instance for background OCR
+        // Background OCR state lives in window.BgOcr (js/bg-ocr.js).
+        BgOcr.attach({
+            receivedImagesRef: receivedImages,
+            getScribePreloaded: () => scribePreloaded,
+            clearScribePreloaded: () => { scribePreloaded = null; },
+        });
 
         // Collection state and operations live in window.Collections (js/collections.js).
         // Function declarations referenced in cardHandlers are hoisted within this
@@ -212,7 +213,7 @@
             onUpdateExportButton: () => updateExportButton(),
             onSelectionChange: () => onSelectionChange(),
             onOpenExportModal: (id) => openExportModalForCollection(id),
-            onCancelImageOcr: (idx) => cancelImageOcr(idx),
+            onCancelImageOcr: (idx) => BgOcr.cancel(idx),
             cardHandlers: {
                 onDiscardConfirm: (idx) => doDiscard(idx),
                 onDiscardCancel: (idx) => cancelDiscard(idx),
@@ -609,8 +610,7 @@
                 if (a.href.startsWith('blob:')) URL.revokeObjectURL(a.href);
             });
             // Cancel all background OCR
-            ocrQueue = [];
-            bgOcrAbortController?.abort();
+            BgOcr.reset();
             // Clear image data from memory
             for (let i = 0; i < receivedImages.length; i++) {
                 receivedImages[i] = null;
@@ -828,8 +828,8 @@
                             showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
 
                             // Cancel any pending/in-progress OCR and restart for the new image
-                            cancelImageOcr(replaceIdx);
-                            queueBackgroundOcr(replaceIdx);
+                            BgOcr.cancel(replaceIdx);
+                            BgOcr.queue(replaceIdx);
                         } else {
                             logger.warn(`replace-image: old hash not found, adding as new image`);
                         }
@@ -871,7 +871,7 @@
                     }
 
                     // Queue background OCR for this image
-                    queueBackgroundOcr(imageIndex);
+                    BgOcr.queue(imageIndex);
 
                     // Compute SHA-256 of the decrypted plaintext data and send
                     // file-ack back to the sender for end-to-end integrity verification.
@@ -995,8 +995,8 @@
             logger.success(`Image #${imageIndex + 1} rotated`);
 
             // Restart background OCR for the modified image
-            cancelImageOcr(imageIndex);
-            queueBackgroundOcr(imageIndex);
+            BgOcr.cancel(imageIndex);
+            BgOcr.queue(imageIndex);
         }
 
         /**
@@ -1033,8 +1033,8 @@
 
                 if (btn) btn.classList.remove('active');
                 logger.success(`B&W undone for image #${imageIndex + 1}`);
-                cancelImageOcr(imageIndex);
-                queueBackgroundOcr(imageIndex);
+                BgOcr.cancel(imageIndex);
+                BgOcr.queue(imageIndex);
                 return;
             }
 
@@ -1066,8 +1066,8 @@
             if (btn) btn.classList.add('active');
             logger.success(`B&W applied to image #${imageIndex + 1}`);
 
-            cancelImageOcr(imageIndex);
-            queueBackgroundOcr(imageIndex);
+            BgOcr.cancel(imageIndex);
+            BgOcr.queue(imageIndex);
         }
 
         // ============ Remote Transform Replay ============
@@ -1156,8 +1156,8 @@
                 showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
 
                 // Restart OCR
-                cancelImageOcr(replaceIdx);
-                queueBackgroundOcr(replaceIdx);
+                BgOcr.cancel(replaceIdx);
+                BgOcr.queue(replaceIdx);
 
             } catch (e) {
                 logger.error(`transform-image failed: ${e.message}`);
@@ -1205,7 +1205,7 @@
                 }
             }
             // Cancel any pending background OCR
-            cancelImageOcr(imageIndex);
+            BgOcr.cancel(imageIndex);
             // Remove from owning collection
             Collections.removeImageFromOwningCollection(receivedImages[imageIndex]);
             receivedImages[imageIndex] = null;
@@ -1649,259 +1649,6 @@
             })();
         }
 
-        // ============ Background OCR ============
-
-        // Per-image promise that resolves once the queue has settled OCR for it
-        // (success, failure, skip, or cancel — never rejects). Lets exporters
-        // await OCR completion event-driven instead of polling ocrPageData.
-        function ensureOcrPromise(img) {
-            if (img._resolveOcr) return;
-            img.pendingOcr = new Promise(resolve => { img._resolveOcr = resolve; });
-        }
-        function settleOcrPromise(img) {
-            if (!img) return;
-            const r = img._resolveOcr;
-            img._resolveOcr = null;
-            img.pendingOcr = null;
-            if (r) r();
-        }
-
-        /**
-         * Queue an image for background OCR processing.
-         * Only queues images (not PDFs or other file types).
-         */
-        function queueBackgroundOcr(imageIndex) {
-            const img = receivedImages[imageIndex];
-            if (!img || img.fileType !== 'image') return;
-            img.ocrPageData = null; // reset any previous result
-            ensureOcrPromise(img);
-            if (!ocrQueue.includes(imageIndex)) {
-                ocrQueue.push(imageIndex);
-                logger.info(`[BG-OCR] Queued image #${imageIndex + 1} (queue length: ${ocrQueue.length})`);
-            }
-            updateOcrBadge(imageIndex);
-            processOcrQueue();
-        }
-
-        /**
-         * Cancel background OCR for a specific image (e.g. when replaced or discarded).
-         */
-        function cancelImageOcr(imageIndex) {
-            const wasQueued = ocrQueue.includes(imageIndex);
-            const wasProcessing = currentOcrIndex === imageIndex;
-            // Remove from queue if pending
-            ocrQueue = ocrQueue.filter(i => i !== imageIndex);
-            // Abort if currently processing
-            if (wasProcessing) {
-                bgOcrAbortController?.abort();
-            }
-            const img = receivedImages[imageIndex];
-            const hadCachedData = img && img.ocrPageData;
-            if (img) img.ocrPageData = null;
-            settleOcrPromise(img);
-            updateOcrBadge(imageIndex);
-            if (wasQueued || wasProcessing || hadCachedData) {
-                logger.info(`[BG-OCR] Cancelled OCR for image #${imageIndex + 1} (was: ${wasProcessing ? 'processing' : wasQueued ? 'queued' : 'cached'})`);
-            }
-        }
-
-        /**
-         * Update the OCR status badge on an image card.
-         */
-        function updateOcrBadge(imageIndex) {
-            const card = document.querySelector(`.received-image-item[data-image-index="${imageIndex}"]`);
-            if (!card) return;
-            let badge = card.querySelector('.ocr-badge');
-            const img = receivedImages[imageIndex];
-            if (!img || img.fileType !== 'image') {
-                if (badge) badge.remove();
-                return;
-            }
-            if (!badge) {
-                badge = document.createElement('span');
-                badge.className = 'ocr-badge';
-                badge.style.cssText = 'position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.6); color: #fff; font-size: 0.75em; padding: 2px 7px; border-radius: 4px; pointer-events: none;';
-                const thumbContainer = card.querySelector('.image-thumb-container');
-                if (thumbContainer) thumbContainer.appendChild(badge);
-            }
-            if (img.ocrPageData) {
-                badge.textContent = 'OCR ✓';
-                badge.style.background = 'rgba(46,125,50,0.75)';
-            } else if (currentOcrIndex === imageIndex) {
-                badge.textContent = 'OCR…';
-                badge.style.background = 'rgba(21,101,192,0.75)';
-            } else if (ocrQueue.includes(imageIndex)) {
-                badge.textContent = 'OCR ⏳';
-                badge.style.background = 'rgba(0,0,0,0.6)';
-            } else {
-                badge.remove();
-            }
-        }
-
-        /**
-         * Downscale a single image for OCR (max 2000px on longest side).
-         * Returns a Promise<File> suitable for scribe.importFiles().
-         * Returns null if the image has been discarded or is invalid.
-         */
-        async function downscaleForOcr(idx) {
-            const img = receivedImages[idx];
-            if (!img || img.fileType !== 'image') return null;
-            const OCR_MAX_PX = 2000;
-            const blob = new Blob([img.data], { type: img.mimeType });
-            const bmp = await createImageBitmap(blob);
-            const { width, height } = bmp;
-            const longest = Math.max(width, height);
-            if (longest <= OCR_MAX_PX) {
-                bmp.close();
-                return new File([blob], img.name || 'image.jpg', { type: img.mimeType });
-            }
-            const scale = OCR_MAX_PX / longest;
-            const nw = Math.round(width * scale);
-            const nh = Math.round(height * scale);
-            const cv = new OffscreenCanvas(nw, nh);
-            const ctx = cv.getContext('2d');
-            ctx.drawImage(bmp, 0, 0, nw, nh);
-            bmp.close();
-            const scaledBlob = await cv.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
-            return new File([scaledBlob], img.name || 'image.jpg', { type: 'image/jpeg' });
-        }
-
-        /**
-         * Process the background OCR queue one image at a time.
-         * Downscaling of the next image is pipelined concurrently with the
-         * current recognize() call (createImageBitmap / OffscreenCanvas run
-         * off the main thread, so this is genuine parallelism).
-         */
-        async function processOcrQueue() {
-            if (ocrProcessing) return;
-            ocrProcessing = true;
-            logger.info(`[BG-OCR] Queue processing started (${ocrQueue.length} item(s))`);
-
-            // Map: imageIndex -> Promise<File|null> for pre-downscaled images
-            const pendingDownscale = new Map();
-
-            // Pre-start downscaling the first queued image immediately
-            if (ocrQueue.length > 0) {
-                const firstIdx = ocrQueue[0];
-                pendingDownscale.set(firstIdx, downscaleForOcr(firstIdx));
-            }
-
-            try {
-                while (ocrQueue.length > 0) {
-                    const idx = ocrQueue.shift();
-
-                    // Pre-start downscaling the next image in queue right away
-                    if (ocrQueue.length > 0) {
-                        const nextIdx = ocrQueue[0];
-                        if (!pendingDownscale.has(nextIdx)) {
-                            pendingDownscale.set(nextIdx, downscaleForOcr(nextIdx));
-                        }
-                    }
-
-                    const img = receivedImages[idx];
-                    if (!img || img.fileType !== 'image') {
-                        logger.info(`[BG-OCR] Skipping image #${idx + 1}: ${!img ? 'null/discarded' : 'not an image (type=' + img.fileType + ')'}`);
-                        pendingDownscale.delete(idx);
-                        settleOcrPromise(img);
-                        continue;
-                    }
-                    if (img.ocrPageData) {
-                        logger.info(`[BG-OCR] Skipping image #${idx + 1}: already has cached OCR data`);
-                        pendingDownscale.delete(idx);
-                        settleOcrPromise(img);
-                        continue;
-                    }
-
-                    currentOcrIndex = idx;
-                    bgOcrAbortController = new AbortController();
-                    updateOcrBadge(idx);
-                    logger.info(`[BG-OCR] Starting OCR for image #${idx + 1} (${ocrQueue.length} remaining in queue)`);
-
-                    try {
-                        // Get or init scribe handle
-                        if (!bgOcrScribe || !bgOcrScribe.isAlive) {
-                            if (scribePreloaded) {
-                                bgOcrScribe = await scribePreloaded;
-                                scribePreloaded = null; // take ownership
-                            }
-                            if (!bgOcrScribe || !bgOcrScribe.isAlive) {
-                                bgOcrScribe = await window.ScribeHandle.create();
-                            }
-                        }
-
-                        if (bgOcrAbortController.signal.aborted) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); pendingDownscale.delete(idx); continue; }
-
-                        // Retrieve pre-downscaled file (already running in parallel) or downscale now
-                        const ocrFile = pendingDownscale.has(idx)
-                            ? await pendingDownscale.get(idx)
-                            : await downscaleForOcr(idx);
-                        pendingDownscale.delete(idx);
-
-                        if (!ocrFile) { logger.info(`[BG-OCR] Skipping image #${idx + 1}: discarded during downscale`); continue; }
-
-                        if (bgOcrAbortController.signal.aborted) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
-
-                        await bgOcrScribe.importFiles([ocrFile]);
-
-                        if (bgOcrAbortController.signal.aborted) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
-
-                        // Pre-start downscaling the next image while recognize() runs
-                        // (createImageBitmap / OffscreenCanvas are truly async — off-thread)
-                        if (ocrQueue.length > 0) {
-                            const nextIdx = ocrQueue[0];
-                            if (!pendingDownscale.has(nextIdx)) {
-                                pendingDownscale.set(nextIdx, downscaleForOcr(nextIdx));
-                                logger.info(`[BG-OCR] Pre-downscaling image #${nextIdx + 1} while recognizing #${idx + 1}`);
-                            }
-                        }
-
-                        const ocrLangs = window.__wsConfig?.ocrLangs || ['eng', 'fra'];
-                        const ocrPsm = window.__wsConfig?.ocrPsm || '12';
-                        await bgOcrScribe.recognize({ langs: ocrLangs, modeAdv: 'lstm', config: { tessedit_pageseg_mode: ocrPsm } });
-
-                        if (bgOcrAbortController.signal.aborted) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
-
-                        // Clone OCR result data — use structuredClone to handle circular refs
-                        const pageData = bgOcrScribe.data.ocr.active[0];
-                        const metrics = bgOcrScribe.data.pageMetrics[0];
-                        const clonedPage = structuredClone(pageData);
-                        const clonedMetrics = structuredClone(metrics);
-
-                        // Store on the image object
-                        img.ocrPageData = { page: clonedPage, metrics: clonedMetrics };
-
-                        logger.success(`[BG-OCR] Completed for image #${idx + 1}`);
-
-                        // Reset scribe state for next image (drops handle if scribe only supports terminate)
-                        const stillAlive = await bgOcrScribe.reset();
-                        if (!stillAlive) bgOcrScribe = null;
-                    } catch (e) {
-                        if (bgOcrAbortController.signal.aborted) {
-                            logger.info(`[BG-OCR] Aborted for image #${idx + 1} (edit/discard/replace)`);
-                        } else {
-                            logger.warn(`[BG-OCR] Failed for image #${idx + 1}: ${e.message} — will fall back to on-demand OCR at export`);
-                        }
-                        // Try to reset scribe for next image
-                        try {
-                            if (bgOcrScribe) {
-                                const stillAlive = await bgOcrScribe.reset();
-                                if (!stillAlive) bgOcrScribe = null;
-                            }
-                        } catch (_) { bgOcrScribe = null; }
-                    } finally {
-                        currentOcrIndex = null;
-                        bgOcrAbortController = null;
-                        // Resolve waiters whether OCR succeeded, failed, or aborted.
-                        // ocrPageData reflects the outcome; consumers check it.
-                        settleOcrPromise(receivedImages[idx]);
-                        updateOcrBadge(idx);
-                    }
-                }
-            } finally {
-                ocrProcessing = false;
-                logger.info('[BG-OCR] Queue processing finished');
-            }
-        }
 
         /**
          * Generate a searchable PDF using scribe.js OCR.
@@ -2067,11 +1814,9 @@
         // Pick the best available scribe handle for an export (in order of preference:
         // reuse the bg-OCR scribe if idle, the preloaded one, else create fresh).
         async function acquireScribeForExport() {
-            let scribe;
-            if (bgOcrScribe && bgOcrScribe.isAlive && !ocrProcessing) {
+            let scribe = BgOcr.takeScribeIfIdle();
+            if (scribe) {
                 logger.info('Reusing background OCR scribe instance');
-                scribe = bgOcrScribe;
-                bgOcrScribe = null;
             } else if (scribePreloaded) {
                 logger.info('Using preloaded scribe instance');
                 scribe = await scribePreloaded;
@@ -2131,9 +1876,9 @@
                 if (!allCached) {
                     for (const img of needsOcr) {
                         const idx = receivedImages.indexOf(img);
-                        if (idx !== -1 && !ocrQueue.includes(idx) && currentOcrIndex !== idx) {
+                        if (idx !== -1 && !BgOcr.isQueued(idx) && !BgOcr.isProcessing(idx)) {
                             logger.info(`Queuing image #${idx + 1} for background OCR (was not in queue)`);
-                            queueBackgroundOcr(idx);
+                            BgOcr.queue(idx);
                         }
                     }
                     progressInterval = setInterval(() => {
@@ -2477,8 +2222,8 @@
                     if (imgEl) imgEl.src = newUrl;
                     if (dlEl) dlEl.href = newUrl;
 
-                    cancelImageOcr(imageIndex);
-                    queueBackgroundOcr(imageIndex);
+                    BgOcr.cancel(imageIndex);
+                    BgOcr.queue(imageIndex);
 
                     logger.success(`Cropped image: ${dstW}x${dstH}px`);
                 }

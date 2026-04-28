@@ -99,6 +99,14 @@ WebSend/
         │   │               #   that hide the clear-vs-terminate API fork. Receive.html
         │   │               #   uses it for preloaded, background-queue, and per-export
         │   │               #   scribe lifecycles
+        │   ├── bg-ocr.js   # Background OCR queue for the receive page. Walks
+        │   │               #   receivedImages one at a time, downscales to <=2000px,
+        │   │               #   runs scribe.js OCR, caches the page data on the image
+        │   │               #   for later cached-assembly into a searchable PDF. Renders
+        │   │               #   the OCR ⏳ / OCR… / OCR ✓ status badge on each card.
+        │   │               #   Each queued image gets img.pendingOcr awaited by exporters.
+        │   │               #   Exposes window.BgOcr (queue/cancel/waitFor/refreshBadge/
+        │   │               #   isQueued/isProcessing/takeScribeIfIdle/reset)
         │   ├── peer-ui.js  # Shared sidebar helpers (loadEruda, onConnectionTypeDetected,
         │   │               #   showVerifiedInSidebar) used identically by send.html and
         │   │               #   receive.html. Exposes window.PeerUI
