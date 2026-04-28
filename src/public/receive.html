@@ -2256,6 +2256,21 @@
 
         // ============ Background OCR ============
 
+        // Per-image promise that resolves once the queue has settled OCR for it
+        // (success, failure, skip, or cancel — never rejects). Lets exporters
+        // await OCR completion event-driven instead of polling ocrPageData.
+        function ensureOcrPromise(img) {
+            if (img._resolveOcr) return;
+            img.pendingOcr = new Promise(resolve => { img._resolveOcr = resolve; });
+        }
+        function settleOcrPromise(img) {
+            if (!img) return;
+            const r = img._resolveOcr;
+            img._resolveOcr = null;
+            img.pendingOcr = null;
+            if (r) r();
+        }
+
         /**
          * Queue an image for background OCR processing.
          * Only queues images (not PDFs or other file types).
@@ -2264,6 +2279,7 @@
             const img = receivedImages[imageIndex];
             if (!img || img.fileType !== 'image') return;
             img.ocrPageData = null; // reset any previous result
+            ensureOcrPromise(img);
             if (!ocrQueue.includes(imageIndex)) {
                 ocrQueue.push(imageIndex);
                 logger.info(`[BG-OCR] Queued image #${imageIndex + 1} (queue length: ${ocrQueue.length})`);
@@ -2287,6 +2303,7 @@
             const img = receivedImages[imageIndex];
             const hadCachedData = img && img.ocrPageData;
             if (img) img.ocrPageData = null;
+            settleOcrPromise(img);
             updateOcrBadge(imageIndex);
             if (wasQueued || wasProcessing || hadCachedData) {
                 logger.info(`[BG-OCR] Cancelled OCR for image #${imageIndex + 1} (was: ${wasProcessing ? 'processing' : wasQueued ? 'queued' : 'cached'})`);
@@ -2390,11 +2407,13 @@
                     if (!img || img.fileType !== 'image') {
                         logger.info(`[BG-OCR] Skipping image #${idx + 1}: ${!img ? 'null/discarded' : 'not an image (type=' + img.fileType + ')'}`);
                         pendingDownscale.delete(idx);
+                        settleOcrPromise(img);
                         continue;
                     }
                     if (img.ocrPageData) {
                         logger.info(`[BG-OCR] Skipping image #${idx + 1}: already has cached OCR data`);
                         pendingDownscale.delete(idx);
+                        settleOcrPromise(img);
                         continue;
                     }
 
@@ -2477,6 +2496,9 @@
                     } finally {
                         currentOcrIndex = null;
                         bgOcrAbortController = null;
+                        // Resolve waiters whether OCR succeeded, failed, or aborted.
+                        // ocrPageData reflects the outcome; consumers check it.
+                        settleOcrPromise(receivedImages[idx]);
                         updateOcrBadge(idx);
                     }
                 }
@@ -2603,6 +2625,70 @@
             };
         }
 
+        // Build original-quality File[] for the active images, optionally B&W.
+        async function buildOrigFiles(activeImages, { bw }) {
+            return Promise.all(activeImages.map(async (img, i) => {
+                const blob = bw
+                    ? await toBWPng(img.data, img.mimeType)
+                    : new Blob([img.data], { type: img.mimeType });
+                return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
+            }));
+        }
+
+        // Splice cached OCR pages onto a scribe that's already imported origFiles.
+        // Throws if any image lacks cached data — caller falls back to full OCR.
+        async function applyCachedOcrToScribe(scribe, origFiles, activeImages) {
+            const ImageCache = scribe.data.image;
+            const pageMetrics = scribe.data.pageMetrics;
+            for (let i = 0; i < activeImages.length; i++) {
+                const cached = activeImages[i].ocrPageData;
+                if (!cached || !cached.page) {
+                    throw new Error(`Missing cached OCR data for image ${i + 1}`);
+                }
+                // Deep clone so we don't mutate the cache when scaling
+                const cachedPage = structuredClone(cached.page);
+                const cachedMetrics = structuredClone(cached.metrics);
+
+                const origBmp = await createImageBitmap(origFiles[i]);
+                const origW = origBmp.width;
+                const origH = origBmp.height;
+                origBmp.close();
+
+                window.OcrRescale.rescaleOcrPage(cachedPage, cachedMetrics, origW, origH);
+
+                scribe.data.ocr.active[i] = cachedPage;
+                pageMetrics[i].dims.width = origW;
+                pageMetrics[i].dims.height = origH;
+
+                const reader = new FileReader();
+                const origBase64 = await new Promise((resolve) => {
+                    reader.onload = () => resolve(reader.result);
+                    reader.readAsDataURL(origFiles[i]);
+                });
+                ImageCache.nativeSrc[i] = Promise.resolve({ src: origBase64, n: i, type: 'native', rotated: false, binarized: false });
+            }
+        }
+
+        // Pick the best available scribe handle for an export (in order of preference:
+        // reuse the bg-OCR scribe if idle, the preloaded one, else create fresh).
+        async function acquireScribeForExport() {
+            let scribe;
+            if (bgOcrScribe && bgOcrScribe.isAlive && !ocrProcessing) {
+                logger.info('Reusing background OCR scribe instance');
+                scribe = bgOcrScribe;
+                bgOcrScribe = null;
+            } else if (scribePreloaded) {
+                logger.info('Using preloaded scribe instance');
+                scribe = await scribePreloaded;
+                scribePreloaded = null;
+            }
+            if (!scribe || !scribe.isAlive) {
+                logger.info('Initializing new scribe instance for PDF assembly');
+                scribe = await window.ScribeHandle.create();
+            }
+            return scribe;
+        }
+
         async function generateOcrPdf() {
             logger.info('=== OCR PDF export started ===');
             const exportAbort = new AbortController();
@@ -2619,235 +2705,133 @@
                 return;
             }
 
-            // Check how many images still need OCR
-            const cachedCount = activeImages.filter(img => img.ocrPageData).length;
+            const imageCount = activeImages.length;
             const needsOcr = activeImages.filter(img => !img.ocrPageData);
             const allCached = needsOcr.length === 0;
-            logger.info(`Selected ${activeImages.length} images: ${cachedCount} cached, ${needsOcr.length} pending`);
+            logger.info(`Selected ${imageCount} images: ${imageCount - needsOcr.length} cached, ${needsOcr.length} pending`);
 
-            if (allCached) {
-                logger.info('All OCR results cached — will assemble PDF from cache');
-                btn.textContent = i18n.t('receive.ocrProcessing', { count: activeImages.length });
-                btn.disabled = true;
-            } else {
-                logger.info(`Waiting for background OCR to finish ${needsOcr.length} remaining images`);
+            const showCancelButton = () => {
                 btn.disabled = false;
                 btn.style.background = '#c62828';
                 btn.textContent = i18n.t('receive.ocrCancel');
                 btn.onclick = () => { exportAbort.abort(); };
+            };
+            if (allCached) {
+                btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
+                btn.disabled = true;
+            } else {
+                showCancelButton();
             }
 
-            const imageCount = activeImages.length;
-            const timeoutMs = imageCount * 3 * 60000; // 3 min per image
             const timeoutMinutes = imageCount * 3;
+            const timeoutId = setTimeout(() => exportAbort.abort(new Error('OCR_TIMEOUT')), timeoutMinutes * 60000);
+            let progressInterval;
 
-            // Timeout guard
-            let timeoutId;
-            const timeoutPromise = new Promise((_, reject) => {
-                timeoutId = setTimeout(() => reject(new Error('OCR_TIMEOUT')), timeoutMs);
-            });
-
-            // Cancel guard — event-based, no polling
-            const cancelPromise = new Promise((_, reject) => {
-                if (signal.aborted) return reject(new DOMException('cancelled', 'AbortError'));
-                signal.addEventListener('abort',
-                    () => reject(new DOMException('cancelled', 'AbortError')),
-                    { once: true });
-            });
-
-            // Prevent browser from throttling this tab
             const keepalive = makeKeepAlive();
             keepalive.start();
 
+            let scribe;
             try {
-                const ocrWork = (async () => {
-                    // If not all cached, wait for background OCR to finish
-                    if (!allCached) {
-                        // Ensure uncached images are in the queue
-                        for (const img of needsOcr) {
-                            const idx = receivedImages.indexOf(img);
-                            if (idx !== -1 && !ocrQueue.includes(idx) && currentOcrIndex !== idx) {
-                                logger.info(`Queuing image #${idx + 1} for background OCR (was not in queue)`);
-                                queueBackgroundOcr(idx);
-                            }
+                // Queue any uncached images and await their per-image promises.
+                if (!allCached) {
+                    for (const img of needsOcr) {
+                        const idx = receivedImages.indexOf(img);
+                        if (idx !== -1 && !ocrQueue.includes(idx) && currentOcrIndex !== idx) {
+                            logger.info(`Queuing image #${idx + 1} for background OCR (was not in queue)`);
+                            queueBackgroundOcr(idx);
                         }
-                        // Poll until all are done or cancelled
-                        logger.info('Polling for background OCR completion...');
-                        await new Promise((resolve, reject) => {
-                            if (signal.aborted) return reject(new DOMException('cancelled', 'AbortError'));
-                            const onAbort = () => reject(new DOMException('cancelled', 'AbortError'));
-                            signal.addEventListener('abort', onAbort, { once: true });
-                            const poll = () => {
-                                if (signal.aborted) return; // abort listener will reject
-                                const stillPending = activeImages.filter(img => !img.ocrPageData).length;
-                                if (stillPending === 0) {
-                                    signal.removeEventListener('abort', onAbort);
-                                    logger.info('All background OCR completed');
-                                    return resolve();
-                                }
-                                btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount }) + ` (${imageCount - stillPending}/${imageCount})`;
-                                setTimeout(poll, 500);
-                            };
-                            poll();
-                        });
                     }
-
-                    signal.throwIfAborted();
-
-                    // --- Try assembling from cached OCR data ---
-                    logger.info('Assembling PDF from cached OCR data...');
-                    btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
-
-                    // Get a scribe handle for PDF assembly
-                    let scribe;
-                    if (bgOcrScribe && bgOcrScribe.isAlive && !ocrProcessing) {
-                        logger.info('Reusing background OCR scribe instance');
-                        scribe = bgOcrScribe;
-                        bgOcrScribe = null;
-                    } else if (scribePreloaded) {
-                        logger.info('Using preloaded scribe instance');
-                        scribe = await scribePreloaded;
-                        scribePreloaded = null;
-                    }
-                    if (!scribe || !scribe.isAlive) {
-                        logger.info('Initializing new scribe instance for PDF assembly');
-                        scribe = await window.ScribeHandle.create();
-                    }
-
-                    signal.throwIfAborted();
-
-                    try {
-                        // Attempt cached assembly
-                        const bw = isToggleActive('export-bw');
-                        const origFiles = await Promise.all(activeImages.map(async (img, i) => {
-                            let blob;
-                            if (bw) {
-                                blob = await toBWPng(img.data, img.mimeType);
-                            } else {
-                                blob = new Blob([img.data], { type: img.mimeType });
-                            }
-                            return new File([blob], img.name || `image_${i}.jpg`, { type: blob.type });
-                        }));
-
-                        logger.info('Importing ' + origFiles.length + ' original images into scribe');
-                        await scribe.importFiles(origFiles);
-
-                        signal.throwIfAborted();
-
-                        // Set cached OCR data on scribe's internal state (skip recognize)
-                        const ImageCache = scribe.data.image;
-                        const pageMetrics = scribe.data.pageMetrics;
-                        for (let i = 0; i < activeImages.length; i++) {
-                            const cached = activeImages[i].ocrPageData;
-                            if (!cached || !cached.page) {
-                                throw new Error(`Missing cached OCR data for image ${i + 1}`);
-                            }
-                            // Deep clone so we don't mutate the cache when scaling
-                            const cachedPage = structuredClone(cached.page);
-                            const cachedMetrics = structuredClone(cached.metrics);
-
-                            const origBmp = await createImageBitmap(origFiles[i]);
-                            const origW = origBmp.width;
-                            const origH = origBmp.height;
-                            origBmp.close();
-
-                            // Scale OCR coordinates from downscaled dims to original dims
-                            window.OcrRescale.rescaleOcrPage(cachedPage, cachedMetrics, origW, origH);
-
-                            scribe.data.ocr.active[i] = cachedPage;
-                            pageMetrics[i].dims.width = origW;
-                            pageMetrics[i].dims.height = origH;
-
-                            // Swap nativeSrc to original-quality image
-                            const reader = new FileReader();
-                            const origBase64 = await new Promise((resolve) => {
-                                reader.onload = () => resolve(reader.result);
-                                reader.readAsDataURL(origFiles[i]);
-                            });
-                            const origWrapper = { src: origBase64, n: i, type: 'native', rotated: false, binarized: false };
-                            ImageCache.nativeSrc[i] = Promise.resolve(origWrapper);
+                    progressInterval = setInterval(() => {
+                        const remaining = activeImages.filter(img => !img.ocrPageData).length;
+                        if (remaining > 0) {
+                            btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount }) + ` (${imageCount - remaining}/${imageCount})`;
                         }
-
-                        logger.info('Exporting PDF from cached OCR data');
-                        const pdfResult = await scribe.exportData('pdf');
-                        logger.success('PDF assembled from cached OCR data successfully');
-
-                        await scribe.dispose();
-                        scribePreloaded = null;
-                        return pdfResult;
-
-                    } catch (cacheErr) {
-                        if (cacheErr.name === 'AbortError') throw cacheErr;
-
-                        // --- Cached assembly failed — fall back to full on-demand OCR ---
-                        logger.warn('Cached OCR assembly failed: ' + cacheErr.message + ' — falling back to full on-demand OCR');
-                        showToast('Cached OCR failed, running full OCR...', { type: 'warn' });
-
-                        // Reset scribe for a clean run
-                        try {
-                            const stillAlive = await scribe.reset();
-                            if (!stillAlive) scribe = null;
-                        } catch (_) { scribe = null; }
-
-                        if (!scribe || !scribe.isAlive) {
-                            logger.info('[OCR fallback] Re-initializing scribe after cache failure');
-                            scribe = await window.ScribeHandle.create();
-                        }
-
-                        btn.disabled = false;
-                        btn.style.background = '#c62828';
-                        btn.textContent = i18n.t('receive.ocrCancel');
-                        btn.onclick = () => { exportAbort.abort(); };
-
-                        const pdfResult = await ocrRecognizeAndExport(scribe, activeImages, btn, signal);
-                        logger.success('[OCR fallback] PDF generated successfully via on-demand OCR');
-
-                        await scribe.dispose();
-                        scribePreloaded = null;
-                        return pdfResult;
-                    }
-                })();
-
-                const pdfResult = await Promise.race([ocrWork, timeoutPromise, cancelPromise]);
-                clearTimeout(timeoutId);
-
-                let pdfBlob;
-                if (pdfResult instanceof Blob) {
-                    pdfBlob = pdfResult;
-                } else if (pdfResult instanceof ArrayBuffer || pdfResult instanceof Uint8Array) {
-                    pdfBlob = new Blob([pdfResult], { type: 'application/pdf' });
-                } else {
-                    pdfBlob = new Blob([pdfResult], { type: 'application/pdf' });
+                    }, 500);
+                    logger.info('Awaiting background OCR completion...');
+                    await Promise.race([
+                        Promise.all(activeImages.map(img => img.pendingOcr || Promise.resolve())),
+                        new Promise((_, reject) => {
+                            if (signal.aborted) return reject(signal.reason || new DOMException('cancelled', 'AbortError'));
+                            signal.addEventListener('abort', () => reject(signal.reason || new DOMException('cancelled', 'AbortError')), { once: true });
+                        }),
+                    ]);
+                    clearInterval(progressInterval);
+                    progressInterval = null;
+                    logger.info('Background OCR settled for all selected images');
                 }
 
+                signal.throwIfAborted();
+                btn.textContent = i18n.t('receive.ocrProcessing', { count: imageCount });
+
+                const bw = isToggleActive('export-bw');
+                const origFiles = await buildOrigFiles(activeImages, { bw });
+                scribe = await acquireScribeForExport();
+                signal.throwIfAborted();
+
+                logger.info('Importing ' + origFiles.length + ' original images into scribe');
+                await scribe.importFiles(origFiles);
+                signal.throwIfAborted();
+
+                let pdfResult;
+                try {
+                    logger.info('Assembling PDF from cached OCR data...');
+                    await applyCachedOcrToScribe(scribe, origFiles, activeImages);
+                    logger.info('Exporting PDF from cached OCR data');
+                    pdfResult = await scribe.exportData('pdf');
+                    logger.success('PDF assembled from cached OCR data successfully');
+                } catch (cacheErr) {
+                    if (cacheErr.name === 'AbortError') throw cacheErr;
+                    logger.warn('Cached OCR assembly failed: ' + cacheErr.message + ' — falling back to full on-demand OCR');
+                    showToast('Cached OCR failed, running full OCR...', { type: 'warn' });
+
+                    try {
+                        const stillAlive = await scribe.reset();
+                        if (!stillAlive) scribe = null;
+                    } catch (_) { scribe = null; }
+                    if (!scribe || !scribe.isAlive) {
+                        logger.info('[OCR fallback] Re-initializing scribe after cache failure');
+                        scribe = await window.ScribeHandle.create();
+                    }
+                    showCancelButton();
+
+                    pdfResult = await ocrRecognizeAndExport(scribe, activeImages, btn, signal);
+                    logger.success('[OCR fallback] PDF generated successfully via on-demand OCR');
+                }
+
+                const pdfBlob = pdfResult instanceof Blob
+                    ? pdfResult
+                    : new Blob([pdfResult], { type: 'application/pdf' });
                 const url = URL.createObjectURL(pdfBlob);
                 const a = document.createElement('a');
                 a.href = url;
-                const datePart = formatDateForFilename();
-                a.download = `${getExportPrefix()}_ocr_${datePart}.pdf`;
+                a.download = `${getExportPrefix()}_ocr_${formatDateForFilename()}.pdf`;
                 a.click();
                 URL.revokeObjectURL(url);
 
                 logger.success('=== OCR PDF downloaded successfully ===');
             } catch (e) {
-                clearTimeout(timeoutId);
-                if (e.name === 'AbortError') {
+                const isTimeout = signal.reason && signal.reason.message === 'OCR_TIMEOUT';
+                if (isTimeout) {
+                    logger.error(`OCR timed out after ${timeoutMinutes} min`);
+                    showToast(i18n.t('receive.ocrTimeout', { minutes: timeoutMinutes }));
+                } else if (e.name === 'AbortError' || signal.aborted) {
                     logger.warn('OCR cancelled by user — falling back to plain PDF');
                     showToast(i18n.t('receive.ocrCancelledFallback'));
                     btn.style.background = '#1565c0';
                     btn.disabled = true;
                     await generatePlainPdf();
                     return;
-                } else if (e.message === 'OCR_TIMEOUT') {
-                    logger.error(`OCR timed out after ${timeoutMinutes} min`);
-                    showToast(i18n.t('receive.ocrTimeout', { minutes: timeoutMinutes }));
                 } else {
                     logger.error('OCR PDF generation failed: ' + e.message);
                     showToast(i18n.t('receive.ocrFailed', { error: e.message }));
                 }
             } finally {
-                exportAbort.abort(); // unblock any lingering listeners
+                clearTimeout(timeoutId);
+                if (progressInterval) clearInterval(progressInterval);
+                exportAbort.abort();
                 keepalive.stop();
+                try { if (scribe) await scribe.dispose(); } catch (_) {}
+                scribePreloaded = null;
                 btn.disabled = false;
                 btn.style.background = '#1565c0';
                 updateExportButton();
