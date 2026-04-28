@@ -3,7 +3,10 @@
  * Extracted from the inline scripts in receive.html and send.html to avoid
  * duplication and make the functions unit-testable.
  *
- * Exposes window.ImageTransforms = { applyOtsu, perspectiveTransform }
+ * Exposes window.ImageTransforms = {
+ *   applyOtsu, perspectiveTransform, distance,
+ *   rotateImage, flipImage, binarize, cropPerspective
+ * }
  */
 (function () {
 /**
@@ -203,5 +206,136 @@ function _bilinearSample(imgData, x, y) {
     };
 }
 
-window.ImageTransforms = { applyOtsu, perspectiveTransform, distance };
+// ---- canvas-pipeline helpers (blob → image → canvas → operate → bytes) ----
+
+/**
+ * Normalize input to a Blob. Accepts a Blob or {data, mimeType}.
+ */
+function _toBlob(input) {
+    if (input instanceof Blob) return input;
+    return new Blob([input.data], { type: input.mimeType });
+}
+
+/**
+ * Load input into an ImageBitmap. Caller is responsible for .close()ing it.
+ */
+async function _loadBitmap(input) {
+    return await createImageBitmap(_toBlob(input));
+}
+
+/**
+ * Encode a canvas to {data: Uint8Array, mimeType}.
+ */
+async function _canvasToBytes(canvas, mimeType, quality) {
+    const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob(b => b ? resolve(b) : reject(new Error('Canvas toBlob failed')), mimeType, quality);
+    });
+    const buf = await blob.arrayBuffer();
+    return { data: new Uint8Array(buf), mimeType };
+}
+
+/**
+ * Rotate by `degrees` (multiples of 90) and re-encode as JPEG @0.95.
+ * @param {Blob|{data,mimeType}} input
+ * @param {{degrees?: number}} [opts]
+ * @returns {Promise<{data: Uint8Array, mimeType: string}>}
+ */
+async function rotateImage(input, opts) {
+    const degrees = (opts && opts.degrees) || 90;
+    const bitmap = await _loadBitmap(input);
+    const canvas = document.createElement('canvas');
+    const swap = degrees % 180 !== 0;
+    canvas.width = swap ? bitmap.height : bitmap.width;
+    canvas.height = swap ? bitmap.width : bitmap.height;
+    const ctx = canvas.getContext('2d');
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate((degrees * Math.PI) / 180);
+    ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+    bitmap.close();
+    return _canvasToBytes(canvas, 'image/jpeg', 0.95);
+}
+
+/**
+ * Flip horizontally (axis: 'h') or vertically (axis: 'v'). JPEG @0.95.
+ */
+async function flipImage(input, opts) {
+    const axis = (opts && opts.axis) || 'h';
+    const bitmap = await _loadBitmap(input);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d');
+    if (axis === 'h') {
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+    } else {
+        ctx.translate(0, canvas.height);
+        ctx.scale(1, -1);
+    }
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    return _canvasToBytes(canvas, 'image/jpeg', 0.95);
+}
+
+/**
+ * Apply Otsu B&W binarization, output PNG (lossless after thresholding).
+ */
+async function binarize(input) {
+    const bitmap = await _loadBitmap(input);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    applyOtsu(imageData);
+    ctx.putImageData(imageData, 0, 0);
+    return _canvasToBytes(canvas, 'image/png');
+}
+
+/**
+ * Perspective-crop using normalized corner coordinates (each in [0,1]).
+ * Output dimensions are derived from the longer of the parallel edges.
+ * JPEG @0.92.
+ * @param {Blob|{data,mimeType}} input
+ * @param {{corners: {tl,tr,br,bl}}} opts - corners as {x,y} normalized to [0,1]
+ */
+async function cropPerspective(input, opts) {
+    // perspectiveTransform needs an HTMLImageElement (drawImage source for getImageData).
+    const blob = _toBlob(input);
+    const url = URL.createObjectURL(blob);
+    try {
+        const imgEl = await new Promise((resolve, reject) => {
+            const im = new Image();
+            im.onload = () => resolve(im);
+            im.onerror = () => reject(new Error('Image load failed'));
+            im.src = url;
+        });
+        const c = opts.corners;
+        const srcW = imgEl.width;
+        const srcH = imgEl.height;
+        const srcCorners = [
+            { x: c.tl.x * srcW, y: c.tl.y * srcH },
+            { x: c.tr.x * srcW, y: c.tr.y * srcH },
+            { x: c.br.x * srcW, y: c.br.y * srcH },
+            { x: c.bl.x * srcW, y: c.bl.y * srcH }
+        ];
+        const topW = distance(srcCorners[0], srcCorners[1]);
+        const botW = distance(srcCorners[3], srcCorners[2]);
+        const leftH = distance(srcCorners[0], srcCorners[3]);
+        const rightH = distance(srcCorners[1], srcCorners[2]);
+        const dstW = Math.round(Math.max(topW, botW));
+        const dstH = Math.round(Math.max(leftH, rightH));
+        const resultCanvas = perspectiveTransform(imgEl, srcCorners, dstW, dstH);
+        return _canvasToBytes(resultCanvas, 'image/jpeg', 0.92);
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
+
+window.ImageTransforms = {
+    applyOtsu, perspectiveTransform, distance,
+    rotateImage, flipImage, binarize, cropPerspective
+};
 })();

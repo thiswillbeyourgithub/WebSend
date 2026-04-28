@@ -40,7 +40,8 @@ const stubDocument = {
 };
 
 const win = await loadBrowserModule(modulePath, { document: stubDocument });
-const { applyOtsu, perspectiveTransform, distance } = win.ImageTransforms;
+const { applyOtsu, perspectiveTransform, distance,
+        rotateImage, flipImage, binarize, cropPerspective } = win.ImageTransforms;
 
 // ---- applyOtsu ----
 
@@ -87,4 +88,14 @@ test('distance: 5 for 3-4-5 right triangle', () => {
 test('distance: symmetric', () => {
     const a = { x: 1, y: 2 }, b = { x: 4, y: 6 };
     assert.equal(distance(a, b), distance(b, a));
+});
+
+// ---- new pipeline helpers: API-shape only ----
+// Deeper behavioral tests need a real canvas + createImageBitmap + Blob; covered by E2E.
+
+test('rotateImage / flipImage / binarize / cropPerspective are exported as functions', () => {
+    assert.equal(typeof rotateImage, 'function');
+    assert.equal(typeof flipImage, 'function');
+    assert.equal(typeof binarize, 'function');
+    assert.equal(typeof cropPerspective, 'function');
 });

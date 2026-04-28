@@ -293,7 +293,7 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/webrtc.js" integrity="sha384-EvTZLSb4ItLK3dL2FeIVgpu2EyTKLO+dcHvnUUOBei/gkPV4z7+nl2C6uULMv4i7"></script>
-    <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-531l7cDBCA5mQdwGDYQl9X2tKu9r4DBFqodsBxtyKt07W8NqGt/b0tc+PlI62j5Z"></script>
+    <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-KZL1G6hHUlqSP54O3kYuW9oJxJBOdB6ypb8mmOPatYZ4S0gyDlsFX4i0nc2bf5Xq"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
     <script>
@@ -1613,6 +1613,9 @@
             showStep(stepChoose);
         }
 
+        /** MIME → output file extension for stripped images. */
+        const MIME_TO_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
+
         /** Strip metadata from a single file and return a processed File, or null on failure.
          *  Non-image files are returned as-is (no metadata stripping possible). */
         async function stripFileMetadata(file) {
@@ -1634,7 +1637,8 @@
             try {
                 const rawData = new Uint8Array(await file.arrayBuffer());
                 const stripped = await stripImageMetadata(rawData, file.type);
-                const processed = new File([stripped.data], file.name.replace(/\.[^.]+$/, '.png'), {
+                const ext = MIME_TO_EXT[stripped.mimeType] || 'bin';
+                const processed = new File([stripped.data], file.name.replace(/\.[^.]+$/, '.' + ext), {
                     type: stripped.mimeType
                 });
                 logger.success(`Metadata stripped: ${file.name} ${file.size} → ${processed.size} bytes`);
@@ -1724,11 +1728,12 @@
          * into a canvas and re-encoding it therefore discards GPS coordinates, camera
          * model/serial, timestamps, author fields, and any other embedded metadata.
          *
-         * Output is always JPEG at quality 0.95, regardless of the input format.
+         * Output is always PNG, regardless of the input format. PNG is lossless
+         * and matches the format the receiver expects for stripped uploads.
          *
          * @param {Uint8Array} data - Raw bytes of the original image
          * @param {string} mimeType - MIME type of the original image
-         * @returns {Promise<{data: Uint8Array, mimeType: string}>} Metadata-free JPEG bytes
+         * @returns {Promise<{data: Uint8Array, mimeType: string}>} Metadata-free PNG bytes
          */
         function stripImageMetadata(data, mimeType) {
             return new Promise((resolve, reject) => {

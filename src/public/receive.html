@@ -151,7 +151,7 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/webrtc.js" integrity="sha384-EvTZLSb4ItLK3dL2FeIVgpu2EyTKLO+dcHvnUUOBei/gkPV4z7+nl2C6uULMv4i7"></script>
-    <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-531l7cDBCA5mQdwGDYQl9X2tKu9r4DBFqodsBxtyKt07W8NqGt/b0tc+PlI62j5Z"></script>
+    <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-KZL1G6hHUlqSP54O3kYuW9oJxJBOdB6ypb8mmOPatYZ4S0gyDlsFX4i0nc2bf5Xq"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
@@ -165,7 +165,8 @@
         initSidebar();
     </script>
     <script>
-        const { applyOtsu, perspectiveTransform, distance } = window.ImageTransforms;
+        const { applyOtsu, perspectiveTransform, distance,
+                rotateImage, flipImage, binarize, cropPerspective } = window.ImageTransforms;
         /**
          * Receive page logic
          * 1. Generate key pair
@@ -1284,20 +1285,9 @@
             const img = receivedImages[imageIndex];
             if (!img) return;
 
-            const bitmap = await createImageBitmap(new Blob([img.data], { type: img.mimeType }));
-            const canvas = document.createElement('canvas');
-            canvas.width = bitmap.height;
-            canvas.height = bitmap.width;
-            const ctx = canvas.getContext('2d');
-            ctx.translate(canvas.width / 2, canvas.height / 2);
-            ctx.rotate(Math.PI / 2);
-            ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
-            bitmap.close();
-
-            const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
-            const arrayBuf = await blob.arrayBuffer();
-            img.data = new Uint8Array(arrayBuf);
-            img.mimeType = 'image/jpeg';
+            const result = await rotateImage({ data: img.data, mimeType: img.mimeType }, { degrees: 90 });
+            img.data = result.data;
+            img.mimeType = result.mimeType;
 
             // Update display
             const displayImg = document.getElementById(`img-${imageIndex}`);
@@ -1364,22 +1354,9 @@
                 name: img.name
             };
 
-            const bitmap = await createImageBitmap(new Blob([img.data], { type: img.mimeType }));
-            const canvas = document.createElement('canvas');
-            canvas.width = bitmap.width;
-            canvas.height = bitmap.height;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(bitmap, 0, 0);
-            bitmap.close();
-
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            applyOtsu(imageData);
-            ctx.putImageData(imageData, 0, 0);
-
-            const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
-            const arrayBuf = await blob.arrayBuffer();
-            img.data = new Uint8Array(arrayBuf);
-            img.mimeType = 'image/png';
+            const result = await binarize({ data: img.data, mimeType: img.mimeType });
+            img.data = result.data;
+            img.mimeType = result.mimeType;
             img.name = img.name.replace(/\.[^.]+$/, '.png');
 
             // Update display
@@ -1413,82 +1390,13 @@
          * @returns {Promise<{data: Uint8Array, mimeType: string}>}
          */
         async function applyTransformToData(inputData, inputMimeType, transform) {
-            const bitmap = await createImageBitmap(new Blob([inputData], { type: inputMimeType }));
-            const canvas = document.createElement('canvas');
-            let ctx, blob;
-
-            if (transform.op === 'rotateCW') {
-                canvas.width = bitmap.height;
-                canvas.height = bitmap.width;
-                ctx = canvas.getContext('2d');
-                ctx.translate(canvas.width / 2, canvas.height / 2);
-                ctx.rotate(Math.PI / 2);
-                ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
-                bitmap.close();
-                blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
-                const arr = new Uint8Array(await blob.arrayBuffer());
-                return { data: arr, mimeType: 'image/jpeg' };
-
-            } else if (transform.op === 'flipH') {
-                canvas.width = bitmap.width;
-                canvas.height = bitmap.height;
-                ctx = canvas.getContext('2d');
-                ctx.translate(canvas.width, 0);
-                ctx.scale(-1, 1);
-                ctx.drawImage(bitmap, 0, 0);
-                bitmap.close();
-                blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
-                const arr = new Uint8Array(await blob.arrayBuffer());
-                return { data: arr, mimeType: 'image/jpeg' };
-
-            } else if (transform.op === 'bw') {
-                canvas.width = bitmap.width;
-                canvas.height = bitmap.height;
-                ctx = canvas.getContext('2d');
-                ctx.drawImage(bitmap, 0, 0);
-                bitmap.close();
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                applyOtsu(imageData);
-                ctx.putImageData(imageData, 0, 0);
-                blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
-                const arr = new Uint8Array(await blob.arrayBuffer());
-                return { data: arr, mimeType: 'image/png' };
-
-            } else if (transform.op === 'crop') {
-                // Need to load as Image for perspectiveTransform
-                bitmap.close();
-                const imgEl = new Image();
-                const imgUrl = URL.createObjectURL(new Blob([inputData], { type: inputMimeType }));
-                await new Promise((resolve, reject) => {
-                    imgEl.onload = resolve;
-                    imgEl.onerror = reject;
-                    imgEl.src = imgUrl;
-                });
-                URL.revokeObjectURL(imgUrl);
-
-                const c = transform.corners;
-                const srcW = imgEl.width;
-                const srcH = imgEl.height;
-                const srcCorners = [
-                    { x: c.tl.x * srcW, y: c.tl.y * srcH },
-                    { x: c.tr.x * srcW, y: c.tr.y * srcH },
-                    { x: c.br.x * srcW, y: c.br.y * srcH },
-                    { x: c.bl.x * srcW, y: c.bl.y * srcH }
-                ];
-                const topWidth = distance(srcCorners[0], srcCorners[1]);
-                const bottomWidth = distance(srcCorners[3], srcCorners[2]);
-                const leftHeight = distance(srcCorners[0], srcCorners[3]);
-                const rightHeight = distance(srcCorners[1], srcCorners[2]);
-                const dstW = Math.round(Math.max(topWidth, bottomWidth));
-                const dstH = Math.round(Math.max(leftHeight, rightHeight));
-                const resultCanvas = perspectiveTransform(imgEl, srcCorners, dstW, dstH);
-                blob = await new Promise(r => resultCanvas.toBlob(r, 'image/jpeg', 0.92));
-                const arr = new Uint8Array(await blob.arrayBuffer());
-                return { data: arr, mimeType: 'image/jpeg' };
-
-            } else {
-                bitmap.close();
-                throw new Error(`Unknown transform op: ${transform.op}`);
+            const input = { data: inputData, mimeType: inputMimeType };
+            switch (transform.op) {
+                case 'rotateCW': return rotateImage(input, { degrees: 90 });
+                case 'flipH':    return flipImage(input, { axis: 'h' });
+                case 'bw':       return binarize(input);
+                case 'crop':     return cropPerspective(input, { corners: transform.corners });
+                default: throw new Error(`Unknown transform op: ${transform.op}`);
             }
         }
 
@@ -2253,29 +2161,9 @@
          * Convert image data to a B&W PNG blob via Otsu binarization.
          * Used by ZIP export when B&W mode is enabled.
          */
-        function toBWPng(data, mimeType) {
-            return new Promise((resolve, reject) => {
-                const blob = new Blob([data], { type: mimeType });
-                const url = URL.createObjectURL(blob);
-                const img = new Image();
-                img.onload = () => {
-                    URL.revokeObjectURL(url);
-                    const canvas = document.createElement('canvas');
-                    canvas.width = img.width;
-                    canvas.height = img.height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0);
-                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                    applyOtsu(imageData);
-                    ctx.putImageData(imageData, 0, 0);
-                    canvas.toBlob(pngBlob => {
-                        if (!pngBlob) { reject(new Error('Canvas toBlob failed')); return; }
-                        resolve(pngBlob);
-                    }, 'image/png');
-                };
-                img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image load failed')); };
-                img.src = url;
-            });
+        async function toBWPng(data, mimeType) {
+            const result = await binarize({ data, mimeType });
+            return new Blob([result.data], { type: result.mimeType });
         }
 
         /**
