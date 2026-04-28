@@ -158,6 +158,7 @@
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-U3uN/GufXxFg7QEGmrhlFDEMRIVoVmWft0Xjs9iIXraKTxqmC5vnfj9aO1krfQmy"></script>
+    <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-Jsg+a3xnj4NcIcrrw1HtC9Nnkpz9lW1XvD739ArCQ2X3246EOrpez7hgvmFANsAw"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -201,58 +202,33 @@
         let bgOcrAbortController = null; // per-iteration AbortController for background OCR
         let bgOcrScribe = null; // reusable scribe instance for background OCR
 
-        // Collections: each batch from sender = one collection (displayed as "Document")
-        let collections = []; // [{id, name, images: [{data, mimeType, name}]}]
-        let nextCollectionId = 0;
-        let activeCollectionId = null; // id of the collection currently receiving images
-
-        /** Create a new collection for an incoming batch */
-        function createNewCollection() {
-            const now = new Date();
-            const pad = n => String(n).padStart(2, '0');
-            const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
-            const id = nextCollectionId++;
-            const name = `Document ${id + 1}`;
-            collections.push({ id, name, timeStr, images: [] });
-            activeCollectionId = id;
-            renderCollectionHeader(id, name, timeStr);
-            return id;
-        }
-
-        /** Get the active collection, creating one if needed (backwards compat) */
-        function getActiveCollection() {
-            if (activeCollectionId === null || !collections.find(c => c.id === activeCollectionId)) {
-                createNewCollection();
-            }
-            return collections.find(c => c.id === activeCollectionId);
-        }
-
-        /** Get collection by id */
-        function getCollection(id) {
-            return collections.find(c => c.id === id);
-        }
-
-        /** Get all non-null images across all collections, in collection order */
-        function getAllImages() {
-            const result = [];
-            for (const col of collections) {
-                for (const img of col.images) {
-                    if (img !== null) result.push(img);
-                }
-            }
-            return result;
-        }
-
-        /** Get total count of non-null images across all collections */
-        function getTotalImageCount() {
-            let count = 0;
-            for (const col of collections) {
-                for (const img of col.images) {
-                    if (img !== null) count++;
-                }
-            }
-            return count;
-        }
+        // Collection state and operations live in window.Collections (js/collections.js).
+        // Function declarations referenced in cardHandlers are hoisted within this
+        // script block, so they are available now even though they appear below.
+        Collections.attach({
+            receivedImagesRef: receivedImages,
+            mainContainer: document.getElementById('received-images'),
+            i18n: i18n,
+            onUpdateExportButton: () => updateExportButton(),
+            onSelectionChange: () => onSelectionChange(),
+            onOpenExportModal: (id) => openExportModalForCollection(id),
+            onCancelImageOcr: (idx) => cancelImageOcr(idx),
+            cardHandlers: {
+                onDiscardConfirm: (idx) => doDiscard(idx),
+                onDiscardCancel: (idx) => cancelDiscard(idx),
+                onSelectionChange: () => onSelectionChange(),
+                onToggleCardMenu: (e, idx) => toggleCardMenu(e, idx),
+                onCloseCardMenu: (idx) => closeCardMenu(idx),
+                onToggleSelectFromMenu: (idx) => toggleSelectFromMenu(idx),
+                onOpenLightbox: (idx) => openLightbox(idx),
+                onRotate: (idx) => rotateReceivedImage(idx),
+                onCrop: (idx) => openCropModal(idx),
+                onBW: (idx) => applyBWToImage(idx),
+                onDiscard: (idx) => discardImage(idx),
+                onPdfToImages: (idx) => exportPdfAsImages(idx),
+                onPdfToOcr: (idx) => exportPdfAsOcr(idx),
+            },
+        });
 
         // Re-acquire wake lock after the screen wakes up (browsers release it on hide)
         document.addEventListener('visibilitychange', async () => {
@@ -639,10 +615,9 @@
             for (let i = 0; i < receivedImages.length; i++) {
                 receivedImages[i] = null;
             }
-            receivedImages = [];
-            collections = [];
-            nextCollectionId = 0;
-            activeCollectionId = null;
+            // Clear in place to preserve the array reference held by Collections.
+            receivedImages.length = 0;
+            Collections.reset();
             // Close WebRTC connection
             if (rtc) {
                 rtc.receiveBuffer = [];
@@ -731,7 +706,7 @@
 
         function handleDeleteImage(msg) {
             logger.info('Received delete-image request for hash: ' + msg.hash);
-            deleteReceivedImageByHash(msg.hash);
+            Collections.deleteByHash(msg.hash);
         }
 
         function handleTransformImageMsg(msg) {
@@ -747,15 +722,15 @@
 
         function handleBatchStart(msg) {
             logger.info('Batch start received — creating new collection');
-            createNewCollection();
+            Collections.createNew();
         }
 
         function handleBatchStartIfNonempty(msg) {
             // Only create a new collection if the active one already has images
-            const active = collections.find(c => c.id === activeCollectionId);
+            const active = Collections.peekActive();
             if (active && active.images.length > 0) {
                 logger.info('Batch start (if-nonempty) received — active collection has images, creating new collection');
-                createNewCollection();
+                Collections.createNew();
             } else {
                 logger.info('Batch start (if-nonempty) received — active collection is empty, reusing it');
             }
@@ -875,23 +850,18 @@
                     receivedImages.push(imgObj);
 
                     // Also store in active collection
-                    const col = getActiveCollection();
+                    const col = Collections.getActive();
                     col.images.push(imgObj);
 
                     // For non-image files, use the original filename as the
                     // collection name instead of generic "Document N"
                     if (fileType !== 'image' && col.images.length === 1 && metadata.name) {
-                        col.name = metadata.name;
-                        const section = document.querySelector(`.collection-section[data-collection-id="${col.id}"]`);
-                        if (section) {
-                            const nameEl = section.querySelector('.collection-name');
-                            if (nameEl) nameEl.textContent = metadata.name;
-                        }
+                        Collections.setName(col.id, metadata.name);
                         logger.info(`Collection renamed to file name: ${metadata.name}`);
                     }
 
                     photoCount++;
-                    addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileData.byteLength);
+                    Collections.addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileData.byteLength);
 
                     updateExportButton();
 
@@ -944,287 +914,8 @@
             await handler(msg);
         }
 
-        /** Render a collection header + image grid container in the DOM */
-        function renderCollectionHeader(collectionId, name, timeStr) {
-            const mainContainer = document.getElementById('received-images');
-
-            // Remove placeholder text on first collection
-            if (collections.length === 1) {
-                mainContainer.innerHTML = '';
-            }
-
-            const section = document.createElement('div');
-            section.className = 'collection-section';
-            section.setAttribute('data-collection-id', collectionId);
-            const headerDiv = document.createElement('div');
-            headerDiv.className = 'collection-header';
-            headerDiv.setAttribute('data-collection-id', collectionId);
-
-            const headerLeft = document.createElement('div');
-            headerLeft.className = 'collection-header-left';
-
-            const collapseBtn = document.createElement('button');
-            collapseBtn.className = 'collection-collapse-btn';
-            collapseBtn.title = 'Collapse/Expand';
-            collapseBtn.textContent = '▼';
-            collapseBtn.addEventListener('click', () => toggleCollectionCollapse(collectionId));
-
-            const nameSpan = document.createElement('span');
-            nameSpan.className = 'collection-name';
-            nameSpan.contentEditable = 'true';
-            nameSpan.spellcheck = false;
-            nameSpan.textContent = name;
-            nameSpan.addEventListener('blur', () => renameCollection(collectionId, nameSpan.textContent));
-            nameSpan.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') { e.preventDefault(); nameSpan.blur(); }
-            });
-
-            const timeSpan = document.createElement('span');
-            timeSpan.className = 'collection-time';
-            timeSpan.textContent = `(${timeStr})`;
-
-            const countSpan = document.createElement('span');
-            countSpan.className = 'collection-count';
-            countSpan.id = `col-count-${collectionId}`;
-            countSpan.textContent = '0';
-
-            headerLeft.append(collapseBtn, nameSpan, timeSpan, countSpan);
-
-            const headerRight = document.createElement('div');
-            headerRight.className = 'collection-header-right';
-
-            const selectAllLabel = i18n.t('receive.selectAll') || 'Select all';
-            const selectAllBtn = document.createElement('button');
-            selectAllBtn.className = 'btn btn-action collection-select-all-btn';
-            selectAllBtn.title = selectAllLabel;
-            selectAllBtn.textContent = selectAllLabel;
-            selectAllBtn.addEventListener('click', () => toggleCollectionSelectAll(collectionId));
-
-            const exportBtn = document.createElement('button');
-            exportBtn.className = 'btn btn-action collection-export-btn';
-            exportBtn.title = 'Export';
-            exportBtn.textContent = '📦 Export';
-            exportBtn.addEventListener('click', () => openExportModalForCollection(collectionId));
-
-            headerRight.append(selectAllBtn, exportBtn);
-            headerDiv.append(headerLeft, headerRight);
-
-            const imagesGrid = document.createElement('div');
-            imagesGrid.className = 'collection-images';
-            imagesGrid.id = `collection-images-${collectionId}`;
-            imagesGrid.style.display = 'grid';
-            imagesGrid.style.gridTemplateColumns = 'repeat(2, 1fr)';
-            imagesGrid.style.gap = '15px';
-
-            section.append(headerDiv, imagesGrid);
-            mainContainer.prepend(section);
-
-            // Make collection header a drop target for inter-collection drag
-            const header = section.querySelector('.collection-header');
-            header.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                e.dataTransfer.dropEffect = 'move';
-                header.classList.add('collection-drop-target');
-            });
-            header.addEventListener('dragleave', () => {
-                header.classList.remove('collection-drop-target');
-            });
-            header.addEventListener('drop', (e) => {
-                e.preventDefault();
-                header.classList.remove('collection-drop-target');
-                const imageIndex = parseInt(e.dataTransfer.getData('text/plain'));
-                if (!isNaN(imageIndex)) {
-                    moveImageToCollection(imageIndex, collectionId);
-                }
-            });
-        }
-
-        /** Update the image count badge on a collection header */
-        /** Delete a received image by its SHA-256 hash (sent by sender on delete) */
-        function deleteReceivedImageByHash(hash) {
-            const idx = receivedImages.findIndex(img => img && img.hash === hash);
-            if (idx === -1) {
-                logger.warn('delete-image: no image found with hash ' + hash);
-                return;
-            }
-
-            // Cancel any pending background OCR
-            cancelImageOcr(idx);
-
-            // Revoke object URLs
-            const card = document.querySelector(`.received-image-item[data-image-index="${idx}"]`);
-            if (card) {
-                const img = card.querySelector('img');
-                if (img && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-                const dl = card.querySelector(`#download-${idx}`);
-                if (dl && dl.href && dl.href.startsWith('blob:') && (!img || dl.href !== img.src)) {
-                    URL.revokeObjectURL(dl.href);
-                }
-            }
-
-            // Remove from collection
-            const imgObj = receivedImages[idx];
-            if (imgObj) {
-                for (const col of collections) {
-                    const colIdx = col.images.indexOf(imgObj);
-                    if (colIdx !== -1) {
-                        col.images[colIdx] = null;
-                        updateCollectionCount(col.id);
-                        break;
-                    }
-                }
-            }
-
-            receivedImages[idx] = null;
-            if (card) card.remove();
-            updateExportButton();
-            logger.success('Deleted image with hash ' + hash.substring(0, 8) + '...');
-        }
-
-        function updateCollectionCount(collectionId) {
-            const col = getCollection(collectionId);
-            if (!col) return;
-            const count = col.images.filter(img => img !== null).length;
-            const el = document.getElementById(`col-count-${collectionId}`);
-            if (el) el.textContent = count;
-        }
-
-        /** Rename a collection and update download filenames for its files */
-        function renameCollection(collectionId, newName) {
-            const col = getCollection(collectionId);
-            if (!col) return;
-            const trimmed = newName.trim();
-            if (!trimmed) return;
-            col.name = trimmed;
-            col.renamed = true;
-            // Update download filenames for all files in this collection
-            const safeName = trimmed.replace(/[^a-zA-Z0-9_\- ]/g, '').replace(/\s+/g, '_').toLowerCase() || 'document';
-            col.images.forEach((img, idx) => {
-                const globalIdx = receivedImages.indexOf(img);
-                if (globalIdx < 0) return;
-                const dlLink = document.getElementById(`download-${globalIdx}`);
-                if (!dlLink) return;
-                const ext = img.name ? img.name.split('.').pop() : (img.mimeType.split('/').pop().split('+')[0] || 'bin');
-                const suffix = col.images.length > 1 ? `_${idx + 1}` : '';
-                dlLink.setAttribute('download', `${safeName}${suffix}.${ext}`);
-            });
-        }
-
-        /** Toggle collapse/expand of a collection */
-        function toggleCollectionCollapse(collectionId) {
-            const section = document.querySelector(`.collection-section[data-collection-id="${collectionId}"]`);
-            if (!section) return;
-            const grid = section.querySelector('.collection-images');
-            const btn = section.querySelector('.collection-collapse-btn');
-            const collapsed = grid.style.display === 'none';
-            grid.style.display = collapsed ? 'grid' : 'none';
-            btn.textContent = collapsed ? '▼' : '▶';
-        }
-
-        /** Toggle select all / deselect all within a collection */
-        function toggleCollectionSelectAll(collectionId) {
-            const grid = document.getElementById(`collection-images-${collectionId}`);
-            if (!grid) return;
-            const checkboxes = grid.querySelectorAll('input[type="checkbox"][id^="select-"]');
-            const allChecked = [...checkboxes].every(cb => cb.checked);
-            checkboxes.forEach(cb => { cb.checked = !allChecked; });
-            onSelectionChange();
-        }
-
-        /** Move an image from its current collection to a target collection */
-        function moveImageToCollection(imageIndex, targetCollectionId) {
-            const img = receivedImages[imageIndex];
-            if (!img) return;
-
-            // Find source collection
-            let srcCol = null;
-            for (const col of collections) {
-                const idx = col.images.indexOf(img);
-                if (idx !== -1) {
-                    col.images.splice(idx, 1);
-                    srcCol = col;
-                    break;
-                }
-            }
-
-            // Add to target collection
-            const targetCol = getCollection(targetCollectionId);
-            if (!targetCol) return;
-            targetCol.images.push(img);
-
-            // Move DOM element
-            const card = document.querySelector(`.received-image-item[data-image-index="${imageIndex}"]`);
-            const targetGrid = document.getElementById(`collection-images-${targetCollectionId}`);
-            if (card && targetGrid) {
-                card.setAttribute('data-collection-id', targetCollectionId);
-                targetGrid.appendChild(card);
-            }
-
-            // Update counts
-            if (srcCol) updateCollectionCount(srcCol.id);
-            updateCollectionCount(targetCollectionId);
-            updateBadgeNumbers();
-        }
-
-        /**
-         * Add a decrypted image to the received images gallery.
-         * @param {string} url - Object URL of the decrypted image blob
-         * @param {string} filename - Original filename from encrypted metadata
-         * @param {number} imageIndex - Index in receivedImages array
-         * @param {number} collectionId - Collection to add the image to
-         */
-        /** Format bytes as human-readable string */
-        function formatFileSize(bytes) {
-            if (bytes < 1024) return bytes + ' B';
-            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-        }
-
-        /** Get an icon for a file based on MIME type */
-        function getFileIcon(mimeType) {
-            if (mimeType === 'application/pdf') return '📄';
-            if (mimeType.startsWith('text/')) return '📝';
-            if (mimeType.startsWith('audio/')) return '🎵';
-            if (mimeType.startsWith('video/')) return '🎬';
-            if (mimeType.includes('zip') || mimeType.includes('archive') || mimeType.includes('compressed')) return '📦';
-            return '📎';
-        }
-
-        // Thin wrapper around window.ReceiveCard.renderCard (public/js/receive-card.js).
-        // The module owns the createElement + textContent construction so a crafted
-        // peer filename like `<img src=x onerror=...>` cannot execute. This function
-        // only resolves the parent container and wires page-scoped side effects
-        // (drag setup, count update).
-        function addReceivedFile(url, filename, imageIndex, collectionId, fileType, fileSize) {
-            const container = document.getElementById(`collection-images-${collectionId}`);
-            if (!container) return;
-
-            const item = ReceiveCard.renderCard({
-                url, filename, imageIndex, collectionId, fileType, fileSize,
-                mimeType: receivedImages[imageIndex] && receivedImages[imageIndex].mimeType,
-                i18n, getFileIcon, formatFileSize,
-                handlers: {
-                    onDiscardConfirm: doDiscard,
-                    onDiscardCancel: cancelDiscard,
-                    onSelectionChange,
-                    onToggleCardMenu: toggleCardMenu,
-                    onCloseCardMenu: closeCardMenu,
-                    onToggleSelectFromMenu: toggleSelectFromMenu,
-                    onOpenLightbox: openLightbox,
-                    onRotate: rotateReceivedImage,
-                    onCrop: openCropModal,
-                    onBW: applyBWToImage,
-                    onDiscard: discardImage,
-                    onPdfToImages: exportPdfAsImages,
-                    onPdfToOcr: exportPdfAsOcr,
-                },
-            });
-
-            container.appendChild(item);
-            setupDragEvents(item);
-            updateCollectionCount(collectionId);
-        }
-
+        // Card handlers passed to Collections.attach below; Collections owns
+        // addReceivedFile/renderCollectionHeader/move/rename/delete now.
         // ============ Image preview lightbox ============
 
         // ============ Card kebab menu ============
@@ -1515,18 +1206,8 @@
             }
             // Cancel any pending background OCR
             cancelImageOcr(imageIndex);
-            // Remove from collection
-            const imgObj = receivedImages[imageIndex];
-            if (imgObj) {
-                for (const col of collections) {
-                    const idx = col.images.indexOf(imgObj);
-                    if (idx !== -1) {
-                        col.images[idx] = null;
-                        updateCollectionCount(col.id);
-                        break;
-                    }
-                }
-            }
+            // Remove from owning collection
+            Collections.removeImageFromOwningCollection(receivedImages[imageIndex]);
             receivedImages[imageIndex] = null;
             card.remove();
             updateExportButton();
@@ -1718,294 +1399,8 @@
             }
         }
 
-        // ============ Drag & Drop Reordering ============
-
-        let dragSrcEl = null;
-        let touchDragEl = null;
-        let touchClone = null;
-        let longPressTimer = null;
-
-        function setupDragEvents(item) {
-            // Desktop drag events
-            item.addEventListener('dragstart', handleDragStart);
-            item.addEventListener('dragover', handleDragOver);
-            item.addEventListener('dragenter', handleDragEnter);
-            item.addEventListener('dragleave', handleDragLeave);
-            item.addEventListener('drop', handleDrop);
-            item.addEventListener('dragend', handleDragEnd);
-
-            // Mobile touch events (long press to drag)
-            const handle = item.querySelector('.drag-handle');
-            handle.addEventListener('touchstart', handleTouchStart, { passive: false });
-            handle.addEventListener('touchmove', handleTouchMove, { passive: false });
-            handle.addEventListener('touchend', handleTouchEnd);
-        }
-
-        function showNewDocumentDropZone() {
-            let zone = document.getElementById('new-document-drop-zone');
-            if (!zone) {
-                zone = document.createElement('div');
-                zone.id = 'new-document-drop-zone';
-                zone.className = 'new-document-drop-zone';
-                zone.innerHTML = '＋ New Document';
-                zone.addEventListener('dragover', (e) => {
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = 'move';
-                    zone.classList.add('new-document-drop-zone-active');
-                });
-                zone.addEventListener('dragleave', () => {
-                    zone.classList.remove('new-document-drop-zone-active');
-                });
-                zone.addEventListener('drop', (e) => {
-                    e.preventDefault();
-                    zone.classList.remove('new-document-drop-zone-active');
-                    const imageIndex = parseInt(e.dataTransfer.getData('text/plain'));
-                    if (!isNaN(imageIndex)) {
-                        moveImageToNewCollection(imageIndex);
-                    }
-                });
-                document.getElementById('received-images').appendChild(zone);
-            }
-            zone.style.display = 'flex';
-        }
-
-        function hideNewDocumentDropZone() {
-            const zone = document.getElementById('new-document-drop-zone');
-            if (zone) zone.style.display = 'none';
-        }
-
-        function moveImageToNewCollection(imageIndex) {
-            const newColId = createNewCollection();
-            moveImageToCollection(imageIndex, newColId);
-        }
-
-        function handleDragStart(e) {
-            dragSrcEl = this;
-            this.classList.add('dragging');
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', this.getAttribute('data-image-index'));
-            showNewDocumentDropZone();
-        }
-
-        function handleDragOver(e) {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-        }
-
-        function handleDragEnter(e) {
-            e.preventDefault();
-            if (this !== dragSrcEl) this.classList.add('drag-over');
-        }
-
-        function handleDragLeave() {
-            this.classList.remove('drag-over');
-        }
-
-        function handleDrop(e) {
-            e.stopPropagation();
-            e.preventDefault();
-            if (dragSrcEl === this) return;
-            this.classList.remove('drag-over');
-
-            // Check if cross-collection move
-            const srcColId = dragSrcEl.getAttribute('data-collection-id');
-            const targetColId = this.getAttribute('data-collection-id');
-            if (srcColId !== targetColId) {
-                const imageIndex = parseInt(dragSrcEl.getAttribute('data-image-index'));
-                moveImageToCollection(imageIndex, parseInt(targetColId));
-            } else {
-                reorderImages(dragSrcEl, this);
-            }
-        }
-
-        function handleDragEnd() {
-            this.classList.remove('dragging');
-            document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
-            hideNewDocumentDropZone();
-        }
-
-        // Touch-based drag for mobile
-        function handleTouchStart(e) {
-            const item = e.target.closest('.received-image-item');
-            longPressTimer = setTimeout(() => {
-                e.preventDefault();
-                touchDragEl = item;
-                item.classList.add('dragging');
-                showNewDocumentDropZone();
-
-                // Create a floating clone
-                touchClone = item.cloneNode(true);
-                touchClone.style.cssText = 'position:fixed;pointer-events:none;z-index:9999;opacity:0.7;width:' + item.offsetWidth + 'px;';
-                const touch = e.touches[0];
-                touchClone.style.left = touch.clientX - 30 + 'px';
-                touchClone.style.top = touch.clientY - 30 + 'px';
-                document.body.appendChild(touchClone);
-            }, 400);
-        }
-
-        function handleTouchMove(e) {
-            if (!touchDragEl) {
-                clearTimeout(longPressTimer);
-                return;
-            }
-            e.preventDefault();
-            const touch = e.touches[0];
-            if (touchClone) {
-                touchClone.style.left = touch.clientX - 30 + 'px';
-                touchClone.style.top = touch.clientY - 30 + 'px';
-            }
-            // Highlight drop target
-            document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
-            document.querySelectorAll('.collection-header').forEach(el => el.classList.remove('collection-drop-target'));
-            const newDocZone = document.getElementById('new-document-drop-zone');
-            if (newDocZone) newDocZone.classList.remove('new-document-drop-zone-active');
-            const target = document.elementFromPoint(touch.clientX, touch.clientY);
-            if (target) {
-                const targetItem = target.closest('.received-image-item');
-                const targetHeader = target.closest('.collection-header');
-                const targetNewDoc = target.closest('#new-document-drop-zone');
-                if (targetNewDoc) {
-                    targetNewDoc.classList.add('new-document-drop-zone-active');
-                } else if (targetHeader) {
-                    targetHeader.classList.add('collection-drop-target');
-                } else if (targetItem && targetItem !== touchDragEl) {
-                    targetItem.classList.add('drag-over');
-                }
-            }
-        }
-
-        function handleTouchEnd(e) {
-            clearTimeout(longPressTimer);
-            if (!touchDragEl) return;
-
-            // Find drop target
-            const touch = e.changedTouches[0];
-            if (touchClone) {
-                touchClone.style.display = 'none'; // hide clone so elementFromPoint finds underlying element
-            }
-            const target = document.elementFromPoint(touch.clientX, touch.clientY);
-            const targetItem = target ? target.closest('.received-image-item') : null;
-
-            // Check if dropped on new document zone
-            const targetNewDoc = target ? target.closest('#new-document-drop-zone') : null;
-            // Also check if dropped on a collection header
-            const targetHeader = target ? target.closest('.collection-header') : null;
-
-            if (targetNewDoc && touchDragEl) {
-                const imageIndex = parseInt(touchDragEl.getAttribute('data-image-index'));
-                moveImageToNewCollection(imageIndex);
-            } else if (targetHeader && touchDragEl) {
-                const targetColId = parseInt(targetHeader.getAttribute('data-collection-id'));
-                const imageIndex = parseInt(touchDragEl.getAttribute('data-image-index'));
-                moveImageToCollection(imageIndex, targetColId);
-            } else if (targetItem && targetItem !== touchDragEl) {
-                const srcColId = touchDragEl.getAttribute('data-collection-id');
-                const tgtColId = targetItem.getAttribute('data-collection-id');
-                if (srcColId !== tgtColId) {
-                    const imageIndex = parseInt(touchDragEl.getAttribute('data-image-index'));
-                    moveImageToCollection(imageIndex, parseInt(tgtColId));
-                } else {
-                    reorderImages(touchDragEl, targetItem);
-                }
-            }
-
-            // Cleanup
-            touchDragEl.classList.remove('dragging');
-            document.querySelectorAll('.received-image-item').forEach(el => el.classList.remove('drag-over'));
-            document.querySelectorAll('.collection-header').forEach(el => el.classList.remove('collection-drop-target'));
-            hideNewDocumentDropZone();
-            if (touchClone) { touchClone.remove(); touchClone = null; }
-            touchDragEl = null;
-        }
-
-        function reorderImages(srcEl, targetEl) {
-            // Use the parent collection grid as container
-            const container = srcEl.closest('.collection-images') || document.getElementById('received-images');
-            const items = [...container.querySelectorAll('.received-image-item')];
-            const srcIdx = items.indexOf(srcEl);
-            const targetIdx = items.indexOf(targetEl);
-
-            // Swap in receivedImages array: map DOM positions to data indices
-            const srcDataIdx = parseInt(srcEl.getAttribute('data-image-index'));
-            const targetDataIdx = parseInt(targetEl.getAttribute('data-image-index'));
-
-            // Swap the data in the array
-            const tmp = receivedImages[srcDataIdx];
-            receivedImages[srcDataIdx] = receivedImages[targetDataIdx];
-            receivedImages[targetDataIdx] = tmp;
-
-            // Also swap in collection images array
-            const colId = srcEl.getAttribute('data-collection-id');
-            if (colId !== null) {
-                const col = getCollection(parseInt(colId));
-                if (col) {
-                    const srcImg = receivedImages[srcDataIdx];
-                    const targetImg = receivedImages[targetDataIdx];
-                    const si = col.images.indexOf(targetImg); // after swap in receivedImages
-                    const ti = col.images.indexOf(srcImg);
-                    if (si !== -1 && ti !== -1) {
-                        const t = col.images[si];
-                        col.images[si] = col.images[ti];
-                        col.images[ti] = t;
-                    }
-                }
-            }
-
-            // Swap data-image-index attributes
-            srcEl.setAttribute('data-image-index', targetDataIdx);
-            targetEl.setAttribute('data-image-index', srcDataIdx);
-
-            // Update all index-dependent IDs and attributes
-            updateImageCardIndex(srcEl, targetDataIdx);
-            updateImageCardIndex(targetEl, srcDataIdx);
-
-            // Move DOM elements
-            if (srcIdx < targetIdx) {
-                container.insertBefore(srcEl, targetEl.nextSibling);
-            } else {
-                container.insertBefore(srcEl, targetEl);
-            }
-
-            // Update all badge numbers based on DOM order
-            updateBadgeNumbers();
-        }
-
-        function updateImageCardIndex(card, newIndex) {
-            // Update img id
-            const img = card.querySelector('img[id^="img-"]');
-            if (img) {
-                img.id = `img-${newIndex}`;
-                img.setAttribute('onclick', `openLightbox(${newIndex})`);
-            }
-            // Update checkbox
-            const cb = card.querySelector('input[type="checkbox"][id^="select-"]');
-            if (cb) cb.id = `select-${newIndex}`;
-            // Update download link
-            const dl = card.querySelector('a[id^="download-"]');
-            if (dl) dl.id = `download-${newIndex}`;
-            // Update card menu
-            const menu = card.querySelector('[id^="card-menu-"]');
-            if (menu) menu.id = `card-menu-${newIndex}`;
-            // Update button and link onclicks
-            card.querySelectorAll('[onclick]').forEach(el => {
-                el.setAttribute('onclick', el.getAttribute('onclick').replace(/\(\d+\)/g, `(${newIndex})`));
-            });
-            // Update download filename
-            if (dl && receivedImages[newIndex]) {
-                dl.setAttribute('download', receivedImages[newIndex].name);
-            }
-        }
-
-        function updateBadgeNumbers() {
-            const container = document.getElementById('received-images');
-            const items = container.querySelectorAll('.received-image-item');
-            // Items are newest-first in DOM, so badge = total - domIndex
-            const total = items.length;
-            items.forEach((item, domIdx) => {
-                const badge = item.querySelector('.image-badge');
-                if (badge) badge.textContent = `#${total - domIdx}`;
-            });
-        }
+        // Drag & drop reordering, badge numbering, and image-card index sync
+        // all live in window.Collections (js/collections.js).
 
         /** Open the export modal */
         let exportCollectionId = null; // null = export all, number = specific collection
@@ -2013,7 +1408,7 @@
         /** Get export filename prefix based on whether we're exporting a specific collection */
         function getExportPrefix() {
             if (exportCollectionId !== null) {
-                const col = getCollection(exportCollectionId);
+                const col = Collections.getById(exportCollectionId);
                 if (col) {
                     // Sanitize collection name for filename
                     const safeName = col.name.replace(/[^a-zA-Z0-9_\- ]/g, '').replace(/\s+/g, '_').toLowerCase();
