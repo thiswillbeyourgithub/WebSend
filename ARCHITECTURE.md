@@ -99,6 +99,13 @@ WebSend/
         │   │               #   that hide the clear-vs-terminate API fork. Receive.html
         │   │               #   uses it for preloaded, background-queue, and per-export
         │   │               #   scribe lifecycles
+        │   ├── receive-export.js # Export pipeline for the receive page: ZIP,
+        │   │               #   plain PDF (via pdf-builder.js), OCR PDF (scribe.js
+        │   │               #   with cached/fallback paths), and the per-card
+        │   │               #   PDF→images / PDF→OCR actions (MuPDF). Owns the
+        │   │               #   export modal wiring and the preloaded client-zip
+        │   │               #   and scribe handles; bridges scribePreloaded to
+        │   │               #   bg-ocr.js. Exposes window.ReceiveExport
         │   ├── bg-ocr.js   # Background OCR queue for the receive page. Walks
         │   │               #   receivedImages one at a time, downscales to <=2000px,
         │   │               #   runs scribe.js OCR, caches the page data on the image
@@ -301,7 +308,7 @@ A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and abort
 
 **Not yet covered** (intentional gaps — documented so the picture is honest):
 - Frontend modules with no unit tests: `webrtc.js` (peer-connection state machine, chunked transfer, connection-type detection), `logger.js`, `i18n.js` — tightly coupled to real `RTCPeerConnection` / DOM, so the E2E tier exercises them instead.
-- Receiver UI logic: the export modal (PDF / ZIP / B&W Otsu / scribe.js OCR), the perspective-crop tool, and the **transform-replay protocol** (`transform-image` messages for `rotateCW` / `flipH` / `bw` / `crop`). (The hand-crafted minimal PDF generator now lives in `js/pdf-builder.js` and has unit tests covering xref offsets, trailer size, and multi-image structure.)
+- Receiver UI logic: the perspective-crop tool and the **transform-replay protocol** (`transform-image` messages for `rotateCW` / `flipH` / `bw` / `crop`). The export modal (PDF / ZIP / B&W Otsu / scribe.js OCR / per-PDF actions) lives in `js/receive-export.js`; the hand-crafted minimal PDF generator lives in `js/pdf-builder.js` and has unit tests covering xref offsets, trailer size, and multi-image structure.
 - Protocol edge paths: fingerprint **mismatch / abort**, `file-ack` integrity **mismatch or timeout → retry**, room TTL expiry (10 min), SRI-mismatch failure mode. E2E only drives the happy path.
 - PWA service-worker caching + `controllerchange` auto-reload.
 - `src/healthcheck.js` and SSO / oauth2-proxy endpoints.
