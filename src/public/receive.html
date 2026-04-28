@@ -161,6 +161,7 @@
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-Jsg+a3xnj4NcIcrrw1HtC9Nnkpz9lW1XvD739ArCQ2X3246EOrpez7hgvmFANsAw"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-fzEmHjLzTWKrjkJI4bozuob2VT9l1vjdHXgSgeI2m8fR3LgicoqHEinkouXksQvL"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-BKUlRg9kPHUDg90WhcWuurrn9Y19aAR8F7P0R0VS8YXCu5SKBhCkKT/72nbZHW6f"></script>
+    <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-KyLkSmoYpiZRkpiO7Jy1s9FFdYvAWeJljeEkgQUqTNQSwwqIHRCI01xNE8+TD4fD"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -195,6 +196,7 @@
         let weConfirmed = false;  // Track if we confirmed fingerprints
         let theyConfirmed = false; // Track if sender confirmed fingerprints
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string, ocrPageData: object|null}
+        const preBWData = {}; // Pre-BW originals for undo, keyed by imageIndex (used by applyBWToImage and TransformReplay)
         let pendingReplaceHash = null; // Hash of image being replaced by an incoming edit
 
         // Background OCR state lives in window.BgOcr (js/bg-ocr.js).
@@ -213,6 +215,11 @@
             receivedImagesRef: receivedImages,
             getScribePreloaded: () => ReceiveExport.getScribePreloaded(),
             clearScribePreloaded: () => ReceiveExport.clearScribePreloaded(),
+        });
+        // Remote transform-replay protocol lives in window.TransformReplay (js/transform-replay.js).
+        TransformReplay.attach({
+            receivedImages: receivedImages,
+            preBWData: preBWData,
         });
         document.addEventListener('DOMContentLoaded', () => ReceiveExport.init());
 
@@ -725,7 +732,7 @@
         function handleTransformImageMsg(msg) {
             // Sender wants us to replay transforms locally instead of resending full image
             logger.info(`Received transform-image for hash ${msg.oldHash} (${msg.transforms.length} ops)`);
-            handleTransformImage(msg.oldHash, msg.transforms);
+            TransformReplay.handle(msg.oldHash, msg.transforms);
         }
 
         function handleReplaceImage(msg) {
@@ -1015,9 +1022,6 @@
         /**
          * Apply Otsu B&W binarization to a received image in place.
          */
-        // Store pre-BW originals for undo, keyed by imageIndex
-        const preBWData = {};
-
         async function applyBWToImage(imageIndex) {
             const img = receivedImages[imageIndex];
             if (!img) return;
@@ -1083,100 +1087,7 @@
             BgOcr.queue(imageIndex);
         }
 
-        // ============ Remote Transform Replay ============
-
-        /**
-         * Apply a single transform operation to a canvas-loaded image.
-         * Returns a Blob of the result.
-         * @param {Uint8Array} inputData - Image data
-         * @param {string} inputMimeType - MIME type of inputData
-         * @param {Object} transform - { op, corners? }
-         * @returns {Promise<{data: Uint8Array, mimeType: string}>}
-         */
-        async function applyTransformToData(inputData, inputMimeType, transform) {
-            const input = { data: inputData, mimeType: inputMimeType };
-            switch (transform.op) {
-                case 'rotateCW': return rotateImage(input, { degrees: 90 });
-                case 'flipH':    return flipImage(input, { axis: 'h' });
-                case 'bw':       return binarize(input);
-                case 'crop':     return cropPerspective(input, { corners: transform.corners });
-                default: throw new Error(`Unknown transform op: ${transform.op}`);
-            }
-        }
-
-        /**
-         * Handle a transform-image message from the sender.
-         * Replays transforms on the original image data, verifies hash, updates display.
-         */
-        function sendTransformNack(oldHash, reason) {
-            try {
-                rtc.sendMessage({ type: 'transform-nack', oldHash, reason });
-            } catch (e) {
-                logger.error('failed to send transform-nack: ' + e.message);
-            }
-        }
-
-        async function handleTransformImage(oldHash, transforms) {
-            const replaceIdx = receivedImages.findIndex(img => img && img.hash === oldHash);
-            if (replaceIdx === -1) {
-                logger.warn(`transform-image: hash ${oldHash} not found, ignoring`);
-                sendTransformNack(oldHash, 'unknown-hash');
-                return;
-            }
-
-            const imgObj = receivedImages[replaceIdx];
-            if (!imgObj.originalData) {
-                logger.warn('transform-image: no originalData stored, ignoring');
-                sendTransformNack(oldHash, 'missing-original');
-                return;
-            }
-
-            try {
-                // Apply transforms sequentially to the original data
-                let currentData = imgObj.originalData;
-                let currentMimeType = imgObj.originalMimeType;
-
-                for (const t of transforms) {
-                    const result = await applyTransformToData(currentData, currentMimeType, t);
-                    currentData = result.data;
-                    currentMimeType = result.mimeType;
-                }
-
-                // Update the image data (keep original hash for future lookups)
-                imgObj.data = currentData;
-                imgObj.mimeType = currentMimeType;
-                imgObj.ocrPageData = null;
-
-                // Clear BW undo state if any
-                if (preBWData[replaceIdx]) {
-                    delete preBWData[replaceIdx];
-                }
-
-                // Update display
-                const displayImg = document.getElementById(`img-${replaceIdx}`);
-                const dlEl = document.getElementById(`download-${replaceIdx}`);
-                if (displayImg) {
-                    if (displayImg.src.startsWith('blob:')) URL.revokeObjectURL(displayImg.src);
-                    const newUrl = URL.createObjectURL(new Blob([currentData], { type: currentMimeType }));
-                    displayImg.src = newUrl;
-                    if (dlEl) {
-                        if (dlEl.href.startsWith('blob:')) URL.revokeObjectURL(dlEl.href);
-                        dlEl.href = newUrl;
-                    }
-                }
-
-                logger.success(`Transform applied locally (${transforms.length} ops)`);
-                showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
-
-                // Restart OCR
-                BgOcr.cancel(replaceIdx);
-                BgOcr.queue(replaceIdx);
-
-            } catch (e) {
-                logger.error(`transform-image failed: ${e.message}`);
-                sendTransformNack(oldHash, e?.message || 'transform-replay-failed');
-            }
-        }
+        // Remote Transform Replay lives in window.TransformReplay (js/transform-replay.js).
 
         // ============ Image Discard ============
 
