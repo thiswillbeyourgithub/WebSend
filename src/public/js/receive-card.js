@@ -188,5 +188,38 @@
         return item;
     }
 
-    window.ReceiveCard = { renderCard };
+    /**
+     * Replace a card's img src and download href with a fresh blob URL created
+     * from `blob`. Revokes the previous URL. Returns the new URL string.
+     */
+    function setCardImage(imageIndex, blob, opts = {}) {
+        const img = document.getElementById(`img-${imageIndex}`);
+        const dl  = document.getElementById(`download-${imageIndex}`);
+        const oldUrl = img ? img.src : (dl ? dl.href : '');
+        const newUrl = URL.createObjectURL(blob);
+        if (img) img.src = newUrl;
+        if (dl)  dl.href = newUrl;
+        if (dl && opts.filename) dl.download = opts.filename;
+        if (oldUrl && oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl);
+        return newUrl;
+    }
+
+    /**
+     * Revoke the blob URL(s) held by a card. Accepts either an imageIndex
+     * (number) or an existing card element.
+     */
+    function revokeCardUrls(target) {
+        const card = (typeof target === 'number')
+            ? document.querySelector(`.received-image-item[data-image-index="${target}"]`)
+            : target;
+        if (!card) return;
+        const img = card.querySelector('img');
+        if (img && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+        const dl = card.querySelector('a[id^="download-"]');
+        if (dl && dl.href.startsWith('blob:') && (!img || dl.href !== img.src)) {
+            URL.revokeObjectURL(dl.href);
+        }
+    }
+
+    window.ReceiveCard = { renderCard, setCardImage, revokeCardUrls };
 })();

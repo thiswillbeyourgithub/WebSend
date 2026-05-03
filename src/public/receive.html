@@ -157,11 +157,11 @@
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
-    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-U3uN/GufXxFg7QEGmrhlFDEMRIVoVmWft0Xjs9iIXraKTxqmC5vnfj9aO1krfQmy"></script>
-    <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-Jsg+a3xnj4NcIcrrw1HtC9Nnkpz9lW1XvD739ArCQ2X3246EOrpez7hgvmFANsAw"></script>
+    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-bP286JQvBDI/Gv/zT+xKFKW64BSNxvOMqqARKNOVj59eLDMuPXFG0UydA3XJccja"></script>
+    <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-fjlaFFHPEtVq70nQIB1+d0FzP2mFqr+CdjmrAi7jplCb8QA9U2ery+nUqwlp37oW"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-fzEmHjLzTWKrjkJI4bozuob2VT9l1vjdHXgSgeI2m8fR3LgicoqHEinkouXksQvL"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-BKUlRg9kPHUDg90WhcWuurrn9Y19aAR8F7P0R0VS8YXCu5SKBhCkKT/72nbZHW6f"></script>
-    <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-KyLkSmoYpiZRkpiO7Jy1s9FFdYvAWeJljeEkgQUqTNQSwwqIHRCI01xNE8+TD4fD"></script>
+    <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-lsAsSwyBhcJRRNHP56JMOKcGY7bu9dycQORVuD/O/9UyBM/1Dvw2uhLs3tMM/X89"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -623,12 +623,7 @@
          */
         function cleanupAllData() {
             // Revoke all object URLs from displayed images
-            document.querySelectorAll('.received-image-item img').forEach(img => {
-                if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-            });
-            document.querySelectorAll('.received-image-item a[id^="download-"]').forEach(a => {
-                if (a.href.startsWith('blob:')) URL.revokeObjectURL(a.href);
-            });
+            document.querySelectorAll('.received-image-item').forEach(c => ReceiveCard.revokeCardUrls(c));
             // Cancel all background OCR
             BgOcr.reset();
             // Clear image data from memory
@@ -793,7 +788,6 @@
 
                     // Create blob from data for display/download
                     const fileBlob = new Blob([fileData], { type: fileMimeType });
-                    const fileUrl = URL.createObjectURL(fileBlob);
 
                     // Determine file type category
                     const isImage = fileMimeType.startsWith('image/');
@@ -824,20 +818,7 @@
                             oldImg.originalMimeType = fileMimeType;
 
                             // Update the DOM card
-                            const card = document.querySelector(`.received-image-item[data-image-index="${replaceIdx}"]`);
-                            if (card) {
-                                const imgEl = card.querySelector('img');
-                                if (imgEl) {
-                                    if (imgEl.src.startsWith('blob:')) URL.revokeObjectURL(imgEl.src);
-                                    imgEl.src = fileUrl;
-                                }
-                                const dlLink = card.querySelector(`#download-${replaceIdx}`);
-                                if (dlLink) {
-                                    if (dlLink.href.startsWith('blob:')) URL.revokeObjectURL(dlLink.href);
-                                    dlLink.href = fileUrl;
-                                    dlLink.download = fileName;
-                                }
-                            }
+                            ReceiveCard.setCardImage(replaceIdx, fileBlob, { filename: fileName });
 
                             // Compute SHA-256 and ack
                             const decryptedHash = await WebSendCrypto.sha256Hex(data);
@@ -857,6 +838,7 @@
 
                     if (!wasReplacement) {
                     // Add to received files and active collection (normal flow)
+                    const fileUrl = URL.createObjectURL(fileBlob);
                     const imageIndex = receivedImages.length;
                     const imgObj = {
                         data: fileData,
@@ -996,18 +978,7 @@
             img.data = result.data;
             img.mimeType = result.mimeType;
 
-            // Update display
-            const displayImg = document.getElementById(`img-${imageIndex}`);
-            const oldSrc = displayImg.src;
-            const newUrl = URL.createObjectURL(new Blob([img.data], { type: img.mimeType }));
-            displayImg.src = newUrl;
-            if (oldSrc.startsWith('blob:')) URL.revokeObjectURL(oldSrc);
-
-            // Update download link
-            const dl = document.getElementById(`download-${imageIndex}`);
-            if (dl.href.startsWith('blob:')) URL.revokeObjectURL(dl.href);
-            dl.href = newUrl;
-
+            ReceiveCard.setCardImage(imageIndex, new Blob([img.data], { type: img.mimeType }));
             logger.success(`Image #${imageIndex + 1} rotated`);
 
             // Restart background OCR for the modified image
@@ -1032,17 +1003,7 @@
                 img.name = orig.name;
                 delete preBWData[imageIndex];
 
-                // Update display
-                const displayImg = document.getElementById(`img-${imageIndex}`);
-                const oldSrc = displayImg.src;
-                const newUrl = URL.createObjectURL(new Blob([img.data], { type: img.mimeType }));
-                displayImg.src = newUrl;
-                if (oldSrc.startsWith('blob:')) URL.revokeObjectURL(oldSrc);
-
-                const dl = document.getElementById(`download-${imageIndex}`);
-                if (dl.href.startsWith('blob:')) URL.revokeObjectURL(dl.href);
-                dl.href = newUrl;
-                dl.download = img.name;
+                ReceiveCard.setCardImage(imageIndex, new Blob([img.data], { type: img.mimeType }), { filename: img.name });
 
                 if (btn) btn.classList.remove('active');
                 logger.success(`B&W undone for image #${imageIndex + 1}`);
@@ -1063,18 +1024,7 @@
             img.mimeType = result.mimeType;
             img.name = img.name.replace(/\.[^.]+$/, '.png');
 
-            // Update display
-            const displayImg = document.getElementById(`img-${imageIndex}`);
-            const oldSrc = displayImg.src;
-            const newUrl = URL.createObjectURL(new Blob([img.data], { type: img.mimeType }));
-            displayImg.src = newUrl;
-            if (oldSrc.startsWith('blob:')) URL.revokeObjectURL(oldSrc);
-
-            // Update download link
-            const dl = document.getElementById(`download-${imageIndex}`);
-            if (dl.href.startsWith('blob:')) URL.revokeObjectURL(dl.href);
-            dl.href = newUrl;
-            dl.download = img.name;
+            ReceiveCard.setCardImage(imageIndex, new Blob([img.data], { type: img.mimeType }), { filename: img.name });
 
             if (btn) btn.classList.add('active');
             logger.success(`B&W applied to image #${imageIndex + 1}`);
@@ -1112,18 +1062,8 @@
         function doDiscard(imageIndex) {
             logger.info(`Discarding image ${imageIndex}`);
             // Revoke object URLs to free memory
+            ReceiveCard.revokeCardUrls(imageIndex);
             const card = document.querySelector(`[data-image-index="${imageIndex}"]`);
-            const img = card.querySelector('img');
-            if (img && img.src.startsWith('blob:')) {
-                URL.revokeObjectURL(img.src);
-            }
-            const downloadLink = card.querySelector(`#download-${imageIndex}`);
-            if (downloadLink && downloadLink.href.startsWith('blob:')) {
-                // Only revoke if different from img src (after crop they may differ)
-                if (!img || downloadLink.href !== img.src) {
-                    URL.revokeObjectURL(downloadLink.href);
-                }
-            }
             // Cancel any pending background OCR
             BgOcr.cancel(imageIndex);
             // Remove from owning collection
@@ -1324,19 +1264,7 @@
                     imgData.mimeType = 'image/jpeg';
                     imgData.ocrPageData = null;
 
-                    const imgEl = document.getElementById(`img-${imageIndex}`);
-                    const dlEl = document.getElementById(`download-${imageIndex}`);
-                    if (imgEl && imgEl.src.startsWith('blob:')) {
-                        const oldImgUrl = imgEl.src;
-                        const oldDlUrl = dlEl ? dlEl.href : oldImgUrl;
-                        URL.revokeObjectURL(oldImgUrl);
-                        if (oldDlUrl !== oldImgUrl && oldDlUrl.startsWith('blob:')) {
-                            URL.revokeObjectURL(oldDlUrl);
-                        }
-                    }
-                    const newUrl = URL.createObjectURL(resultBlob);
-                    if (imgEl) imgEl.src = newUrl;
-                    if (dlEl) dlEl.href = newUrl;
+                    ReceiveCard.setCardImage(imageIndex, resultBlob);
 
                     BgOcr.cancel(imageIndex);
                     BgOcr.queue(imageIndex);

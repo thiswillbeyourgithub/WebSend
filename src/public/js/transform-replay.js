@@ -84,17 +84,7 @@
                 delete preBWData[replaceIdx];
             }
 
-            const displayImg = document.getElementById(`img-${replaceIdx}`);
-            const dlEl = document.getElementById(`download-${replaceIdx}`);
-            if (displayImg) {
-                if (displayImg.src.startsWith('blob:')) URL.revokeObjectURL(displayImg.src);
-                const newUrl = URL.createObjectURL(new Blob([currentData], { type: currentMimeType }));
-                displayImg.src = newUrl;
-                if (dlEl) {
-                    if (dlEl.href.startsWith('blob:')) URL.revokeObjectURL(dlEl.href);
-                    dlEl.href = newUrl;
-                }
-            }
+            window.ReceiveCard.setCardImage(replaceIdx, new Blob([currentData], { type: currentMimeType }));
 
             logger.success(`Transform applied locally (${transforms.length} ops)`);
             showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });

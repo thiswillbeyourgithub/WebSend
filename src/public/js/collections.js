@@ -569,15 +569,7 @@
 
         onCancelImageOcr(idx);
 
-        const card = document.querySelector(`.received-image-item[data-image-index="${idx}"]`);
-        if (card) {
-            const img = card.querySelector('img');
-            if (img && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-            const dl = card.querySelector(`#download-${idx}`);
-            if (dl && dl.href && dl.href.startsWith('blob:') && (!img || dl.href !== img.src)) {
-                URL.revokeObjectURL(dl.href);
-            }
-        }
+        window.ReceiveCard.revokeCardUrls(idx);
 
         const imgObj = receivedImagesRef[idx];
         if (imgObj) {
