@@ -124,6 +124,11 @@ WebSend/
         │   │               #   window.ReceiveCard.renderCard(opts) → HTMLElement.
         │   │               #   Caller (receive.html#addReceivedFile) owns parent
         │   │               #   lookup, appendChild, drag-event setup
+        │   ├── sender-gallery.js # Genius-Scan-like gallery for the sender page.
+        │   │               #   Owns galleryPhotos state, thumbnail grid, per-photo
+        │   │               #   edit (rotate/flip/BW/crop), drag-and-drop reorder,
+        │   │               #   and batch finalization. Cross-page state injected
+        │   │               #   via Gallery.attach({...}). Exposes window.Gallery
         │   ├── qrcode.min.js # QR code generator library (vendored, used by receiver)
         │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
         │

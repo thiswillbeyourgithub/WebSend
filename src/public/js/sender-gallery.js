@@ -1,0 +1,438 @@
+/**
+ * sender-gallery.js
+ *
+ * Genius-Scan-like gallery for the sender page. Manages the list of captured
+ * photos (`galleryPhotos`), thumbnail grid, per-photo edit view (rotate, flip,
+ * B&W, crop), drag-and-drop reorder, and batch finalization.
+ *
+ * Cross-page references are wired in via Gallery.attach({...}) once during
+ * page init.
+ *
+ * Exposed as window.Gallery.
+ * Generated with the help of Claude Code.
+ */
+(function () {
+    'use strict';
+
+    // -- State --
+    let galleryPhotos = [];
+    let photoIdCounter = 0;
+    let galleryEditIndex = -1;
+
+    // -- Wired-in deps (set by attach) --
+    let _rtc = null;
+    let _i18n = null;
+    let _logger = null;
+    let _showToast = null;
+    let _showStep = null;
+    let _stepChoose = null;
+    let _stopCapture = null;
+    let _openCropModal = null;
+    let _applyOtsu = null;
+    let _getFlashMode = null;
+    let _getCaptureStream = null;
+    let _setCropContext = null;
+    let _sendQueue = null;
+
+    function attach(deps) {
+        _rtc = deps.rtc;
+        _i18n = deps.i18n;
+        _logger = deps.logger;
+        _showToast = deps.showToast;
+        _showStep = deps.showStep;
+        _stepChoose = deps.stepChoose;
+        _stopCapture = deps.stopCapture;
+        _openCropModal = deps.openCropModal;
+        _applyOtsu = deps.applyOtsu;
+        _getFlashMode = deps.getFlashMode;
+        _getCaptureStream = deps.getCaptureStream;
+        _setCropContext = deps.setCropContext;
+        _sendQueue = deps.sendQueue;
+    }
+
+    // -- Public state accessors --
+
+    function photos() { return galleryPhotos; }
+    function size() { return galleryPhotos.length; }
+    function getEditIndex() { return galleryEditIndex; }
+    function nextId() { return ++photoIdCounter; }
+
+    function addPhoto(photo) {
+        galleryPhotos.push(photo);
+        updateGalleryBadge();
+    }
+
+    // -- Gallery UI --
+
+    function updateGalleryBadge() {
+        const badge = document.getElementById('gallery-badge');
+        const count = galleryPhotos.length;
+        badge.textContent = count;
+        if (count > 0) {
+            badge.classList.remove('hidden');
+        } else {
+            badge.classList.add('hidden');
+        }
+    }
+
+    function openGallery() {
+        if (galleryPhotos.length === 0) {
+            _showToast(_i18n.t('send.noPhotos'));
+            return;
+        }
+        // Turn off torch if active to save battery while browsing gallery
+        const flashMode = _getFlashMode();
+        const captureStream = _getCaptureStream();
+        if (flashMode === 'torch' && captureStream) {
+            const track = captureStream.getVideoTracks()[0];
+            if (track) {
+                track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {});
+            }
+        }
+        // Pause camera to save resources while browsing gallery
+        const video = document.getElementById('capture-video');
+        if (video.srcObject) {
+            video.srcObject.getTracks().forEach(t => t.enabled = false);
+        }
+        document.body.style.overflow = 'hidden';
+        document.getElementById('gallery-modal').classList.remove('hidden');
+        renderGalleryGrid();
+    }
+
+    function closeGallery() {
+        document.getElementById('gallery-modal').classList.add('hidden');
+        document.getElementById('gallery-edit-view').classList.add('hidden');
+        galleryEditIndex = -1;
+        // Resume camera
+        const video = document.getElementById('capture-video');
+        if (video.srcObject) {
+            video.srcObject.getTracks().forEach(t => t.enabled = true);
+        }
+        // Re-enable torch if it was on before opening gallery
+        const flashMode = _getFlashMode();
+        const captureStream = _getCaptureStream();
+        if (flashMode === 'torch' && captureStream) {
+            const track = captureStream.getVideoTracks()[0];
+            if (track) {
+                track.applyConstraints({ advanced: [{ torch: true }] }).catch(() => {});
+            }
+        }
+        document.body.style.overflow = '';
+    }
+
+    function renderGalleryGrid() {
+        const grid = document.getElementById('gallery-grid');
+        grid.innerHTML = '';
+
+        galleryPhotos.forEach((photo, idx) => {
+            const thumb = document.createElement('div');
+            thumb.className = 'gallery-thumb';
+            thumb.draggable = true;
+            thumb.dataset.index = idx;
+
+            const img = document.createElement('img');
+            img.src = photo.thumbUrl;
+            img.alt = `Photo ${idx + 1}`;
+
+            const indexBadge = document.createElement('span');
+            indexBadge.className = 'gallery-thumb-index';
+            indexBadge.textContent = idx + 1;
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'gallery-thumb-delete';
+            deleteBtn.textContent = '✕';
+            deleteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                deleteGalleryPhoto(idx);
+            });
+
+            thumb.appendChild(img);
+            thumb.appendChild(indexBadge);
+            thumb.appendChild(deleteBtn);
+
+            // Tap to open edit view
+            thumb.addEventListener('click', () => openGalleryEdit(idx));
+
+            // Drag-and-drop reorder
+            thumb.addEventListener('dragstart', (e) => {
+                e.dataTransfer.setData('text/plain', idx);
+                thumb.classList.add('dragging');
+            });
+            thumb.addEventListener('dragend', () => thumb.classList.remove('dragging'));
+            thumb.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                thumb.classList.add('drag-over');
+            });
+            thumb.addEventListener('dragleave', () => thumb.classList.remove('drag-over'));
+            thumb.addEventListener('drop', (e) => {
+                e.preventDefault();
+                thumb.classList.remove('drag-over');
+                const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
+                const toIdx = idx;
+                if (fromIdx !== toIdx) {
+                    const [moved] = galleryPhotos.splice(fromIdx, 1);
+                    galleryPhotos.splice(toIdx, 0, moved);
+                    renderGalleryGrid();
+                }
+            });
+
+            // Touch-based reorder: long press to drag
+            let touchTimer = null;
+            let touchDragging = false;
+            let touchFromIdx = -1;
+            thumb.addEventListener('touchstart', (e) => {
+                touchTimer = setTimeout(() => {
+                    touchDragging = true;
+                    touchFromIdx = idx;
+                    thumb.classList.add('dragging');
+                }, 400);
+            }, { passive: true });
+            thumb.addEventListener('touchmove', () => {
+                if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
+            });
+            thumb.addEventListener('touchend', (e) => {
+                if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
+                if (touchDragging) {
+                    // Find element under touch
+                    const touch = e.changedTouches[0];
+                    const target = document.elementFromPoint(touch.clientX, touch.clientY);
+                    const targetThumb = target ? target.closest('.gallery-thumb') : null;
+                    if (targetThumb && targetThumb.dataset.index !== undefined) {
+                        const toIdx = parseInt(targetThumb.dataset.index);
+                        if (touchFromIdx !== toIdx) {
+                            const [moved] = galleryPhotos.splice(touchFromIdx, 1);
+                            galleryPhotos.splice(toIdx, 0, moved);
+                        }
+                    }
+                    touchDragging = false;
+                    touchFromIdx = -1;
+                    renderGalleryGrid();
+                }
+            });
+
+            grid.appendChild(thumb);
+        });
+
+        // Update send button label
+        const label = document.getElementById('gallery-send-label');
+        label.textContent = _i18n.t('send.sendAll').replace('{n}', galleryPhotos.length);
+    }
+
+    function deleteGalleryPhoto(idx) {
+        const photo = galleryPhotos[idx];
+        if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+
+        // If already sent to receiver, tell receiver to delete it
+        if (photo.sentHash) {
+            _rtc.sendMessage({ type: 'delete-image', hash: photo.sentHash });
+        } else {
+            // If still in sendQueue, remove it
+            const qIdx = _sendQueue.findIndex(item => item.photoId === photo.id);
+            if (qIdx !== -1) _sendQueue.splice(qIdx, 1);
+        }
+
+        galleryPhotos.splice(idx, 1);
+        updateGalleryBadge();
+        if (galleryPhotos.length === 0) {
+            closeGallery();
+        } else {
+            renderGalleryGrid();
+        }
+    }
+
+    function clearGallery() {
+        galleryPhotos.forEach(p => {
+            if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
+            // If already sent, tell receiver to delete
+            if (p.sentHash) {
+                _rtc.sendMessage({ type: 'delete-image', hash: p.sentHash });
+            } else {
+                // Remove from sendQueue if pending
+                const qIdx = _sendQueue.findIndex(item => item.photoId === p.id);
+                if (qIdx !== -1) _sendQueue.splice(qIdx, 1);
+            }
+        });
+        galleryPhotos = [];
+        updateGalleryBadge();
+        closeGallery();
+    }
+
+    function openGalleryEdit(idx) {
+        galleryEditIndex = idx;
+        const photo = galleryPhotos[idx];
+        const editView = document.getElementById('gallery-edit-view');
+        const editImg = document.getElementById('gallery-edit-image');
+
+        if (editImg.src && editImg.src.startsWith('blob:')) {
+            URL.revokeObjectURL(editImg.src);
+        }
+        editImg.src = URL.createObjectURL(photo.blob);
+        editView.classList.remove('hidden');
+
+        // Reset B&W state
+        document.getElementById('gallery-bw-btn').classList.remove('active');
+    }
+
+    function closeGalleryEdit() {
+        document.getElementById('gallery-edit-view').classList.add('hidden');
+        galleryEditIndex = -1;
+        renderGalleryGrid();
+    }
+
+    async function applyGalleryTransform(transformFn) {
+        if (galleryEditIndex < 0 || galleryEditIndex >= galleryPhotos.length) return;
+        const photo = galleryPhotos[galleryEditIndex];
+
+        const img = new Image();
+        const url = URL.createObjectURL(photo.blob);
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = reject;
+            img.src = url;
+        });
+        URL.revokeObjectURL(url);
+
+        const resultBlob = await transformFn(img);
+
+        // Update gallery entry
+        if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+        photo.blob = resultBlob;
+        photo.originalBlob = resultBlob;
+        photo.thumbUrl = URL.createObjectURL(resultBlob);
+
+        // Refresh edit view
+        const editImg = document.getElementById('gallery-edit-image');
+        if (editImg.src && editImg.src.startsWith('blob:')) URL.revokeObjectURL(editImg.src);
+        editImg.src = URL.createObjectURL(resultBlob);
+
+        // If already sent, send transform commands instead of full resend
+        if (photo.sentHash) {
+            const oldHash = photo.sentHash;
+            _logger.info(`Sending transform commands for ${oldHash.substring(0, 8)}... (${photo.transforms.length} ops)`);
+            _rtc.sendMessage({
+                type: 'transform-image',
+                oldHash: oldHash,
+                transforms: photo.transforms
+            });
+            photo.sentHash = oldHash; // keep tracking (receiver will use same hash lookup)
+        }
+    }
+
+    async function galleryRotateCW() {
+        if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
+            galleryPhotos[galleryEditIndex].transforms.push({ op: 'rotateCW' });
+        }
+        await applyGalleryTransform(async (img) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.height;
+            canvas.height = img.width;
+            const ctx = canvas.getContext('2d');
+            ctx.translate(canvas.width / 2, canvas.height / 2);
+            ctx.rotate(Math.PI / 2);
+            ctx.drawImage(img, -img.width / 2, -img.height / 2);
+            return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+        });
+    }
+
+    async function galleryFlipH() {
+        if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
+            galleryPhotos[galleryEditIndex].transforms.push({ op: 'flipH' });
+        }
+        await applyGalleryTransform(async (img) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(img, 0, 0);
+            return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+        });
+    }
+
+    async function galleryApplyBW() {
+        if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
+            galleryPhotos[galleryEditIndex].transforms.push({ op: 'bw' });
+        }
+        await applyGalleryTransform(async (img) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            _applyOtsu(imageData);
+            ctx.putImageData(imageData, 0, 0);
+            return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        });
+        document.getElementById('gallery-bw-btn').classList.add('active');
+    }
+
+    function galleryOpenCrop() {
+        if (galleryEditIndex < 0) return;
+        const photo = galleryPhotos[galleryEditIndex];
+        _setCropContext(photo.blob, photo.originalBlob);
+        _openCropModal();
+    }
+
+    function applyCropResult(editIdx, { blob, corners }) {
+        if (editIdx < 0 || editIdx >= galleryPhotos.length) return;
+        const photo = galleryPhotos[editIdx];
+        if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+        photo.blob = blob;
+        photo.originalBlob = blob;
+        photo.thumbUrl = URL.createObjectURL(blob);
+        photo.transforms.push({ op: 'crop', corners });
+
+        if (photo.sentHash) {
+            const oldHash = photo.sentHash;
+            _logger.info(`Sending transform commands for crop (replacing ${oldHash.substring(0, 8)}...)`);
+            _rtc.sendMessage({
+                type: 'transform-image',
+                oldHash: oldHash,
+                transforms: photo.transforms
+            });
+        }
+
+        openGalleryEdit(editIdx);
+    }
+
+    function finalizeBatch() {
+        // Send batch-end to finalize the collection on the receiver
+        _rtc.sendMessage({ type: 'batch-end' });
+        _logger.info('Batch finalized');
+
+        // Clear gallery thumbnails (photos already sent)
+        galleryPhotos.forEach(p => { if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl); });
+        galleryPhotos = [];
+        updateGalleryBadge();
+        closeGallery();
+
+        // Stop camera and return to choose step
+        _stopCapture();
+        _showStep(_stepChoose);
+    }
+
+    window.Gallery = {
+        attach,
+        photos,
+        size,
+        getEditIndex,
+        nextId,
+        addPhoto,
+        updateGalleryBadge,
+        openGallery,
+        closeGallery,
+        renderGalleryGrid,
+        deleteGalleryPhoto,
+        clearGallery,
+        openGalleryEdit,
+        closeGalleryEdit,
+        galleryRotateCW,
+        galleryFlipH,
+        galleryApplyBW,
+        galleryOpenCrop,
+        applyCropResult,
+        finalizeBatch,
+    };
+})();

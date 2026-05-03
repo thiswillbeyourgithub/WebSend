@@ -296,6 +296,7 @@
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-KZL1G6hHUlqSP54O3kYuW9oJxJBOdB6ypb8mmOPatYZ4S0gyDlsFX4i0nc2bf5Xq"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
+    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-xz/V81MW1orpqLM/GR+6FRdEClw1N8KSAPluwdL5OyB9fzipxtshKjefv6K/ytbO"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -343,11 +344,7 @@
         let lastDetectedCorners = null;
         let sendQueue = [];       // Pending photo blobs awaiting transmission
         let isSendingQueue = false; // Whether the queue drain loop is running
-        // Gallery: photos captured in continuous camera mode (Genius Scan-like)
-        let galleryPhotos = [];    // Array of { blob, thumbUrl, originalBlob, id, sentHash, sendStatus, transforms }
-        let photoIdCounter = 0;    // Unique ID counter for gallery photos
         let pendingBatchEnd = false; // Whether to send batch-end when queue drains
-        let galleryEditIndex = -1; // Index of photo being edited in gallery
 
         // Re-acquire wake lock and auto-reconnect when screen wakes up
         document.addEventListener('visibilitychange', async () => {
@@ -494,6 +491,22 @@
             rtc.onStateChange = onStateChange;
             rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
+            Gallery.attach({
+                rtc,
+                i18n,
+                logger,
+                showToast,
+                showStep,
+                stepChoose,
+                stopCapture,
+                openCropModal,
+                applyOtsu: ImageTransforms.applyOtsu,
+                getFlashMode: () => flashMode,
+                getCaptureStream: () => captureStream,
+                setCropContext: (blob, original) => { currentPhotoBlob = blob; originalPhotoBlob = original; },
+                sendQueue,
+            });
+
             // Set up button handlers
             document.getElementById('start-scan-btn').addEventListener('click', startScanner);
             document.getElementById('manual-url-btn').addEventListener('click', () => {
@@ -509,27 +522,27 @@
             document.getElementById('use-dir-btn').addEventListener('click', () => document.getElementById('dir-input').click());
             document.getElementById('dir-input').addEventListener('change', handleFileSelect);
             document.getElementById('capture-btn').addEventListener('click', capturePhoto);
-            document.getElementById('gallery-btn').addEventListener('click', openGallery);
-            document.getElementById('camera-done-btn').addEventListener('click', finalizeBatch);
-            document.getElementById('gallery-back-btn').addEventListener('click', closeGallery);
-            document.getElementById('gallery-clear-btn').addEventListener('click', clearGallery);
-            document.getElementById('gallery-send-btn').addEventListener('click', finalizeBatch);
-            document.getElementById('gallery-edit-back-btn').addEventListener('click', closeGalleryEdit);
+            document.getElementById('gallery-btn').addEventListener('click', Gallery.openGallery);
+            document.getElementById('camera-done-btn').addEventListener('click', Gallery.finalizeBatch);
+            document.getElementById('gallery-back-btn').addEventListener('click', Gallery.closeGallery);
+            document.getElementById('gallery-clear-btn').addEventListener('click', Gallery.clearGallery);
+            document.getElementById('gallery-send-btn').addEventListener('click', Gallery.finalizeBatch);
+            document.getElementById('gallery-edit-back-btn').addEventListener('click', Gallery.closeGalleryEdit);
             document.getElementById('gallery-edit-delete-btn').addEventListener('click', () => {
-                if (galleryEditIndex >= 0) {
-                    const idx = galleryEditIndex;
-                    closeGalleryEdit();
-                    deleteGalleryPhoto(idx);
+                const idx = Gallery.getEditIndex();
+                if (idx >= 0) {
+                    Gallery.closeGalleryEdit();
+                    Gallery.deleteGalleryPhoto(idx);
                 }
             });
-            document.getElementById('gallery-rotate-btn').addEventListener('click', galleryRotateCW);
-            document.getElementById('gallery-crop-btn').addEventListener('click', galleryOpenCrop);
-            document.getElementById('gallery-flip-btn').addEventListener('click', galleryFlipH);
-            document.getElementById('gallery-bw-btn').addEventListener('click', galleryApplyBW);
+            document.getElementById('gallery-rotate-btn').addEventListener('click', Gallery.galleryRotateCW);
+            document.getElementById('gallery-crop-btn').addEventListener('click', Gallery.galleryOpenCrop);
+            document.getElementById('gallery-flip-btn').addEventListener('click', Gallery.galleryFlipH);
+            document.getElementById('gallery-bw-btn').addEventListener('click', Gallery.galleryApplyBW);
             document.getElementById('back-to-choose-btn').addEventListener('click', () => {
                 // Warn if gallery has photos
-                if (galleryPhotos.length > 0 && !confirm(i18n.t('send.galleryEmpty') + '?')) return;
-                clearGallery();
+                if (Gallery.size() > 0 && !confirm(i18n.t('send.galleryEmpty') + '?')) return;
+                Gallery.clearGallery();
                 // Finalize the batch on the receiver side
                 rtc.sendMessage({ type: 'batch-end' });
                 stopCapture();
@@ -910,7 +923,7 @@
             const reason = msg.reason || 'unknown';
             logger.warn(`transform-nack received for ${msg.oldHash?.substring(0, 8)}... (${reason})`);
 
-            const photo = galleryPhotos.find(p => p && p.sentHash === msg.oldHash);
+            const photo = Gallery.photos().find(p => p && p.sentHash === msg.oldHash);
             if (!photo) {
                 logger.warn('transform-nack: no local photo matches oldHash, cannot recover');
                 showToast(i18n.t('send.transformFailedUnknown'), { type: 'error' });
@@ -1257,12 +1270,11 @@
 
             // Add to gallery (camera stays open) and queue for immediate send
             const thumbUrl = URL.createObjectURL(capturedBlob);
-            const photo = { blob: capturedBlob, thumbUrl, originalBlob: capturedBlob, id: ++photoIdCounter, sentHash: null, sendStatus: 'queuing', transforms: [] };
-            galleryPhotos.push(photo);
-            updateGalleryBadge();
+            const photoId = Gallery.nextId();
+            Gallery.addPhoto({ blob: capturedBlob, thumbUrl, originalBlob: capturedBlob, id: photoId, sentHash: null, sendStatus: 'queuing', transforms: [] });
 
             // Queue for immediate background send
-            sendQueue.push({ blob: capturedBlob, photoId: photo.id });
+            sendQueue.push({ blob: capturedBlob, photoId });
             drainQueue();
 
             // Brief visual feedback: flash the screen white
@@ -1270,348 +1282,9 @@
             container.style.boxShadow = 'inset 0 0 0 1000px rgba(255,255,255,0.5)';
             setTimeout(() => { container.style.boxShadow = ''; }, 120);
 
-            logger.info(`Photo added to gallery (${galleryPhotos.length} total)`);
+            logger.info(`Photo added to gallery (${Gallery.size()} total)`);
         }
 
-        // ============ Gallery (Genius Scan-like) ============
-
-        /** Update the badge counter on the gallery button */
-        function updateGalleryBadge() {
-            const badge = document.getElementById('gallery-badge');
-            const count = galleryPhotos.length;
-            badge.textContent = count;
-            if (count > 0) {
-                badge.classList.remove('hidden');
-            } else {
-                badge.classList.add('hidden');
-            }
-        }
-
-        /** Open the gallery modal */
-        function openGallery() {
-            if (galleryPhotos.length === 0) {
-                showToast(i18n.t('send.noPhotos'));
-                return;
-            }
-            // Turn off torch if active to save battery while browsing gallery
-            if (flashMode === 'torch' && captureStream) {
-                const track = captureStream.getVideoTracks()[0];
-                if (track) {
-                    track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {});
-                }
-            }
-            // Pause camera to save resources while browsing gallery
-            const video = document.getElementById('capture-video');
-            if (video.srcObject) {
-                video.srcObject.getTracks().forEach(t => t.enabled = false);
-            }
-            document.body.style.overflow = 'hidden';
-            document.getElementById('gallery-modal').classList.remove('hidden');
-            renderGalleryGrid();
-        }
-
-        /** Close the gallery modal */
-        function closeGallery() {
-            document.getElementById('gallery-modal').classList.add('hidden');
-            document.getElementById('gallery-edit-view').classList.add('hidden');
-            galleryEditIndex = -1;
-            // Resume camera
-            const video = document.getElementById('capture-video');
-            if (video.srcObject) {
-                video.srcObject.getTracks().forEach(t => t.enabled = true);
-            }
-            // Re-enable torch if it was on before opening gallery
-            if (flashMode === 'torch' && captureStream) {
-                const track = captureStream.getVideoTracks()[0];
-                if (track) {
-                    track.applyConstraints({ advanced: [{ torch: true }] }).catch(() => {});
-                }
-            }
-            document.body.style.overflow = '';
-        }
-
-        /** Render the thumbnail grid in the gallery modal */
-        function renderGalleryGrid() {
-            const grid = document.getElementById('gallery-grid');
-            grid.innerHTML = '';
-
-            galleryPhotos.forEach((photo, idx) => {
-                const thumb = document.createElement('div');
-                thumb.className = 'gallery-thumb';
-                thumb.draggable = true;
-                thumb.dataset.index = idx;
-
-                const img = document.createElement('img');
-                img.src = photo.thumbUrl;
-                img.alt = `Photo ${idx + 1}`;
-
-                const indexBadge = document.createElement('span');
-                indexBadge.className = 'gallery-thumb-index';
-                indexBadge.textContent = idx + 1;
-
-                const deleteBtn = document.createElement('button');
-                deleteBtn.className = 'gallery-thumb-delete';
-                deleteBtn.textContent = '✕';
-                deleteBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    deleteGalleryPhoto(idx);
-                });
-
-                thumb.appendChild(img);
-                thumb.appendChild(indexBadge);
-                thumb.appendChild(deleteBtn);
-
-                // Tap to open edit view
-                thumb.addEventListener('click', () => openGalleryEdit(idx));
-
-                // Drag-and-drop reorder
-                thumb.addEventListener('dragstart', (e) => {
-                    e.dataTransfer.setData('text/plain', idx);
-                    thumb.classList.add('dragging');
-                });
-                thumb.addEventListener('dragend', () => thumb.classList.remove('dragging'));
-                thumb.addEventListener('dragover', (e) => {
-                    e.preventDefault();
-                    thumb.classList.add('drag-over');
-                });
-                thumb.addEventListener('dragleave', () => thumb.classList.remove('drag-over'));
-                thumb.addEventListener('drop', (e) => {
-                    e.preventDefault();
-                    thumb.classList.remove('drag-over');
-                    const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
-                    const toIdx = idx;
-                    if (fromIdx !== toIdx) {
-                        const [moved] = galleryPhotos.splice(fromIdx, 1);
-                        galleryPhotos.splice(toIdx, 0, moved);
-                        renderGalleryGrid();
-                    }
-                });
-
-                // Touch-based reorder: long press to drag
-                let touchTimer = null;
-                let touchDragging = false;
-                let touchFromIdx = -1;
-                thumb.addEventListener('touchstart', (e) => {
-                    touchTimer = setTimeout(() => {
-                        touchDragging = true;
-                        touchFromIdx = idx;
-                        thumb.classList.add('dragging');
-                    }, 400);
-                }, { passive: true });
-                thumb.addEventListener('touchmove', () => {
-                    if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
-                });
-                thumb.addEventListener('touchend', (e) => {
-                    if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
-                    if (touchDragging) {
-                        // Find element under touch
-                        const touch = e.changedTouches[0];
-                        const target = document.elementFromPoint(touch.clientX, touch.clientY);
-                        const targetThumb = target ? target.closest('.gallery-thumb') : null;
-                        if (targetThumb && targetThumb.dataset.index !== undefined) {
-                            const toIdx = parseInt(targetThumb.dataset.index);
-                            if (touchFromIdx !== toIdx) {
-                                const [moved] = galleryPhotos.splice(touchFromIdx, 1);
-                                galleryPhotos.splice(toIdx, 0, moved);
-                            }
-                        }
-                        touchDragging = false;
-                        touchFromIdx = -1;
-                        renderGalleryGrid();
-                    }
-                });
-
-                grid.appendChild(thumb);
-            });
-
-            // Update send button label
-            const label = document.getElementById('gallery-send-label');
-            label.textContent = i18n.t('send.sendAll').replace('{n}', galleryPhotos.length);
-        }
-
-        /** Delete a photo from the gallery */
-        function deleteGalleryPhoto(idx) {
-            const photo = galleryPhotos[idx];
-            if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
-
-            // If already sent to receiver, tell receiver to delete it
-            if (photo.sentHash) {
-                rtc.sendMessage({ type: 'delete-image', hash: photo.sentHash });
-            } else {
-                // If still in sendQueue, remove it
-                const qIdx = sendQueue.findIndex(item => item.photoId === photo.id);
-                if (qIdx !== -1) sendQueue.splice(qIdx, 1);
-            }
-
-            galleryPhotos.splice(idx, 1);
-            updateGalleryBadge();
-            if (galleryPhotos.length === 0) {
-                closeGallery();
-            } else {
-                renderGalleryGrid();
-            }
-        }
-
-        /** Clear all gallery photos */
-        function clearGallery() {
-            galleryPhotos.forEach(p => {
-                if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
-                // If already sent, tell receiver to delete
-                if (p.sentHash) {
-                    rtc.sendMessage({ type: 'delete-image', hash: p.sentHash });
-                } else {
-                    // Remove from sendQueue if pending
-                    const qIdx = sendQueue.findIndex(item => item.photoId === p.id);
-                    if (qIdx !== -1) sendQueue.splice(qIdx, 1);
-                }
-            });
-            galleryPhotos = [];
-            updateGalleryBadge();
-            closeGallery();
-        }
-
-        /** Open the edit view for a single gallery photo */
-        function openGalleryEdit(idx) {
-            galleryEditIndex = idx;
-            const photo = galleryPhotos[idx];
-            const editView = document.getElementById('gallery-edit-view');
-            const editImg = document.getElementById('gallery-edit-image');
-
-            if (editImg.src && editImg.src.startsWith('blob:')) {
-                URL.revokeObjectURL(editImg.src);
-            }
-            editImg.src = URL.createObjectURL(photo.blob);
-            editView.classList.remove('hidden');
-
-            // Reset B&W state
-            document.getElementById('gallery-bw-btn').classList.remove('active');
-        }
-
-        /** Close the gallery edit view and return to grid */
-        function closeGalleryEdit() {
-            document.getElementById('gallery-edit-view').classList.add('hidden');
-            galleryEditIndex = -1;
-            renderGalleryGrid();
-        }
-
-        /** Helper: apply an image transform to the gallery photo at galleryEditIndex */
-        async function applyGalleryTransform(transformFn) {
-            if (galleryEditIndex < 0 || galleryEditIndex >= galleryPhotos.length) return;
-            const photo = galleryPhotos[galleryEditIndex];
-
-            const img = new Image();
-            const url = URL.createObjectURL(photo.blob);
-            await new Promise((resolve, reject) => {
-                img.onload = resolve;
-                img.onerror = reject;
-                img.src = url;
-            });
-            URL.revokeObjectURL(url);
-
-            const resultBlob = await transformFn(img);
-
-            // Update gallery entry
-            if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
-            photo.blob = resultBlob;
-            photo.originalBlob = resultBlob;
-            photo.thumbUrl = URL.createObjectURL(resultBlob);
-
-            // Refresh edit view
-            const editImg = document.getElementById('gallery-edit-image');
-            if (editImg.src && editImg.src.startsWith('blob:')) URL.revokeObjectURL(editImg.src);
-            editImg.src = URL.createObjectURL(resultBlob);
-
-            // If already sent, send transform commands instead of full resend
-            if (photo.sentHash) {
-                const oldHash = photo.sentHash;
-                logger.info(`Sending transform commands for ${oldHash.substring(0, 8)}... (${photo.transforms.length} ops)`);
-                rtc.sendMessage({
-                    type: 'transform-image',
-                    oldHash: oldHash,
-                    transforms: photo.transforms
-                });
-                photo.sentHash = oldHash; // keep tracking (receiver will use same hash lookup)
-            }
-        }
-
-        /** Rotate gallery photo 90° CW */
-        async function galleryRotateCW() {
-            if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
-                galleryPhotos[galleryEditIndex].transforms.push({ op: 'rotateCW' });
-            }
-            await applyGalleryTransform(async (img) => {
-                const canvas = document.createElement('canvas');
-                canvas.width = img.height;
-                canvas.height = img.width;
-                const ctx = canvas.getContext('2d');
-                ctx.translate(canvas.width / 2, canvas.height / 2);
-                ctx.rotate(Math.PI / 2);
-                ctx.drawImage(img, -img.width / 2, -img.height / 2);
-                return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
-            });
-        }
-
-        /** Flip gallery photo horizontally */
-        async function galleryFlipH() {
-            if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
-                galleryPhotos[galleryEditIndex].transforms.push({ op: 'flipH' });
-            }
-            await applyGalleryTransform(async (img) => {
-                const canvas = document.createElement('canvas');
-                canvas.width = img.width;
-                canvas.height = img.height;
-                const ctx = canvas.getContext('2d');
-                ctx.translate(canvas.width, 0);
-                ctx.scale(-1, 1);
-                ctx.drawImage(img, 0, 0);
-                return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
-            });
-        }
-
-        /** Apply B&W to gallery photo */
-        async function galleryApplyBW() {
-            if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
-                galleryPhotos[galleryEditIndex].transforms.push({ op: 'bw' });
-            }
-            await applyGalleryTransform(async (img) => {
-                const canvas = document.createElement('canvas');
-                canvas.width = img.naturalWidth;
-                canvas.height = img.naturalHeight;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0);
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                applyOtsu(imageData);
-                ctx.putImageData(imageData, 0, 0);
-                return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-            });
-            document.getElementById('gallery-bw-btn').classList.add('active');
-        }
-
-        /** Open crop modal for gallery photo */
-        function galleryOpenCrop() {
-            if (galleryEditIndex < 0) return;
-            const photo = galleryPhotos[galleryEditIndex];
-            currentPhotoBlob = photo.blob;
-            originalPhotoBlob = photo.originalBlob;
-            openCropModal();
-        }
-
-        /** Finalize the current batch — photos were already sent on capture */
-        function finalizeBatch() {
-            // Send batch-end to finalize the collection on the receiver
-            rtc.sendMessage({ type: 'batch-end' });
-            logger.info('Batch finalized');
-
-            // Clear gallery thumbnails (photos already sent)
-            galleryPhotos.forEach(p => { if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl); });
-            galleryPhotos = [];
-            updateGalleryBadge();
-            closeGallery();
-
-            // Stop camera and return to choose step
-            stopCapture();
-            showStep(stepChoose);
-        }
 
         /** MIME → output file extension for stripped images. */
         const MIME_TO_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
@@ -1858,7 +1531,7 @@
                     successCount++;
                     // Update gallery photo with sent hash if it came from the camera flow
                     if (item.photoId != null) {
-                        const gPhoto = galleryPhotos.find(p => p.id === item.photoId);
+                        const gPhoto = Gallery.photos().find(p => p.id === item.photoId);
                         if (gPhoto) {
                             gPhoto.sentHash = localHash;
                             gPhoto.sendStatus = 'sent';
@@ -1869,7 +1542,7 @@
                     sendQueue.shift();
                     // Mark as failed in gallery
                     if (item.photoId != null) {
-                        const gPhoto = galleryPhotos.find(p => p.id === item.photoId);
+                        const gPhoto = Gallery.photos().find(p => p.id === item.photoId);
                         if (gPhoto) gPhoto.sendStatus = 'failed';
                     }
                     logger.error('Queued photo failed: ' + e.message);
@@ -2054,7 +1727,7 @@
 
             // Capture which gallery index (if any) this crop applies to, so
             // a later open doesn't race with this one.
-            const editIdx = galleryEditIndex;
+            const editIdx = Gallery.getEditIndex();
 
             CropModal.open({
                 sourceBlob,
@@ -2073,26 +1746,9 @@
                     );
 
                     // Gallery-edit path: update gallery entry, send transform-image if already sent
-                    if (editIdx >= 0 && editIdx < galleryPhotos.length) {
-                        const photo = galleryPhotos[editIdx];
-                        if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
-                        photo.blob = currentPhotoBlob;
-                        photo.originalBlob = currentPhotoBlob;
-                        photo.thumbUrl = URL.createObjectURL(currentPhotoBlob);
-                        photo.transforms.push({ op: 'crop', corners: normalizedCorners });
+                    if (editIdx >= 0 && editIdx < Gallery.size()) {
                         logger.success(`Cropped gallery image: ${dstW}x${dstH}px`);
-
-                        if (photo.sentHash) {
-                            const oldHash = photo.sentHash;
-                            logger.info(`Sending transform commands for crop (replacing ${oldHash.substring(0, 8)}...)`);
-                            rtc.sendMessage({
-                                type: 'transform-image',
-                                oldHash: oldHash,
-                                transforms: photo.transforms
-                            });
-                        }
-
-                        openGalleryEdit(editIdx);
+                        Gallery.applyCropResult(editIdx, { blob: currentPhotoBlob, corners: normalizedCorners });
                         return;
                     }
 
