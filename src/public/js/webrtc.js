@@ -32,6 +32,7 @@ class WebSendRTC {
         this.receiveBuffer = [];
         this.receivedSize = 0;
         this.expectedSize = 0;
+        this._lastLoggedDecile = -1;
 
         // ICE candidate handling
         this.pendingIceCandidates = [];
@@ -271,6 +272,7 @@ class WebSendRTC {
                     this.receiveBuffer = [];
                     this.receivedSize = 0;
                     this.expectedSize = msg.size;
+                    this._lastLoggedDecile = -1;
                     logger.info(`Receiving encrypted file (${msg.size} bytes, padded)`);
                 } else if (msg.type === 'file-end') {
                     logger.info('File transfer complete, assembling...');
@@ -315,9 +317,10 @@ class WebSendRTC {
             // Binary data (file chunk)
             this.receiveBuffer.push(data);
             this.receivedSize += data.byteLength;
-            const percent = Math.round((this.receivedSize / this.expectedSize) * 100);
-            if (percent % 10 === 0) {
-                logger.info(`Receiving: ${percent}%`);
+            const decile = Math.floor((this.receivedSize / this.expectedSize) * 10) * 10;
+            if (decile !== this._lastLoggedDecile) {
+                this._lastLoggedDecile = decile;
+                logger.info(`Receiving: ${decile}%`);
             }
             if (this.onMessage) {
                 this.onMessage({
@@ -1043,6 +1046,7 @@ class WebSendRTC {
         this.receiveBuffer = [];
         this.receivedSize = 0;
         this.expectedSize = 0;
+        this._lastLoggedDecile = -1;
         this.pendingIceCandidates = [];
         if (this.dataChannel) {
             this.dataChannel.close();
