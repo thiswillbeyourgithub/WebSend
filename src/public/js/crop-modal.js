@@ -61,7 +61,7 @@
         wrap.querySelector('[data-crop-action="apply"]').addEventListener('click', apply);
 
         if (window.i18n && typeof window.i18n.applyTranslations === 'function') {
-            try { window.i18n.applyTranslations(); } catch (_) { /* i18n not ready; labels fall back to defaults */ }
+            try { window.i18n.applyTranslations(); } catch (e) { (window.logger && window.logger.warn ? window.logger.warn : console.warn).call(window.logger || console, 'crop-modal: i18n.applyTranslations() failed; labels stay in English: ' + (e && e.message)); }
         }
 
         initialized = true;
