@@ -11,6 +11,7 @@
   "/js/ocr-rescale.js": "sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn",
   "/js/pdf-builder.js": "sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/",
   "/js/peer-ui.js": "sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A",
+  "/js/protocol.js": "sha384-wOjId0OVKzyBy5nyPtTttd7IUkWlF0/k+SLliOrOpjUInFgSVyAUS7HKTguA/h+l",
   "/js/qrcode.min.js": "sha384-HGmnkDZJy7mRkoARekrrj0VjEFSh9a0Z8qxGri/kTTAJkgR8hqD1lHsYSh3JdzRi",
   "/js/receive-card.js": "sha384-bP286JQvBDI/Gv/zT+xKFKW64BSNxvOMqqARKNOVj59eLDMuPXFG0UydA3XJccja",
   "/js/receive-export.js": "sha384-BKUlRg9kPHUDg90WhcWuurrn9Y19aAR8F7P0R0VS8YXCu5SKBhCkKT/72nbZHW6f",
