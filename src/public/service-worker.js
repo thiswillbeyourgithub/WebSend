@@ -25,7 +25,6 @@ const STATIC_ASSETS = [
     '/js/webrtc.js',
     '/js/qrcode.min.js',
     '/js/jsqr.min.js',
-    '/js/sdp-compress.js',
     '/icons/icon-192.png',
     '/icons/icon-512.png',
     '/manifest.json'

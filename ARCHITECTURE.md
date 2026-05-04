@@ -85,9 +85,6 @@ WebSend/
         │   │               #   DEV mode (toggled via server config) enables verbose output
         │   ├── i18n.js     # Internationalization: English + French. Detects browser locale,
         │   │               #   applies translations via data-i18n attributes on DOM elements
-        │   ├── sdp-compress.js # SDP compression utilities (extracts essential SDP fields,
-        │   │               #   compresses with deflate, reconstructs minimal valid SDP).
-        │   │               #   Used to keep QR codes small
         │   ├── crop-modal.js # Shared perspective-crop modal (injects its own DOM).
         │   │               #   Exposes window.CropModal.open({ sourceBlob, initialCorners,
         │   │               #   detectCorners, onApply, onCancel }); used by both send.html
@@ -333,7 +330,7 @@ This feature is experimental and was added with assistance from
 
 Three tiers, layered from fast/cheap to slow/realistic:
 
-- **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `sdp-compress.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed.
+- **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed.
 - **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, and the `/vendor` `/scribe` `/tessdata` static mounts. A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
 - **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer.
 
