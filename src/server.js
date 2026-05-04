@@ -567,6 +567,50 @@ const MAX_SDP_LEN = 20_000;
 // above the typical handful of host/srflx/relay candidates a real client
 // generates.
 const MAX_ICE_CANDIDATES = 50;
+const MAX_ICE_CANDIDATE_LEN = 1024;
+const MAX_ICE_MID_LEN = 16;
+const MAX_ICE_UFRAG_LEN = 256;
+const MAX_ICE_MLINE_INDEX = 32;
+
+/**
+ * Validate and reconstruct an RTCIceCandidateInit body. Whitelists fields,
+ * enforces length/type bounds, and returns a clean object — never the raw
+ * req.body — to prevent storing arbitrary attacker-controlled JSON that
+ * gets fed into new RTCIceCandidate() on the peer.
+ *
+ * Returns { ok: true, value } or { ok: false, error }.
+ */
+function validateIceBody(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return { ok: false, error: 'body must be a JSON object' };
+    }
+    if (typeof body.candidate !== 'string' || body.candidate.length === 0 ||
+        body.candidate.length > MAX_ICE_CANDIDATE_LEN) {
+        return { ok: false, error: `candidate must be a string 1..${MAX_ICE_CANDIDATE_LEN}` };
+    }
+    const out = { candidate: body.candidate };
+    if (body.sdpMid !== undefined && body.sdpMid !== null) {
+        if (typeof body.sdpMid !== 'string' || body.sdpMid.length > MAX_ICE_MID_LEN) {
+            return { ok: false, error: `sdpMid must be a string ≤${MAX_ICE_MID_LEN}` };
+        }
+        out.sdpMid = body.sdpMid;
+    }
+    if (body.sdpMLineIndex !== undefined && body.sdpMLineIndex !== null) {
+        if (!Number.isInteger(body.sdpMLineIndex) ||
+            body.sdpMLineIndex < 0 || body.sdpMLineIndex > MAX_ICE_MLINE_INDEX) {
+            return { ok: false, error: `sdpMLineIndex must be an integer 0..${MAX_ICE_MLINE_INDEX}` };
+        }
+        out.sdpMLineIndex = body.sdpMLineIndex;
+    }
+    if (body.usernameFragment !== undefined && body.usernameFragment !== null) {
+        if (typeof body.usernameFragment !== 'string' ||
+            body.usernameFragment.length > MAX_ICE_UFRAG_LEN) {
+            return { ok: false, error: `usernameFragment must be a string ≤${MAX_ICE_UFRAG_LEN}` };
+        }
+        out.usernameFragment = body.usernameFragment;
+    }
+    return { ok: true, value: out };
+}
 
 /**
  * Validate an SDP description body. Returns null on success or an error
@@ -710,9 +754,11 @@ app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoo
     if (req.room.iceCandidatesOffer.length >= MAX_ICE_CANDIDATES) {
         return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
     }
-    req.room.iceCandidatesOffer.push(req.body);
+    const result = validateIceBody(req.body);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    req.room.iceCandidatesOffer.push(result.value);
     debugLog('ICE', `Offer ICE candidate added for room ${req.params.id}`, {
-        candidate: req.body.candidate?.substring(0, 50),
+        candidate: result.value.candidate.substring(0, 50),
         total: req.room.iceCandidatesOffer.length
     });
     res.json({ success: true });
@@ -740,9 +786,11 @@ app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRo
     if (req.room.iceCandidatesAnswer.length >= MAX_ICE_CANDIDATES) {
         return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
     }
-    req.room.iceCandidatesAnswer.push(req.body);
+    const result = validateIceBody(req.body);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    req.room.iceCandidatesAnswer.push(result.value);
     debugLog('ICE', `Answer ICE candidate added for room ${req.params.id}`, {
-        candidate: req.body.candidate?.substring(0, 50),
+        candidate: result.value.candidate.substring(0, 50),
         total: req.room.iceCandidatesAnswer.length
     });
     res.json({ success: true });
