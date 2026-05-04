@@ -28,7 +28,6 @@
     let _stepChoose = null;
     let _stopCapture = null;
     let _openCropModal = null;
-    let _applyOtsu = null;
     let _getFlashMode = null;
     let _getCaptureStream = null;
     let _setCropContext = null;
@@ -43,7 +42,6 @@
         _stepChoose = deps.stepChoose;
         _stopCapture = deps.stopCapture;
         _openCropModal = deps.openCropModal;
-        _applyOtsu = deps.applyOtsu;
         _getFlashMode = deps.getFlashMode;
         _getCaptureStream = deps.getCaptureStream;
         _setCropContext = deps.setCropContext;
@@ -283,16 +281,11 @@
         if (galleryEditIndex < 0 || galleryEditIndex >= galleryPhotos.length) return;
         const photo = galleryPhotos[galleryEditIndex];
 
-        const img = new Image();
-        const url = URL.createObjectURL(photo.blob);
-        await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = reject;
-            img.src = url;
-        });
-        URL.revokeObjectURL(url);
-
-        const resultBlob = await transformFn(img);
+        // transformFn(blob) returns either a Blob or {data, mimeType}.
+        const result = await transformFn(photo.blob);
+        const resultBlob = result instanceof Blob
+            ? result
+            : new Blob([result.data], { type: result.mimeType });
 
         // Update gallery entry
         if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
@@ -318,49 +311,21 @@
         if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
             galleryPhotos[galleryEditIndex].transforms.push({ op: 'rotateCW' });
         }
-        await applyGalleryTransform(async (img) => {
-            const canvas = document.createElement('canvas');
-            canvas.width = img.height;
-            canvas.height = img.width;
-            const ctx = canvas.getContext('2d');
-            ctx.translate(canvas.width / 2, canvas.height / 2);
-            ctx.rotate(Math.PI / 2);
-            ctx.drawImage(img, -img.width / 2, -img.height / 2);
-            return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
-        });
+        await applyGalleryTransform(blob => window.ImageTransforms.rotateImage(blob, { degrees: 90 }));
     }
 
     async function galleryFlipH() {
         if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
             galleryPhotos[galleryEditIndex].transforms.push({ op: 'flipH' });
         }
-        await applyGalleryTransform(async (img) => {
-            const canvas = document.createElement('canvas');
-            canvas.width = img.width;
-            canvas.height = img.height;
-            const ctx = canvas.getContext('2d');
-            ctx.translate(canvas.width, 0);
-            ctx.scale(-1, 1);
-            ctx.drawImage(img, 0, 0);
-            return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
-        });
+        await applyGalleryTransform(blob => window.ImageTransforms.flipImage(blob, { axis: 'h' }));
     }
 
     async function galleryApplyBW() {
         if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
             galleryPhotos[galleryEditIndex].transforms.push({ op: 'bw' });
         }
-        await applyGalleryTransform(async (img) => {
-            const canvas = document.createElement('canvas');
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0);
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            _applyOtsu(imageData);
-            ctx.putImageData(imageData, 0, 0);
-            return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-        });
+        await applyGalleryTransform(blob => window.ImageTransforms.binarize(blob));
         document.getElementById('gallery-bw-btn').classList.add('active');
     }
 
