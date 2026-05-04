@@ -26,6 +26,16 @@
         item.setAttribute('data-collection-id', collectionId);
         item.setAttribute('draggable', 'true');
 
+        // Handlers read the live index from the DOM so reorder works without
+        // patching every event listener. Index-suffixed IDs are tracked in
+        // `idElements` and rewritten by item.__updateIndex on reorder.
+        const getIdx = () => parseInt(item.getAttribute('data-image-index'));
+        const idElements = []; // [{el, prefix}]
+        function trackId(el, prefix, idx) {
+            el.id = `${prefix}${idx}`;
+            idElements.push({ el, prefix });
+        }
+
         const dragHandle = document.createElement('div');
         dragHandle.className = 'drag-handle';
         dragHandle.title = 'Drag to reorder';
@@ -44,11 +54,11 @@
         const yesBtn = document.createElement('button');
         yesBtn.className = 'btn btn-action discard-confirm-yes';
         yesBtn.textContent = i18n.t('receive.discardYes');
-        yesBtn.addEventListener('click', () => handlers.onDiscardConfirm(imageIndex));
+        yesBtn.addEventListener('click', () => handlers.onDiscardConfirm(getIdx()));
         const noBtn = document.createElement('button');
         noBtn.className = 'btn btn-action btn-secondary';
         noBtn.textContent = i18n.t('receive.discardNo');
-        noBtn.addEventListener('click', () => handlers.onDiscardCancel(imageIndex));
+        noBtn.addEventListener('click', () => handlers.onDiscardCancel(getIdx()));
         discardBtnRow.append(yesBtn, noBtn);
         discardConfirm.appendChild(discardBtnRow);
 
@@ -56,7 +66,7 @@
         const selectCheckbox = document.createElement('input');
         selectCheckbox.type = 'checkbox';
         selectCheckbox.checked = true;
-        selectCheckbox.id = `select-${imageIndex}`;
+        trackId(selectCheckbox, 'select-', imageIndex);
         selectCheckbox.className = 'card-select-checkbox';
         selectCheckbox.addEventListener('change', () => handlers.onSelectionChange());
 
@@ -65,16 +75,20 @@
         kebabBtn.className = 'card-kebab-btn';
         kebabBtn.title = 'Actions';
         kebabBtn.textContent = '⋮';
-        kebabBtn.addEventListener('click', (e) => handlers.onToggleCardMenu(e, imageIndex));
+        kebabBtn.addEventListener('click', (e) => handlers.onToggleCardMenu(e, getIdx()));
 
         function buildCardMenu(entries) {
             const menu = document.createElement('div');
             menu.className = 'card-menu hidden';
-            menu.id = `card-menu-${imageIndex}`;
+            trackId(menu, 'card-menu-', imageIndex);
             for (const entry of entries) {
                 const el = document.createElement(entry.tag || 'button');
                 el.className = 'card-menu-item' + (entry.danger ? ' card-menu-item-danger' : '');
-                if (entry.id) el.id = entry.id;
+                if (entry.idPrefix) {
+                    trackId(el, entry.idPrefix, imageIndex);
+                } else if (entry.id) {
+                    el.id = entry.id;
+                }
                 if (entry.href) el.href = entry.href;
                 if (entry.download !== undefined) el.download = entry.download;
                 if (entry.children) {
@@ -84,7 +98,7 @@
                 }
                 el.addEventListener('click', () => {
                     if (entry.onClick) entry.onClick(el);
-                    handlers.onCloseCardMenu(imageIndex);
+                    handlers.onCloseCardMenu(getIdx());
                 });
                 menu.appendChild(el);
             }
@@ -102,16 +116,16 @@
         // can flip them via getElementById when the selection toggles.
         function makeSelectMenuItem() {
             const iconSpan = document.createElement('span');
-            iconSpan.id = `select-icon-${imageIndex}`;
+            trackId(iconSpan, 'select-icon-', imageIndex);
             iconSpan.textContent = '☑️';
             const labelSpan = document.createElement('span');
-            labelSpan.id = `select-label-${imageIndex}`;
+            trackId(labelSpan, 'select-label-', imageIndex);
             labelSpan.textContent = i18n.t('receive.toggleSelect');
             const space = document.createTextNode(' ');
             return {
                 tag: 'button',
                 children: [iconSpan, space, labelSpan],
-                onClick: () => handlers.onToggleSelectFromMenu(imageIndex),
+                onClick: () => handlers.onToggleSelectFromMenu(getIdx()),
             };
         }
 
@@ -122,10 +136,10 @@
             const img = document.createElement('img');
             img.src = url;
             img.alt = 'Received photo';
-            img.id = `img-${imageIndex}`;
+            trackId(img, 'img-', imageIndex);
             img.addEventListener('click', (event) => {
-                if (event.shiftKey) handlers.onToggleSelectFromMenu(imageIndex);
-                else handlers.onOpenLightbox(imageIndex);
+                if (event.shiftKey) handlers.onToggleSelectFromMenu(getIdx());
+                else handlers.onOpenLightbox(getIdx());
             });
             thumb.appendChild(img);
             thumb.appendChild(makeBadge('image-badge-overlay'));
@@ -134,11 +148,11 @@
 
             const menu = buildCardMenu([
                 makeSelectMenuItem(),
-                { label: `🔄 ${i18n.t('send.rotate')}`, onClick: () => handlers.onRotate(imageIndex) },
-                { label: `✂️ ${i18n.t('receive.crop')}`, onClick: () => handlers.onCrop(imageIndex) },
-                { label: `⬛ ${i18n.t('send.applyBW')}`, onClick: () => handlers.onBW(imageIndex) },
-                { tag: 'a', href: url, download: filename, id: `download-${imageIndex}`, label: `📥 ${i18n.t('receive.download')}` },
-                { label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => handlers.onDiscard(imageIndex) },
+                { label: `🔄 ${i18n.t('send.rotate')}`, onClick: () => handlers.onRotate(getIdx()) },
+                { label: `✂️ ${i18n.t('receive.crop')}`, onClick: () => handlers.onCrop(getIdx()) },
+                { label: `⬛ ${i18n.t('send.applyBW')}`, onClick: () => handlers.onBW(getIdx()) },
+                { tag: 'a', href: url, download: filename, idPrefix: 'download-', label: `📥 ${i18n.t('receive.download')}` },
+                { label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => handlers.onDiscard(getIdx()) },
             ]);
             thumb.appendChild(menu);
 
@@ -170,20 +184,31 @@
 
             const entries = [
                 makeSelectMenuItem(),
-                { tag: 'a', href: url, download: filename, id: `download-${imageIndex}`, label: `📥 ${i18n.t('receive.download')}` },
+                { tag: 'a', href: url, download: filename, idPrefix: 'download-', label: `📥 ${i18n.t('receive.download')}` },
             ];
             if (fileType === 'pdf') {
                 entries.push(
-                    { label: `📸 ${i18n.t('receive.pdfToImages')}`, onClick: (btn) => handlers.onPdfToImages(imageIndex, btn) },
-                    { label: `📝 ${i18n.t('receive.pdfToOcr')}`, onClick: (btn) => handlers.onPdfToOcr(imageIndex, btn) },
+                    { label: `📸 ${i18n.t('receive.pdfToImages')}`, onClick: (btn) => handlers.onPdfToImages(getIdx(), btn) },
+                    { label: `📝 ${i18n.t('receive.pdfToOcr')}`, onClick: (btn) => handlers.onPdfToOcr(getIdx(), btn) },
                 );
             }
-            entries.push({ label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => handlers.onDiscard(imageIndex) });
+            entries.push({ label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => handlers.onDiscard(getIdx()) });
             card.appendChild(buildCardMenu(entries));
 
             item.appendChild(card);
             item.appendChild(discardConfirm);
         }
+
+        // Reorder hook: rewrite all index-suffixed IDs and the data attribute
+        // in one O(idElements.length) pass — no DOM selector walks, no regex,
+        // and no inline onclick patching. The download anchor's `download`
+        // attribute is updated from the (caller-provided) name.
+        item.__updateIndex = (newIdx, downloadName) => {
+            item.setAttribute('data-image-index', newIdx);
+            for (const { el, prefix } of idElements) el.id = `${prefix}${newIdx}`;
+            const dl = idElements.find(e => e.prefix === 'download-');
+            if (dl && downloadName) dl.el.download = downloadName;
+        };
 
         return item;
     }

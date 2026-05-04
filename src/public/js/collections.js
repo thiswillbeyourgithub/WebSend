@@ -73,22 +73,15 @@
     }
 
     function updateImageCardIndex(card, newIndex) {
-        const img = card.querySelector('img[id^="img-"]');
-        if (img) {
-            img.id = `img-${newIndex}`;
-            img.setAttribute('onclick', `openLightbox(${newIndex})`);
-        }
-        const cb = card.querySelector('input[type="checkbox"][id^="select-"]');
-        if (cb) cb.id = `select-${newIndex}`;
-        const dl = card.querySelector('a[id^="download-"]');
-        if (dl) dl.id = `download-${newIndex}`;
-        const menu = card.querySelector('[id^="card-menu-"]');
-        if (menu) menu.id = `card-menu-${newIndex}`;
-        card.querySelectorAll('[onclick]').forEach(el => {
-            el.setAttribute('onclick', el.getAttribute('onclick').replace(/\(\d+\)/g, `(${newIndex})`));
-        });
-        if (dl && receivedImagesRef[newIndex]) {
-            dl.setAttribute('download', receivedImagesRef[newIndex].name);
+        // Cards built by ReceiveCard.renderCard expose an __updateIndex closure
+        // that reassigns all index-suffixed IDs in one pass. Click handlers
+        // read item.dataset.imageIndex live, so no listener patching is needed.
+        const downloadName = receivedImagesRef[newIndex] ? receivedImagesRef[newIndex].name : null;
+        if (card.__updateIndex) {
+            card.__updateIndex(newIndex, downloadName);
+        } else {
+            // Defensive fallback for any non-renderCard-built card (shouldn't happen).
+            card.setAttribute('data-image-index', newIndex);
         }
     }
 
