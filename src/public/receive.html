@@ -161,8 +161,8 @@
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-ZGMsM74141CQWdyknfkfd1bTxRCKY83A2f1xPK0haYNwrkiaAa2Uz0eoBEvbmNuB"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-jmbs2WN52h9SkRpJ2lohLmqnjamiu0nRINJYMpKj/EKMWER0/mZayY6LAgZQK00K"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-UfsS0BAxaJ1eH6wj8oXd8thSJ6wZhY/t+IaDBxGY0V5jxgo6Hbu8PbHCveB6yzwE"></script>
-    <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-VzYnchg6Ic2gJm/GV894kpIlznlbC3X/E09IuyHQmwW4oJvsEe+zUEWv2vZCvuOx"></script>
-    <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-44V7g/h8ANRsAnXBk6iBwdX4nnn7Li++H8u0iHc2j3hO+lcNDf5MoAFxLVUKAum7"></script>
+    <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-CTuOyPjsQ/QqRP69QyNh7TB8QJreW+4WiE/98Ld83vABUgxV+RidmZdm3kCGQ8lq"></script>
+    <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-wMjGYKoeH0AM1ZrvzOqY08vRI51FbiK0h6Ije0gC4Feu/lG4YSrNwBhu0DFocvfP"></script>
     <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-WBzNtjfK5VjXycJgNAMT3KP4I2SEz6e5T304qNlmhHfsTI1aegPcvlefDcwbRWur"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-CBtzVz27+ym9ufzsf1pzrlxYUoaet/YKfOIKQ+/o8VOQZqxxo2yyXSRSse6l9RIm"></script>
     <script>
@@ -216,8 +216,7 @@
         });
         BgOcr.attach({
             receivedImagesRef: receivedImages,
-            getScribePreloaded: () => ReceiveExport.getScribePreloaded(),
-            clearScribePreloaded: () => ReceiveExport.clearScribePreloaded(),
+            claimScribePreloaded: () => ReceiveExport.claimScribePreloaded(),
         });
         // Decrypt-and-display pipeline for incoming encrypted-file messages.
         ReceiveFlow.attach({

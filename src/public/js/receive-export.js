@@ -52,9 +52,15 @@
         if (opts.getWsConfig) _getWsConfig = opts.getWsConfig;
     }
 
-    // -- Bridge for bg-ocr.js (it reads/clears the preloaded scribe handle) --
-    function getScribePreloaded() { return scribePreloaded; }
-    function clearScribePreloaded() { scribePreloaded = null; }
+    // -- Bridge for bg-ocr.js: atomic claim. Returns the preloaded promise
+    // (or null) and immediately nulls the slot so two concurrent claimers
+    // never both think they own the same handle. preloadScribe() will
+    // refill the slot on the next call if needed. --
+    function claimScribePreloaded() {
+        const p = scribePreloaded;
+        scribePreloaded = null;
+        return p;
+    }
 
     function reset() {
         exportCollectionId = null;
@@ -484,10 +490,12 @@
         let scribe = window.BgOcr.takeScribeIfIdle();
         if (scribe) {
             logger.info('Reusing background OCR scribe instance');
-        } else if (scribePreloaded) {
-            logger.info('Using preloaded scribe instance');
-            scribe = await scribePreloaded;
-            scribePreloaded = null;
+        } else {
+            const claim = claimScribePreloaded();
+            if (claim) {
+                logger.info('Using preloaded scribe instance');
+                scribe = await claim;
+            }
         }
         if (!scribe || !scribe.isAlive) {
             logger.info('Initializing new scribe instance for PDF assembly');
@@ -611,7 +619,6 @@
             exportAbort.abort();
             keepalive.stop();
             try { if (scribe) await scribe.dispose(); } catch (e) { logger.warn('scribe.dispose() failed in OCR export cleanup: ' + (e && e.message)); }
-            scribePreloaded = null;
             btn.disabled = false;
             btn.style.background = '#1565c0';
             // Drop the cancel-handler closure — without this, a subsequent
@@ -765,9 +772,9 @@
             // Always go through ScribeHandle: it absorbs the clear()/terminate()
             // fork and tracks isAlive so dispose() in finally is idempotent.
             let scribe = null;
-            if (scribePreloaded) {
-                scribe = await scribePreloaded;
-                scribePreloaded = null; // take ownership
+            const claim = claimScribePreloaded();
+            if (claim) {
+                scribe = await claim;
             }
             if (!scribe || !scribe.isAlive) {
                 scribe = await window.ScribeHandle.create();
@@ -816,7 +823,6 @@
         openExportModalForCollection,
         exportPdfAsImages,
         exportPdfAsOcr,
-        getScribePreloaded,
-        clearScribePreloaded,
+        claimScribePreloaded,
     };
 })();

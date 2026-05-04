@@ -29,13 +29,11 @@
 
     // -- Wired-in deps (set by attach) --
     let receivedImagesRef = null;
-    let getScribePreloaded = () => null;
-    let clearScribePreloaded = () => {};
+    let claimScribePreloaded = () => null;
 
     function attach(opts) {
         receivedImagesRef = opts.receivedImagesRef;
-        if (opts.getScribePreloaded) getScribePreloaded = opts.getScribePreloaded;
-        if (opts.clearScribePreloaded) clearScribePreloaded = opts.clearScribePreloaded;
+        if (opts.claimScribePreloaded) claimScribePreloaded = opts.claimScribePreloaded;
     }
 
     // -- Per-image promise plumbing --
@@ -245,10 +243,9 @@
                 try {
                     // Get or init scribe handle
                     if (!bgOcrScribe || !bgOcrScribe.isAlive) {
-                        const preloaded = getScribePreloaded();
+                        const preloaded = claimScribePreloaded();
                         if (preloaded) {
                             bgOcrScribe = await preloaded;
-                            clearScribePreloaded(); // take ownership
                         }
                         if (!bgOcrScribe || !bgOcrScribe.isAlive) {
                             bgOcrScribe = await window.ScribeHandle.create();
