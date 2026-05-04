@@ -157,7 +157,7 @@
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
-    <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-VT6muOiC3u7dSjFcoKgSu5MVcHVoDWfAjlC1CKrGN4b7TU7SjW5pLLHivyQzRDGW"></script>
+    <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-z+l2PvbhouddMzfCnhc+f9bxqLZhfhkcVU83viVGukdqg9goFAY52Kfpf3dVWiTX"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-ZGMsM74141CQWdyknfkfd1bTxRCKY83A2f1xPK0haYNwrkiaAa2Uz0eoBEvbmNuB"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-jmbs2WN52h9SkRpJ2lohLmqnjamiu0nRINJYMpKj/EKMWER0/mZayY6LAgZQK00K"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-e+URZStv2YNuswmm+QjbkuCvNOLOyNFUOd4zSNl7BiHlaieijAN+t+fRzmxktPVu"></script>
@@ -443,12 +443,8 @@
                 statusEl.className = 'status status-connected';
             } else if (state === 'failed') {
                 // Show detailed failure info — the user needs to know what went wrong
-                const hasTurn = rtc.iceServers.some(s => {
-                    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-                    return urls.some(u => u.startsWith('turn:'));
-                });
                 let detail = i18n.t('receive.failed');
-                if (!hasTurn) {
+                if (!PeerUI.hasTurn(rtc.iceServers)) {
                     detail += '\n' + i18n.t('receive.failedNoTurn');
                 }
                 statusEl.textContent = detail;
