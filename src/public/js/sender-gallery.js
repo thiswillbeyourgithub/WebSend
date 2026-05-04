@@ -20,9 +20,10 @@
     let galleryEditIndex = -1;
 
     // -- Wired-in deps (set by attach) --
-    // rtc and sendQueue are accessed via getters because the sender page
-    // replaces both on reconnect — caching the references would leave Gallery
-    // pointing at a dead peer connection and an orphaned queue array.
+    // rtc is accessed via getter because the sender page replaces it on
+    // reconnect — caching the reference would leave Gallery pointing at a
+    // dead peer connection. The send queue lives in window.SenderSend; we
+    // call removeQueuedPhotoById to drop a not-yet-sent photo on delete.
     let _getRtc = null;
     let _i18n = null;
     let _logger = null;
@@ -34,7 +35,7 @@
     let _getFlashMode = null;
     let _getCaptureStream = null;
     let _setCropContext = null;
-    let _getSendQueue = null;
+    let _removeQueuedPhotoById = null;
 
     function attach(deps) {
         _getRtc = deps.getRtc;
@@ -48,7 +49,7 @@
         _getFlashMode = deps.getFlashMode;
         _getCaptureStream = deps.getCaptureStream;
         _setCropContext = deps.setCropContext;
-        _getSendQueue = deps.getSendQueue;
+        _removeQueuedPhotoById = deps.removeQueuedPhotoById;
     }
 
     // -- Public state accessors --
@@ -227,10 +228,7 @@
         if (photo.sentHash) {
             _getRtc().sendMessage(Protocol.build.deleteImage(photo.sentHash));
         } else {
-            // If still in sendQueue, remove it
-            const queue = _getSendQueue();
-            const qIdx = queue.findIndex(item => item.photoId === photo.id);
-            if (qIdx !== -1) queue.splice(qIdx, 1);
+            _removeQueuedPhotoById(photo.id);
         }
 
         galleryPhotos.splice(idx, 1);
@@ -249,10 +247,7 @@
             if (p.sentHash) {
                 _getRtc().sendMessage(Protocol.build.deleteImage(p.sentHash));
             } else {
-                // Remove from sendQueue if pending
-                const queue = _getSendQueue();
-                const qIdx = queue.findIndex(item => item.photoId === p.id);
-                if (qIdx !== -1) queue.splice(qIdx, 1);
+                _removeQueuedPhotoById(p.id);
             }
         });
         galleryPhotos = [];

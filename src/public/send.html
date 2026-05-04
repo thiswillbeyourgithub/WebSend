@@ -298,7 +298,8 @@
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-W8sV9MnnPgsbNkgy5QXPeccux0y5xwrniXEw8E4YkXqvMh6PeXHZKW0YMW4d4mRb"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-z+l2PvbhouddMzfCnhc+f9bxqLZhfhkcVU83viVGukdqg9goFAY52Kfpf3dVWiTX"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-ZGMsM74141CQWdyknfkfd1bTxRCKY83A2f1xPK0haYNwrkiaAa2Uz0eoBEvbmNuB"></script>
-    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-eRfDrFWooEfoFLjVYxHgD8E26FVHjJOu0hJD11QXoW+xOXSKkCMMMKplgHiAKOTZ"></script>
+    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-bO8089J3hTnxkteLrsohdT8ThfRiDz/207AqFYxvrsS7NA5ETB7d/KBZuJlJVNzx"></script>
+    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-Y7M5Qnbr3ble2Q19gtYqmjDrOnmsy4e6t/JV110+FW+XYtueHNoRJC23MIFP9MFJ"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -344,9 +345,7 @@
         let detectEnabled = localStorage.getItem('docDetectEnabled') === 'true';
         let detectInterval = null;
         let lastDetectedCorners = null;
-        let sendQueue = [];       // Pending photo blobs awaiting transmission
-        let isSendingQueue = false; // Whether the queue drain loop is running
-        let pendingBatchEnd = false; // Whether to send batch-end when queue drains
+        // Send queue state lives in window.SenderSend (sender-send.js).
 
         // Re-acquire wake lock and auto-reconnect when screen wakes up
         document.addEventListener('visibilitychange', async () => {
@@ -493,6 +492,15 @@
             rtc.onStateChange = onStateChange;
             rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
+            SenderSend.attach({
+                getRtc: () => rtc,
+                getSharedKey: () => sharedKey,
+                i18n,
+                logger,
+                showToast,
+                getGalleryPhotos: () => Gallery.photos(),
+            });
+
             Gallery.attach({
                 getRtc: () => rtc,
                 i18n,
@@ -505,7 +513,7 @@
                 getFlashMode: () => flashMode,
                 getCaptureStream: () => captureStream,
                 setCropContext: (blob, original) => { currentPhotoBlob = blob; originalPhotoBlob = original; },
-                getSendQueue: () => sendQueue,
+                removeQueuedPhotoById: (id) => SenderSend.removePhotoById(id),
             });
 
             // Set up button handlers
@@ -792,8 +800,7 @@
             sharedKey = null;
             weConfirmed = false;
             theyConfirmed = false;
-            sendQueue = [];
-            isSendingQueue = false;
+            SenderSend.clear();
 
             rtc = new WebSendRTC();
             await rtc.init();
@@ -819,8 +826,7 @@
             currentPhotoBlob = null;
             originalPhotoBlob = null;
             preBWBlob = null;
-            sendQueue = [];
-            isSendingQueue = false;
+            SenderSend.clear();
             // Revoke preview image URL
             const preview = document.getElementById('preview-image');
             if (preview && preview.src && preview.src.startsWith('blob:')) {
@@ -934,13 +940,12 @@
             photo.transforms = [];
             photo.sendStatus = 'queuing';
 
-            sendQueue.push({ blob: photo.blob, photoId: photo.id, replaceHash: msg.oldHash });
-            logger.info(`Re-queued photo for replace-image fallback (${sendQueue.length} in queue)`);
+            SenderSend.push({ blob: photo.blob, photoId: photo.id, replaceHash: msg.oldHash });
+            logger.info(`Re-queued photo for replace-image fallback (${SenderSend.size()} in queue)`);
 
             showToast(i18n.t('send.transformRetrying'), { type: 'warn' });
 
-            updateQueueBanner();
-            drainQueue();
+            SenderSend.drain();
         }
 
         const messageHandlers = {
@@ -1273,8 +1278,8 @@
             Gallery.addPhoto({ blob: capturedBlob, thumbUrl, originalBlob: capturedBlob, id: photoId, sentHash: null, sendStatus: 'queuing', transforms: [] });
 
             // Queue for immediate background send
-            sendQueue.push({ blob: capturedBlob, photoId });
-            drainQueue();
+            SenderSend.push({ blob: capturedBlob, photoId });
+            SenderSend.drain();
 
             // Brief visual feedback: flash the screen white
             const container = document.getElementById('capture-camera-container');
@@ -1346,12 +1351,11 @@
                         showToast(i18n.t('error.noPhotoOrKey'), { type: 'warn' });
                         return;
                     }
-                    sendQueue.push({ blob: processed, photoId: null });
+                    SenderSend.push({ blob: processed, photoId: null });
                     showToast(`${processed.name} queued for sending`, { type: 'success' });
-                    updateQueueBanner();
                     rtc.sendMessage(Protocol.build.batchStart());
-                    pendingBatchEnd = true;
-                    drainQueue();
+                    SenderSend.markBatchEndPending();
+                    SenderSend.drain();
                 }
                 event.target.value = '';
                 return;
@@ -1369,7 +1373,7 @@
             for (const file of files) {
                 const processed = await stripFileMetadata(file);
                 if (processed) {
-                    sendQueue.push({ blob: processed, photoId: null });
+                    SenderSend.push({ blob: processed, photoId: null });
                     queued++;
                 } else {
                     failed++;
@@ -1382,10 +1386,9 @@
             }
             if (queued > 0) {
                 showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
-                updateQueueBanner();
                 rtc.sendMessage(Protocol.build.batchStart());
-                pendingBatchEnd = true;
-                drainQueue();
+                SenderSend.markBatchEndPending();
+                SenderSend.drain();
             }
 
             // Reset file input so selecting the same files again triggers change
@@ -1465,7 +1468,7 @@
         /**
          * Queue the current photo for background transmission and return immediately
          * to the choose step so the user can take another photo straight away.
-         * Multiple photos can be queued; they are sent one by one by drainQueue().
+         * Multiple photos can be queued; they are sent one by one by SenderSend.drain().
          */
         async function sendPhoto() {
             if (!currentPhotoBlob || !sharedKey) {
@@ -1473,8 +1476,8 @@
                 return;
             }
 
-            sendQueue.push({ blob: currentPhotoBlob, photoId: null });
-            logger.info(`Photo queued for background send (${sendQueue.length} in queue)`);
+            SenderSend.push({ blob: currentPhotoBlob, photoId: null });
+            logger.info(`Photo queued for background send (${SenderSend.size()} in queue)`);
 
             // Clear preview state immediately so user can take the next shot
             currentPhotoBlob = null;
@@ -1489,134 +1492,9 @@
             }
 
             showStep(stepChoose);
-            updateQueueBanner();
             rtc.sendMessage(Protocol.build.batchStart());
-            pendingBatchEnd = true;
-            drainQueue();
-        }
-
-        /** Update the sticky banner that shows background-send progress */
-        function updateQueueBanner() {
-            const banner = document.getElementById('queue-banner');
-            const text = document.getElementById('queue-banner-text');
-            if (sendQueue.length === 0 && !isSendingQueue) {
-                banner.classList.add('hidden');
-                document.getElementById('queue-progress-fill').style.width = '0%';
-                return;
-            }
-            banner.classList.remove('hidden');
-            text.textContent = i18n.t('send.queueSending').replace('{n}', sendQueue.length);
-        }
-
-        /**
-         * Drain the send queue serially in the background.
-         * Safe to call multiple times; only one drain loop runs at a time.
-         */
-        async function drainQueue() {
-            if (isSendingQueue) return;
-            isSendingQueue = true;
-            updateQueueBanner();
-
-            let successCount = 0;
-            while (sendQueue.length > 0) {
-                const item = sendQueue[0];
-                try {
-                    // If this is a replacement, tell receiver which image to replace
-                    if (item.replaceHash) {
-                        rtc.sendMessage(Protocol.build.replaceImage(item.replaceHash));
-                    }
-                    const localHash = await sendOnePhoto(item.blob);
-                    sendQueue.shift();
-                    successCount++;
-                    // Update gallery photo with sent hash if it came from the camera flow
-                    if (item.photoId != null) {
-                        const gPhoto = Gallery.photos().find(p => p.id === item.photoId);
-                        if (gPhoto) {
-                            gPhoto.sentHash = localHash;
-                            gPhoto.sendStatus = 'sent';
-                        }
-                    }
-                    logger.success('Queued photo sent and verified by receiver');
-                } catch (e) {
-                    sendQueue.shift();
-                    // Mark as failed in gallery
-                    if (item.photoId != null) {
-                        const gPhoto = Gallery.photos().find(p => p.id === item.photoId);
-                        if (gPhoto) gPhoto.sendStatus = 'failed';
-                    }
-                    logger.error('Queued photo failed: ' + e.message);
-                    const isTimeout = e.message.includes('timeout');
-                    const isNack = e.message.includes('Receiver decryption failed');
-                    if (isTimeout) {
-                        showToast(i18n.t('send.transferTimeout'));
-                    } else if (isNack) {
-                        showToast(i18n.t('send.checksumMismatch'));
-                    } else {
-                        showToast(i18n.t('send.sendFailed'));
-                    }
-                }
-                updateQueueBanner();
-            }
-
-            if (pendingBatchEnd) {
-                rtc.sendMessage(Protocol.build.batchEnd());
-                pendingBatchEnd = false;
-            }
-            isSendingQueue = false;
-            updateQueueBanner();
-
-            if (successCount === 1) {
-                showToast(i18n.t('send.transferVerified'), { type: 'success' });
-            } else if (successCount > 1) {
-                showToast(i18n.t('send.allSent').replace('{n}', successCount), { type: 'success' });
-            }
-        }
-
-        /**
-         * Encrypt and transmit a single photo blob over the WebRTC data channel.
-         * Resolves when the receiver sends a file-ack; throws on nack or timeout.
-         * @param {Blob} blob - Photo blob to send
-         */
-        async function sendOnePhoto(blob) {
-            const photoData = await blob.arrayBuffer();
-            logger.info(`Sending queued photo: ${photoData.byteLength} bytes`);
-
-            const localHash = await WebSendCrypto.sha256Hex(photoData);
-            logger.info(`Plaintext SHA-256: ${localHash}`);
-
-            const filename = blob.name || `websend_${Date.now()}.png`;
-            const mimeType = blob.type || 'image/png';
-
-            const encryptedData = await WebSendCrypto.encryptWithMetadata(
-                photoData,
-                { name: filename, mimeType: mimeType, originalSize: photoData.byteLength },
-                sharedKey
-            );
-            logger.info(`Encrypted size: ${encryptedData.byteLength} bytes (padded)`);
-
-            let xferStart = Date.now();
-            let lastStatsUpdate = 0;
-            await rtc.sendFile(encryptedData, (percent, offset, totalSize) => {
-                const fill = document.getElementById('queue-progress-fill');
-                if (fill) fill.style.width = percent + '%';
-                const now = Date.now();
-                if (now - lastStatsUpdate >= 200) {
-                    lastStatsUpdate = now;
-                    const elapsed = (now - xferStart) / 1000;
-                    const rate = elapsed > 0 ? offset / elapsed : 0;
-                    const remaining = rate > 0 ? (totalSize - offset) / rate : Infinity;
-                    const statsEl = document.getElementById('queue-transfer-stats');
-                    if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);
-                }
-            });
-            {
-                const elapsed = (Date.now() - xferStart) / 1000;
-                const actualRate = elapsed > 0 ? encryptedData.byteLength / elapsed : 0;
-                logger.info(`Transfer complete: ${formatRate(actualRate)} avg (${elapsed.toFixed(1)}s, ${encryptedData.byteLength} bytes)`);
-                const statsEl = document.getElementById('queue-transfer-stats');
-                if (statsEl) statsEl.textContent = '';
-            }
-            return localHash;
+            SenderSend.markBatchEndPending();
+            SenderSend.drain();
         }
 
         // ============ Fingerprint Verification ============
