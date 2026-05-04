@@ -697,8 +697,12 @@
             let roomId = null;
             let secret = null;
 
-            // Check if it's a URL with /send/ROOMID#SECRET pattern
-            const urlMatch = data.match(/\/send\/([A-Z0-9]{6})#(.+)$/i);
+            // Check if it's a URL with /send/ROOMID#SECRET pattern.
+            // Secret is base64url-encoded 16 random bytes (server-helpers.js
+            // generateRoomSecret) → 22 chars from [A-Za-z0-9_-]. Bound the
+            // capture so a malicious QR can't smuggle CR/LF or other junk
+            // into the X-Room-Secret header.
+            const urlMatch = data.match(/\/send\/([A-Z0-9]{6})#([A-Za-z0-9_-]{20,32})$/i);
             if (urlMatch) {
                 roomId = urlMatch[1].toUpperCase();
                 secret = urlMatch[2];
