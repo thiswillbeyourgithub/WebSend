@@ -264,6 +264,13 @@ class WebSendRTC {
         if (typeof data === 'string') {
             try {
                 const msg = JSON.parse(data);
+                // Validate wire messages. 'progress' and 'encrypted-file' are local
+                // synthetic events (never on the wire) so they bypass this path.
+                const vr = Protocol.validate(msg);
+                if (!vr.ok) {
+                    logger.error('Dropping inbound message: ' + vr.error);
+                    return;
+                }
                 logger.info(`Received message type: ${msg.type}`);
 
                 if (msg.type === 'file-start') {
@@ -339,6 +346,11 @@ class WebSendRTC {
     sendMessage(message) {
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
             logger.error('Data channel not open');
+            return false;
+        }
+        const vr = Protocol.validate(message);
+        if (!vr.ok) {
+            logger.error('Refusing to send invalid message: ' + vr.error);
             return false;
         }
         this.dataChannel.send(JSON.stringify(message));
