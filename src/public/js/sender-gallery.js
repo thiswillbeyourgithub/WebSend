@@ -287,10 +287,12 @@
             ? result
             : new Blob([result.data], { type: result.mimeType });
 
-        // Update gallery entry
+        // Update gallery entry. originalBlob is the crop baseline and must
+        // only be touched by applyCropResult — overwriting it here would
+        // make a subsequent "crop from original" silently use the wrong
+        // baseline after any prior rotate/flip/BW.
         if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
         photo.blob = resultBlob;
-        photo.originalBlob = resultBlob;
         photo.thumbUrl = URL.createObjectURL(resultBlob);
 
         // Refresh edit view
