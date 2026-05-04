@@ -357,6 +357,26 @@ setInterval(cleanupRooms, 60 * 1000);
 const fs = require('fs');
 
 if (UMAMI_URL && UMAMI_WEBSITE_ID) {
+    // Validate before HTML interpolation: these values are spliced raw into a
+    // <script> tag served on every page, so a value containing `"`, `>`, or
+    // whitespace would break the page or open a script-injection vector.
+    const UMAMI_URL_RE = /^https?:\/\/[a-z0-9._\-]+(:\d+)?(\/[a-zA-Z0-9._~\-\/]*)?$/i;
+    const UMAMI_ID_RE = /^[a-zA-Z0-9\-]{1,64}$/;
+    const UMAMI_DNT_RE = /^(true|false)$/;
+    if (!UMAMI_URL_RE.test(UMAMI_URL)) {
+        console.error(`FATAL: UMAMI_URL is not a valid URL: ${JSON.stringify(UMAMI_URL)}`);
+        console.error('Expected format: https://host[:port][/path] with no quotes or whitespace.');
+        process.exit(1);
+    }
+    if (!UMAMI_ID_RE.test(UMAMI_WEBSITE_ID)) {
+        console.error(`FATAL: UMAMI_WEBSITE_ID must match /^[a-zA-Z0-9-]{1,64}$/, got: ${JSON.stringify(UMAMI_WEBSITE_ID)}`);
+        process.exit(1);
+    }
+    if (!UMAMI_DNT_RE.test(UMAMI_DNT)) {
+        console.error(`FATAL: UMAMI_DNT must be "true" or "false", got: ${JSON.stringify(UMAMI_DNT)}`);
+        process.exit(1);
+    }
+
     const umamiScript = `    <script defer src="${UMAMI_URL}/getinfo" data-website-id="${UMAMI_WEBSITE_ID}" data-do-not-track="${UMAMI_DNT}"></script>\n`;
 
     // Read each HTML file once at startup, inject the analytics snippet,
