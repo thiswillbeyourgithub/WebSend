@@ -556,13 +556,7 @@
                     }
                 }, 500);
                 logger.info('Awaiting background OCR completion...');
-                await Promise.race([
-                    Promise.all(activeImages.map(img => img.pendingOcr || Promise.resolve())),
-                    new Promise((_, reject) => {
-                        if (signal.aborted) return reject(signal.reason || new DOMException('cancelled', 'AbortError'));
-                        signal.addEventListener('abort', () => reject(signal.reason || new DOMException('cancelled', 'AbortError')), { once: true });
-                    }),
-                ]);
+                await waitForBgOcr(activeImages, signal);
                 clearInterval(progressInterval);
                 progressInterval = null;
                 logger.info('Background OCR settled for all selected images');
@@ -580,31 +574,9 @@
             await scribe.importFiles(origFiles);
             signal.throwIfAborted();
 
-            let pdfResult;
-            try {
-                logger.info('Assembling PDF from cached OCR data...');
-                await applyCachedOcrToScribe(scribe, origFiles, activeImages);
-                logger.info('Exporting PDF from cached OCR data');
-                pdfResult = await scribe.exportData('pdf');
-                logger.success('PDF assembled from cached OCR data successfully');
-            } catch (cacheErr) {
-                if (cacheErr.name === 'AbortError') throw cacheErr;
-                logger.warn('Cached OCR assembly failed: ' + cacheErr.message + ' — falling back to full on-demand OCR');
-                window.showToast('Cached OCR failed, running full OCR...', { type: 'warn' });
-
-                try {
-                    const stillAlive = await scribe.reset();
-                    if (!stillAlive) scribe = null;
-                } catch (_) { scribe = null; }
-                if (!scribe || !scribe.isAlive) {
-                    logger.info('[OCR fallback] Re-initializing scribe after cache failure');
-                    scribe = await window.ScribeHandle.create();
-                }
-                showCancelButton();
-
-                pdfResult = await ocrRecognizeAndExport(scribe, activeImages, btn, signal);
-                logger.success('[OCR fallback] PDF generated successfully via on-demand OCR');
-            }
+            const assembled = await assembleOcrPdf(scribe, origFiles, activeImages, btn, signal, showCancelButton);
+            scribe = assembled.scribe; // assembleOcrPdf may have replaced the handle on cache-failure fallback
+            const pdfResult = assembled.pdfResult;
 
             const pdfBlob = pdfResult instanceof Blob
                 ? pdfResult
@@ -642,8 +614,55 @@
             scribePreloaded = null;
             btn.disabled = false;
             btn.style.background = '#1565c0';
+            // Drop the cancel-handler closure — without this, a subsequent
+            // export click could fire the previous run's exportAbort.
+            btn.onclick = null;
             _updateExportBtn();
             logger.info('=== OCR PDF export finished ===');
+        }
+    }
+
+    // Wait until every selected image's background OCR has settled, or until
+    // the export-abort signal fires (cancel / timeout).
+    async function waitForBgOcr(activeImages, signal) {
+        await Promise.race([
+            Promise.all(activeImages.map(img => img.pendingOcr || Promise.resolve())),
+            new Promise((_, reject) => {
+                if (signal.aborted) return reject(signal.reason || new DOMException('cancelled', 'AbortError'));
+                signal.addEventListener('abort', () => reject(signal.reason || new DOMException('cancelled', 'AbortError')), { once: true });
+            }),
+        ]);
+    }
+
+    // Try to assemble the PDF from cached OCR pages. On any non-abort failure,
+    // re-init scribe and fall back to running OCR on demand. Returns
+    // { scribe, pdfResult } so the caller can keep using the (possibly
+    // replaced) scribe handle for cleanup.
+    async function assembleOcrPdf(scribe, origFiles, activeImages, btn, signal, showCancelButton) {
+        try {
+            logger.info('Assembling PDF from cached OCR data...');
+            await applyCachedOcrToScribe(scribe, origFiles, activeImages);
+            logger.info('Exporting PDF from cached OCR data');
+            const pdfResult = await scribe.exportData('pdf');
+            logger.success('PDF assembled from cached OCR data successfully');
+            return { scribe, pdfResult };
+        } catch (cacheErr) {
+            if (cacheErr.name === 'AbortError') throw cacheErr;
+            logger.warn('Cached OCR assembly failed: ' + cacheErr.message + ' — falling back to full on-demand OCR');
+            window.showToast('Cached OCR failed, running full OCR...', { type: 'warn' });
+
+            try {
+                const stillAlive = await scribe.reset();
+                if (!stillAlive) scribe = null;
+            } catch (_) { scribe = null; }
+            if (!scribe || !scribe.isAlive) {
+                logger.info('[OCR fallback] Re-initializing scribe after cache failure');
+                scribe = await window.ScribeHandle.create();
+            }
+            showCancelButton();
+            const pdfResult = await ocrRecognizeAndExport(scribe, activeImages, btn, signal);
+            logger.success('[OCR fallback] PDF generated successfully via on-demand OCR');
+            return { scribe, pdfResult };
         }
     }
 
