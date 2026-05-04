@@ -675,11 +675,10 @@
     /**
      * Export a received PDF as a ZIP of page images.
      */
-    async function exportPdfAsImages(imageIndex) {
+    async function exportPdfAsImages(imageIndex, btn) {
         const file = receivedImages[imageIndex];
         if (!file || file.fileType !== 'pdf') return;
-
-        const btn = event.target;
+        if (!btn) { logger.error('exportPdfAsImages: missing btn argument'); return; }
         const origText = btn.textContent;
         btn.disabled = true;
         btn.textContent = i18n.t('receive.pdfExporting');
@@ -721,11 +720,10 @@
     /**
      * Export a received PDF as a searchable OCR PDF using scribe.js.
      */
-    async function exportPdfAsOcr(imageIndex) {
+    async function exportPdfAsOcr(imageIndex, btn) {
         const file = receivedImages[imageIndex];
         if (!file || file.fileType !== 'pdf') return;
-
-        const btn = event.target;
+        if (!btn) { logger.error('exportPdfAsOcr: missing btn argument'); return; }
         const origText = btn.textContent;
         btn.disabled = true;
         btn.textContent = i18n.t('receive.pdfExporting');

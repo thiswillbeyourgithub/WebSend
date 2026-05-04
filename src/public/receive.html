@@ -158,10 +158,10 @@
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
-    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-bP286JQvBDI/Gv/zT+xKFKW64BSNxvOMqqARKNOVj59eLDMuPXFG0UydA3XJccja"></script>
+    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-oGl+tmOPpY9pqq31+zz9kT7ja/3GO60g3PoKcQUccl4QOC2V21c9C05SBTkLgog2"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-fjlaFFHPEtVq70nQIB1+d0FzP2mFqr+CdjmrAi7jplCb8QA9U2ery+nUqwlp37oW"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-fzEmHjLzTWKrjkJI4bozuob2VT9l1vjdHXgSgeI2m8fR3LgicoqHEinkouXksQvL"></script>
-    <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-BKUlRg9kPHUDg90WhcWuurrn9Y19aAR8F7P0R0VS8YXCu5SKBhCkKT/72nbZHW6f"></script>
+    <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-Qm2w8Df6jC+/gBHo/QMPrtyY8GjKhoa/tiBadSDDHRV31d4APcvJaplTO7adkSvI"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-CBtzVz27+ym9ufzsf1pzrlxYUoaet/YKfOIKQ+/o8VOQZqxxo2yyXSRSse6l9RIm"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -247,8 +247,8 @@
                 onCrop: (idx) => openCropModal(idx),
                 onBW: (idx) => applyBWToImage(idx),
                 onDiscard: (idx) => discardImage(idx),
-                onPdfToImages: (idx) => ReceiveExport.exportPdfAsImages(idx),
-                onPdfToOcr: (idx) => ReceiveExport.exportPdfAsOcr(idx),
+                onPdfToImages: (idx, btn) => ReceiveExport.exportPdfAsImages(idx, btn),
+                onPdfToOcr: (idx, btn) => ReceiveExport.exportPdfAsOcr(idx, btn),
             },
         });
 

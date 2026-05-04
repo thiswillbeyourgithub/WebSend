@@ -83,7 +83,7 @@
                     el.textContent = entry.label;
                 }
                 el.addEventListener('click', () => {
-                    if (entry.onClick) entry.onClick();
+                    if (entry.onClick) entry.onClick(el);
                     handlers.onCloseCardMenu(imageIndex);
                 });
                 menu.appendChild(el);
@@ -174,8 +174,8 @@
             ];
             if (fileType === 'pdf') {
                 entries.push(
-                    { label: `📸 ${i18n.t('receive.pdfToImages')}`, onClick: () => handlers.onPdfToImages(imageIndex) },
-                    { label: `📝 ${i18n.t('receive.pdfToOcr')}`, onClick: () => handlers.onPdfToOcr(imageIndex) },
+                    { label: `📸 ${i18n.t('receive.pdfToImages')}`, onClick: (btn) => handlers.onPdfToImages(imageIndex, btn) },
+                    { label: `📝 ${i18n.t('receive.pdfToOcr')}`, onClick: (btn) => handlers.onPdfToOcr(imageIndex, btn) },
                 );
             }
             entries.push({ label: `🗑️ ${i18n.t('receive.discard')}`, danger: true, onClick: () => handlers.onDiscard(imageIndex) });
