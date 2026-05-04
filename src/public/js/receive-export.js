@@ -16,6 +16,17 @@
 (function () {
     'use strict';
 
+    // Read a Blob/File as a data URL ("data:<mime>;base64,...").
+    // Used to feed scribe's ImageCache.nativeSrc, which expects a string source.
+    function fileToDataUrl(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+            reader.readAsDataURL(file);
+        });
+    }
+
     // -- Module-private state --
     let exportCollectionId = null;       // null = export all, number = specific collection
     let clientZipPreloaded = null;       // Promise<{downloadZip}> or null
@@ -419,11 +430,7 @@
 
             window.OcrRescale.rescaleOcrPage(ocrPages[i], pageMetrics[i], origW, origH);
 
-            const reader = new FileReader();
-            const origBase64 = await new Promise((resolve) => {
-                reader.onload = () => resolve(reader.result);
-                reader.readAsDataURL(origFiles[i]);
-            });
+            const origBase64 = await fileToDataUrl(origFiles[i]);
             const origWrapper = { src: origBase64, n: i, type: 'native', rotated: false, binarized: false };
             ImageCache.nativeSrc[i] = Promise.resolve(origWrapper);
         }
@@ -466,11 +473,7 @@
             pageMetrics[i].dims.width = origW;
             pageMetrics[i].dims.height = origH;
 
-            const reader = new FileReader();
-            const origBase64 = await new Promise((resolve) => {
-                reader.onload = () => resolve(reader.result);
-                reader.readAsDataURL(origFiles[i]);
-            });
+            const origBase64 = await fileToDataUrl(origFiles[i]);
             ImageCache.nativeSrc[i] = Promise.resolve({ src: origBase64, n: i, type: 'native', rotated: false, binarized: false });
         }
     }
