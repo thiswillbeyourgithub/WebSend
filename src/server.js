@@ -551,6 +551,13 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
 // to the peer verbatim.
 const MAX_SDP_LEN = 20_000;
 
+// Cap stored ICE candidates per side. Without this, a peer with the room
+// secret could push up to general-rate-limit candidates per minute (each up
+// to the 50KB body cap) for the room's TTL — tens of MB per room. 50 is well
+// above the typical handful of host/srflx/relay candidates a real client
+// generates.
+const MAX_ICE_CANDIDATES = 50;
+
 /**
  * Validate an SDP description body. Returns null on success or an error
  * message on failure. Strict: rejects unknown top-level fields so a malicious
@@ -690,6 +697,9 @@ app.get('/api/rooms/:id/answer', validateRoomSecret, (req, res) => {
  * Rate limited: general (100/min)
  */
 app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    if (req.room.iceCandidatesOffer.length >= MAX_ICE_CANDIDATES) {
+        return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
+    }
     req.room.iceCandidatesOffer.push(req.body);
     debugLog('ICE', `Offer ICE candidate added for room ${req.params.id}`, {
         candidate: req.body.candidate?.substring(0, 50),
@@ -717,6 +727,9 @@ app.get('/api/rooms/:id/ice/offer', validateRoomSecret, (req, res) => {
  * Rate limited: general (100/min)
  */
 app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    if (req.room.iceCandidatesAnswer.length >= MAX_ICE_CANDIDATES) {
+        return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
+    }
     req.room.iceCandidatesAnswer.push(req.body);
     debugLog('ICE', `Answer ICE candidate added for room ${req.params.id}`, {
         candidate: req.body.candidate?.substring(0, 50),
