@@ -753,140 +753,131 @@
             logger.info('Batch end received');
         }
 
+        function finalizeReceiveStats() {
+            const elapsed = receiveXferStart ? (Date.now() - receiveXferStart) / 1000 : 0;
+            if (elapsed > 0) {
+                const actualRate = receiveLastTotal > 0 ? receiveLastTotal / elapsed : 0;
+                logger.info(`Receive complete: ${formatRate(actualRate)} avg (${elapsed.toFixed(1)}s)`);
+            }
+            receiveXferStart = null; receiveLastStatsUpdate = 0; receiveLastTotal = 0;
+            document.getElementById('progress-bar').classList.add('hidden');
+            document.getElementById('transfer-stats').textContent = '';
+        }
+
+        async function decryptIncomingFile(blob) {
+            const encryptedData = await blob.arrayBuffer();
+            const { metadata, data } = await WebSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
+            logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${metadata.originalSize} bytes)`);
+
+            const fileData = new Uint8Array(data);
+            const fileMimeType = metadata.mimeType;
+            const fileBlob = new Blob([fileData], { type: fileMimeType });
+            const isImage = fileMimeType.startsWith('image/');
+            const isPdf = fileMimeType === 'application/pdf';
+            const fileType = isImage ? 'image' : isPdf ? 'pdf' : 'other';
+            const ext = fileMimeType.split('/').pop().split('+')[0] || 'bin';
+            const fileName = metadata.name || `websend_${connectionTimestamp}_${photoCount + 1}.${ext}`;
+
+            return { metadata, data, fileData, fileMimeType, fileBlob, fileType, fileName };
+        }
+
+        async function applyImageReplacement(replaceIdx, decoded) {
+            const { data, fileData, fileMimeType, fileBlob, fileType, fileName } = decoded;
+            const oldImg = receivedImages[replaceIdx];
+            logger.info(`Replacing image at index ${replaceIdx}`);
+
+            oldImg.data = fileData;
+            oldImg.mimeType = fileMimeType;
+            oldImg.name = fileName;
+            oldImg.fileType = fileType;
+            oldImg.hash = null;
+            oldImg.originalData = new Uint8Array(fileData);
+            oldImg.originalMimeType = fileMimeType;
+
+            ReceiveCard.setCardImage(replaceIdx, fileBlob, { filename: fileName });
+
+            const decryptedHash = await WebSendCrypto.sha256Hex(data);
+            oldImg.hash = decryptedHash;
+            logger.info(`Replacement SHA-256: ${decryptedHash}`);
+            rtc.sendMessage(Protocol.build.fileAck(decryptedHash));
+            logger.success(`Image replaced (index ${replaceIdx}) and ack sent`);
+            showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
+
+            BgOcr.cancel(replaceIdx);
+            BgOcr.queue(replaceIdx);
+        }
+
+        async function addNewReceivedImage(decoded) {
+            const { metadata, data, fileData, fileMimeType, fileBlob, fileType, fileName } = decoded;
+            const fileUrl = URL.createObjectURL(fileBlob);
+            const imageIndex = receivedImages.length;
+            const imgObj = {
+                data: fileData,
+                mimeType: fileMimeType,
+                name: fileName,
+                hash: null,
+                fileType: fileType,
+                originalData: new Uint8Array(fileData),
+                originalMimeType: fileMimeType
+            };
+            receivedImages.push(imgObj);
+
+            const col = Collections.getActive();
+            col.images.push(imgObj);
+
+            if (fileType !== 'image' && col.images.length === 1 && metadata.name) {
+                Collections.setName(col.id, metadata.name);
+                logger.info(`Collection renamed to file name: ${metadata.name}`);
+            }
+
+            photoCount++;
+            Collections.addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileData.byteLength);
+
+            updateExportButton();
+
+            if (receivedImages.filter(img => img !== null && img.fileType === 'image').length === 1) {
+                ReceiveExport.preloadClientZip();
+            }
+
+            BgOcr.queue(imageIndex);
+
+            const decryptedHash = await WebSendCrypto.sha256Hex(data);
+            imgObj.hash = decryptedHash;
+            logger.info(`Decrypted SHA-256: ${decryptedHash}`);
+            rtc.sendMessage(Protocol.build.fileAck(decryptedHash));
+            logger.success('File decrypted, displayed, and ack sent');
+        }
+
         async function handleEncryptedFile(msg) {
-                // Received encrypted file with bundled metadata, decrypt it
-                logger.info('Received encrypted file, decrypting with metadata...');
-                {
-                    const elapsed = receiveXferStart ? (Date.now() - receiveXferStart) / 1000 : 0;
-                    if (elapsed > 0) {
-                        const actualRate = receiveLastTotal > 0 ? receiveLastTotal / elapsed : 0;
-                        logger.info(`Receive complete: ${formatRate(actualRate)} avg (${elapsed.toFixed(1)}s)`);
+            logger.info('Received encrypted file, decrypting with metadata...');
+            finalizeReceiveStats();
+
+            if (!sharedKey) {
+                logger.error('Cannot decrypt - key exchange not complete');
+                return;
+            }
+
+            try {
+                const decoded = await decryptIncomingFile(msg.blob);
+
+                let replaceIdx = -1;
+                if (pendingReplaceHash) {
+                    replaceIdx = receivedImages.findIndex(img => img && img.hash === pendingReplaceHash);
+                    pendingReplaceHash = null;
+                    if (replaceIdx === -1) {
+                        logger.warn(`replace-image: old hash not found, adding as new image`);
                     }
-                    receiveXferStart = null; receiveLastStatsUpdate = 0; receiveLastTotal = 0;
                 }
-                document.getElementById('progress-bar').classList.add('hidden');
-                document.getElementById('transfer-stats').textContent = '';
 
-                if (!sharedKey) {
-                    logger.error('Cannot decrypt - key exchange not complete');
-                    return;
+                if (replaceIdx !== -1) {
+                    await applyImageReplacement(replaceIdx, decoded);
+                } else {
+                    await addNewReceivedImage(decoded);
                 }
-
-                try {
-                    const encryptedData = await msg.blob.arrayBuffer();
-
-                    // Decrypt and extract metadata (name, mimeType, originalSize)
-                    // Padding is automatically removed during decryption
-                    const { metadata, data } = await WebSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
-
-                    logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${metadata.originalSize} bytes)`);
-
-                    const fileData = new Uint8Array(data);
-                    const fileMimeType = metadata.mimeType;
-
-                    // Create blob from data for display/download
-                    const fileBlob = new Blob([fileData], { type: fileMimeType });
-
-                    // Determine file type category
-                    const isImage = fileMimeType.startsWith('image/');
-                    const isPdf = fileMimeType === 'application/pdf';
-                    const fileType = isImage ? 'image' : isPdf ? 'pdf' : 'other';
-
-                    // Use original filename from sender, fallback to generated name
-                    const ext = fileMimeType.split('/').pop().split('+')[0] || 'bin';
-                    const fileName = metadata.name || `websend_${connectionTimestamp}_${photoCount + 1}.${ext}`;
-
-                    // Check if this is a replacement for an edited image
-                    let wasReplacement = false;
-                    if (pendingReplaceHash) {
-                        const replaceIdx = receivedImages.findIndex(img => img && img.hash === pendingReplaceHash);
-                        pendingReplaceHash = null;
-                        if (replaceIdx !== -1) {
-                            wasReplacement = true;
-                            const oldImg = receivedImages[replaceIdx];
-                            logger.info(`Replacing image at index ${replaceIdx}`);
-
-                            // Update the image data in place
-                            oldImg.data = fileData;
-                            oldImg.mimeType = fileMimeType;
-                            oldImg.name = fileName;
-                            oldImg.fileType = fileType;
-                            oldImg.hash = null;
-                            oldImg.originalData = new Uint8Array(fileData);
-                            oldImg.originalMimeType = fileMimeType;
-
-                            // Update the DOM card
-                            ReceiveCard.setCardImage(replaceIdx, fileBlob, { filename: fileName });
-
-                            // Compute SHA-256 and ack
-                            const decryptedHash = await WebSendCrypto.sha256Hex(data);
-                            oldImg.hash = decryptedHash;
-                            logger.info(`Replacement SHA-256: ${decryptedHash}`);
-                            rtc.sendMessage(Protocol.build.fileAck(decryptedHash));
-                            logger.success(`Image replaced (index ${replaceIdx}) and ack sent`);
-                            showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
-
-                            // Cancel any pending/in-progress OCR and restart for the new image
-                            BgOcr.cancel(replaceIdx);
-                            BgOcr.queue(replaceIdx);
-                        } else {
-                            logger.warn(`replace-image: old hash not found, adding as new image`);
-                        }
-                    }
-
-                    if (!wasReplacement) {
-                    // Add to received files and active collection (normal flow)
-                    const fileUrl = URL.createObjectURL(fileBlob);
-                    const imageIndex = receivedImages.length;
-                    const imgObj = {
-                        data: fileData,
-                        mimeType: fileMimeType,
-                        name: fileName,
-                        hash: null,
-                        fileType: fileType,
-                        originalData: new Uint8Array(fileData),
-                        originalMimeType: fileMimeType
-                    };
-                    receivedImages.push(imgObj);
-
-                    // Also store in active collection
-                    const col = Collections.getActive();
-                    col.images.push(imgObj);
-
-                    // For non-image files, use the original filename as the
-                    // collection name instead of generic "Document N"
-                    if (fileType !== 'image' && col.images.length === 1 && metadata.name) {
-                        Collections.setName(col.id, metadata.name);
-                        logger.info(`Collection renamed to file name: ${metadata.name}`);
-                    }
-
-                    photoCount++;
-                    Collections.addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileData.byteLength);
-
-                    updateExportButton();
-
-                    // Preload client-zip after first image arrives
-                    if (receivedImages.filter(img => img !== null && img.fileType === 'image').length === 1) {
-                        ReceiveExport.preloadClientZip();
-                    }
-
-                    // Queue background OCR for this image
-                    BgOcr.queue(imageIndex);
-
-                    // Compute SHA-256 of the decrypted plaintext data and send
-                    // file-ack back to the sender for end-to-end integrity verification.
-                    const decryptedHash = await WebSendCrypto.sha256Hex(data);
-                    imgObj.hash = decryptedHash;
-                    logger.info(`Decrypted SHA-256: ${decryptedHash}`);
-                    rtc.sendMessage(Protocol.build.fileAck(decryptedHash));
-                    logger.success('File decrypted, displayed, and ack sent');
-                    } // end if (!wasReplacement)
-                } catch (e) {
-                    logger.error('Failed to decrypt photo: ' + e.message);
-                    // Send file-nack so the sender knows decryption failed
-                    // and can offer a retry instead of waiting for timeout
-                    rtc.sendMessage(Protocol.build.fileNack(e.message));
-                }
+            } catch (e) {
+                logger.error('Failed to decrypt photo: ' + e.message);
+                rtc.sendMessage(Protocol.build.fileNack(e.message));
+            }
         }
 
         // file-ack / file-nack are intercepted by webrtc.js (resolved via
