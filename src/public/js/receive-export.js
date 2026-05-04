@@ -610,7 +610,7 @@
             if (progressInterval) clearInterval(progressInterval);
             exportAbort.abort();
             keepalive.stop();
-            try { if (scribe) await scribe.dispose(); } catch (_) {}
+            try { if (scribe) await scribe.dispose(); } catch (e) { logger.warn('scribe.dispose() failed in OCR export cleanup: ' + (e && e.message)); }
             scribePreloaded = null;
             btn.disabled = false;
             btn.style.background = '#1565c0';
@@ -654,7 +654,7 @@
             try {
                 const stillAlive = await scribe.reset();
                 if (!stillAlive) scribe = null;
-            } catch (_) { scribe = null; }
+            } catch (e) { logger.warn('scribe.reset() failed, will recreate: ' + (e && e.message)); scribe = null; }
             if (!scribe || !scribe.isAlive) {
                 logger.info('[OCR fallback] Re-initializing scribe after cache failure');
                 scribe = await window.ScribeHandle.create();
