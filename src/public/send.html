@@ -297,7 +297,7 @@
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-KZL1G6hHUlqSP54O3kYuW9oJxJBOdB6ypb8mmOPatYZ4S0gyDlsFX4i0nc2bf5Xq"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-W8sV9MnnPgsbNkgy5QXPeccux0y5xwrniXEw8E4YkXqvMh6PeXHZKW0YMW4d4mRb"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-VT6muOiC3u7dSjFcoKgSu5MVcHVoDWfAjlC1CKrGN4b7TU7SjW5pLLHivyQzRDGW"></script>
-    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-T/NMhreXgqto29pwA4WtK8swfAXndE33fvDb59ehpsvQiOVzBB8bf4wtJGDif/NN"></script>
+    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-eRfDrFWooEfoFLjVYxHgD8E26FVHjJOu0hJD11QXoW+xOXSKkCMMMKplgHiAKOTZ"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -493,7 +493,7 @@
             rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
             Gallery.attach({
-                rtc,
+                getRtc: () => rtc,
                 i18n,
                 logger,
                 showToast,
@@ -504,7 +504,7 @@
                 getFlashMode: () => flashMode,
                 getCaptureStream: () => captureStream,
                 setCropContext: (blob, original) => { currentPhotoBlob = blob; originalPhotoBlob = original; },
-                sendQueue,
+                getSendQueue: () => sendQueue,
             });
 
             // Set up button handlers

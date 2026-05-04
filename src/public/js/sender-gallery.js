@@ -20,7 +20,10 @@
     let galleryEditIndex = -1;
 
     // -- Wired-in deps (set by attach) --
-    let _rtc = null;
+    // rtc and sendQueue are accessed via getters because the sender page
+    // replaces both on reconnect — caching the references would leave Gallery
+    // pointing at a dead peer connection and an orphaned queue array.
+    let _getRtc = null;
     let _i18n = null;
     let _logger = null;
     let _showToast = null;
@@ -31,10 +34,10 @@
     let _getFlashMode = null;
     let _getCaptureStream = null;
     let _setCropContext = null;
-    let _sendQueue = null;
+    let _getSendQueue = null;
 
     function attach(deps) {
-        _rtc = deps.rtc;
+        _getRtc = deps.getRtc;
         _i18n = deps.i18n;
         _logger = deps.logger;
         _showToast = deps.showToast;
@@ -45,7 +48,7 @@
         _getFlashMode = deps.getFlashMode;
         _getCaptureStream = deps.getCaptureStream;
         _setCropContext = deps.setCropContext;
-        _sendQueue = deps.sendQueue;
+        _getSendQueue = deps.getSendQueue;
     }
 
     // -- Public state accessors --
@@ -222,11 +225,12 @@
 
         // If already sent to receiver, tell receiver to delete it
         if (photo.sentHash) {
-            _rtc.sendMessage(Protocol.build.deleteImage(photo.sentHash));
+            _getRtc().sendMessage(Protocol.build.deleteImage(photo.sentHash));
         } else {
             // If still in sendQueue, remove it
-            const qIdx = _sendQueue.findIndex(item => item.photoId === photo.id);
-            if (qIdx !== -1) _sendQueue.splice(qIdx, 1);
+            const queue = _getSendQueue();
+            const qIdx = queue.findIndex(item => item.photoId === photo.id);
+            if (qIdx !== -1) queue.splice(qIdx, 1);
         }
 
         galleryPhotos.splice(idx, 1);
@@ -243,11 +247,12 @@
             if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
             // If already sent, tell receiver to delete
             if (p.sentHash) {
-                _rtc.sendMessage(Protocol.build.deleteImage(p.sentHash));
+                _getRtc().sendMessage(Protocol.build.deleteImage(p.sentHash));
             } else {
                 // Remove from sendQueue if pending
-                const qIdx = _sendQueue.findIndex(item => item.photoId === p.id);
-                if (qIdx !== -1) _sendQueue.splice(qIdx, 1);
+                const queue = _getSendQueue();
+                const qIdx = queue.findIndex(item => item.photoId === p.id);
+                if (qIdx !== -1) queue.splice(qIdx, 1);
             }
         });
         galleryPhotos = [];
@@ -304,7 +309,7 @@
         if (photo.sentHash) {
             const oldHash = photo.sentHash;
             _logger.info(`Sending transform commands for ${oldHash.substring(0, 8)}... (${photo.transforms.length} ops)`);
-            _rtc.sendMessage(Protocol.build.transformImage(oldHash, photo.transforms));
+            _getRtc().sendMessage(Protocol.build.transformImage(oldHash, photo.transforms));
             photo.sentHash = oldHash; // keep tracking (receiver will use same hash lookup)
         }
     }
@@ -350,7 +355,7 @@
         if (photo.sentHash) {
             const oldHash = photo.sentHash;
             _logger.info(`Sending transform commands for crop (replacing ${oldHash.substring(0, 8)}...)`);
-            _rtc.sendMessage(Protocol.build.transformImage(oldHash, photo.transforms));
+            _getRtc().sendMessage(Protocol.build.transformImage(oldHash, photo.transforms));
         }
 
         openGalleryEdit(editIdx);
@@ -358,7 +363,7 @@
 
     function finalizeBatch() {
         // Send batch-end to finalize the collection on the receiver
-        _rtc.sendMessage(Protocol.build.batchEnd());
+        _getRtc().sendMessage(Protocol.build.batchEnd());
         _logger.info('Batch finalized');
 
         // Clear gallery thumbnails (photos already sent)
