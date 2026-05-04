@@ -383,10 +383,7 @@ class WebSendRTC {
         // File-start message contains only the encrypted size (which is padded).
         // No plaintext metadata is revealed - name, type, and original size
         // are encrypted inside the payload.
-        this.sendMessage({
-            type: 'file-start',
-            size: totalSize
-        });
+        this.sendMessage(Protocol.build.fileStart(totalSize));
 
         logger.info(`Sending encrypted file (${totalSize} bytes, padded)`);
 
@@ -403,7 +400,7 @@ class WebSendRTC {
             if (onProgress) onProgress(percent, offset, totalSize);
         }
 
-        this.sendMessage({ type: 'file-end' });
+        this.sendMessage(Protocol.build.fileEnd());
         logger.info('All chunks sent, waiting for receiver acknowledgment...');
 
         // Wait for file-ack / file-nack from receiver, or timeout.

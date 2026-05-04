@@ -151,7 +151,7 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/protocol.js" integrity="sha384-wOjId0OVKzyBy5nyPtTttd7IUkWlF0/k+SLliOrOpjUInFgSVyAUS7HKTguA/h+l"></script>
-    <script src="/js/webrtc.js" integrity="sha384-2JFAW7p+6KzkUuTKrmAvCZj0r0FV488QY8MYFr4N3JSs3j9qKWguWRFEu9Ad+EOR"></script>
+    <script src="/js/webrtc.js" integrity="sha384-WbZ97LFEwndhKd0msVvGaFCWti/MfahEvxHizmKICOmokkrFO2TgpQ5SB6uq3hAc"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-KZL1G6hHUlqSP54O3kYuW9oJxJBOdB6ypb8mmOPatYZ4S0gyDlsFX4i0nc2bf5Xq"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
@@ -162,7 +162,7 @@
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-fjlaFFHPEtVq70nQIB1+d0FzP2mFqr+CdjmrAi7jplCb8QA9U2ery+nUqwlp37oW"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-fzEmHjLzTWKrjkJI4bozuob2VT9l1vjdHXgSgeI2m8fR3LgicoqHEinkouXksQvL"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-BKUlRg9kPHUDg90WhcWuurrn9Y19aAR8F7P0R0VS8YXCu5SKBhCkKT/72nbZHW6f"></script>
-    <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-lsAsSwyBhcJRRNHP56JMOKcGY7bu9dycQORVuD/O/9UyBM/1Dvw2uhLs3tMM/X89"></script>
+    <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-CBtzVz27+ym9ufzsf1pzrlxYUoaet/YKfOIKQ+/o8VOQZqxxo2yyXSRSse6l9RIm"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -464,10 +464,7 @@
 
             // Send our public key to the sender
             const publicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
-            const sent = rtc.sendMessage({
-                type: 'public-key',
-                key: publicKeyB64
-            });
+            const sent = rtc.sendMessage(Protocol.build.publicKey(publicKeyB64));
             if (sent) {
                 logger.info('Sent public key to sender');
             } else {
@@ -825,7 +822,7 @@
                             const decryptedHash = await WebSendCrypto.sha256Hex(data);
                             oldImg.hash = decryptedHash;
                             logger.info(`Replacement SHA-256: ${decryptedHash}`);
-                            rtc.sendMessage({ type: 'file-ack', sha256: decryptedHash });
+                            rtc.sendMessage(Protocol.build.fileAck(decryptedHash));
                             logger.success(`Image replaced (index ${replaceIdx}) and ack sent`);
                             showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
 
@@ -881,14 +878,14 @@
                     const decryptedHash = await WebSendCrypto.sha256Hex(data);
                     imgObj.hash = decryptedHash;
                     logger.info(`Decrypted SHA-256: ${decryptedHash}`);
-                    rtc.sendMessage({ type: 'file-ack', sha256: decryptedHash });
+                    rtc.sendMessage(Protocol.build.fileAck(decryptedHash));
                     logger.success('File decrypted, displayed, and ack sent');
                     } // end if (!wasReplacement)
                 } catch (e) {
                     logger.error('Failed to decrypt photo: ' + e.message);
                     // Send file-nack so the sender knows decryption failed
                     // and can offer a retry instead of waiting for timeout
-                    rtc.sendMessage({ type: 'file-nack', error: e.message });
+                    rtc.sendMessage(Protocol.build.fileNack(e.message));
                 }
         }
 
@@ -1128,7 +1125,7 @@
             document.getElementById('waiting-confirmation').classList.remove('hidden');
 
             // Tell sender we confirmed
-            rtc.sendMessage({ type: 'fingerprint-confirmed' });
+            rtc.sendMessage(Protocol.build.fingerprintConfirmed());
 
             checkBothConfirmed();
         }
@@ -1138,7 +1135,7 @@
             logger.error('User denied fingerprint match - aborting connection');
 
             // Tell sender we denied
-            rtc.sendMessage({ type: 'fingerprint-denied' });
+            rtc.sendMessage(Protocol.build.fingerprintDenied());
 
             showToast(i18n.t('verify.selfDenied'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
         }
@@ -1157,7 +1154,7 @@
                 PeerUI.showVerifiedInSidebar();
 
                 // Tell sender both parties verified, so they can show the photo send UI
-                rtc.sendMessage({ type: 'ready' });
+                rtc.sendMessage(Protocol.build.ready());
             }
         }
 

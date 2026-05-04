@@ -293,11 +293,11 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-PYKJb3pe3NcMDQEwtE4dhco57JRgW3sUP+Lt2IGccOSTCWPwdPLSdiriuPuir0F0"></script>
     <script src="/js/protocol.js" integrity="sha384-wOjId0OVKzyBy5nyPtTttd7IUkWlF0/k+SLliOrOpjUInFgSVyAUS7HKTguA/h+l"></script>
-    <script src="/js/webrtc.js" integrity="sha384-2JFAW7p+6KzkUuTKrmAvCZj0r0FV488QY8MYFr4N3JSs3j9qKWguWRFEu9Ad+EOR"></script>
+    <script src="/js/webrtc.js" integrity="sha384-WbZ97LFEwndhKd0msVvGaFCWti/MfahEvxHizmKICOmokkrFO2TgpQ5SB6uq3hAc"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-KZL1G6hHUlqSP54O3kYuW9oJxJBOdB6ypb8mmOPatYZ4S0gyDlsFX4i0nc2bf5Xq"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-LVd5pIZLwGlNHRANptD40rEq85ii6YejiDNtX5gu/InetUWVO9QeTt0UOy4BO/7x"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-pcYbwXEVAkeg4w8aa07yZtmYV1uEBINErKFSUo3TaiVIyZFoQeqccucZTvl4Gg/A"></script>
-    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-xz/V81MW1orpqLM/GR+6FRdEClw1N8KSAPluwdL5OyB9fzipxtshKjefv6K/ytbO"></script>
+    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-H+wg5J/Kwzz9XsCu/o11MRxtksE+4HdaO2GANbloXW/vwSQKzUMaAZK7Nfmjcvpx"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -545,7 +545,7 @@
                 if (Gallery.size() > 0 && !confirm(i18n.t('send.galleryEmpty') + '?')) return;
                 Gallery.clearGallery();
                 // Finalize the batch on the receiver side
-                rtc.sendMessage({ type: 'batch-end' });
+                rtc.sendMessage(Protocol.build.batchEnd());
                 stopCapture();
                 showStep(stepChoose);
             });
@@ -885,10 +885,7 @@
 
                 // Send our public key to receiver so they can derive the same shared secret
                 const ourPublicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
-                rtc.sendMessage({
-                    type: 'sender-public-key',
-                    key: ourPublicKeyB64
-                });
+                rtc.sendMessage(Protocol.build.senderPublicKey(ourPublicKeyB64));
                 logger.info('Sent our public key to receiver');
 
                 // Show blocking verification modal
@@ -991,7 +988,7 @@
 
                 // Create a new collection on the receiver when camera opens,
                 // but only if the current batch already has images (avoid empty documents)
-                rtc.sendMessage({ type: 'batch-start-if-nonempty' });
+                rtc.sendMessage(Protocol.build.batchStartIfNonempty());
 
                 // Apply advanced constraints (AF, AE, AWB) if supported.
                 // These are applied after getUserMedia because some devices
@@ -1351,7 +1348,7 @@
                     sendQueue.push({ blob: processed, photoId: null });
                     showToast(`${processed.name} queued for sending`, { type: 'success' });
                     updateQueueBanner();
-                    rtc.sendMessage({ type: 'batch-start' });
+                    rtc.sendMessage(Protocol.build.batchStart());
                     pendingBatchEnd = true;
                     drainQueue();
                 }
@@ -1385,7 +1382,7 @@
             if (queued > 0) {
                 showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
                 updateQueueBanner();
-                rtc.sendMessage({ type: 'batch-start' });
+                rtc.sendMessage(Protocol.build.batchStart());
                 pendingBatchEnd = true;
                 drainQueue();
             }
@@ -1492,7 +1489,7 @@
 
             showStep(stepChoose);
             updateQueueBanner();
-            rtc.sendMessage({ type: 'batch-start' });
+            rtc.sendMessage(Protocol.build.batchStart());
             pendingBatchEnd = true;
             drainQueue();
         }
@@ -1525,7 +1522,7 @@
                 try {
                     // If this is a replacement, tell receiver which image to replace
                     if (item.replaceHash) {
-                        rtc.sendMessage({ type: 'replace-image', oldHash: item.replaceHash });
+                        rtc.sendMessage(Protocol.build.replaceImage(item.replaceHash));
                     }
                     const localHash = await sendOnePhoto(item.blob);
                     sendQueue.shift();
@@ -1561,7 +1558,7 @@
             }
 
             if (pendingBatchEnd) {
-                rtc.sendMessage({ type: 'batch-end' });
+                rtc.sendMessage(Protocol.build.batchEnd());
                 pendingBatchEnd = false;
             }
             isSendingQueue = false;
@@ -1672,7 +1669,7 @@
             showStep(stepWaitingConfirmation);
 
             // Tell receiver we confirmed
-            rtc.sendMessage({ type: 'fingerprint-confirmed' });
+            rtc.sendMessage(Protocol.build.fingerprintConfirmed());
 
             checkBothConfirmed();
         }
@@ -1682,7 +1679,7 @@
             logger.error('User denied fingerprint match - aborting connection');
 
             // Tell receiver we denied
-            rtc.sendMessage({ type: 'fingerprint-denied' });
+            rtc.sendMessage(Protocol.build.fingerprintDenied());
 
             showToast(i18n.t('verify.selfDenied'), { duration: 5000 });
         }

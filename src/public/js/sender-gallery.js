@@ -224,7 +224,7 @@
 
         // If already sent to receiver, tell receiver to delete it
         if (photo.sentHash) {
-            _rtc.sendMessage({ type: 'delete-image', hash: photo.sentHash });
+            _rtc.sendMessage(Protocol.build.deleteImage(photo.sentHash));
         } else {
             // If still in sendQueue, remove it
             const qIdx = _sendQueue.findIndex(item => item.photoId === photo.id);
@@ -245,7 +245,7 @@
             if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
             // If already sent, tell receiver to delete
             if (p.sentHash) {
-                _rtc.sendMessage({ type: 'delete-image', hash: p.sentHash });
+                _rtc.sendMessage(Protocol.build.deleteImage(p.sentHash));
             } else {
                 // Remove from sendQueue if pending
                 const qIdx = _sendQueue.findIndex(item => item.photoId === p.id);
@@ -309,11 +309,7 @@
         if (photo.sentHash) {
             const oldHash = photo.sentHash;
             _logger.info(`Sending transform commands for ${oldHash.substring(0, 8)}... (${photo.transforms.length} ops)`);
-            _rtc.sendMessage({
-                type: 'transform-image',
-                oldHash: oldHash,
-                transforms: photo.transforms
-            });
+            _rtc.sendMessage(Protocol.build.transformImage(oldHash, photo.transforms));
             photo.sentHash = oldHash; // keep tracking (receiver will use same hash lookup)
         }
     }
@@ -387,11 +383,7 @@
         if (photo.sentHash) {
             const oldHash = photo.sentHash;
             _logger.info(`Sending transform commands for crop (replacing ${oldHash.substring(0, 8)}...)`);
-            _rtc.sendMessage({
-                type: 'transform-image',
-                oldHash: oldHash,
-                transforms: photo.transforms
-            });
+            _rtc.sendMessage(Protocol.build.transformImage(oldHash, photo.transforms));
         }
 
         openGalleryEdit(editIdx);
@@ -399,7 +391,7 @@
 
     function finalizeBatch() {
         // Send batch-end to finalize the collection on the receiver
-        _rtc.sendMessage({ type: 'batch-end' });
+        _rtc.sendMessage(Protocol.build.batchEnd());
         _logger.info('Batch finalized');
 
         // Clear gallery thumbnails (photos already sent)

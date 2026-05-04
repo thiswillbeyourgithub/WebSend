@@ -45,7 +45,7 @@
 
     function sendNack(oldHash, reason) {
         try {
-            rtc.sendMessage({ type: 'transform-nack', oldHash, reason });
+            rtc.sendMessage(Protocol.build.transformNack(oldHash, reason));
         } catch (e) {
             logger.error('failed to send transform-nack: ' + e.message);
         }
