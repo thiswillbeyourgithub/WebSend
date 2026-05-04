@@ -896,10 +896,11 @@
         }
 
         function handleFingerprintConfirmed(msg) {
-            // Receiver confirmed the fingerprints match
+            // Receiver confirmed the fingerprints match. The receiver drives
+            // the transition to stepChoose by sending 'ready' once both sides
+            // have confirmed; nothing else to do on our side here.
             logger.info('Receiver confirmed fingerprint match');
             theyConfirmed = true;
-            checkBothConfirmed();
         }
 
         function handleFingerprintDenied(msg) {
@@ -1216,11 +1217,11 @@
             if (flashBtn) flashBtn.classList.add('hidden');
         }
 
-        /** Capture a single frame from the video stream and convert to JPEG blob.
-         *  Uses high-quality JPEG (0.95) for much better file size vs PNG while
-         *  retaining excellent visual quality. If flash mode is 'flash', the torch
-         *  is fired briefly during capture to illuminate the scene. */
-        /** Capture a photo and add it to the gallery without leaving camera view */
+        /**
+         * Capture a single frame from the video stream and add it to the gallery
+         * without leaving the camera view. Encodes as high-quality JPEG (0.95).
+         * If flash mode is 'flash', the torch is fired briefly during capture.
+         */
         async function capturePhoto() {
             const video = document.getElementById('capture-video');
             const canvas = document.getElementById('capture-canvas');
@@ -1638,8 +1639,6 @@
 
             // Tell receiver we confirmed
             rtc.sendMessage(Protocol.build.fingerprintConfirmed());
-
-            checkBothConfirmed();
         }
 
         /** User denied fingerprints match - abort connection (possible MITM) */
@@ -1650,15 +1649,6 @@
             rtc.sendMessage(Protocol.build.fingerprintDenied());
 
             showToast(i18n.t('verify.selfDenied'), { duration: 5000 });
-        }
-
-        /** Check if both parties confirmed - receiver will send 'ready' to trigger photo UI */
-        function checkBothConfirmed() {
-            if (weConfirmed && theyConfirmed) {
-                logger.success('Both parties confirmed - waiting for receiver ready signal');
-                // The receiver will send 'ready' message after both confirm
-                // which triggers showStep(stepChoose)
-            }
         }
 
         // ============ Document Cropping (perspective correction) ============
