@@ -546,6 +546,36 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
     res.json({ roomId, secret });
 });
 
+// Max SDP body size (per side). The 50kb express.json limit is the outer cap;
+// this stricter per-field check rejects bloat that would otherwise be echoed
+// to the peer verbatim.
+const MAX_SDP_LEN = 20_000;
+
+/**
+ * Validate an SDP description body. Returns null on success or an error
+ * message on failure. Strict: rejects unknown top-level fields so a malicious
+ * sender cannot smuggle extra properties into the peer's RTCSessionDescription.
+ */
+function validateSdpBody(body, expectedType) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return 'body must be a JSON object';
+    }
+    if (body.type !== expectedType) {
+        return `type must be "${expectedType}"`;
+    }
+    if (typeof body.sdp !== 'string') {
+        return 'sdp must be a string';
+    }
+    if (body.sdp.length === 0 || body.sdp.length > MAX_SDP_LEN) {
+        return `sdp length must be 1..${MAX_SDP_LEN}`;
+    }
+    const allowed = new Set(['type', 'sdp']);
+    for (const key of Object.keys(body)) {
+        if (!allowed.has(key)) return `unexpected field: ${key}`;
+    }
+    return null;
+}
+
 /**
  * Store SDP offer for a room
  * POST /api/rooms/:id/offer
@@ -554,7 +584,9 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
  * Rate limited: general (100/min)
  */
 app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
-    req.room.offer = req.body;
+    const err = validateSdpBody(req.body, 'offer');
+    if (err) return res.status(400).json({ error: err });
+    req.room.offer = { type: req.body.type, sdp: req.body.sdp };
     console.log(`Room ${req.params.id}: offer stored`);
     debugLog('SIGNALING', `Offer stored for room ${req.params.id}`, {
         sdpLength: req.body.sdp?.length,
@@ -589,7 +621,9 @@ app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), validateRoomS
  * Rate limited: general (100/min)
  */
 app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
-    req.room.answer = req.body;
+    const err = validateSdpBody(req.body, 'answer');
+    if (err) return res.status(400).json({ error: err });
+    req.room.answer = { type: req.body.type, sdp: req.body.sdp };
     console.log(`Room ${req.params.id}: answer stored`);
     debugLog('SIGNALING', `Answer stored for room ${req.params.id}`, {
         sdpLength: req.body.sdp?.length,

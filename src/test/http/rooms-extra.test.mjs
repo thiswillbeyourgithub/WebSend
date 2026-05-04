@@ -36,7 +36,7 @@ test('GET /api/rooms/:id reports existence and offer/answer state', async () => 
     assert.deepEqual(await res.json(), { exists: true, hasOffer: false, hasAnswer: false });
 
     // After posting an offer: hasOffer flips to true
-    await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, { offer: { type: 'offer', sdp: 'v=0\r\n' } }, secret);
+    await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, { type: 'offer', sdp: 'v=0\r\n' }, secret);
     res = await get(`${srv.baseUrl}/api/rooms/${roomId}`, secret);
     assert.deepEqual(await res.json(), { exists: true, hasOffer: true, hasAnswer: false });
 });
@@ -95,14 +95,14 @@ test('ICE candidates accumulate in insertion order', async () => {
 test('Request without X-Room-Secret returns 401', async () => {
     const { roomId } = await newRoom();
     const res = await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`,
-        { offer: { type: 'offer', sdp: 'v=0\r\n' } }); // no secret
+        { type: 'offer', sdp: 'v=0\r\n' }); // no secret
     assert.equal(res.status, 401);
 });
 
 test('JSON body over 50kb limit is rejected (413)', async () => {
     const { roomId, secret } = await newRoom();
     // ~60kb of SDP — well past the 50kb cap
-    const huge = { offer: { type: 'offer', sdp: 'v=0\r\n' + 'a'.repeat(60 * 1024) } };
+    const huge = { type: 'offer', sdp: 'v=0\r\n' + 'a'.repeat(60 * 1024) };
     const res = await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, huge, secret);
     assert.equal(res.status, 413);
 });
