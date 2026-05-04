@@ -490,6 +490,15 @@ const i18n = (function() {
         return text;
     }
 
+    // Explicit allowlist of i18n keys whose translation is intentionally HTML
+    // (e.g. embedded <br> or <strong>). All other keys go through textContent
+    // — `translated.includes('<')` was a fragile heuristic that would treat
+    // any future translation containing a `<` as trusted HTML.
+    const HTML_KEYS = new Set([
+        'index.footer', // contains <br>
+        'send.tip',     // contains <strong>
+    ]);
+
     /**
      * Apply translations to all elements with data-i18n attribute
      */
@@ -497,9 +506,7 @@ const i18n = (function() {
         document.querySelectorAll('[data-i18n]').forEach(el => {
             const key = el.getAttribute('data-i18n');
             const translated = t(key);
-
-            // Check if translation contains HTML
-            if (translated.includes('<')) {
+            if (HTML_KEYS.has(key)) {
                 el.innerHTML = translated;
             } else {
                 el.textContent = translated;

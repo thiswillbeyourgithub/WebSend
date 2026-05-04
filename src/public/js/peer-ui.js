@@ -39,15 +39,17 @@
         if (!section || !infoDiv) return;
         section.classList.remove('hidden');
 
+        // textContent (not innerHTML) so future changes that route a server-
+        // supplied or peer-supplied string into info.details cannot inject HTML.
+        const prefix = info.type === 'relay' ? '🔄 ' : '⚡ ';
+        infoDiv.textContent = prefix + info.details;
         if (info.type === 'relay') {
             infoDiv.style.background = '#fff3e0';
             infoDiv.style.border = '1px solid #ffcc80';
-            infoDiv.innerHTML = `🔄 ${info.details}`;
             infoDiv.style.color = '#e65100';
         } else {
             infoDiv.style.background = '#e3f2fd';
             infoDiv.style.border = '1px solid #90caf9';
-            infoDiv.innerHTML = `⚡ ${info.details}`;
             infoDiv.style.color = '#1565c0';
         }
     }
