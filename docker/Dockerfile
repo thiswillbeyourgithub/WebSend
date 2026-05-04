@@ -26,6 +26,7 @@ RUN if [ "$RUN_NPM_AUDIT" = "true" ]; then npm audit --audit-level=high; fi
 
 # Copy application files
 COPY server.js ./
+COPY server-helpers.js ./
 COPY public/ ./public/
 COPY check-sri.js ./
 COPY healthcheck.js ./
