@@ -244,12 +244,17 @@ class WebSendRTC {
         this.dataChannel.onclose = () => {
             logger.info('Data channel closed');
             logger.debug('DATACHANNEL', 'Channel closed');
+            // Fail any in-flight sendFile waiting on an ack — without this the
+            // sender would otherwise time out 30s later for a transfer that is
+            // already known-doomed.
+            this._rejectFileAck(new Error('Data channel closed before file-ack arrived'));
         };
 
         this.dataChannel.onerror = (event) => {
             const errorMsg = event.error ? event.error.message : (event.message || 'Unknown error');
             logger.error('Data channel error: ' + errorMsg);
             logger.debug('DATACHANNEL', 'Channel error', { error: errorMsg });
+            this._rejectFileAck(new Error('Data channel error: ' + errorMsg));
         };
 
         this.dataChannel.onmessage = (event) => {
@@ -302,21 +307,11 @@ class WebSendRTC {
                 } else if (msg.type === 'file-ack') {
                     // Receiver confirmed successful decryption with their computed hash
                     logger.info(`Received file-ack with SHA-256: ${msg.sha256}`);
-                    if (this._fileAckResolve) {
-                        clearTimeout(this._fileAckTimeout);
-                        this._fileAckResolve({ acknowledged: true, sha256: msg.sha256 });
-                        this._fileAckResolve = null;
-                        this._fileAckReject = null;
-                    }
+                    this._resolveFileAck({ acknowledged: true, sha256: msg.sha256 });
                 } else if (msg.type === 'file-nack') {
                     // Receiver reported decryption failure
                     logger.error(`Received file-nack: ${msg.error}`);
-                    if (this._fileAckReject) {
-                        clearTimeout(this._fileAckTimeout);
-                        this._fileAckReject(new Error(`Receiver decryption failed: ${msg.error}`));
-                        this._fileAckResolve = null;
-                        this._fileAckReject = null;
-                    }
+                    this._rejectFileAck(new Error(`Receiver decryption failed: ${msg.error}`));
                 } else {
                     if (this.onMessage) {
                         this.onMessage(msg);
@@ -377,51 +372,84 @@ class WebSendRTC {
             return false;
         }
 
-        if (this._fileAckResolve) {
+        if (this._fileAckInFlight) {
             throw new Error('sendFile already in progress — wait for the previous transfer to finish');
         }
+        this._fileAckInFlight = true;
 
-        const CHUNK_SIZE = 16384; // 16KB chunks
-        const totalSize = encryptedData.byteLength;
-        let offset = 0;
+        try {
+            const CHUNK_SIZE = 16384; // 16KB chunks
+            const totalSize = encryptedData.byteLength;
+            let offset = 0;
 
-        // File-start message contains only the encrypted size (which is padded).
-        // No plaintext metadata is revealed - name, type, and original size
-        // are encrypted inside the payload.
-        this.sendMessage(Protocol.build.fileStart(totalSize));
-
-        logger.info(`Sending encrypted file (${totalSize} bytes, padded)`);
-
-        while (offset < totalSize) {
-            while (this.dataChannel.bufferedAmount > 1024 * 1024) {
-                await new Promise(resolve => setTimeout(resolve, 50));
+            // File-start message contains only the encrypted size (which is padded).
+            // No plaintext metadata is revealed - name, type, and original size
+            // are encrypted inside the payload.
+            if (!this.sendMessage(Protocol.build.fileStart(totalSize))) {
+                throw new Error('Failed to send file-start (channel not open)');
             }
 
-            const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
-            this.dataChannel.send(chunk);
-            offset += chunk.byteLength;
+            logger.info(`Sending encrypted file (${totalSize} bytes, padded)`);
 
-            const percent = Math.round((offset / totalSize) * 100);
-            if (onProgress) onProgress(percent, offset, totalSize);
-        }
-
-        this.sendMessage(Protocol.build.fileEnd());
-        logger.info('All chunks sent, waiting for receiver acknowledgment...');
-
-        // Wait for file-ack / file-nack from receiver, or timeout.
-        // This ensures the sender only sees "success" after the receiver
-        // has confirmed successful decryption with a matching checksum.
-        return new Promise((resolve, reject) => {
-            this._fileAckResolve = resolve;
-            this._fileAckReject = reject;
-            this._fileAckTimeout = setTimeout(() => {
-                if (this._fileAckReject) {
-                    this._fileAckReject(new Error('Transfer acknowledgment timeout — no confirmation from receiver after 30s'));
-                    this._fileAckResolve = null;
-                    this._fileAckReject = null;
+            while (offset < totalSize) {
+                while (this.dataChannel.bufferedAmount > 1024 * 1024) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
                 }
-            }, this._FILE_ACK_TIMEOUT_MS);
-        });
+                if (this.dataChannel.readyState !== 'open') {
+                    throw new Error('Data channel closed mid-transfer');
+                }
+
+                const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
+                this.dataChannel.send(chunk);
+                offset += chunk.byteLength;
+
+                const percent = Math.round((offset / totalSize) * 100);
+                if (onProgress) onProgress(percent, offset, totalSize);
+            }
+
+            if (!this.sendMessage(Protocol.build.fileEnd())) {
+                throw new Error('Failed to send file-end (channel not open)');
+            }
+            logger.info('All chunks sent, waiting for receiver acknowledgment...');
+
+            // Wait for file-ack / file-nack from receiver, or timeout.
+            // The handler in handleMessage() and the timeout below all funnel
+            // through _resolveFileAck()/_rejectFileAck() so the in-flight flag
+            // and ack state are cleared exactly once.
+            return await new Promise((resolve, reject) => {
+                this._fileAckResolve = resolve;
+                this._fileAckReject = reject;
+                this._fileAckTimeout = setTimeout(() => {
+                    this._rejectFileAck(new Error('Transfer acknowledgment timeout — no confirmation from receiver after 30s'));
+                }, this._FILE_ACK_TIMEOUT_MS);
+            });
+        } finally {
+            // Clear in-flight flag in every exit path. Ack-state pointers are
+            // already null after _resolveFileAck/_rejectFileAck; if we threw
+            // before installing them, there is nothing to clear.
+            this._fileAckInFlight = false;
+        }
+    }
+
+    _clearFileAckState() {
+        if (this._fileAckTimeout) {
+            clearTimeout(this._fileAckTimeout);
+            this._fileAckTimeout = null;
+        }
+        this._fileAckResolve = null;
+        this._fileAckReject = null;
+    }
+
+    _resolveFileAck(value) {
+        const resolve = this._fileAckResolve;
+        this._clearFileAckState();
+        if (resolve) resolve(value);
+    }
+
+    _rejectFileAck(err) {
+        const reject = this._fileAckReject;
+        this._clearFileAckState();
+        if (reject) reject(err);
     }
 
     // ============ Server-based Signaling ============
