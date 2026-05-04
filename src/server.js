@@ -131,8 +131,8 @@ class LruMap {
     get size() { return this.map.size; }
     has(key) { return this.map.has(key); }
     get(key) {
+        if (!this.map.has(key)) return undefined;
         const value = this.map.get(key);
-        if (value === undefined && !this.map.has(key)) return undefined;
         this.map.delete(key);
         this.map.set(key, value);
         return value;
