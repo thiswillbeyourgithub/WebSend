@@ -326,5 +326,5 @@
         setupHandles();
     }
 
-    window.CropModal = { open };
+    window.CropModal = { open, normalizeCorners };
 })();
