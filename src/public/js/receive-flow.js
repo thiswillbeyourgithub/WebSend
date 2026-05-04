@@ -45,10 +45,23 @@
         _updateExportButton = opts.updateExportButton;
     }
 
+    /**
+     * The sender controls metadata.name. Strip control chars and path
+     * separators, cap at 255, drop to empty string if nothing remains.
+     * Downstream code falls back to a generated filename when empty.
+     */
+    function sanitizeMetadataName(name) {
+        if (typeof name !== 'string') return '';
+        // eslint-disable-next-line no-control-regex
+        const cleaned = name.replace(/[\x00-\x1F\x7F/\\]/g, '').trim().slice(0, 255);
+        return cleaned;
+    }
+
     async function decryptIncomingFile(blob) {
         const sharedKey = _getSharedKey();
         const encryptedData = await blob.arrayBuffer();
         const { metadata, data } = await window.WebSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
+        metadata.name = sanitizeMetadataName(metadata.name);
         _logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${metadata.originalSize} bytes)`);
 
         const fileData = new Uint8Array(data);
