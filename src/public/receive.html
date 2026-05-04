@@ -495,29 +495,49 @@
         }
 
         /**
-         * Wait for the data channel to be in 'open' state
-         * Returns immediately if already open, otherwise polls with a timeout
+         * Wait for the data channel to be in 'open' state.
+         * Resolves immediately if already open. Otherwise attaches the 'open'
+         * event once the channel object exists. The brief 200 ms poll only
+         * covers the gap until ondatachannel fires (receiver side); after that
+         * it's fully event-driven, no busy-waiting.
          */
         function waitForDataChannel() {
             return new Promise((resolve, reject) => {
-                // Check if already open
-                if (rtc.dataChannel && rtc.dataChannel.readyState === 'open') {
-                    resolve();
-                    return;
-                }
+                const MAX_WAIT_MS = 10000;
+                let timeoutId = null;
+                let channelPollId = null;
 
-                // Poll for data channel to open
-                const maxWait = 10000; // 10 seconds
-                const startTime = Date.now();
-                const checkInterval = setInterval(() => {
-                    if (rtc.dataChannel && rtc.dataChannel.readyState === 'open') {
-                        clearInterval(checkInterval);
+                const cleanup = () => {
+                    if (timeoutId) clearTimeout(timeoutId);
+                    if (channelPollId) clearInterval(channelPollId);
+                };
+
+                timeoutId = setTimeout(() => {
+                    cleanup();
+                    reject(new Error('Data channel did not open in time'));
+                }, MAX_WAIT_MS);
+
+                const attachOpenListener = (dc) => {
+                    if (dc.readyState === 'open') {
+                        cleanup();
                         resolve();
-                    } else if (Date.now() - startTime > maxWait) {
-                        clearInterval(checkInterval);
-                        reject(new Error('Data channel did not open in time'));
+                        return;
                     }
-                }, 100);
+                    dc.addEventListener('open', () => { cleanup(); resolve(); }, { once: true });
+                };
+
+                if (rtc.dataChannel) {
+                    attachOpenListener(rtc.dataChannel);
+                } else {
+                    // Wait for ondatachannel to assign rtc.dataChannel.
+                    channelPollId = setInterval(() => {
+                        if (rtc.dataChannel) {
+                            clearInterval(channelPollId);
+                            channelPollId = null;
+                            attachOpenListener(rtc.dataChannel);
+                        }
+                    }, 200);
+                }
             });
         }
 
