@@ -20,7 +20,8 @@
     'use strict';
 
     // -- State --
-    let ocrQueue = [];                // indices into receivedImages waiting for OCR
+    let ocrQueue = [];                // indices into receivedImages waiting for OCR (insertion order)
+    const ocrQueueSet = new Set();    // O(1) membership companion (kept in sync with ocrQueue)
     let ocrProcessing = false;        // whether the worker loop is running
     let currentOcrIndex = null;       // index currently being OCR'd
     let bgOcrAbortController = null;  // per-iteration AbortController
@@ -59,8 +60,9 @@
         if (!img || img.fileType !== 'image') return;
         img.ocrPageData = null; // reset any previous result
         ensureOcrPromise(img);
-        if (!ocrQueue.includes(imageIndex)) {
+        if (!ocrQueueSet.has(imageIndex)) {
             ocrQueue.push(imageIndex);
+            ocrQueueSet.add(imageIndex);
             window.logger.info(`[BG-OCR] Queued image #${imageIndex + 1} (queue length: ${ocrQueue.length})`);
         }
         refreshBadge(imageIndex);
@@ -71,9 +73,12 @@
      * Cancel background OCR for a specific image (e.g. when replaced or discarded).
      */
     function cancel(imageIndex) {
-        const wasQueued = ocrQueue.includes(imageIndex);
+        const wasQueued = ocrQueueSet.has(imageIndex);
         const wasProcessing = currentOcrIndex === imageIndex;
-        ocrQueue = ocrQueue.filter(i => i !== imageIndex);
+        if (wasQueued) {
+            ocrQueue = ocrQueue.filter(i => i !== imageIndex);
+            ocrQueueSet.delete(imageIndex);
+        }
         if (wasProcessing) {
             bgOcrAbortController?.abort();
         }
@@ -94,7 +99,7 @@
     }
 
     function isQueued(imageIndex) {
-        return ocrQueue.includes(imageIndex);
+        return ocrQueueSet.has(imageIndex);
     }
 
     function isProcessing(imageIndex) {
@@ -118,6 +123,7 @@
     /** Clear all queue state (used by cleanupAllData). */
     function reset() {
         ocrQueue = [];
+        ocrQueueSet.clear();
         bgOcrAbortController?.abort();
         currentOcrIndex = null;
     }
@@ -147,7 +153,7 @@
         } else if (currentOcrIndex === imageIndex) {
             badge.textContent = 'OCR…';
             badge.style.background = 'rgba(21,101,192,0.75)';
-        } else if (ocrQueue.includes(imageIndex)) {
+        } else if (ocrQueueSet.has(imageIndex)) {
             badge.textContent = 'OCR ⏳';
             badge.style.background = 'rgba(0,0,0,0.6)';
         } else {
@@ -207,6 +213,7 @@
         try {
             while (ocrQueue.length > 0) {
                 const idx = ocrQueue.shift();
+                ocrQueueSet.delete(idx);
 
                 // Pre-start downscaling the next image in queue right away
                 if (ocrQueue.length > 0) {
