@@ -70,10 +70,16 @@ WebSend/
         │   │               #   fingerprinting for MITM detection, size-bucket padding
         │   │               #   to hide exact file sizes, and metadata bundling (filename,
         │   │               #   MIME type encrypted inside the payload)
+        │   ├── protocol.js # Data-channel message schemas, validation, and builders.
+        │   │               #   Exposes window.Protocol.validate(msg) → {ok,error} and
+        │   │               #   Protocol.build.* typed builder functions (one per wire
+        │   │               #   message type). Every builder stamps protocolVersion:1.
+        │   │               #   Must be loaded before webrtc.js
         │   ├── webrtc.js   # WebRTC peer connection management: room creation/joining,
         │   │               #   SDP offer/answer exchange via server API, trickle ICE
         │   │               #   candidate relay, data channel setup, chunked file transfer,
-        │   │               #   connection type detection (direct vs TURN relay)
+        │   │               #   connection type detection (direct vs TURN relay).
+        │   │               #   Validates all inbound/outbound JSON messages via Protocol
         │   ├── logger.js   # In-memory log buffer with UI panel (slide-up overlay).
         │   │               #   Supports info/success/warn/error/debug levels.
         │   │               #   DEV mode (toggled via server config) enables verbose output
