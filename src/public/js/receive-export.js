@@ -181,8 +181,7 @@
      * Used by ZIP export when B&W mode is enabled.
      */
     async function toBWPng(data, mimeType) {
-        const result = await window.ImageTransforms.binarize({ data, mimeType });
-        return new Blob([result.data], { type: result.mimeType });
+        return window.ImageTransforms.toBlob(await window.ImageTransforms.binarize({ data, mimeType }));
     }
 
     /**

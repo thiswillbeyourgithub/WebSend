@@ -281,11 +281,7 @@
         if (galleryEditIndex < 0 || galleryEditIndex >= galleryPhotos.length) return;
         const photo = galleryPhotos[galleryEditIndex];
 
-        // transformFn(blob) returns either a Blob or {data, mimeType}.
-        const result = await transformFn(photo.blob);
-        const resultBlob = result instanceof Blob
-            ? result
-            : new Blob([result.data], { type: result.mimeType });
+        const resultBlob = window.ImageTransforms.toBlob(await transformFn(photo.blob));
 
         // Update gallery entry. originalBlob is the crop baseline and must
         // only be touched by applyCropResult — overwriting it here would

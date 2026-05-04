@@ -334,8 +334,20 @@ async function cropPerspective(input, opts) {
     }
 }
 
+/**
+ * Normalize a transform result to a Blob.
+ * rotateImage/flipImage return a Blob; binarize/cropPerspective return
+ * {data: Uint8Array, mimeType: string}. Callers that just want a Blob
+ * (sender-gallery preview, crop result) shouldn't have to repeat this fork.
+ */
+function toBlob(result, fallbackMime = 'image/jpeg') {
+    if (result instanceof Blob) return result;
+    if (result && result.data) return new Blob([result.data], { type: result.mimeType || fallbackMime });
+    throw new Error('ImageTransforms.toBlob: unsupported result shape');
+}
+
 window.ImageTransforms = {
     applyOtsu, perspectiveTransform, distance,
-    rotateImage, flipImage, binarize, cropPerspective
+    rotateImage, flipImage, binarize, cropPerspective, toBlob
 };
 })();
