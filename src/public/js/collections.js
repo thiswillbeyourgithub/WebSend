@@ -405,6 +405,13 @@
     // -- Public API --
 
     function reset() {
+        // Defence in depth: revoke blob URLs on any rendered cards before
+        // dropping references so reset() is safe even when callers forget.
+        if (mainContainerEl && window.ReceiveCard?.revokeCardUrls) {
+            mainContainerEl.querySelectorAll('.received-image-item').forEach(card => {
+                try { window.ReceiveCard.revokeCardUrls(card); } catch (_) {}
+            });
+        }
         collections = [];
         nextCollectionId = 0;
         activeCollectionId = null;
