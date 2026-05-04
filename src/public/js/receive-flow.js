@@ -97,7 +97,11 @@
         const decryptedHash = await window.WebSendCrypto.sha256Hex(data);
         oldImg.hash = decryptedHash;
         _logger.info(`Replacement SHA-256: ${decryptedHash}`);
-        _getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash));
+        if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
+            _logger.warn('Replacement ack could not be sent (channel closed) — sender will treat transfer as failed');
+            _showToast(_i18n.t('receive.ackLost') || 'Connection lost before ack — sender may retry', { type: 'warn' });
+            return;
+        }
         _logger.success(`Image replaced (index ${replaceIdx}) and ack sent`);
         _showToast(_i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
 
@@ -142,7 +146,11 @@
         const decryptedHash = await window.WebSendCrypto.sha256Hex(data);
         imgObj.hash = decryptedHash;
         _logger.info(`Decrypted SHA-256: ${decryptedHash}`);
-        _getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash));
+        if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
+            _logger.warn('Ack could not be sent (channel closed) — sender will treat transfer as failed');
+            _showToast(_i18n.t('receive.ackLost') || 'Connection lost before ack — sender may retry', { type: 'warn' });
+            return;
+        }
         _logger.success('File decrypted, displayed, and ack sent');
     }
 
@@ -175,7 +183,9 @@
             }
         } catch (e) {
             _logger.error('Failed to decrypt photo: ' + e.message);
-            _getRtc().sendMessage(window.Protocol.build.fileNack(e.message));
+            if (!_getRtc().sendMessage(window.Protocol.build.fileNack(e.message))) {
+                _logger.warn('Nack could not be sent (channel closed) — sender will time out');
+            }
         }
     }
 
