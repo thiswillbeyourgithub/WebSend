@@ -32,6 +32,7 @@
     let clientZipPreloaded = null;       // Promise<{downloadZip}> or null
     let scribePreloaded = null;          // Promise<ScribeHandle|null> or null
     let mupdfInstance = null;            // cached MuPDF worker
+    let ocrExportInFlight = false;       // re-entry guard for generateOcrPdf
 
     // -- Wired-in deps (set by attach) --
     let receivedImages = null;
@@ -505,10 +506,20 @@
     }
 
     async function generateOcrPdf() {
+        if (ocrExportInFlight) {
+            logger.warn('OCR PDF export already in progress — ignoring duplicate trigger');
+            window.showToast(i18n.t('receive.ocrAlreadyRunning') || 'Export already in progress', { type: 'warn' });
+            return;
+        }
+        ocrExportInFlight = true;
         logger.info('=== OCR PDF export started ===');
         const exportAbort = new AbortController();
         const signal = exportAbort.signal;
         const btn = document.getElementById('export-btn');
+        // Tag the button with this run's abort controller. If a later run
+        // somehow installs its own handler before our finally fires, the
+        // identity check below prevents us from clearing the new handler.
+        btn.__activeExportAbort = exportAbort;
 
         const selectedIndices = _getSelectedIndices(exportCollectionId !== null ? exportCollectionId : undefined);
         const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
@@ -619,11 +630,17 @@
             exportAbort.abort();
             keepalive.stop();
             try { if (scribe) await scribe.dispose(); } catch (e) { logger.warn('scribe.dispose() failed in OCR export cleanup: ' + (e && e.message)); }
-            btn.disabled = false;
-            btn.style.background = '#1565c0';
-            // Drop the cancel-handler closure — without this, a subsequent
-            // export click could fire the previous run's exportAbort.
-            btn.onclick = null;
+            // Only revert the button if we still own it. If a later run took
+            // over (impossible while ocrExportInFlight guards entry, but
+            // belt-and-braces in case future code adds another writer), don't
+            // stomp its state.
+            if (btn.__activeExportAbort === exportAbort) {
+                btn.disabled = false;
+                btn.style.background = '#1565c0';
+                btn.onclick = null;
+                btn.__activeExportAbort = null;
+            }
+            ocrExportInFlight = false;
             _updateExportBtn();
             logger.info('=== OCR PDF export finished ===');
         }
