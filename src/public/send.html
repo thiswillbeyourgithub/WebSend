@@ -297,6 +297,7 @@
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-KZL1G6hHUlqSP54O3kYuW9oJxJBOdB6ypb8mmOPatYZ4S0gyDlsFX4i0nc2bf5Xq"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-W8sV9MnnPgsbNkgy5QXPeccux0y5xwrniXEw8E4YkXqvMh6PeXHZKW0YMW4d4mRb"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-VT6muOiC3u7dSjFcoKgSu5MVcHVoDWfAjlC1CKrGN4b7TU7SjW5pLLHivyQzRDGW"></script>
+    <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-ZGMsM74141CQWdyknfkfd1bTxRCKY83A2f1xPK0haYNwrkiaAa2Uz0eoBEvbmNuB"></script>
     <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-eRfDrFWooEfoFLjVYxHgD8E26FVHjJOu0hJD11QXoW+xOXSKkCMMMKplgHiAKOTZ"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -1627,39 +1628,7 @@
 
         /** Display the blocking verification modal with key fingerprints */
         function showVerificationModal() {
-            const modal = document.getElementById('verification-modal');
-            modal.classList.remove('hidden');
-            modal.style.display = 'flex';
-
-            // Set up button handlers
-            document.getElementById('confirm-match-btn').onclick = onConfirmMatch;
-            document.getElementById('deny-match-btn').onclick = onDenyMatch;
-
-            // Keyboard shortcuts: Enter/Space = confirm, Escape = deny
-            function onVerifyKeydown(e) {
-                if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    onConfirmMatch();
-                } else if (e.key === 'Escape') {
-                    e.preventDefault();
-                    onDenyMatch();
-                }
-            }
-            document.addEventListener('keydown', onVerifyKeydown);
-            // Store reference so we can remove it when modal closes
-            modal._verifyKeydown = onVerifyKeydown;
-        }
-
-        /** Hide the verification modal */
-        function hideVerificationModal() {
-            const modal = document.getElementById('verification-modal');
-            // Remove keyboard listener added by showVerificationModal
-            if (modal._verifyKeydown) {
-                document.removeEventListener('keydown', modal._verifyKeydown);
-                modal._verifyKeydown = null;
-            }
-            modal.classList.add('hidden');
-            modal.style.display = 'none';
+            VerificationModal.show({ onConfirm: onConfirmMatch, onDeny: onDenyMatch });
         }
 
         /** User confirmed fingerprints match - notify receiver and wait for mutual confirmation */
@@ -1668,7 +1637,7 @@
             weConfirmed = true;
 
             // Hide modal, show waiting message
-            hideVerificationModal();
+            VerificationModal.hide();
             showStep(stepWaitingConfirmation);
 
             // Tell receiver we confirmed

@@ -158,6 +158,7 @@
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-VT6muOiC3u7dSjFcoKgSu5MVcHVoDWfAjlC1CKrGN4b7TU7SjW5pLLHivyQzRDGW"></script>
+    <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-ZGMsM74141CQWdyknfkfd1bTxRCKY83A2f1xPK0haYNwrkiaAa2Uz0eoBEvbmNuB"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-jmbs2WN52h9SkRpJ2lohLmqnjamiu0nRINJYMpKj/EKMWER0/mZayY6LAgZQK00K"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-e+URZStv2YNuswmm+QjbkuCvNOLOyNFUOd4zSNl7BiHlaieijAN+t+fRzmxktPVu"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-VzYnchg6Ic2gJm/GV894kpIlznlbC3X/E09IuyHQmwW4oJvsEe+zUEWv2vZCvuOx"></script>
@@ -1003,37 +1004,7 @@
          * User must confirm or deny before any photo transfer can begin.
          */
         function showVerificationModal() {
-            const modal = document.getElementById('verification-modal');
-            modal.classList.remove('hidden');
-            modal.style.display = 'flex';
-
-            // Set up button handlers
-            document.getElementById('confirm-match-btn').onclick = onConfirmMatch;
-            document.getElementById('deny-match-btn').onclick = onDenyMatch;
-
-            // Keyboard shortcuts: Enter/Space = confirm, Escape = deny
-            function onVerifyKeydown(e) {
-                if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    onConfirmMatch();
-                } else if (e.key === 'Escape') {
-                    e.preventDefault();
-                    onDenyMatch();
-                }
-            }
-            document.addEventListener('keydown', onVerifyKeydown);
-            modal._verifyKeydown = onVerifyKeydown;
-        }
-
-        /** Hide the verification modal (called after user confirms or denies) */
-        function hideVerificationModal() {
-            const modal = document.getElementById('verification-modal');
-            if (modal._verifyKeydown) {
-                document.removeEventListener('keydown', modal._verifyKeydown);
-                modal._verifyKeydown = null;
-            }
-            modal.classList.add('hidden');
-            modal.style.display = 'none';
+            VerificationModal.show({ onConfirm: onConfirmMatch, onDeny: onDenyMatch });
         }
 
         /** User confirmed fingerprints match - notify the sender and wait for mutual confirmation */
@@ -1042,7 +1013,7 @@
             weConfirmed = true;
 
             // Hide modal, show waiting message
-            hideVerificationModal();
+            VerificationModal.hide();
             document.getElementById('waiting-confirmation').classList.remove('hidden');
 
             // Tell sender we confirmed
