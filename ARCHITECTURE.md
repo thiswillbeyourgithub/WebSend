@@ -65,6 +65,11 @@ WebSend/
         │                   #   responsive layout, crop modal, logs panel
         │
         ├── js/
+        │   ├── collections.js # Receive page "collections" (one per sender batch,
+        │   │               #   shown as a Document N section). Owns the collections
+        │   │               #   array, activeCollectionId, and DOM rendering / drag-
+        │   │               #   and-drop wiring. Cross-page state injected via
+        │   │               #   Collections.attach({...}). Exposes window.Collections
         │   ├── crypto.js   # ECDH key exchange (P-256) + AES-GCM-256 encryption via
         │   │               #   Web Crypto API. Includes HKDF key derivation, key
         │   │               #   fingerprinting for MITM detection, size-bucket padding
@@ -89,6 +94,15 @@ WebSend/
         │   │               #   Exposes window.CropModal.open({ sourceBlob, initialCorners,
         │   │               #   detectCorners, onApply, onCancel }); used by both send.html
         │   │               #   and receive.html so the ~450 LOC crop logic is not duplicated
+        │   ├── doc-detect.js # Pure-JS document edge detection: downscale → grayscale
+        │   │               #   → blur → Sobel → Otsu → contour trace → Douglas-Peucker
+        │   │               #   → largest convex quad. Used by sender camera live overlay
+        │   │               #   and the crop modal's auto-corner-detection. Exposes DocDetect
+        │   ├── image-transforms.js # Shared image-transform utilities (applyOtsu,
+        │   │               #   perspectiveTransform, distance, rotateImage, flipImage,
+        │   │               #   binarize, cropPerspective). All transform results go through
+        │   │               #   a central toBlob() normalizer. Used by sender gallery edits
+        │   │               #   and receiver transform-replay. Exposes window.ImageTransforms
         │   ├── ocr-rescale.js # Pure helper: rescales scribe-OCR coordinates from the
         │   │               #   downscaled OCR-input dims back to the original image dims.
         │   │               #   Used by both the cached-assembly path and the on-demand
@@ -149,6 +163,28 @@ WebSend/
         │   │               #   encryption + transmit (sendOnePhoto), per-photo
         │   │               #   gallery status updates, sticky progress banner, and
         │   │               #   the optional batch-end signal. Exposes window.SenderSend
+        │   ├── sidebar.js # Shared sidebar (kebab button, overlay, language selector,
+        │   │               #   connection info, logs/about actions, DEV badge) used by
+        │   │               #   index/receive/send. Exposes buildSidebar(), initSidebar(),
+        │   │               #   updateDevBadge() (also on window) so each page only wires once
+        │   ├── transfer-stats.js # Pure helpers to format transfer progress (rate,
+        │   │               #   percent, ETA) into "42%  1.2 MB/s  14s" labels. Used by
+        │   │               #   both send.html and receive.html
+        │   ├── transform-replay.js # Receiver-side handler for `transform-image`
+        │   │               #   messages: looks up image by oldHash, replays the transform
+        │   │               #   list against stored originalData via image-transforms.js,
+        │   │               #   swaps the card blob URL, restarts BgOcr. Sends `transform-
+        │   │               #   nack` on failure. State injected via attach(). Exposes
+        │   │               #   window.TransformReplay
+        │   ├── verification-modal.js # Shared blocking modal for ECDH fingerprint
+        │   │               #   verification. Used by both send.html and receive.html;
+        │   │               #   centralises the modal show/hide + keydown listener
+        │   │               #   cleanup that was previously duplicated. Exposes
+        │   │               #   window.VerificationModal
+        │   ├── wake-lock.js # Shared Screen Wake Lock manager (acquire/release +
+        │   │               #   re-acquisition after visibilitychange). Used by both
+        │   │               #   send.html and receive.html to keep the screen on during
+        │   │               #   active transfers. Exposes wakeLockMgr
         │   ├── sender-gallery.js # Genius-Scan-like gallery for the sender page.
         │   │               #   Owns galleryPhotos state, thumbnail grid, per-photo
         │   │               #   edit (rotate/flip/BW/crop), drag-and-drop reorder,
@@ -244,6 +280,7 @@ the matching photo, it surfaces an error toast and gives up.
 | Method | Path                         | Purpose                              | Auth        | Rate Limit      |
 |--------|------------------------------|--------------------------------------|-------------|-----------------|
 | GET    | `/api/config`                | ICE server list + DEV flag           | None        | None            |
+| GET    | `/api/stats`                 | Active room count (for fingerprint length) | None  | None            |
 | POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None        | 5/min per IP    |
 | GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 30/min per IP   |
 | POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Room secret | 100/min per IP  |
