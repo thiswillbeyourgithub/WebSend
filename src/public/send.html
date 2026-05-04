@@ -299,6 +299,7 @@
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-z+l2PvbhouddMzfCnhc+f9bxqLZhfhkcVU83viVGukdqg9goFAY52Kfpf3dVWiTX"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-ZGMsM74141CQWdyknfkfd1bTxRCKY83A2f1xPK0haYNwrkiaAa2Uz0eoBEvbmNuB"></script>
     <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-bO8089J3hTnxkteLrsohdT8ThfRiDz/207AqFYxvrsS7NA5ETB7d/KBZuJlJVNzx"></script>
+    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-Eiw7pNHvCoaXr50bgNObbTDKb4k+jDLpSC/BuqpNzmlY1cSYbh+Gbdcgmm4073bw"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-+Fc7HHAj1bzSYieSuOFuOWlUjXDWMgWoo+x3A4nb9+mZcjh8AimVl8aYo0UCWKOq"></script>
     <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-Y7M5Qnbr3ble2Q19gtYqmjDrOnmsy4e6t/JV110+FW+XYtueHNoRJC23MIFP9MFJ"></script>
     <script>
@@ -324,17 +325,20 @@
          * 6. Send through WebRTC data channel
          */
 
-        let rtc = null;
-        let keyPair = null; // Our ECDH key pair
-        let sharedKey = null; // AES key derived from ECDH
         let currentPhotoBlob = null;
         // Stores the original (pre-crop) blob so re-cropping uses the uncropped image
         let originalPhotoBlob = null;
         let preBWBlob = null; // Stores pre-B&W blob for undo
-        let weConfirmed = false;  // Track if we confirmed fingerprints
-        let theyConfirmed = false; // Track if receiver confirmed fingerprints
+        // Connection state (rtc, keyPair, sharedKey, fingerprint flags) lives in
+        // window.SenderConnect (sender-connect.js).
         // Camera/scanner/flash/detection state lives in window.SenderCamera (sender-camera.js).
         // Send queue state lives in window.SenderSend (sender-send.js).
+        //
+        // Required attach order in init() (do not reorder):
+        //   1. SenderConnect.attach + .init  — owns rtc/sharedKey getters
+        //   2. SenderCamera.attach            — independent
+        //   3. SenderSend.attach              — depends on SenderConnect getters
+        //   4. Gallery.attach                 — depends on all of the above
 
         // Re-acquire wake lock and auto-reconnect when screen wakes up
         document.addEventListener('visibilitychange', async () => {
@@ -349,14 +353,9 @@
                 await wakeLockMgr.acquire();
             }
             // If we have a room in the URL and the connection dropped, reconnect
-            const roomId = getRoomIdFromUrl();
-            const secret = getRoomSecretFromUrl();
-            if (roomId && secret && rtc && rtc.pc) {
-                const state = rtc.pc.connectionState;
-                if (state === 'failed' || state === 'disconnected') {
-                    logger.info('Page visible again — connection lost, reconnecting...');
-                    reconnectSender(roomId, secret);
-                }
+            if (SenderConnect.connectionLost()) {
+                logger.info('Page visible again — connection lost, reconnecting...');
+                SenderConnect.reconnect();
             }
         });
 
@@ -459,29 +458,35 @@
                 logger.warn('Could not fetch server config: ' + e.message);
             }
 
-            // Generate our ECDH key pair for key exchange
-            keyPair = await WebSendCrypto.generateKeyPair();
+            // 1. Connect module owns rtc/keyPair/sharedKey
+            SenderConnect.attach({
+                i18n,
+                logger,
+                showToast,
+                onReadyToCapture: () => showStep(stepChoose),
+                onFingerprintReady: (theirFp, ourFp) => {
+                    document.getElementById('sender-fingerprint').textContent = ourFp;
+                    document.getElementById('receiver-fingerprint').textContent = theirFp;
+                    showVerificationModal();
+                },
+                onShowConnecting: () => showStep(stepConnecting),
+                onScanRequested: () => showStep(stepScan),
+            });
+            await SenderConnect.init();
 
-            rtc = new WebSendRTC();
-            await rtc.init();
-
-            rtc.onConnected = onConnected;
-            rtc.onDisconnected = onDisconnected;
-            rtc.onMessage = onMessage;
-            rtc.onStateChange = onStateChange;
-            rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
-
+            // 2. Send queue (uses connect getters)
             SenderSend.attach({
-                getRtc: () => rtc,
-                getSharedKey: () => sharedKey,
+                getRtc: SenderConnect.getRtc,
+                getSharedKey: SenderConnect.getSharedKey,
                 i18n,
                 logger,
                 showToast,
                 getGalleryPhotos: () => Gallery.photos(),
             });
 
+            // 3. Camera (independent of connect except for batch-start signal)
             SenderCamera.attach({
-                getRtc: () => rtc,
+                getRtc: SenderConnect.getRtc,
                 i18n,
                 logger,
                 showToast,
@@ -495,19 +500,20 @@
                 },
             });
 
+            // 4. Gallery (depends on connect + camera + send)
             Gallery.attach({
-                getRtc: () => rtc,
+                getRtc: SenderConnect.getRtc,
                 i18n,
                 logger,
                 showToast,
                 showStep,
                 stepChoose,
-                stopCapture: () => SenderCamera.stopCapture(),
+                stopCapture: SenderCamera.stopCapture,
                 openCropModal,
-                getFlashMode: () => SenderCamera.getFlashMode(),
-                getCaptureStream: () => SenderCamera.getCaptureStream(),
+                getFlashMode: SenderCamera.getFlashMode,
+                getCaptureStream: SenderCamera.getCaptureStream,
                 setCropContext: (blob, original) => { currentPhotoBlob = blob; originalPhotoBlob = original; },
-                removeQueuedPhotoById: (id) => SenderSend.removePhotoById(id),
+                removeQueuedPhotoById: SenderSend.removePhotoById,
             });
 
             // Set up button handlers
@@ -553,7 +559,7 @@
                 if (Gallery.size() > 0 && !confirm(i18n.t('send.galleryEmpty') + '?')) return;
                 Gallery.clearGallery();
                 // Finalize the batch on the receiver side
-                rtc.sendMessage(Protocol.build.batchEnd());
+                SenderConnect.getRtc().sendMessage(Protocol.build.batchEnd());
                 SenderCamera.stopCapture();
                 showStep(stepChoose);
             });
@@ -570,29 +576,8 @@
 
             // Join room after async initialization is complete
             if (roomId && secret) {
-                await joinRoom(roomId, secret);
-            }
-        }
-
-        // ============ Room Joining ============
-
-        async function joinRoom(roomId, secret) {
-            showStep(stepConnecting);
-            document.getElementById('connection-status').textContent = i18n.t('send.connecting');
-            document.getElementById('connection-status').className = 'status status-info';
-
-            try {
-                await rtc.joinRoom(roomId, secret);
-                // Connection will be established, onConnected will be called
-            } catch (e) {
-                logger.error('Failed to join room: ' + e.message);
-                document.getElementById('connection-status').textContent = i18n.t('send.failed') + ': ' + e.message;
-                document.getElementById('connection-status').className = 'status status-error';
-
-                // Show button to go back to scan
-                setTimeout(() => {
-                    showStep(stepScan);
-                }, 3000);
+                showStep(stepConnecting);
+                await SenderConnect.join(roomId, secret);
             }
         }
 
@@ -622,7 +607,8 @@
             }
 
             if (roomId && secret) {
-                await joinRoom(roomId, secret);
+                showStep(stepConnecting);
+                await SenderConnect.join(roomId, secret);
             } else if (roomId) {
                 logger.error('Invalid QR code - room secret missing');
                 showToast(i18n.t('send.invalidQR.secretMissing'));
@@ -634,93 +620,9 @@
             }
         }
 
-        // ============ Connection Handlers ============
-
-        /** Update the connection status indicator based on WebRTC state changes */
-        function onStateChange(state) {
-            const statusEl = document.getElementById('connection-status');
-            if (state === 'connecting') {
-                statusEl.textContent = i18n.t('send.establishing');
-                statusEl.className = 'status status-info';
-            } else if (state === 'connected') {
-                statusEl.textContent = i18n.t('send.connected');
-                statusEl.className = 'status status-connected';
-            } else if (state === 'failed') {
-                // Show detailed failure info — the user needs to know what went wrong
-                let detail = i18n.t('send.failed');
-                if (!PeerUI.hasTurn(rtc.iceServers)) {
-                    detail += '\n' + i18n.t('send.failedNoTurn');
-                }
-                statusEl.textContent = detail;
-                statusEl.className = 'status status-error';
-                statusEl.classList.add('status-pre-line');
-                // Add a retry button so the user can easily go back to scanning
-                // instead of relying on the small back-link at the top
-                if (!document.getElementById('error-retry-btn')) {
-                    const retryBtn = document.createElement('button');
-                    retryBtn.id = 'error-retry-btn';
-                    retryBtn.textContent = i18n.t('send.backToScan') || 'Back to scan';
-                    retryBtn.className = 'btn btn-action retry-btn';
-                    retryBtn.addEventListener('click', () => {
-                        retryBtn.remove();
-                        showStep(stepScan);
-                    });
-                    stepConnecting.appendChild(retryBtn);
-                }
-                // Keep step-connecting visible so the error message is shown
-                showStep(stepConnecting);
-            }
-        }
-
-        /**
-         * Called when WebRTC peer connection is established.
-         * Does NOT immediately show the photo send UI - that happens only after
-         * both parties verify key fingerprints (receiver sends 'ready' message).
-         */
-        async function onConnected() {
-            logger.success('Connected to receiver!');
-            // Keep screen awake while connected
-            wakeLockMgr.desired = true;
-            await wakeLockMgr.acquire();
-        }
-
-        function onDisconnected() {
-            logger.warn('Disconnected from receiver');
-            wakeLockMgr.release();
-            showToast(i18n.t('send.disconnectedHint'), { duration: 0 });
-        }
-
-        async function reconnectSender(roomId, secret) {
-            logger.info('Reconnecting sender...');
-            showToast(i18n.t('send.reconnecting'), { duration: 3000 });
-
-            // Close existing connection
-            if (rtc) {
-                try { rtc.close(); } catch (_) {}
-            }
-
-            // Reset crypto and queue state
-            keyPair = await WebSendCrypto.generateKeyPair();
-            sharedKey = null;
-            weConfirmed = false;
-            theyConfirmed = false;
-            SenderSend.clear();
-
-            rtc = new WebSendRTC();
-            await rtc.init();
-            rtc.onConnected = onConnected;
-            rtc.onDisconnected = onDisconnected;
-            rtc.onMessage = onMessage;
-            rtc.onStateChange = onStateChange;
-            rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
-
-            try {
-                await joinRoom(roomId, secret);
-            } catch (e) {
-                logger.error('Reconnect failed: ' + e.message);
-                showToast(i18n.t('send.reconnectFailed'), { duration: 0 });
-            }
-        }
+        // Connection lifecycle (WebRTC state, key exchange, fingerprint
+        // verification handshake, reconnect, transform-nack retry, message
+        // dispatcher) lives in window.SenderConnect (sender-connect.js).
 
         /**
          * Clean up all sensitive data on page unload: clear photo blob,
@@ -736,131 +638,12 @@
             if (preview && preview.src && preview.src.startsWith('blob:')) {
                 URL.revokeObjectURL(preview.src);
             }
-            // Stop camera streams
             SenderCamera.cleanup();
-            // Close WebRTC connection and clear buffers
-            if (rtc) {
-                rtc.receiveBuffer = [];
-                rtc.close();
-            }
-            // Clear crypto keys
-            keyPair = null;
-            sharedKey = null;
-            // Release wake lock
+            SenderConnect.cleanup();
             wakeLockMgr.release();
         }
 
         window.addEventListener('beforeunload', cleanupAllData);
-
-        async function handlePublicKey(msg) {
-            // Receiver sent their ECDH public key
-            logger.info('Received receiver public key, performing key exchange...');
-            try {
-                // Import receiver's public key
-                const receiverPublicKey = await WebSendCrypto.importPublicKey(msg.key);
-
-                // Derive shared secret using ECDH
-                sharedKey = await WebSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
-
-                // Fetch active room count to adapt fingerprint length:
-                // fewer rooms = shorter key (easier to compare), more = longer (collision resistance)
-                let fpLength = 12; // fallback to max if stats unavailable
-                try {
-                    const statsRes = await fetch('/api/stats');
-                    if (statsRes.ok) {
-                        const stats = await statsRes.json();
-                        fpLength = WebSendCrypto.computeFingerprintLength(stats.activeRooms);
-                    }
-                } catch (e) {
-                    logger.warn('Could not fetch room stats, using max fingerprint length');
-                }
-
-                // Get fingerprints for verification (length adapts to server load)
-                const ourFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey, fpLength);
-                const theirFingerprint = await WebSendCrypto.getKeyFingerprint(receiverPublicKey, fpLength);
-
-                // Display fingerprints in verification modal
-                // Sender key at top, receiver key at bottom (consistent on both devices)
-                document.getElementById('sender-fingerprint').textContent = ourFingerprint;
-                document.getElementById('receiver-fingerprint').textContent = theirFingerprint;
-
-                logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
-
-                // Send our public key to receiver so they can derive the same shared secret
-                const ourPublicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
-                rtc.sendMessage(Protocol.build.senderPublicKey(ourPublicKeyB64));
-                logger.info('Sent our public key to receiver');
-
-                // Show blocking verification modal
-                showVerificationModal();
-            } catch (e) {
-                logger.error('Failed to complete key exchange: ' + e.message);
-            }
-        }
-
-        function handleFingerprintConfirmed(msg) {
-            // Receiver confirmed the fingerprints match. The receiver drives
-            // the transition to stepChoose by sending 'ready' once both sides
-            // have confirmed; nothing else to do on our side here.
-            logger.info('Receiver confirmed fingerprint match');
-            theyConfirmed = true;
-        }
-
-        function handleFingerprintDenied(msg) {
-            // Receiver denied - abort connection
-            logger.error('Receiver denied fingerprint match - possible MITM attack!');
-            showToast(i18n.t('verify.deniedByReceiver'), { duration: 5000 });
-        }
-
-        function handleReady(msg) {
-            // Receiver confirmed both parties verified - can now send photos
-            logger.success('Both parties verified, can now send photos');
-            PeerUI.showVerifiedInSidebar();
-            showStep(stepChoose);
-        }
-
-        function handleTransformNack(msg) {
-            // Receiver could not apply a transform-image. Recover by re-sending
-            // the already-transformed bytes via the replace-image flow.
-            const reason = msg.reason || 'unknown';
-            logger.warn(`transform-nack received for ${msg.oldHash?.substring(0, 8)}... (${reason})`);
-
-            const photo = Gallery.photos().find(p => p && p.sentHash === msg.oldHash);
-            if (!photo) {
-                logger.warn('transform-nack: no local photo matches oldHash, cannot recover');
-                showToast(i18n.t('send.transformFailedUnknown'), { type: 'error' });
-                return;
-            }
-
-            // Receiver will rebuild from the replacement bytes, so future
-            // transforms must start fresh from that new baseline.
-            photo.transforms = [];
-            photo.sendStatus = 'queuing';
-
-            SenderSend.push({ blob: photo.blob, photoId: photo.id, replaceHash: msg.oldHash });
-            logger.info(`Re-queued photo for replace-image fallback (${SenderSend.size()} in queue)`);
-
-            showToast(i18n.t('send.transformRetrying'), { type: 'warn' });
-
-            SenderSend.drain();
-        }
-
-        const messageHandlers = {
-            'public-key': handlePublicKey,
-            'fingerprint-confirmed': handleFingerprintConfirmed,
-            'fingerprint-denied': handleFingerprintDenied,
-            'ready': handleReady,
-            'transform-nack': handleTransformNack,
-        };
-
-        async function onMessage(msg) {
-            const handler = messageHandlers[msg.type];
-            if (!handler) {
-                logger.warn(`Unknown message type: ${msg.type}`);
-                return;
-            }
-            await handler(msg);
-        }
 
         // ============ Photo Capture ============
         // Camera capture, flash, document detection and per-frame capture
@@ -925,13 +708,13 @@
                     showPreview(currentPhotoBlob);
                 } else {
                     // Non-image: queue directly for sending
-                    if (!sharedKey) {
+                    if (!SenderConnect.getSharedKey()) {
                         showToast(i18n.t('error.noPhotoOrKey'), { type: 'warn' });
                         return;
                     }
                     SenderSend.push({ blob: processed, photoId: null });
                     showToast(`${processed.name} queued for sending`, { type: 'success' });
-                    rtc.sendMessage(Protocol.build.batchStart());
+                    SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
                     SenderSend.markBatchEndPending();
                     SenderSend.drain();
                 }
@@ -940,7 +723,7 @@
             }
 
             // Multiple files: strip metadata on all, queue them directly for sending
-            if (!sharedKey) {
+            if (!SenderConnect.getSharedKey()) {
                 showToast(i18n.t('error.selectImage'), { type: 'warn' });
                 return;
             }
@@ -964,7 +747,7 @@
             }
             if (queued > 0) {
                 showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
-                rtc.sendMessage(Protocol.build.batchStart());
+                SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
                 SenderSend.markBatchEndPending();
                 SenderSend.drain();
             }
@@ -1049,7 +832,7 @@
          * Multiple photos can be queued; they are sent one by one by SenderSend.drain().
          */
         async function sendPhoto() {
-            if (!currentPhotoBlob || !sharedKey) {
+            if (!currentPhotoBlob || !SenderConnect.getSharedKey()) {
                 logger.error('No photo or key exchange not complete');
                 return;
             }
@@ -1070,7 +853,7 @@
             }
 
             showStep(stepChoose);
-            rtc.sendMessage(Protocol.build.batchStart());
+            SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
             SenderSend.markBatchEndPending();
             SenderSend.drain();
         }
@@ -1087,23 +870,15 @@
         /** User confirmed fingerprints match - notify receiver and wait for mutual confirmation */
         function onConfirmMatch() {
             logger.info('User confirmed fingerprints match');
-            weConfirmed = true;
-
-            // Hide modal, show waiting message
             VerificationModal.hide();
             showStep(stepWaitingConfirmation);
-
-            // Tell receiver we confirmed
-            rtc.sendMessage(Protocol.build.fingerprintConfirmed());
+            SenderConnect.confirmFingerprint();
         }
 
         /** User denied fingerprints match - abort connection (possible MITM) */
         function onDenyMatch() {
             logger.error('User denied fingerprint match - aborting connection');
-
-            // Tell receiver we denied
-            rtc.sendMessage(Protocol.build.fingerprintDenied());
-
+            SenderConnect.denyFingerprint();
             showToast(i18n.t('verify.selfDenied'), { duration: 5000 });
         }
 
