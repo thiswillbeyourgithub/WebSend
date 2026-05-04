@@ -530,7 +530,9 @@
             showCancelButton();
         }
 
-        const timeoutMinutes = imageCount * 3;
+        // Cap at 30 min absolute: a 100-image export would otherwise sit on a
+        // 5-hour timer if something hung early. The user can always cancel.
+        const timeoutMinutes = Math.min(imageCount * 3, 30);
         const timeoutId = setTimeout(() => exportAbort.abort(new Error('OCR_TIMEOUT')), timeoutMinutes * 60000);
         let progressInterval;
 
@@ -741,39 +743,40 @@
                 ocrFiles.push(new File([blob], `page_${i + 1}.png`, { type: 'image/png' }));
             }
 
-            let scribe;
+            // Always go through ScribeHandle: it absorbs the clear()/terminate()
+            // fork and tracks isAlive so dispose() in finally is idempotent.
+            let scribe = null;
             if (scribePreloaded) {
                 scribe = await scribePreloaded;
+                scribePreloaded = null; // take ownership
             }
-            if (!scribe) {
-                const scribeModule = await import('/scribe/scribe.js');
-                scribe = scribeModule.default;
-                await scribe.init({ ocr: true, font: true });
-                scribe.opt.displayMode = 'invis';
+            if (!scribe || !scribe.isAlive) {
+                scribe = await window.ScribeHandle.create();
             }
 
-            const config = _getWsConfig();
-            const ocrLangs = (config.ocrLangs || ['eng']).slice(0, 3);
-            const ocrPsm = config.ocrPsm || '12';
+            try {
+                const config = _getWsConfig();
+                const ocrLangs = (config.ocrLangs || ['eng']).slice(0, 3);
+                const ocrPsm = config.ocrPsm || '12';
 
-            await scribe.importFiles(ocrFiles);
-            await scribe.recognize({ langs: ocrLangs, modeAdv: 'lstm', config: { tessedit_pageseg_mode: ocrPsm } });
+                await scribe.importFiles(ocrFiles);
+                await scribe.recognize({ langs: ocrLangs, modeAdv: 'lstm', config: { tessedit_pageseg_mode: ocrPsm } });
 
-            const pdfResult = await scribe.exportData('pdf');
+                const pdfResult = await scribe.exportData('pdf');
 
-            const baseName = file.name.replace(/\.pdf$/i, '');
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(new Blob([pdfResult], { type: 'application/pdf' }));
-            a.download = `${baseName}_ocr_${formatDateForFilename()}.pdf`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(a.href);
+                const baseName = file.name.replace(/\.pdf$/i, '');
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(new Blob([pdfResult], { type: 'application/pdf' }));
+                a.download = `${baseName}_ocr_${formatDateForFilename()}.pdf`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
 
-            if (typeof scribe.clear === 'function') {
-                await scribe.clear();
+                logger.success(`Exported OCR PDF (${pages.length} pages)`);
+            } finally {
+                await scribe.dispose();
             }
-            logger.success(`Exported OCR PDF (${pages.length} pages)`);
         } catch (e) {
             logger.error('PDF OCR export failed: ' + e.message);
             window.showToast('OCR export failed: ' + e.message, { type: 'error' });
