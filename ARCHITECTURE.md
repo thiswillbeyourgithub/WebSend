@@ -138,6 +138,20 @@ WebSend/
         │   │               #   window.ReceiveCard.renderCard(opts) → HTMLElement.
         │   │               #   Caller (receive.html#addReceivedFile) owns parent
         │   │               #   lookup, appendChild, drag-event setup
+        │   ├── sender-connect.js # Sender connection lifecycle: WebRTC state callbacks,
+        │   │               #   ECDH key exchange, fingerprint verification handshake,
+        │   │               #   reconnect-after-disconnect, transform-nack retry, and
+        │   │               #   the inbound message dispatcher. Owns rtc/keyPair/
+        │   │               #   sharedKey. Exposes window.SenderConnect with getRtc/
+        │   │               #   getSharedKey getters consumed by the other modules
+        │   ├── sender-camera.js # Sender camera concerns: QR scanner, photo-capture
+        │   │               #   camera, flash/torch + ImageCapture fallback, live
+        │   │               #   document-corner detection overlay, pinch-to-zoom,
+        │   │               #   per-frame capture. Exposes window.SenderCamera
+        │   ├── sender-send.js # Sender outgoing photo queue: enqueue, serial drain,
+        │   │               #   encryption + transmit (sendOnePhoto), per-photo
+        │   │               #   gallery status updates, sticky progress banner, and
+        │   │               #   the optional batch-end signal. Exposes window.SenderSend
         │   ├── sender-gallery.js # Genius-Scan-like gallery for the sender page.
         │   │               #   Owns galleryPhotos state, thumbnail grid, per-photo
         │   │               #   edit (rotate/flip/BW/crop), drag-and-drop reorder,
