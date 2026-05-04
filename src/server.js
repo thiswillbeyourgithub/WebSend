@@ -388,8 +388,18 @@ if (UMAMI_URL && UMAMI_WEBSITE_ID) {
     };
     const cachedHtml = new Map();
     for (const [name, filePath] of Object.entries(htmlSources)) {
-        const html = fs.readFileSync(filePath, 'utf8').replace('</head>', umamiScript + '</head>');
-        cachedHtml.set(name, html);
+        let html;
+        try {
+            html = fs.readFileSync(filePath, 'utf8');
+        } catch (e) {
+            console.error(`FATAL: Umami enabled but could not read ${name} at ${filePath}: ${e.message}`);
+            process.exit(1);
+        }
+        if (!html.includes('</head>')) {
+            console.error(`FATAL: ${name} has no </head> — cannot inject Umami snippet`);
+            process.exit(1);
+        }
+        cachedHtml.set(name, html.replace('</head>', umamiScript + '</head>'));
     }
 
     const routeToFile = {
