@@ -679,6 +679,9 @@ class WebSendRTC {
      * @param {string} side - 'offer' or 'answer' — the remote side to poll
      */
     startIceCandidatePolling(side) {
+        // Guard against double-start: a stray setInterval would orphan the
+        // previous timer and double the request rate.
+        if (this._icePollTimer) this.stopIceCandidatePolling();
         this._icePollRemoteSide = side;
         logger.debug('ICE', `Starting ICE candidate polling (${side} side)`);
 
