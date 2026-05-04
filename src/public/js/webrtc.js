@@ -59,6 +59,11 @@ class WebSendRTC {
         // forever. Configurable via TURN_TIMEOUT env var (default: 15s).
         this._connectionTimeout = null;
         this._CONNECTION_TIMEOUT_MS = 15000; // default, overridden by server config
+
+        // AbortController for in-flight long-polls (waitForAnswer). close()
+        // aborts it so a subsequent reconnect doesn't run two polling loops
+        // concurrently against the same/old room.
+        this._abortController = new AbortController();
     }
 
     /**
@@ -495,9 +500,14 @@ class WebSendRTC {
         logger.debug('SIGNALING', 'Starting long-poll for answer', { roomId: this.roomId });
 
         while (true) {
+            if (this._abortController.signal.aborted) {
+                logger.debug('SIGNALING', 'waitForAnswer aborted by close() — exiting silently');
+                return;
+            }
             try {
                 const response = await fetch(`/api/rooms/${this.roomId}/answer?wait=true`, {
-                    headers: this.getAuthHeaders()
+                    headers: this.getAuthHeaders(),
+                    signal: this._abortController.signal,
                 });
 
                 logger.debug('SIGNALING', 'Poll response', { status: response.status });
@@ -537,6 +547,12 @@ class WebSendRTC {
             } catch (e) {
                 // RoomGoneError is terminal — stop polling and propagate
                 if (e instanceof RoomGoneError) throw e;
+                // AbortError from close() — terminal, exit silently. The
+                // caller (reconnect flow) has already discarded this rtc.
+                if (e.name === 'AbortError' || this._abortController.signal.aborted) {
+                    logger.debug('SIGNALING', 'waitForAnswer fetch aborted — exiting silently');
+                    return;
+                }
                 // TypeError means a network failure (fetch rejected); retry after backoff
                 logger.warn('Polling error, retrying: ' + e.message);
                 await new Promise(resolve => setTimeout(resolve, 2000));
@@ -1040,6 +1056,9 @@ class WebSendRTC {
      * Close the connection
      */
     close() {
+        // Abort any in-flight long-poll (waitForAnswer) so a fresh
+        // WebSendRTC instance doesn't race with the old loop.
+        try { this._abortController.abort(); } catch (_) {}
         this.stopIceCandidatePolling();
         if (this._disconnectTimer) {
             clearTimeout(this._disconnectTimer);
