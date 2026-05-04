@@ -105,6 +105,14 @@ WebSend/
         │   │               #   that hide the clear-vs-terminate API fork. Receive.html
         │   │               #   uses it for preloaded, background-queue, and per-export
         │   │               #   scribe lifecycles
+        │   ├── receive-flow.js # Decrypt-and-display pipeline for incoming
+        │   │               #   encrypted-file messages: decryptIncomingFile →
+        │   │               #   addNewReceivedImage / applyImageReplacement, plus
+        │   │               #   the handleEncryptedFile entry-point used by the
+        │   │               #   receive.html messageHandlers map. Cross-page state
+        │   │               #   (sharedKey, receivedImages, pendingReplaceHash, …)
+        │   │               #   passed via ReceiveFlow.attach({...}). Exposes
+        │   │               #   window.ReceiveFlow
         │   ├── receive-export.js # Export pipeline for the receive page: ZIP,
         │   │               #   plain PDF (via pdf-builder.js), OCR PDF (scribe.js
         │   │               #   with cached/fallback paths), and the per-card
