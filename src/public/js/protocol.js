@@ -6,8 +6,17 @@
 (function () {
     const PROTOCOL_VERSION = 1;
 
+    // Hard upper bound on a single encrypted-file payload. Padding tops out
+    // around the next power of two above the largest plausible photo, so 1 GiB
+    // is generous and still small enough that a hostile or buggy peer cannot
+    // request a multi-GB allocation or break progress arithmetic.
+    const MAX_FILE_SIZE = 1024 * 1024 * 1024;
+
     // Predicates used in schemas
     function isHex64(v) { return typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v); }
+    function isBoundedSize(v) {
+        return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v >= 0 && v <= MAX_FILE_SIZE;
+    }
     function isTransformArray(v) {
         if (!Array.isArray(v) || v.length === 0) return false;
         const validOps = new Set(['rotateCW', 'flipH', 'bw', 'crop']);
@@ -22,7 +31,7 @@
         'fingerprint-confirmed':   {},
         'fingerprint-denied':      {},
         'ready':                   {},
-        'file-start':              { required: { size: 'number' } },
+        'file-start':              { required: { size: isBoundedSize } },
         'file-end':                {},
         'file-ack':                { required: { sha256: isHex64 } },
         'file-nack':               { required: { error: 'string' } },
@@ -81,5 +90,5 @@
         batchEnd:              ()                        => stamp({ type: 'batch-end' }),
     };
 
-    window.Protocol = { VERSION: PROTOCOL_VERSION, validate, build, _schemas: schemas };
+    window.Protocol = { VERSION: PROTOCOL_VERSION, MAX_FILE_SIZE, validate, build, _schemas: schemas };
 })();
