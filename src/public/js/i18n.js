@@ -499,6 +499,34 @@ const i18n = (function() {
         'send.tip',     // contains <strong>
     ]);
 
+    // Tag whitelist for HTML translations. Anything else (script, img with
+    // event handlers, etc.) is dropped to text. Defence in depth: the
+    // translations themselves are bundled, but a typo in a future PR or a
+    // mistakenly-added key shouldn't translate to an XSS sink.
+    const HTML_TAG_WHITELIST = new Set(['BR', 'STRONG', 'EM', 'B', 'I', 'SPAN']);
+
+    function appendSafeHtml(target, html) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const sanitize = (src) => {
+            const out = [];
+            src.childNodes.forEach(node => {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    out.push(document.createTextNode(node.nodeValue));
+                } else if (node.nodeType === Node.ELEMENT_NODE &&
+                           HTML_TAG_WHITELIST.has(node.tagName)) {
+                    const clone = document.createElement(node.tagName);
+                    sanitize(node).forEach(child => clone.appendChild(child));
+                    out.push(clone);
+                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                    // Disallowed element: keep its text content only.
+                    out.push(document.createTextNode(node.textContent));
+                }
+            });
+            return out;
+        };
+        target.replaceChildren(...sanitize(doc.body));
+    }
+
     /**
      * Apply translations to all elements with data-i18n attribute
      */
@@ -507,7 +535,7 @@ const i18n = (function() {
             const key = el.getAttribute('data-i18n');
             const translated = t(key);
             if (HTML_KEYS.has(key)) {
-                el.innerHTML = translated;
+                appendSafeHtml(el, translated);
             } else {
                 el.textContent = translated;
             }
