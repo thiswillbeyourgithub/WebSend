@@ -351,24 +351,53 @@ const DocDetect = (function () {
         let bestQuad = null;
         let bestArea = 0;
 
+        const tryQuad = (quad) => {
+            const area = _polygonArea(quad);
+            if (area > minArea && area > bestArea && _isConvex(quad)) {
+                bestArea = area;
+                bestQuad = quad;
+            }
+        };
+
         for (const contour of contours) {
-            const perimeter = _perimeter(contour);
-            // Try multiple epsilon values for Douglas-Peucker
-            for (let epsRatio = 0.005; epsRatio <= 0.08; epsRatio += 0.003) {
-                const simplified = _douglasPeucker(contour, perimeter * epsRatio);
-                // Accept up to 12 vertices: curved sides and folded corners produce
-                // extra vertices that DP cannot collapse without losing real corners.
-                if (simplified.length >= 4 && simplified.length <= 12) {
-                    const quad = simplified.length === 4 ? simplified : _reduceToQuad(simplified);
-                    const area = _polygonArea(quad);
-                    if (area > minArea && area > bestArea && _isConvex(quad)) {
-                        bestArea = area;
-                        bestQuad = quad;
+            // Candidate source A: raw contour. Best for clean, straight-edged pages.
+            // Candidate source B: convex hull of the contour. Bridges folded corners
+            //   (concave notches) and smooths curved sides into straight chords.
+            const hull = _convexHull(contour);
+            const sources = hull.length >= 4 ? [contour, hull] : [contour];
+
+            for (const src of sources) {
+                const perimeter = _perimeter(src);
+                for (let epsRatio = 0.005; epsRatio <= 0.08; epsRatio += 0.003) {
+                    const simplified = _douglasPeucker(src, perimeter * epsRatio);
+                    if (simplified.length >= 4 && simplified.length <= 12) {
+                        const quad = simplified.length === 4 ? simplified : _reduceToQuad(simplified);
+                        tryQuad(quad);
                     }
                 }
             }
         }
         return bestQuad;
+    }
+
+    /** Andrew's monotone chain convex hull. Returns CCW-ordered hull points. */
+    function _convexHull(pts) {
+        if (pts.length < 3) return pts.slice();
+        const sorted = pts.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+        const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+        const lower = [];
+        for (const p of sorted) {
+            while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+            lower.push(p);
+        }
+        const upper = [];
+        for (let i = sorted.length - 1; i >= 0; i--) {
+            const p = sorted[i];
+            while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+            upper.push(p);
+        }
+        lower.pop(); upper.pop();
+        return lower.concat(upper);
     }
 
     /** Compute contour perimeter */
