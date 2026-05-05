@@ -22,6 +22,11 @@ signaling (SDP relay) and serving static files — it never sees file data or en
 keys. The `ALLOWED_FILE_TYPES` env var controls which file types are accepted
 (`ONLY_IMAGES`, `IMAGE_OR_PDF`, or `ANY` — default: `ANY`). PDFs can be exported as
 a ZIP of page images or as a searchable OCR PDF using the bundled scribe.js/MuPDF engine.
+Other server-tunable knobs surfaced via `/api/config` and the startup env-var dump:
+`OCR_LANGS` (Tesseract languages, default `eng,fra`), `OCR_PSM` (page-segmentation
+mode, default `12`), `TURN_TIMEOUT` (TURN ICE-gather timeout, seconds, default `15`),
+`DEV_FORCE_CONNECTION` (force `DIRECT` / `RELAY` for testing, default `DEFAULT`),
+and `TEST_DISABLE_RATE_LIMIT` (test escape hatch).
 
 ## Directory Structure
 
@@ -41,10 +46,22 @@ WebSend/
 │
 └── src/
     ├── server.js           # Express server: signaling API, ICE config, static serving,
-    │                       #   serves vendored libs at /vendor/, /scribe/, /tessdata/
-    ├── package.json        # Dependencies (express only)
-    ├── update-sri.js       # SRI hash generator for script/link integrity attributes
-    ├── sri-hashes.json     # Generated SRI hashes (used by update-sri.js)
+    │                       #   serves vendored libs at /vendor/, /scribe/, /tessdata/.
+    │                       #   Also exposes GET /send/:roomId as a pretty-URL redirect
+    │                       #   for the sender flow
+    ├── server-helpers.js   # Pure server-side helpers (origin parsing, rate-limit
+    │                       #   sliding-window logic, TURN HMAC-SHA1 credential
+    │                       #   derivation, fingerprint-length sizing). Unit-tested
+    ├── healthcheck.js      # Tiny HTTP health probe used by the Dockerfile HEALTHCHECK
+    ├── package.json        # Runtime dep: express ^5. Dev deps: @playwright/test,
+    │                       #   canvas, jsdom (used by unit / e2e tests only)
+    ├── update-sri.js       # SRI hash generator for script/link integrity attributes;
+    │                       #   also bumps the service-worker CACHE_NAME timestamp so
+    │                       #   clients auto-reload after every deploy
+    ├── check-sri.js        # Verifier counterpart to update-sri.js: recomputes hashes
+    │                       #   and fails CI / pre-push if any HTML integrity attribute
+    │                       #   is stale
+    ├── sri-hashes.json     # Generated SRI hashes (used by update-sri.js / check-sri.js)
     │
     └── public/             # Static frontend (vanilla HTML/CSS/JS, no build step)
         ├── index.html      # Landing page: "Receive" and "Send" buttons, About modal
@@ -79,6 +96,8 @@ WebSend/
         │   │               #   Exposes window.Protocol.validate(msg) → {ok,error} and
         │   │               #   Protocol.build.* typed builder functions (one per wire
         │   │               #   message type). Every builder stamps protocolVersion:1.
+        │   │               #   Includes bounded integer / size validation on file-start
+        │   │               #   so a hostile peer cannot trigger huge allocations.
         │   │               #   Must be loaded before webrtc.js
         │   ├── webrtc.js   # WebRTC peer connection management: room creation/joining,
         │   │               #   SDP offer/answer exchange via server API, trickle ICE
@@ -98,11 +117,14 @@ WebSend/
         │   │               #   → blur → Sobel → Otsu → contour trace, then per contour
         │   │               #   generates 3 candidate quads in parallel (Douglas-Peucker
         │   │               #   on the raw contour, DP on the convex hull, min-area
-        │   │               #   rotated rectangle via rotating calipers) and picks the
-        │   │               #   best by area × edge-fit so curved sides and folded
-        │   │               #   corners still produce a usable crop. Used by sender
-        │   │               #   camera live overlay and the crop modal's auto-corner-
-        │   │               #   detection. Exposes DocDetect
+        │   │               #   rotated rectangle via rotating calipers) and scores
+        │   │               #   each quad by **perimeter edge alignment** against the
+        │   │               #   Sobel edge map (not brightness/area), so curved sides
+        │   │               #   and folded corners still produce a usable crop. Corners
+        │   │               #   are emitted in a consistent CW order (TL→TR→BR→BL) and
+        │   │               #   segmentation is hardened against degenerate contours.
+        │   │               #   Used by sender camera live overlay and the crop modal's
+        │   │               #   auto-corner-detection. Exposes DocDetect
         │   ├── image-transforms.js # Shared image-transform utilities (applyOtsu,
         │   │               #   perspectiveTransform, distance, rotateImage, flipImage,
         │   │               #   binarize, cropPerspective). All transform results go through
@@ -215,6 +237,7 @@ WebSend/
         │                       #   to any page URL — served locally, no CDN)
         │
         └── icons/
+            ├── icon.svg     # Master vector icon (used as favicon and sidebar brand)
             ├── icon-192.png # PWA icon (192x192)
             └── icon-512.png # PWA icon (512x512)
 ```
@@ -291,7 +314,8 @@ the matching photo, it surfaces an error toast and gives up.
 
 | Method | Path                         | Purpose                              | Auth        | Rate Limit      |
 |--------|------------------------------|--------------------------------------|-------------|-----------------|
-| GET    | `/api/config`                | ICE server list + DEV flag           | None        | None            |
+| GET    | `/send/:roomId`              | Pretty-URL redirect into the sender flow | None    | None            |
+| GET    | `/api/config`                | ICE server list + DEV flag + OCR / file-type config | None | None     |
 | GET    | `/api/stats`                 | Active room count (for fingerprint length) | None  | None            |
 | POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None        | 5/min per IP    |
 | GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 30/min per IP   |
@@ -346,7 +370,7 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
 13. **Proxy trust**: Express trusts `X-Forwarded-For` only from loopback (Caddy).
 14. **Docker hardening**: Read-only filesystem, no-new-privileges, all capabilities dropped,
     non-root user, memory/CPU limits.
-14. **TURN relay security**: Time-based HMAC-SHA1 credentials with configurable TTL. Even
+15. **TURN relay security**: Time-based HMAC-SHA1 credentials with configurable TTL. Even
     when relayed through TURN, photos remain end-to-end encrypted — the TURN server only
     sees encrypted blobs.
 

@@ -51,7 +51,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 3. A **direct peer-to-peer connection** is established via WebRTC
 4. Both parties **verify key fingerprints** by reading short codes aloud to each other
 5. **Sender** takes or selects photos, which are encrypted and sent directly
-6. **Receiver** decrypts, previews, optionally crops, and downloads the photos (individually or as a PDF, with experimental OCR)
+6. **Receiver** decrypts, previews, optionally crops/rotates/binarizes, and downloads the photos — individually, as a ZIP, or as a single PDF (plain or searchable via OCR). Photos are auto-grouped into "collections" (one per sender batch). The sender side also exposes a Genius-Scan-like gallery (rotate, flip, B&W, perspective crop, drag-and-drop reorder) before the photos are sent
 
 ## Security Features
 
@@ -117,22 +117,28 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - All local JavaScript and CSS files include **SRI integrity hashes** in their `<script>` and `<link>` tags, ensuring files have not been tampered with
 
 ### TURN Relay Security
-- TURN credentials are **time-based** (HMAC-SHA1, standard coturn ephemeral credentials) and expire after a configurable TTL (default: 24 hours)
+- TURN credentials are **time-based** (HMAC-SHA1, standard coturn ephemeral credentials) and expire after a configurable TTL (default: 1 hour, see `TURN_CREDENTIAL_TTL`)
 - Even when relayed through TURN, photos are still **end-to-end encrypted** -- the TURN server only sees encrypted blobs
 - TURNS (TURN-over-TLS) requires TLS certificates; if you use **Caddy**, you can mount its managed certificates into the coturn container (see the commented example in `docker-compose.yml`)
 
 ## Non-Security Features
 
-- **PWA (Progressive Web App)**: installable on mobile home screens, with service worker for fast UI shell loading
+- **PWA (Progressive Web App)**: installable on mobile home screens, with service worker for fast UI shell loading and an auto-reload on each deploy (the cache name is timestamped during SRI regeneration)
 - **Internationalization (i18n)**: supports English and French, auto-detected from browser locale
-- **Document cropping**: perspective-corrected 4-corner crop tool on the receiver side (pure vanilla JS, no dependencies)
-- **Export modal**: download all received images as PDF or ZIP, with optional B&W (Otsu thresholding) and **experimental OCR** (scribe.js). OCR uses LSTM-only mode (instead of combined Legacy+LSTM) and downscales large images to 2000px for recognition to improve responsiveness, while preserving original image quality in the final PDF. These trade-offs were chosen with Claude Code to keep OCR usable in a browser context where processing time can otherwise reach ~1 min/image.
-- **PDF export**: download all received images as a single PDF (hand-crafted minimal PDF generator, no dependencies)
-- **ZIP export**: download all received images as a ZIP archive (client-zip, preloaded in background)
+- **Live document edge detection** on the sender camera: pure-JS pipeline (downscale → Sobel → Otsu → contour trace → multi-candidate quad fitting scored by perimeter edge alignment) overlays a green outline of the detected page in real time, and pre-fills corner positions when entering the crop tool
+- **Sender-side gallery (Genius-Scan-like)**: thumbnail grid with per-photo rotate / flip / B&W / perspective crop, drag-and-drop reorder, and batch finalization before sending
+- **Transform replay**: when the sender edits an already-sent photo, only a small `transform-image` command is re-encrypted and re-sent rather than the full image; the receiver replays the transforms against its stored original (with a `transform-nack` fallback that triggers a full resend)
+- **Receiver collections**: photos are auto-grouped per sender batch and shown as "Document N" sections, supporting drag-and-drop reorder and per-collection PDF/ZIP export
+- **Document cropping**: perspective-corrected 4-corner crop tool, shared between sender and receiver via a single `crop-modal.js` module so the logic isn't duplicated
+- **Export modal**: download received images as PDF or ZIP, with optional B&W (Otsu thresholding) and **OCR** producing a searchable PDF (scribe.js + Tesseract WASM). OCR runs in a background queue as photos arrive (status badge per card), then assembles cached results at export time. OCR uses LSTM-only mode and downscales large images to 2000px for recognition to keep it usable in a browser, while preserving original image quality in the final PDF
+- **Per-PDF actions**: when an incoming file is a PDF, dedicated buttons let you re-export it as a ZIP of page images or as a re-OCR'd searchable PDF (rendered with bundled MuPDF)
+- **PDF export**: hand-crafted minimal PDF 1.4 generator, no dependencies (one page per JPEG, page sized to image)
+- **ZIP export**: client-zip (preloaded in background)
 - **B&W document mode**: Otsu's automatic binarization for crisp scanned documents
 - **QR code scanning**: in-browser QR code scanning (jsQR) and generation (qrcode.js)
 - **Connection type detection**: shows whether the connection is direct (local network or via STUN) or relayed (TURN/TURNS)
-- **Debug logging**: "Logs" button on both sender and receiver pages for troubleshooting, with optional verbose DEV mode
+- **Debug logging**: "Logs" button on both sender and receiver pages for troubleshooting, with optional verbose DEV mode. A vendored [eruda](https://github.com/liriliri/eruda) mobile devtools console can be opened on demand by appending `?debug=1` to any page URL or by 5-tapping the DEV badge in the sidebar
+- **Configurable file types**: `ALLOWED_FILE_TYPES` env var restricts uploads to images (`ONLY_IMAGES`), images + PDFs (`IMAGE_OR_PDF`), or anything (`ANY`, default)
 - **Large button UI**: designed for usability by non-technical users
 - **No heavy frameworks**: vanilla HTML5 + CSS + JavaScript only
 
@@ -194,6 +200,13 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `UMAMI_WEBSITE_ID` | Website ID from your Umami dashboard (UUID) | _(empty)_ |
 | `UMAMI_DNT` | Respect browser Do Not Track setting (`true` or `false`) | `true` |
 | `RUN_NPM_AUDIT` | Run `npm audit --audit-level=high` during `docker build` (build arg) | `false` |
+| `ALLOWED_FILE_TYPES` | Restrict accepted uploads: `ONLY_IMAGES`, `IMAGE_OR_PDF`, or `ANY` | `ANY` |
+| `OCR_LANGS` | Tesseract languages used by the receiver's OCR (comma-separated) | `eng,fra` |
+| `OCR_PSM` | Tesseract page-segmentation mode | `12` |
+| `TURN_TIMEOUT` | Seconds the client waits for TURN ICE candidates before giving up | `15` |
+| `DEV_FORCE_CONNECTION` | Force `DIRECT` or `RELAY` ICE policy for testing (otherwise `DEFAULT`) | `DEFAULT` |
+| `PORT` | HTTP port the Node server listens on inside the container | `8080` |
+| `TEST_DISABLE_RATE_LIMIT` | Disable per-IP rate limiting (test escape hatch only) | _(unset)_ |
 
 ## Firewall (UFW)
 
@@ -240,10 +253,13 @@ sudo ufw-docker allow coturn 49161/udp
 
 ## Tech Stack
 
-- **Express.js** -- static file server + signaling API
+- **Express.js** (5.x) -- static file server + signaling API
 - **Web Crypto API** -- ECDH key exchange + AES-256-GCM encryption
 - **WebRTC** -- peer-to-peer data channels
 - **jsQR / qrcode.js** -- QR code scanning and generation
+- **scribe.js-ocr / Tesseract WASM / MuPDF** -- OCR and PDF rendering, all vendored
+- **client-zip** -- streaming ZIP generation in the browser
+- **eruda** -- on-demand mobile devtools console (loaded only via `?debug=1` or DEV badge)
 - **coturn** -- optional TURN relay server (can reuse an existing instance)
 - **Docker** -- containerized deployment
 
@@ -257,7 +273,7 @@ The project uses a three-tier test suite:
 
 | Tier | Command | What it covers | Speed |
 |------|---------|----------------|-------|
-| Unit | `npm run test:unit` | Pure JS modules: crypto, SDP compression, image transforms, server helpers, transfer stats, SRI updater | ~0.5s |
+| Unit | `npm run test:unit` | Pure JS modules: crypto, image transforms, server helpers, transfer stats, SRI updater, hand-rolled PDF builder, and a real-photo regression suite for the document-edge detector (`doc-detect-samples.test.mjs`, gated on the optional `canvas` devDep) | ~0.5s |
 | HTTP integration | `npm run test:http` | Real `server.js` spawned per file via child_process — config, origin validation, rate limiting, room/ICE/SDP signaling, long-poll edge cases, static asset mounts, env-var propagation | ~2s |
 | End-to-end | `npm run test:e2e` | Two real browsers via Playwright (sender + receiver round-trip) | ~30s |
 
@@ -274,8 +290,10 @@ All client-side libraries are vendored directly in the repository (no CDN at run
 | [qrcode.js](https://github.com/soldair/node-qrcode) | 1.5.1 | MIT | QR code generation |
 | [jsQR](https://github.com/cozmo/jsQR) | 1.4.0 | Apache-2.0 | QR code scanning |
 | [client-zip](https://github.com/Touffy/client-zip) | — | MIT | ZIP export |
-| [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (preloaded in background) |
-| [Express.js](https://expressjs.com) | 4.18.2 | MIT | Server-side HTTP framework |
+| [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (preloaded in background; bundles Tesseract WASM and MuPDF) |
+| [Tesseract trained data](https://github.com/tesseract-ocr/tessdata) | — | Apache-2.0 | `eng` + `fra` language models, served locally |
+| [eruda](https://github.com/liriliri/eruda) | — | MIT | Mobile devtools console (on-demand) |
+| [Express.js](https://expressjs.com) | ^5.0.0 | MIT | Server-side HTTP framework |
 
 ## License
 
