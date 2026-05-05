@@ -121,16 +121,30 @@ const DocDetect = (function () {
 
         // 6. Dilate to close gaps in edges
         let dilated = binary;
-        for (let i = 0; i < 5; i++) dilated = _dilate(dilated, w, h);
+        for (let i = 0; i < 3; i++) dilated = _dilate(dilated, w, h);
 
         // 7. Flood-fill from image borders to find background, then extract foreground
-        const foreground = _extractForeground(dilated, w, h);
+        const fgEdges = _extractForeground(dilated, w, h);
 
-        // 8. Find contours of the foreground (document) region
-        const contours = _findContours(foreground, w, h);
+        // 7b. Brightness-based foreground: pages photographed under normal light
+        //     are markedly brighter than typical surfaces, so Otsu on the blurred
+        //     grayscale gives a second segmentation that ignores the busy edge map
+        //     and isn't confused by patterned floors.
+        const grayThresh = _otsuThreshold8(blurred);
+        const fgBright = new Uint8Array(w * h);
+        for (let i = 0; i < blurred.length; i++) {
+            if (blurred[i] >= grayThresh) fgBright[i] = 1;
+        }
+        // Strip border pixels so a bright frame edge doesn't merge with the page mask.
+        for (let x = 0; x < w; x++) { fgBright[x] = 0; fgBright[(h - 1) * w + x] = 0; }
+        for (let y = 0; y < h; y++) { fgBright[y * w] = 0; fgBright[y * w + w - 1] = 0; }
 
-        // 9. Find largest quad
-        const quad = _findLargestQuad(contours, w, h);
+        // 8. Find contours from BOTH foreground masks; the scorer picks the winner.
+        const contours = _findContours(fgEdges, w, h).concat(_findContours(fgBright, w, h));
+
+        // 9. Find largest quad (scorer is brightness-aware so bright-page quads
+        //    beat larger quads that include adjacent darker floor area)
+        const quad = _findLargestQuad(contours, w, h, blurred);
         if (!quad) return null;
 
         // 10. Normalize to 0-1 and sort corners
@@ -201,6 +215,28 @@ const DocDetect = (function () {
 
         let sumB = 0, wB = 0, maxVar = 0, threshold = 0;
         for (let i = 0; i < maxBin; i++) {
+            wB += hist[i];
+            if (wB === 0) continue;
+            const wF = total - wB;
+            if (wF === 0) break;
+            sumB += i * hist[i];
+            const mB = sumB / wB;
+            const mF = (sum - sumB) / wF;
+            const v = wB * wF * (mB - mF) * (mB - mF);
+            if (v > maxVar) { maxVar = v; threshold = i; }
+        }
+        return threshold;
+    }
+
+    /** Otsu's threshold for an 8-bit grayscale Uint8Array */
+    function _otsuThreshold8(data) {
+        const hist = new Uint32Array(256);
+        for (let i = 0; i < data.length; i++) hist[data[i]]++;
+        const total = data.length;
+        let sum = 0;
+        for (let i = 0; i < 256; i++) sum += i * hist[i];
+        let sumB = 0, wB = 0, maxVar = 0, threshold = 0;
+        for (let i = 0; i < 256; i++) {
             wB += hist[i];
             if (wB === 0) continue;
             const wF = total - wB;
@@ -346,23 +382,38 @@ const DocDetect = (function () {
      * Find the largest convex quadrilateral among detected contours.
      * Uses Douglas-Peucker simplification to reduce contours to polygons.
      */
-    function _findLargestQuad(contours, w, h) {
+    function _findLargestQuad(contours, w, h, blurred) {
         const minArea = w * h * 0.03; // Quad must be >3% of frame
+        const maxArea = w * h * 0.75; // ...and not the entire frame (real pages have margin)
         const frameArea = w * h;
         let bestQuad = null;
         let bestScore = 0;
 
-        // Fit score: rewards area, penalizes mean distance from contour points to
-        // the quad's edges. This lets min-area-rect compete with DP-derived quads
-        // without dominating just because a loose bounding box has a larger area.
+        // Compute the global brightness baseline once: the quad's mean brightness is
+        // compared against this so a quad that hugs the bright page outscores one
+        // that wraps page+floor, even if the latter has slightly larger area.
+        let globalSum = 0;
+        if (blurred) {
+            for (let i = 0; i < blurred.length; i++) globalSum += blurred[i];
+        }
+        const globalMean = blurred ? globalSum / blurred.length : 128;
+
+        // Score = areaRatio * edgeFit * brightnessLift. brightnessLift is how much
+        // brighter the quad's interior is vs the global mean (clamped to [0.3, 2]),
+        // which discourages quads that bleed into darker non-page area.
         const tryQuad = (quad, contour) => {
             if (!_isConvex(quad)) return;
             const area = _polygonArea(quad);
-            if (area < minArea) return;
+            if (area < minArea || area > maxArea) return;
             const meanDist = _meanContourEdgeDistance(contour, quad);
             const diag = Math.sqrt(frameArea);
-            const fit = Math.exp(-meanDist / (diag * 0.02)); // ~2% diag tolerance
-            const score = (area / frameArea) * fit;
+            const fit = Math.exp(-meanDist / (diag * 0.02));
+            let lift = 1;
+            if (blurred) {
+                const meanIn = _meanInsideQuad(blurred, w, h, quad);
+                lift = Math.min(2, Math.max(0.3, meanIn / Math.max(globalMean, 1)));
+            }
+            const score = (area / frameArea) * fit * lift * lift;
             if (score > bestScore) {
                 bestScore = score;
                 bestQuad = quad;
@@ -419,6 +470,44 @@ const DocDetect = (function () {
             n++;
         }
         return n ? total / n : 0;
+    }
+
+    /**
+     * Mean grayscale value inside a quad. Samples on a stride-8 grid using the
+     * crossing-number test for point-in-polygon — cheap and accurate enough to
+     * compare candidate quads.
+     */
+    function _meanInsideQuad(gray, w, h, quad) {
+        const stride = 8;
+        let sum = 0, n = 0;
+        let minX = w, minY = h, maxX = 0, maxY = 0;
+        for (const p of quad) {
+            if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        }
+        const x0 = Math.max(0, minX | 0), x1 = Math.min(w - 1, (maxX | 0) + 1);
+        const y0 = Math.max(0, minY | 0), y1 = Math.min(h - 1, (maxY | 0) + 1);
+        for (let y = y0; y <= y1; y += stride) {
+            for (let x = x0; x <= x1; x += stride) {
+                if (_pointInQuad(x, y, quad)) {
+                    sum += gray[y * w + x];
+                    n++;
+                }
+            }
+        }
+        return n ? sum / n : 0;
+    }
+
+    function _pointInQuad(px, py, quad) {
+        let inside = false;
+        for (let i = 0, j = 3; i < 4; j = i++) {
+            const xi = quad[i].x, yi = quad[i].y, xj = quad[j].x, yj = quad[j].y;
+            if (((yi > py) !== (yj > py)) &&
+                (px < (xj - xi) * (py - yi) / (yj - yi + 1e-9) + xi)) {
+                inside = !inside;
+            }
+        }
+        return inside;
     }
 
     function _pointSegmentDistance(p, a, b) {
@@ -610,10 +699,10 @@ const DocDetect = (function () {
             if (s < minSum) { minSum = s; tlIdx = i; }
         }
 
-        // Rotate so tl is first, then order is tl, bl, br, tr (CCW from atan2)
-        // atan2 goes CCW, so after tl comes bl, br, tr
+        // In screen coordinates (y-down) atan2 increases clockwise visually,
+        // so sorted is tl, tr, br, bl after rotating tl to index 0.
         const r = i => sorted[(tlIdx + i) % 4];
-        const result = { tl: r(0), bl: r(1), br: r(2), tr: r(3) };
+        const result = { tl: r(0), tr: r(1), br: r(2), bl: r(3) };
 
         // Validate: check all 4 corners are distinct (no triangle/line degeneracy)
         const corners = [result.tl, result.tr, result.br, result.bl];
