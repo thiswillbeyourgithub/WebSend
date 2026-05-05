@@ -139,8 +139,14 @@ WebSend/
         │   │               #   Each queued image gets img.pendingOcr awaited by exporters.
         │   │               #   Exposes window.BgOcr (queue/cancel/waitFor/refreshBadge/
         │   │               #   isQueued/isProcessing/takeScribeIfIdle/reset)
-        │   ├── peer-ui.js  # Shared sidebar helpers (loadEruda, onConnectionTypeDetected,
-        │   │               #   showVerifiedInSidebar) used identically by send.html and
+        │   ├── eruda-loader.js # Shared on-demand loader for the vendored eruda
+        │   │               #   mobile devtools console. Defines window.loadEruda
+        │   │               #   (used by sidebar.js's 5-tap gesture and the DEV-mode
+        │   │               #   bootstrap in send/receive) and auto-loads eruda when
+        │   │               #   the URL contains ?debug=1. Loaded by index/send/receive
+        │   ├── peer-ui.js  # Shared sidebar helpers (onConnectionTypeDetected,
+        │   │               #   showVerifiedInSidebar; re-exports loadEruda from
+        │   │               #   eruda-loader) used identically by send.html and
         │   │               #   receive.html. Exposes window.PeerUI
         │   ├── receive-card.js # Builds the per-file card DOM (image / pdf / other)
         │   │               #   shown in the receiver's gallery. Pure DOM construction
@@ -199,8 +205,9 @@ WebSend/
         │   │                   #   fonts, and mupdf — preloaded in background
         │   ├── tessdata/       # Tesseract language models (eng + fra .traineddata),
         │   │                   #   served locally to avoid CDN dependency
-        │   └── eruda/          # Mobile devtools console (loaded in DEV mode or via
-        │                       #   5-tap on the DEV badge — served locally, no CDN)
+        │   └── eruda/          # Mobile devtools console (loaded in DEV mode, via
+        │                       #   5-tap on the DEV badge, or by appending ?debug=1
+        │                       #   to any page URL — served locally, no CDN)
         │
         └── icons/
             ├── icon-192.png # PWA icon (192x192)
