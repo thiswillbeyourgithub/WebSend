@@ -311,9 +311,20 @@
         handle.addEventListener('touchend', handleTouchEnd);
     }
 
+    // Defensive: any child tagged with data-blob-url owns a blob URL that
+    // must be revoked before the node is dropped. No producer sets this
+    // attribute today, but routing all teardown through one helper means
+    // future blob-URL children get cleanup for free.
+    function _clearMainContainer() {
+        mainContainerEl.querySelectorAll('[data-blob-url]').forEach(el => {
+            URL.revokeObjectURL(el.dataset.blobUrl);
+        });
+        mainContainerEl.replaceChildren();
+    }
+
     function renderCollectionHeader(collectionId, name, timeStr) {
         if (collections.length === 1) {
-            mainContainerEl.innerHTML = '';
+            _clearMainContainer();
         }
 
         const section = document.createElement('div');
