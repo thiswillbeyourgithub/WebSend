@@ -648,6 +648,26 @@ h1 {
     padding: 5px;
 }
 
+.sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 15px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.sidebar-brand-icon {
+    border-radius: 12px;
+    flex-shrink: 0;
+}
+
+.sidebar-brand-name {
+    color: white;
+    font-size: 1.25rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
 .sidebar-section {
     border-bottom: 1px solid rgba(255, 255, 255, 0.1);
     padding-bottom: 15px;

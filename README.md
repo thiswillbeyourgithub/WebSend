@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src/public/icons/icon.svg" alt="WebSend" width="128" height="128">
+</p>
+
 # WebSend
 
 **Use your regular smartphone as a secure document scanner** -- even for sensitive documents.

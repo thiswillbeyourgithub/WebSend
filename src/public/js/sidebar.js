@@ -43,6 +43,12 @@ function buildSidebar({ showLogs = true } = {}) {
     <div class="sidebar" id="sidebar">
         <button class="sidebar-close" id="sidebar-close">✕</button>
 
+        <!-- Brand / icon -->
+        <div class="sidebar-brand">
+            <img src="/icons/icon.svg" alt="" class="sidebar-brand-icon" width="56" height="56">
+            <div class="sidebar-brand-name" data-i18n="app.name">WebSend</div>
+        </div>
+
         <!-- Language section -->
         <div class="sidebar-section">
             <div class="sidebar-section-title" data-i18n="menu.language">Language</div>

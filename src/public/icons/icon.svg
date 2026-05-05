@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512" role="img" aria-label="WebSend">
+  <title>WebSend</title>
+  <!-- Rounded-square background -->
+  <rect x="2" y="2" width="60" height="60" rx="13" ry="13" fill="#e5e7eb" stroke="#cbd5e1" stroke-width="1"/>
+
+  <!-- Envelope (purple), left portion intact, dissolving toward the right -->
+  <g fill="none" stroke="#7c3aed" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+    <!-- back/body outline (open right side) -->
+    <path d="M10 20 L10 46 L34 46"/>
+    <!-- inner fold lines forming the flap -->
+    <path d="M10 20 L26 33"/>
+    <path d="M10 20 L40 20 L34 25"/>
+    <!-- bottom-left diagonal hint -->
+    <path d="M10 46 L20 38" opacity="0.55"/>
+  </g>
+
+  <!-- Greenish pixel dissolution trail -->
+  <g fill="#22c55e">
+    <rect x="34" y="22" width="4" height="4" rx="0.9" opacity="0.95"/>
+    <rect x="40" y="28" width="4" height="4" rx="0.9" opacity="0.85"/>
+    <rect x="38" y="36" width="3.8" height="3.8" rx="0.9" opacity="0.75"/>
+    <rect x="46" y="22" width="3.6" height="3.6" rx="0.8" opacity="0.65"/>
+    <rect x="48" y="34" width="3.4" height="3.4" rx="0.8" opacity="0.5"/>
+    <rect x="44" y="44" width="3" height="3" rx="0.7" opacity="0.45"/>
+    <rect x="54" y="28" width="3" height="3" rx="0.7" opacity="0.35"/>
+    <rect x="55" y="40" width="2.6" height="2.6" rx="0.6" opacity="0.25"/>
+    <rect x="58" y="22" width="2.2" height="2.2" rx="0.5" opacity="0.2"/>
+  </g>
+</svg>
