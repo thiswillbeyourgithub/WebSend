@@ -348,36 +348,131 @@ const DocDetect = (function () {
      */
     function _findLargestQuad(contours, w, h) {
         const minArea = w * h * 0.03; // Quad must be >3% of frame
+        const frameArea = w * h;
         let bestQuad = null;
-        let bestArea = 0;
+        let bestScore = 0;
 
-        const tryQuad = (quad) => {
+        // Fit score: rewards area, penalizes mean distance from contour points to
+        // the quad's edges. This lets min-area-rect compete with DP-derived quads
+        // without dominating just because a loose bounding box has a larger area.
+        const tryQuad = (quad, contour) => {
+            if (!_isConvex(quad)) return;
             const area = _polygonArea(quad);
-            if (area > minArea && area > bestArea && _isConvex(quad)) {
-                bestArea = area;
+            if (area < minArea) return;
+            const meanDist = _meanContourEdgeDistance(contour, quad);
+            const diag = Math.sqrt(frameArea);
+            const fit = Math.exp(-meanDist / (diag * 0.02)); // ~2% diag tolerance
+            const score = (area / frameArea) * fit;
+            if (score > bestScore) {
+                bestScore = score;
                 bestQuad = quad;
             }
         };
 
         for (const contour of contours) {
-            // Candidate source A: raw contour. Best for clean, straight-edged pages.
-            // Candidate source B: convex hull of the contour. Bridges folded corners
-            //   (concave notches) and smooths curved sides into straight chords.
+            // Three candidate sources per contour, run in parallel and scored uniformly:
+            //   A. Raw contour → DP+reduce. Best for clean, straight-edged pages.
+            //   B. Convex hull → DP+reduce. Bridges folded corners (concave notches)
+            //      and smooths curved sides into straight chords.
+            //   C. Min-area rotated rectangle on the hull. Always returns a quad;
+            //      acts as a fallback when A/B fail to produce a valid candidate.
             const hull = _convexHull(contour);
-            const sources = hull.length >= 4 ? [contour, hull] : [contour];
 
+            const sources = hull.length >= 4 ? [contour, hull] : [contour];
             for (const src of sources) {
                 const perimeter = _perimeter(src);
                 for (let epsRatio = 0.005; epsRatio <= 0.08; epsRatio += 0.003) {
                     const simplified = _douglasPeucker(src, perimeter * epsRatio);
                     if (simplified.length >= 4 && simplified.length <= 12) {
                         const quad = simplified.length === 4 ? simplified : _reduceToQuad(simplified);
-                        tryQuad(quad);
+                        tryQuad(quad, contour);
                     }
                 }
             }
+
+            if (hull.length >= 4) {
+                const rect = _minAreaRect(hull);
+                if (rect) tryQuad(rect, contour);
+            }
         }
         return bestQuad;
+    }
+
+    /**
+     * Mean perpendicular distance from each contour point to its nearest quad edge.
+     * Used to score how well a candidate quad hugs the actual document boundary.
+     */
+    function _meanContourEdgeDistance(contour, quad) {
+        if (!contour.length) return 0;
+        // Sample at most ~64 points to keep this cheap inside the hot loop
+        const step = Math.max(1, (contour.length / 64) | 0);
+        let total = 0, n = 0;
+        for (let i = 0; i < contour.length; i += step) {
+            const p = contour[i];
+            let minD = Infinity;
+            for (let e = 0; e < 4; e++) {
+                const a = quad[e], b = quad[(e + 1) % 4];
+                const d = _pointSegmentDistance(p, a, b);
+                if (d < minD) minD = d;
+            }
+            total += minD;
+            n++;
+        }
+        return n ? total / n : 0;
+    }
+
+    function _pointSegmentDistance(p, a, b) {
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq === 0) return Math.sqrt((p.x - a.x) ** 2 + (p.y - a.y) ** 2);
+        let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+        t = Math.max(0, Math.min(1, t));
+        const qx = a.x + t * dx, qy = a.y + t * dy;
+        return Math.sqrt((p.x - qx) ** 2 + (p.y - qy) ** 2);
+    }
+
+    /**
+     * Minimum-area rotated rectangle of a convex polygon, via rotating calipers.
+     * For each hull edge, project all hull points onto the edge axis and its
+     * normal; the bounding box in that frame is a candidate. Return the smallest.
+     */
+    function _minAreaRect(hull) {
+        if (hull.length < 3) return null;
+        let bestArea = Infinity;
+        let bestRect = null;
+        for (let i = 0; i < hull.length; i++) {
+            const a = hull[i], b = hull[(i + 1) % hull.length];
+            const ex = b.x - a.x, ey = b.y - a.y;
+            const len = Math.sqrt(ex * ex + ey * ey);
+            if (len < 1e-6) continue;
+            const ux = ex / len, uy = ey / len;       // edge direction
+            const nx = -uy, ny = ux;                  // edge normal
+            let minU = Infinity, maxU = -Infinity, minN = Infinity, maxN = -Infinity;
+            for (const p of hull) {
+                const u = (p.x - a.x) * ux + (p.y - a.y) * uy;
+                const v = (p.x - a.x) * nx + (p.y - a.y) * ny;
+                if (u < minU) minU = u;
+                if (u > maxU) maxU = u;
+                if (v < minN) minN = v;
+                if (v > maxN) maxN = v;
+            }
+            const area = (maxU - minU) * (maxN - minN);
+            if (area < bestArea) {
+                bestArea = area;
+                // Reconstruct 4 corners in CCW order
+                const corner = (u, v) => ({
+                    x: a.x + u * ux + v * nx,
+                    y: a.y + u * uy + v * ny,
+                });
+                bestRect = [
+                    corner(minU, minN),
+                    corner(maxU, minN),
+                    corner(maxU, maxN),
+                    corner(minU, maxN),
+                ];
+            }
+        }
+        return bestRect;
     }
 
     /** Andrew's monotone chain convex hull. Returns CCW-ordered hull points. */
