@@ -151,10 +151,13 @@
 
     function preloadClientZip() {
         if (clientZipPreloaded) return;
-        clientZipPreloaded = import('/vendor/client-zip.js').catch(e => {
+        const p = import('/vendor/client-zip.js');
+        clientZipPreloaded = p;
+        p.catch(e => {
             logger.warn('client-zip preload failed (will retry on export): ' + e.message);
-            clientZipPreloaded = null;
-            return null;
+            // Only clear if no later preload has already replaced our entry,
+            // otherwise we'd null out a healthy in-flight retry.
+            if (clientZipPreloaded === p) clientZipPreloaded = null;
         });
     }
 
@@ -280,7 +283,8 @@
         btn.textContent = i18n.t('receive.generatingZip');
 
         try {
-            const clientZipModule = clientZipPreloaded ? await clientZipPreloaded : await import('/vendor/client-zip.js');
+            const preloaded = clientZipPreloaded ? await clientZipPreloaded.catch(() => null) : null;
+            const clientZipModule = preloaded || await import('/vendor/client-zip.js');
             const { downloadZip } = clientZipModule;
 
             const bw = isToggleActive('export-bw');
