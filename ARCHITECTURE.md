@@ -95,9 +95,14 @@ WebSend/
         │   │               #   detectCorners, onApply, onCancel }); used by both send.html
         │   │               #   and receive.html so the ~450 LOC crop logic is not duplicated
         │   ├── doc-detect.js # Pure-JS document edge detection: downscale → grayscale
-        │   │               #   → blur → Sobel → Otsu → contour trace → Douglas-Peucker
-        │   │               #   → largest convex quad. Used by sender camera live overlay
-        │   │               #   and the crop modal's auto-corner-detection. Exposes DocDetect
+        │   │               #   → blur → Sobel → Otsu → contour trace, then per contour
+        │   │               #   generates 3 candidate quads in parallel (Douglas-Peucker
+        │   │               #   on the raw contour, DP on the convex hull, min-area
+        │   │               #   rotated rectangle via rotating calipers) and picks the
+        │   │               #   best by area × edge-fit so curved sides and folded
+        │   │               #   corners still produce a usable crop. Used by sender
+        │   │               #   camera live overlay and the crop modal's auto-corner-
+        │   │               #   detection. Exposes DocDetect
         │   ├── image-transforms.js # Shared image-transform utilities (applyOtsu,
         │   │               #   perspectiveTransform, distance, rotateImage, flipImage,
         │   │               #   binarize, cropPerspective). All transform results go through
