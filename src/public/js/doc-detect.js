@@ -92,8 +92,8 @@ const DocDetect = (function () {
         // 2. Gaussian blur 5x5
         const blurred = _gaussianBlur5(gray, w, h);
 
-        // 3. Sobel edge detection
-        const edges = _sobelEdges(blurred, w, h);
+        // 3. Sobel edge detection (magnitude + signed gx/gy components)
+        const { mag: edges, gx, gy } = _sobelEdges(blurred, w, h);
 
         // 4. Otsu threshold on edge magnitudes (use 60% of Otsu for higher sensitivity)
         const threshold = Math.max(_otsuThreshold(edges) * 0.6, 10);
@@ -101,6 +101,9 @@ const DocDetect = (function () {
         for (let i = 0; i < edges.length; i++) {
             binary[i] = edges[i] >= threshold ? 1 : 0;
         }
+        // Use the median Sobel magnitude (robust to long-tail outliers from a few
+        // very strong edges) as the normaliser for perimeter-edge alignment.
+        const magScale = _percentile(edges, 0.5) || 1;
 
         // 5. Suppress edges near the four image corners (diagonal strips)
         // Paper curling at corners creates false edges that distort the detected quad
@@ -142,9 +145,11 @@ const DocDetect = (function () {
         // 8. Find contours from BOTH foreground masks; the scorer picks the winner.
         const contours = _findContours(fgEdges, w, h).concat(_findContours(fgBright, w, h));
 
-        // 9. Find largest quad (scorer is brightness-aware so bright-page quads
-        //    beat larger quads that include adjacent darker floor area)
-        const quad = _findLargestQuad(contours, w, h, blurred);
+        // 9. Find best quad. Scorer rewards quads whose 4 sides trace real
+        //    image edges (directional Sobel alignment), which is colour- and
+        //    luminance-agnostic — works equally for dark-page-on-light-bg and
+        //    light-page-on-dark-bg.
+        const quad = _findLargestQuad(contours, w, h, gx, gy, magScale);
         if (!quad) return null;
 
         // 10. Normalize to 0-1 and sort corners
@@ -184,9 +189,15 @@ const DocDetect = (function () {
         return out;
     }
 
-    /** Sobel edge magnitude (Manhattan: |Gx| + |Gy|) */
+    /**
+     * Sobel edge detection. Returns Manhattan magnitude plus the signed
+     * gx/gy components — magnitude drives Otsu thresholding, gx/gy feed the
+     * perimeter-alignment scorer in _findLargestQuad.
+     */
     function _sobelEdges(gray, w, h) {
         const mag = new Uint16Array(w * h);
+        const gxBuf = new Int16Array(w * h);
+        const gyBuf = new Int16Array(w * h);
         for (let y = 1; y < h - 1; y++) {
             for (let x = 1; x < w - 1; x++) {
                 const i = y * w + x;
@@ -195,10 +206,12 @@ const DocDetect = (function () {
                 const bl = gray[i + w - 1], bc = gray[i + w], br = gray[i + w + 1];
                 const gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
                 const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+                gxBuf[i] = gx;
+                gyBuf[i] = gy;
                 mag[i] = Math.abs(gx) + Math.abs(gy);
             }
         }
-        return mag;
+        return { mag, gx: gxBuf, gy: gyBuf };
     }
 
     /** Otsu's threshold for a Uint16Array (edge magnitudes) */
@@ -226,6 +239,24 @@ const DocDetect = (function () {
             if (v > maxVar) { maxVar = v; threshold = i; }
         }
         return threshold;
+    }
+
+    /**
+     * Approximate percentile of a Uint16Array via histogram. Used to extract a
+     * robust magnitude scale for the perimeter-alignment scorer — mean is too
+     * easily inflated by a few very strong edges.
+     */
+    function _percentile(data, p) {
+        const maxBin = 1024;
+        const hist = new Uint32Array(maxBin);
+        for (let i = 0; i < data.length; i++) hist[Math.min(data[i], maxBin - 1)]++;
+        const target = data.length * p;
+        let acc = 0;
+        for (let i = 0; i < maxBin; i++) {
+            acc += hist[i];
+            if (acc >= target) return i;
+        }
+        return maxBin - 1;
     }
 
     /** Otsu's threshold for an 8-bit grayscale Uint8Array */
@@ -382,38 +413,40 @@ const DocDetect = (function () {
      * Find the largest convex quadrilateral among detected contours.
      * Uses Douglas-Peucker simplification to reduce contours to polygons.
      */
-    function _findLargestQuad(contours, w, h, blurred) {
+    function _findLargestQuad(contours, w, h, gx, gy, magMean) {
         const minArea = w * h * 0.03; // Quad must be >3% of frame
         const maxArea = w * h * 0.75; // ...and not the entire frame (real pages have margin)
         const frameArea = w * h;
         let bestQuad = null;
         let bestScore = 0;
 
-        // Compute the global brightness baseline once: the quad's mean brightness is
-        // compared against this so a quad that hugs the bright page outscores one
-        // that wraps page+floor, even if the latter has slightly larger area.
-        let globalSum = 0;
-        if (blurred) {
-            for (let i = 0; i < blurred.length; i++) globalSum += blurred[i];
-        }
-        const globalMean = blurred ? globalSum / blurred.length : 128;
-
-        // Score = areaRatio * edgeFit * brightnessLift. brightnessLift is how much
-        // brighter the quad's interior is vs the global mean (clamped to [0.3, 2]),
-        // which discourages quads that bleed into darker non-page area.
+        // Score = areaRatio * edgeFit * align². `align` measures how strongly
+        // the quad's 4 sides trace real image edges, in *direction* as well as
+        // magnitude — at each pixel along a side we accumulate |gradient · sideNormal|,
+        // so gradients that run perpendicular to the side (i.e. real boundaries)
+        // contribute fully while parallel gradients (texture stripes parallel to
+        // the side) contribute zero. Normalised against the image's mean Sobel
+        // magnitude, so values around 1 mean "as edgy as average" and 2-3 mean
+        // "tracing strong real edges". This is colour- and luminance-agnostic.
+        // A real document on a floor/desk always leaves at least a small margin
+        // around the page; reject quads whose corners sit within 1% of the
+        // image border, which kills the failure mode where the scorer prefers
+        // a quad that traces the image's own edge.
+        const margin = Math.min(w, h) * 0.01;
         const tryQuad = (quad, contour) => {
             if (!_isConvex(quad)) return;
             const area = _polygonArea(quad);
             if (area < minArea || area > maxArea) return;
+            for (const p of quad) {
+                if (p.x < margin || p.x > w - margin ||
+                    p.y < margin || p.y > h - margin) return;
+            }
             const meanDist = _meanContourEdgeDistance(contour, quad);
             const diag = Math.sqrt(frameArea);
             const fit = Math.exp(-meanDist / (diag * 0.02));
-            let lift = 1;
-            if (blurred) {
-                const meanIn = _meanInsideQuad(blurred, w, h, quad);
-                lift = Math.min(2, Math.max(0.3, meanIn / Math.max(globalMean, 1)));
-            }
-            const score = (area / frameArea) * fit * lift * lift;
+            const rawAlign = _perimeterEdgeAlignment(quad, gx, gy, w, h, magMean);
+            const align = Math.min(1.5, Math.max(0.5, rawAlign));
+            const score = (area / frameArea) * fit * align * align;
             if (score > bestScore) {
                 bestScore = score;
                 bestQuad = quad;
@@ -473,41 +506,44 @@ const DocDetect = (function () {
     }
 
     /**
-     * Mean grayscale value inside a quad. Samples on a stride-8 grid using the
-     * crossing-number test for point-in-polygon — cheap and accurate enough to
-     * compare candidate quads.
+     * Mean |gradient · sideNormal| along a quad's 4 sides, normalised by the
+     * image's mean Sobel magnitude. Walks each side at 0.5-px steps and bilinearly
+     * samples the signed gx/gy fields so 1-px-wide gradient peaks aren't missed.
+     * High values ⇒ each side is tracing a real boundary whose gradient runs
+     * perpendicular to it (i.e. an actual page edge); low values ⇒ the side cuts
+     * through interior texture or runs parallel to the dominant gradient.
      */
-    function _meanInsideQuad(gray, w, h, quad) {
-        const stride = 8;
-        let sum = 0, n = 0;
-        let minX = w, minY = h, maxX = 0, maxY = 0;
-        for (const p of quad) {
-            if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-            if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-        }
-        const x0 = Math.max(0, minX | 0), x1 = Math.min(w - 1, (maxX | 0) + 1);
-        const y0 = Math.max(0, minY | 0), y1 = Math.min(h - 1, (maxY | 0) + 1);
-        for (let y = y0; y <= y1; y += stride) {
-            for (let x = x0; x <= x1; x += stride) {
-                if (_pointInQuad(x, y, quad)) {
-                    sum += gray[y * w + x];
-                    n++;
-                }
-            }
-        }
-        return n ? sum / n : 0;
-    }
+    function _perimeterEdgeAlignment(quad, gx, gy, w, h, magScale) {
+        const sampleGrad = (x, y) => {
+            if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) return [0, 0];
+            const x0 = x | 0, y0 = y | 0;
+            const fx = x - x0, fy = y - y0;
+            const idx = (xx, yy) => yy * w + xx;
+            const i00 = idx(x0, y0), i10 = idx(x0 + 1, y0), i01 = idx(x0, y0 + 1), i11 = idx(x0 + 1, y0 + 1);
+            const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+            const sx = gx[i00] * w00 + gx[i10] * w10 + gx[i01] * w01 + gx[i11] * w11;
+            const sy = gy[i00] * w00 + gy[i10] * w10 + gy[i01] * w01 + gy[i11] * w11;
+            return [sx, sy];
+        };
 
-    function _pointInQuad(px, py, quad) {
-        let inside = false;
-        for (let i = 0, j = 3; i < 4; j = i++) {
-            const xi = quad[i].x, yi = quad[i].y, xj = quad[j].x, yj = quad[j].y;
-            if (((yi > py) !== (yj > py)) &&
-                (px < (xj - xi) * (py - yi) / (yj - yi + 1e-9) + xi)) {
-                inside = !inside;
+        let total = 0;
+        let steps = 0;
+        for (let e = 0; e < 4; e++) {
+            const a = quad[e], b = quad[(e + 1) % 4];
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 1) continue;
+            const nx = -dy / len, ny = dx / len;       // unit normal to this side
+            const n = Math.max(2, Math.round(len * 2)); // 0.5-px stride
+            for (let i = 0; i < n; i++) {
+                const t = (i + 0.5) / n;
+                const [sx, sy] = sampleGrad(a.x + dx * t, a.y + dy * t);
+                total += Math.abs(sx * nx + sy * ny);
+                steps++;
             }
         }
-        return inside;
+        if (!steps) return 0;
+        return (total / steps) / magScale;
     }
 
     function _pointSegmentDistance(p, a, b) {
