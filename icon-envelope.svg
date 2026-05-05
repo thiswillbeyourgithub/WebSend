@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="256" height="256">
+  <title>WebSend — envelope dissolving into pixels</title>
+  <g fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <!-- envelope body (left side intact, right side dissolving) -->
+    <path d="M6 18 L6 46 L34 46" />
+    <path d="M6 18 L26 34" />
+    <!-- flap -->
+    <path d="M6 18 L26 34 L40 24" />
+    <!-- right edge implied by trailing pixels -->
+  </g>
+  <!-- pixel trail moving right (dissolution) -->
+  <g fill="#2563eb">
+    <rect x="36" y="22" width="4" height="4" rx="0.8" opacity="0.95"/>
+    <rect x="42" y="28" width="4" height="4" rx="0.8" opacity="0.8"/>
+    <rect x="40" y="36" width="4" height="4" rx="0.8" opacity="0.7"/>
+    <rect x="48" y="22" width="4" height="4" rx="0.8" opacity="0.55"/>
+    <rect x="50" y="34" width="3.5" height="3.5" rx="0.8" opacity="0.45"/>
+    <rect x="55" y="28" width="3" height="3" rx="0.8" opacity="0.3"/>
+    <rect x="58" y="38" width="2.5" height="2.5" rx="0.6" opacity="0.2"/>
+  </g>
+</svg>
