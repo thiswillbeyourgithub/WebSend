@@ -983,7 +983,7 @@ h1 {
 .collection-export-btn {
     font-size: 0.75rem !important;
     padding: 4px 10px !important;
-    background: #1565c0 !important;
+    background: #e94560 !important;
     color: white !important;
 }
 
@@ -1829,7 +1829,7 @@ footer {
     padding: 10px 16px;
     border: none;
     border-radius: 5px;
-    background: #1565c0;
+    background: #e94560;
     color: white;
     cursor: pointer;
     font-size: 0.85rem;

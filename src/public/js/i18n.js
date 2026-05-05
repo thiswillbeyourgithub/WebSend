@@ -59,6 +59,8 @@ const i18n = (function() {
             'send.startCamera': 'Start Camera to Scan',
             'send.scanning': 'Scanning...',
             'send.tip': '<strong>Tip:</strong> Point your camera at the QR code on the receiver\'s screen. The QR code contains a security token that cannot be typed manually.',
+            'send.orPasteLink': '<strong>No camera?</strong> Paste the link from the receiver\'s screen:',
+            'send.orPasteLink.go': 'Go',
             'send.connecting': 'Connecting to receiver...',
             'send.establishing': 'Establishing connection...',
             'send.connected': 'Connected!',
@@ -275,6 +277,8 @@ const i18n = (function() {
             'send.startCamera': 'Activer la caméra pour scanner',
             'send.scanning': 'Scan en cours...',
             'send.tip': '<strong>Astuce :</strong> Pointez votre caméra vers le QR code sur l\'écran du destinataire. Le QR code contient un jeton de sécurité qui ne peut pas être saisi manuellement.',
+            'send.orPasteLink': '<strong>Pas de caméra ?</strong> Collez le lien affiché sur l\'écran du destinataire :',
+            'send.orPasteLink.go': 'OK',
             'send.connecting': 'Connexion au destinataire...',
             'send.establishing': 'Établissement de la connexion...',
             'send.connected': 'Connecté !',
@@ -497,6 +501,7 @@ const i18n = (function() {
     const HTML_KEYS = new Set([
         'index.footer', // contains <br>
         'send.tip',     // contains <strong>
+        'send.orPasteLink', // contains <strong>
     ]);
 
     // Tag whitelist for HTML translations. Anything else (script, img with
