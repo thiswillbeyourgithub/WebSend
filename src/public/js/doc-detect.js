@@ -356,8 +356,9 @@ const DocDetect = (function () {
             // Try multiple epsilon values for Douglas-Peucker
             for (let epsRatio = 0.005; epsRatio <= 0.08; epsRatio += 0.003) {
                 const simplified = _douglasPeucker(contour, perimeter * epsRatio);
-                if (simplified.length >= 4 && simplified.length <= 6) {
-                    // If more than 4 points, reduce to best 4 by removing least-significant vertices
+                // Accept up to 12 vertices: curved sides and folded corners produce
+                // extra vertices that DP cannot collapse without losing real corners.
+                if (simplified.length >= 4 && simplified.length <= 12) {
                     const quad = simplified.length === 4 ? simplified : _reduceToQuad(simplified);
                     const area = _polygonArea(quad);
                     if (area > minArea && area > bestArea && _isConvex(quad)) {
@@ -512,9 +513,10 @@ const DocDetect = (function () {
             const len2 = Math.sqrt(v2x * v2x + v2y * v2y);
             if (len1 < 0.001 || len2 < 0.001) return null;
             const cosAngle = dot / (len1 * len2);
-            // Reject if any angle < ~30° or > ~150° (cos > 0.866 or cos < -0.866)
-            // A4 paper in perspective still keeps interior angles within this range
-            if (Math.abs(cosAngle) > 0.866) return null;
+            // Reject if any angle < ~20° or > ~160° (cos > 0.94 or cos < -0.94).
+            // Strong perspective skew or a folded corner can push angles past 30°/150°,
+            // so we keep the bound loose and rely on convexity + side-ratio checks.
+            if (Math.abs(cosAngle) > 0.94) return null;
         }
 
         // Validate: opposite side length ratio — reject if one side is >4x its opposite
