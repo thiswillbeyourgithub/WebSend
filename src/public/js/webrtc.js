@@ -571,6 +571,12 @@ class WebSendRTC {
                     continue;
                 } else if (response.status === 404) {
                     throw new RoomGoneError();
+                } else {
+                    // Unexpected status (401, 429, 5xx, ...). Without this branch
+                    // the while(true) re-fetches immediately — a hot loop that
+                    // hammers the server and can self-trigger rate limiting.
+                    logger.warn(`Unexpected status ${response.status} from answer poll, backing off`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
                 }
             } catch (e) {
                 // RoomGoneError is terminal — stop polling and propagate
