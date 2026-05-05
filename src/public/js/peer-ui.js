@@ -80,4 +80,11 @@
     }
 
     window.PeerUI = { loadEruda, onConnectionTypeDetected, showVerifiedInSidebar, hasTurn };
+
+    // ?debug=1 in the URL loads eruda immediately, regardless of DEV mode.
+    try {
+        if (new URLSearchParams(window.location.search).get('debug') === '1') {
+            loadEruda();
+        }
+    } catch (_) { /* non-fatal */ }
 })();

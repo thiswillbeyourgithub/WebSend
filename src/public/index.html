@@ -151,6 +151,13 @@
             });
         };
 
+        // ?debug=1 in the URL loads eruda immediately, regardless of DEV mode.
+        try {
+            if (new URLSearchParams(window.location.search).get('debug') === '1') {
+                window.loadEruda();
+            }
+        } catch (_) { /* non-fatal */ }
+
         // Fetch server config to update DEV badge and show version
         fetch('/api/config').then(r => r.json()).then(config => {
             updateDevBadge(config.dev); // defined in sidebar.js
