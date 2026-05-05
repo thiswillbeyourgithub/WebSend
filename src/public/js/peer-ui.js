@@ -2,31 +2,16 @@
  * peer-ui.js
  *
  * Small UI helpers shared between sender and receiver pages:
- *   - loadEruda(): on-demand load of vendored mobile devtools console
+ *   - loadEruda(): re-export of window.loadEruda from eruda-loader.js
  *   - onConnectionTypeDetected(info): show direct/relay badge in sidebar
  *   - showVerifiedInSidebar(): append "verified" line below the badge
  *
- * Exposed as window.PeerUI. Depends on global i18n (loaded earlier).
+ * Exposed as window.PeerUI. Depends on global i18n and eruda-loader (loaded earlier).
  */
 (function () {
     'use strict';
 
-    /**
-     * Dynamically load the vendored eruda mobile devtools console.
-     * Only called in DEV mode (or via the 5-tap gesture) to avoid loading
-     * a ~500KB debug library on every page view. Served from /vendor/eruda/
-     * so the app makes zero external network requests.
-     * @returns {Promise<void>}
-     */
-    function loadEruda() {
-        return new Promise((resolve) => {
-            const script = document.createElement('script');
-            script.src = '/vendor/eruda/eruda.js';
-            script.onload = () => { eruda.init(); resolve(); };
-            script.onerror = () => { console.warn('Failed to load eruda'); resolve(); };
-            document.head.appendChild(script);
-        });
-    }
+    const loadEruda = window.loadEruda;
 
     /**
      * Display a badge showing whether the connection is direct (P2P) or
@@ -80,11 +65,4 @@
     }
 
     window.PeerUI = { loadEruda, onConnectionTypeDetected, showVerifiedInSidebar, hasTurn };
-
-    // ?debug=1 in the URL loads eruda immediately, regardless of DEV mode.
-    try {
-        if (new URLSearchParams(window.location.search).get('debug') === '1') {
-            loadEruda();
-        }
-    } catch (_) { /* non-fatal */ }
 })();
