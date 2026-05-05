@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512" role="img" aria-label="WebSend">
   <title>WebSend</title>
   <!-- Rounded-square background -->
-  <rect x="2" y="2" width="60" height="60" rx="13" ry="13" fill="#e5e7eb" stroke="#cbd5e1" stroke-width="1"/>
+  <rect x="2" y="2" width="60" height="60" rx="13" ry="13" fill="#1a1a2e" stroke="#16213e" stroke-width="1"/>
 
-  <!-- Envelope (purple), left portion intact, dissolving toward the right -->
-  <g fill="none" stroke="#7c3aed" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Envelope (UI red), left portion intact, dissolving toward the right -->
+  <g fill="none" stroke="#e94560" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
     <!-- back/body outline (open right side) -->
     <path d="M10 20 L10 46 L34 46"/>
     <!-- inner fold lines forming the flap -->
