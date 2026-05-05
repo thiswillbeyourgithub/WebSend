@@ -510,16 +510,8 @@
             window.showToast(i18n.t('receive.ocrAlreadyRunning') || 'Export already in progress', { type: 'warn' });
             return;
         }
-        ocrExportInFlight = true;
-        logger.info('=== OCR PDF export started ===');
-        const exportAbort = new AbortController();
-        const signal = exportAbort.signal;
-        const btn = document.getElementById('export-btn');
-        // Tag the button with this run's abort controller. If a later run
-        // somehow installs its own handler before our finally fires, the
-        // identity check below prevents us from clearing the new handler.
-        btn.__activeExportAbort = exportAbort;
 
+        const btn = document.getElementById('export-btn');
         const selectedIndices = _getSelectedIndices(exportCollectionId !== null ? exportCollectionId : undefined);
         const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
         if (activeImages.length === 0) {
@@ -529,6 +521,15 @@
             _updateExportBtn();
             return;
         }
+
+        ocrExportInFlight = true;
+        logger.info('=== OCR PDF export started ===');
+        const exportAbort = new AbortController();
+        const signal = exportAbort.signal;
+        // Tag the button with this run's abort controller. If a later run
+        // somehow installs its own handler before our finally fires, the
+        // identity check below prevents us from clearing the new handler.
+        btn.__activeExportAbort = exportAbort;
 
         const imageCount = activeImages.length;
         const needsOcr = activeImages.filter(img => !img.ocrPageData);
