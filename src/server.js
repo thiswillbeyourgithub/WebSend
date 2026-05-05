@@ -628,7 +628,7 @@ function validateSdpBody(body, expectedType) {
         return 'sdp must be a string';
     }
     if (body.sdp.length === 0 || body.sdp.length > MAX_SDP_LEN) {
-        return `sdp length must be 1..${MAX_SDP_LEN}`;
+        return `sdp length must be 1..${MAX_SDP_LEN} (got ${body.sdp.length})`;
     }
     const allowed = new Set(['type', 'sdp']);
     for (const key of Object.keys(body)) {
