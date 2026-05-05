@@ -462,6 +462,14 @@ class WebSendRTC {
     async createRoom() {
         logger.debug('SIGNALING', 'Creating room...');
         const response = await fetch('/api/rooms', { method: 'POST' });
+        if (!response.ok) {
+            // Without this guard, a 429/5xx leaves data.roomId undefined, and
+            // every subsequent /api/rooms/undefined/... call returns 404 with
+            // no useful error surfaced to the user.
+            const retryAfter = response.headers.get('Retry-After');
+            const suffix = retryAfter ? ` (retry after ${retryAfter}s)` : '';
+            throw new Error(`Failed to create room (HTTP ${response.status})${suffix}`);
+        }
         const data = await response.json();
         this.roomId = data.roomId;
         this.roomSecret = data.secret;
