@@ -85,9 +85,27 @@ class WebSendRTC {
      */
     async init() {
         logger.info('Fetching ICE server configuration...');
-        try {
-            const response = await fetch('/api/config');
-            const config = await response.json();
+        // Retry with backoff: a transient /api/config failure (rate limit,
+        // network blip) used to silently fall back to Google STUN only,
+        // losing TURN/TURNS for the entire session.
+        const retryDelays = [500, 1500, 3000];
+        let lastErr;
+        let config = null;
+        for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+            try {
+                const response = await fetch('/api/config');
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                config = await response.json();
+                break;
+            } catch (e) {
+                lastErr = e;
+                if (attempt < retryDelays.length) {
+                    logger.warn(`Failed to fetch config (attempt ${attempt + 1}): ${e.message} — retrying in ${retryDelays[attempt]}ms`);
+                    await new Promise(r => setTimeout(r, retryDelays[attempt]));
+                }
+            }
+        }
+        if (config) {
             this.iceServers = config.iceServers;
             // iceTransportPolicy: 'relay' forces TURN-only (set by DEV_FORCE_CONNECTION on server)
             this.iceTransportPolicy = config.iceTransportPolicy || 'all';
@@ -106,8 +124,8 @@ class WebSendRTC {
             logger.debug('CONFIG', 'ICE servers loaded', { servers: this.iceServers, iceTransportPolicy: this.iceTransportPolicy });
             // Fire-and-forget ICE server reachability check (DEV mode only)
             this.diagnoseIceServers();
-        } catch (e) {
-            logger.warn('Failed to fetch config, using defaults: ' + e.message);
+        } else {
+            logger.warn('Failed to fetch config after retries, using defaults: ' + (lastErr ? lastErr.message : 'unknown'));
             this.iceServers = [
                 { urls: 'stun:stun.l.google.com:19302' }
             ];
