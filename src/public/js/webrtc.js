@@ -1047,7 +1047,10 @@ class WebSendRTC {
      */
     _probeIceServer(probe) {
         return new Promise((resolve) => {
-            const TIMEOUT_MS = 5000;
+            // First-use TURNS gathering (TCP connect + TLS handshake + Allocate)
+            // routinely exceeds 5s, which produced false "UNREACHABLE" reports.
+            const isTurns = probe.url.startsWith('turns:');
+            const TIMEOUT_MS = isTurns ? 12000 : 5000;
             const start = performance.now();
 
             const iceServer = { urls: probe.url };
