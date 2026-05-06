@@ -130,7 +130,10 @@ class WebSendRTC {
         // (both sides call waitForICE() before storing their SDP offer/answer),
         // so lost POSTs or timing gaps in polling are harmless.
         this.pc.onicecandidate = (event) => {
-            if (event.candidate) {
+            // Browsers emit an "end-of-candidates" signal as a non-null
+            // RTCIceCandidate whose .candidate string is empty. Skip it —
+            // the server rejects empty candidate strings with a 400.
+            if (event.candidate && event.candidate.candidate) {
                 const candidateInfo = event.candidate.type || 'unknown';
                 logger.info(`ICE candidate: ${candidateInfo}`);
                 logger.debug('ICE', 'Local candidate generated', {
