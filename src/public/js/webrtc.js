@@ -573,6 +573,7 @@ class WebSendRTC {
                     // Fetch sender's ICE candidates and start polling for late arrivals
                     await this.fetchRemoteIceCandidates('answer');
                     this.startIceCandidatePolling('answer');
+                    this._startConnectionTimeout();
 
                     logger.success('Answer processed');
                     return;
@@ -690,6 +691,12 @@ class WebSendRTC {
         }
 
         logger.success('[Step 6/6] Answer sent — establishing peer connection...');
+
+        // Start the connection-establishment timeout now that both SDPs have
+        // been exchanged. Starting it earlier would let relay ICE gathering
+        // (up to 15s under iceTransportPolicy:'relay') consume the entire
+        // budget before peer connectivity checks even begin.
+        this._startConnectionTimeout();
     }
 
     /**
@@ -752,11 +759,6 @@ class WebSendRTC {
             }
             await this.fetchRemoteIceCandidates(side);
         }, 1000);
-
-        // Start connection timeout — if WebRTC stays stuck in 'connecting' or
-        // 'checking' (e.g. TURN server unreachable, bad credentials), this fires
-        // after 10s to stop the infinite polling and surface a clear error.
-        this._startConnectionTimeout();
     }
 
     /**
