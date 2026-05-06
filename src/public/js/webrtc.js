@@ -824,11 +824,15 @@ class WebSendRTC {
             };
 
             // TURNS gathering (TCP + TLS handshake + TURN Allocate) regularly
-                // exceeds 5s on first use; with iceTransportPolicy:'relay' a
-                // candidate-less SDP leaves ICE with no pairs to try and the
-                // connection fails immediately. Give relay-forced configs more
-                // headroom so the relay candidate makes it into the SDP.
-            const timeoutMs = this.iceTransportPolicy === 'relay' ? 15000 : 5000;
+            // exceeds 5s on first use. Even under the default mixed policy
+            // we want the relay candidate in the SDP — relying solely on
+            // trickle ICE races against the sender's connection timeout.
+            // Extend the budget whenever a TURN/TURNS server is configured.
+            const hasTurn = (this.iceServers || []).some(s => {
+                const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+                return urls.some(u => typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:')));
+            });
+            const timeoutMs = (this.iceTransportPolicy === 'relay' || hasTurn) ? 15000 : 5000;
             const timeout = setTimeout(() => {
                 logger.warn('ICE gathering timeout, proceeding with available candidates');
                 finish();
