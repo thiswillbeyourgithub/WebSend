@@ -77,7 +77,7 @@ const FORCE_FILTERS = {
     DIRECT:      { filter: () => [],                                                                forceRelay: false },
     STUN:        { filter: filterStunString(u => u.startsWith('stun:') && !u.includes('google')),   forceRelay: false },
     GOOGLE_STUN: { filter: filterStunString(u => u.includes('stun.l.google.com')),                  forceRelay: false },
-    TURN:        { filter: filterTurnArray(u => u.startsWith('turn:')),                             forceRelay: true  },
+    TURN:        { filter: filterTurnArray(u => u.startsWith('turn:') && !u.startsWith('turns:')),  forceRelay: true  },
     TURNS:       { filter: filterTurnArray(u => u.startsWith('turns:')),                            forceRelay: true  },
 };
 FORCE_FILTERS.TURN_TLS = FORCE_FILTERS.TURNS;
