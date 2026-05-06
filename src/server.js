@@ -443,12 +443,18 @@ app.get('/api/config', (req, res) => {
     // Add TURN server if configured (requires TURN_SECRET for credentials)
     if (TURN_SERVER && TURN_SECRET) {
         const { username, credential } = helpers.generateTurnCredentials(TURN_SECRET, TURN_CREDENTIAL_TTL);
+        // Strip any :port from TURN_SERVER before composing the TURNS URL so
+        // hostnames without an explicit port don't yield "turns:host?transport=tcp"
+        // (a port-less URL that browsers either reject or default unpredictably).
+        const turnHost = TURN_SERVER.replace(/:\d+$/, '');
         iceServers.push({
             urls: [
                 `turn:${TURN_SERVER}?transport=udp`,
                 `turn:${TURN_SERVER}?transport=tcp`,
-                // TURNS (TURN-over-TLS) on a separate port, for networks blocking non-443/non-HTTPS traffic
-                ...(TURNS_PORT ? [`turns:${TURN_SERVER.replace(/:\d+$/, ':' + TURNS_PORT)}?transport=tcp`] : [])
+                // TURNS (TURN-over-TLS) on a separate port, for networks blocking non-443/non-HTTPS traffic.
+                // Drop ?transport=tcp: turns: is always TCP per RFC 7065, and the redundant param
+                // has historically tripped some WebRTC stacks.
+                ...(TURNS_PORT ? [`turns:${turnHost}:${TURNS_PORT}`] : [])
             ],
             username,
             credential
