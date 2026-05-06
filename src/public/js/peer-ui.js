@@ -52,7 +52,7 @@
     }
 
     /**
-     * True when the supplied iceServers list includes any turn: URL.
+     * True when the supplied iceServers list includes any turn: or turns: URL.
      * Used by both sender and receiver to decide whether a connection
      * failure was likely caused by missing TURN relay.
      */
@@ -60,7 +60,7 @@
         if (!Array.isArray(iceServers)) return false;
         return iceServers.some(s => {
             const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-            return urls.some(u => typeof u === 'string' && u.startsWith('turn:'));
+            return urls.some(u => typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:')));
         });
     }
 
