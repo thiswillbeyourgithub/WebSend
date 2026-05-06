@@ -654,13 +654,15 @@ class WebSendRTC {
         await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
         this.remoteDescriptionSet = true;
 
-        // Step 4: Fetch receiver's trickle ICE candidates. Polling is deferred to after
-        // step 6 so the connection timeout doesn't include answer creation time.
-        // Note: the gap between this one-shot fetch and the deferred polling is harmless
-        // because the receiver's candidates are already embedded in the SDP offer
-        // (the receiver calls waitForICE() before storing its offer).
+        // Step 4: Fetch receiver's trickle ICE candidates and start polling.
+        // Polling must run during waitForICE: under iceTransportPolicy:'relay'
+        // a slow receiver (TURNS gathering >5s) may have posted its offer with
+        // zero embedded candidates, and without trickled candidates arriving in
+        // time the sender's ICE has no pairs and fails immediately on its own
+        // gathering completion.
         logger.info('[Step 4/6] Fetching receiver\'s ICE candidates...');
         await this.fetchRemoteIceCandidates('offer');
+        this.startIceCandidatePolling('offer');
 
         // Step 5: Create and send SDP answer
         logger.info('[Step 5/6] Creating connection answer...');
@@ -688,10 +690,6 @@ class WebSendRTC {
         }
 
         logger.success('[Step 6/6] Answer sent — establishing peer connection...');
-
-        // Start candidate polling and connection timeout now that both sides have exchanged SDPs.
-        // Previously this was at step 4, wasting ~6-7s of the timeout budget on local setup.
-        this.startIceCandidatePolling('offer');
     }
 
     /**
@@ -823,10 +821,16 @@ class WebSendRTC {
                 if (this.pc.iceGatheringState === 'complete') finish();
             };
 
+            // TURNS gathering (TCP + TLS handshake + TURN Allocate) regularly
+                // exceeds 5s on first use; with iceTransportPolicy:'relay' a
+                // candidate-less SDP leaves ICE with no pairs to try and the
+                // connection fails immediately. Give relay-forced configs more
+                // headroom so the relay candidate makes it into the SDP.
+            const timeoutMs = this.iceTransportPolicy === 'relay' ? 15000 : 5000;
             const timeout = setTimeout(() => {
                 logger.warn('ICE gathering timeout, proceeding with available candidates');
                 finish();
-            }, 5000);
+            }, timeoutMs);
 
             this.pc.addEventListener('icegatheringstatechange', onChange);
         });
