@@ -89,16 +89,21 @@
         dc.binaryType = 'arraybuffer';
 
         pc.onicecandidate = (ev) => {
-            if (!ev.candidate) return;
+            if (!ev.candidate) { log('dbg', 'local ICE gathering complete'); return; }
             const c = ev.candidate;
             const body = { candidate: c.candidate };
             if (c.sdpMid !== null && c.sdpMid !== undefined) body.sdpMid = c.sdpMid;
             if (c.sdpMLineIndex !== null && c.sdpMLineIndex !== undefined) body.sdpMLineIndex = c.sdpMLineIndex;
             if (c.usernameFragment) body.usernameFragment = c.usernameFragment;
+            log('dbg', `local ICE: ${c.candidate.slice(0, 80)}`);
             fetch(`${baseUrl}/api/rooms/${roomId}/ice/offer`, {
                 method: 'POST', headers: auth, body: JSON.stringify(body),
             }).catch(e => log('warn', `post ICE failed: ${e.message}`));
         };
+
+        pc.oniceconnectionstatechange = () => log('dbg', `ice state: ${pc.iceConnectionState}`);
+        pc.onconnectionstatechange     = () => log('dbg', `pc state:  ${pc.connectionState}`);
+        pc.onicegatheringstatechange   = () => log('dbg', `gather:    ${pc.iceGatheringState}`);
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
@@ -110,13 +115,20 @@
         const senderUrl = `${baseUrl}/send/${roomId}#${secret}`;
         try { window.__nodeSenderUrl(senderUrl); } catch (_) {}
 
-        // Long-poll for answer.
+        // Long-poll for answer. The server returns 204 (null body) if no answer
+        // arrives within 30s — we just retry.
         log('info', 'Waiting for sender to connect...');
         let answer = null;
+        let attempt = 0;
         while (!answer) {
+            attempt += 1;
+            log('dbg', `answer long-poll #${attempt}...`);
             answer = await httpJson(`${baseUrl}/api/rooms/${roomId}/answer?wait=true`, { headers: auth });
+            if (!answer) log('dbg', `long-poll #${attempt} timed out (204), retrying`);
         }
+        log('ok', `Got answer SDP (${answer.sdp.length} chars)`);
         await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+        log('dbg', 'remoteDescription set');
 
         // Trickle remote ICE candidates.
         const seen = new Set();
@@ -129,6 +141,7 @@
                         const k = `${c.candidate}|${c.sdpMid}|${c.sdpMLineIndex}`;
                         if (seen.has(k)) continue;
                         seen.add(k);
+                        log('dbg', `remote ICE: ${String(c.candidate).slice(0, 80)}`);
                         try { await pc.addIceCandidate(c); } catch (e) { log('warn', `addIceCandidate: ${e.message}`); }
                     }
                 } catch (e) { log('dbg', `ICE poll: ${e.message}`); }
