@@ -281,6 +281,10 @@ Run `npm test` (= unit + HTTP) for the fast inner loop, or `npm run test:all` fo
 
 Known testing gaps (frontend modules like `webrtc.js`/`logger.js`/`i18n.js`, the export modal, crop tool, transform-replay protocol, fingerprint-mismatch / integrity-retry paths, the service worker, healthcheck, and SSO) are listed in [ARCHITECTURE.md](ARCHITECTURE.md#testing).
 
+### CLI receiver (advanced)
+
+A minimal Node script `src/cli/receive.js` pairs as a receiver from a terminal — useful for remote-instance smoke testing and headless captures. It reuses the production `crypto.js` + `protocol.js` verbatim by driving them inside a Playwright-launched headless Chromium (already a devDependency for the e2e tests), so no native node-webrtc dependency is added and the wire protocol cannot drift. See [src/cli/README.md](src/cli/README.md) for usage. Not intended for end users.
+
 ## Third-Party Libraries
 
 All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.

@@ -45,6 +45,17 @@ WebSend/
 │   └── env.example         # Documented env vars: DOMAIN, ICE servers, TURN credentials, ALLOWED_FILE_TYPES
 │
 └── src/
+    ├── cli/                # Optional Node CLI receiver (advanced; not for end users).
+    │   ├── receive.js      # Pairs as a receiver from a terminal; drives a headless
+    │   │                   #   Playwright Chromium (already a devDep) that loads the
+    │   │                   #   production crypto.js + protocol.js from the live server,
+    │   │                   #   so the wire protocol cannot drift. File saves and the
+    │   │                   #   y/n fingerprint prompt are bridged to Node via
+    │   │                   #   page.exposeFunction. No new dependencies.
+    │   ├── shim.js         # In-browser driver injected into the Playwright page;
+    │   │                   #   runs the full receive flow and calls back into Node.
+    │   └── README.md       # Usage doc
+    │
     ├── server.js           # Express server: signaling API, ICE config, static serving,
     │                       #   serves vendored libs at /vendor/, /scribe/, /tessdata/.
     │                       #   Also exposes GET /send/:roomId as a pretty-URL redirect
