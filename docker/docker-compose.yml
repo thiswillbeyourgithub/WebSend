@@ -150,23 +150,23 @@ services:
     # NOTE: DOMAIN must be an IP address here, NOT a hostname — coturn does not
     # resolve DNS for --external-ip. Set a separate TURN_EXTERNAL_IP env var if
     # your DOMAIN is a hostname.
-    command: >
-      -n
-      --log-file=stdout
-      --use-auth-secret
-      --static-auth-secret=${TURN_SECRET}
-      --fingerprint
-      --no-multicast-peers
-      --no-cli
-      --no-dtls
-      --no-tls
-      --realm=websend
-      --min-port=49152
-      --max-port=49161
-      --listening-port=3478
-      --external-ip=${TURN_EXTERNAL_IP:-${DOMAIN:-127.0.0.1}}
-      --check-origin-consistency
-      --cpus=1
+    command:
+      - -n
+      - --log-file=stdout
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET}
+      - --fingerprint
+      - --no-multicast-peers
+      - --no-cli
+      - --no-dtls
+      - --no-tls
+      - --realm=websend
+      - --min-port=49152
+      - --max-port=49161
+      - --listening-port=3478
+      - --external-ip=${TURN_EXTERNAL_IP:-${DOMAIN:-127.0.0.1}}
+      - --check-origin-consistency
+      - --cpus=1
     # Security hardening options
     # Note: no-new-privileges is NOT set because the turnserver binary
     # has file capabilities that require privilege transition at exec.
