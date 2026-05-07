@@ -88,17 +88,18 @@
         const dc = pc.createDataChannel('websend', { ordered: true });
         dc.binaryType = 'arraybuffer';
 
+        // Local ICE candidates only need to be logged in -v; we do NOT trickle
+        // them to the server. The production receiver waits for ICE gathering
+        // to complete and posts the offer with all candidates inline (see
+        // webrtc.js:506 createOfferAndStore + waitForICE), and the sender
+        // expects the offer SDP to contain candidates rather than polling
+        // /ice/offer aggressively. Trickling races against TURNS gathering
+        // and the sender's connection-timeout, which is exactly the failure
+        // mode we hit (ICE went straight to disconnected/failed before remote
+        // candidates were added).
         pc.onicecandidate = (ev) => {
             if (!ev.candidate) { log('dbg', 'local ICE gathering complete'); return; }
-            const c = ev.candidate;
-            const body = { candidate: c.candidate };
-            if (c.sdpMid !== null && c.sdpMid !== undefined) body.sdpMid = c.sdpMid;
-            if (c.sdpMLineIndex !== null && c.sdpMLineIndex !== undefined) body.sdpMLineIndex = c.sdpMLineIndex;
-            if (c.usernameFragment) body.usernameFragment = c.usernameFragment;
-            log('dbg', `local ICE: ${c.candidate.slice(0, 80)}`);
-            fetch(`${baseUrl}/api/rooms/${roomId}/ice/offer`, {
-                method: 'POST', headers: auth, body: JSON.stringify(body),
-            }).catch(e => log('warn', `post ICE failed: ${e.message}`));
+            log('dbg', `local ICE: ${ev.candidate.candidate.slice(0, 80)}`);
         };
 
         pc.oniceconnectionstatechange = () => log('dbg', `ice state: ${pc.iceConnectionState}`);
@@ -107,9 +108,34 @@
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
+
+        // Wait for ICE gathering to complete with a TURN-aware timeout (matches
+        // production webrtc.js waitForICE).
+        const hasTurn = (rtcConfig.iceServers || []).some(s => {
+            const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+            return urls.some(u => typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:')));
+        });
+        const gatherTimeoutMs = (rtcConfig.iceTransportPolicy === 'relay' || hasTurn)
+            ? (config?.turnTimeout ? config.turnTimeout * 1000 : 15000)
+            : 5000;
+        log('info', `Gathering ICE candidates (timeout ${gatherTimeoutMs / 1000}s)...`);
+        await new Promise((resolve) => {
+            if (pc.iceGatheringState === 'complete') return resolve();
+            const t = setTimeout(() => {
+                log('warn', 'ICE gathering timeout, posting available candidates');
+                resolve();
+            }, gatherTimeoutMs);
+            pc.addEventListener('icegatheringstatechange', () => {
+                if (pc.iceGatheringState === 'complete') { clearTimeout(t); resolve(); }
+            });
+        });
+
+        // Post the fully-gathered offer (candidates baked into SDP).
+        const finalSdp = pc.localDescription.sdp;
+        log('dbg', `posting offer (${finalSdp.length} chars, candidates inline)`);
         await httpJson(`${baseUrl}/api/rooms/${roomId}/offer`, {
             method: 'POST', headers: auth,
-            body: JSON.stringify({ type: 'offer', sdp: offer.sdp }),
+            body: JSON.stringify({ type: 'offer', sdp: finalSdp }),
         });
 
         const senderUrl = `${baseUrl}/send/${roomId}#${secret}`;
