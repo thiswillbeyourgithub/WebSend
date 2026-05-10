@@ -160,12 +160,12 @@
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-YrOsZ+KNCRdbEqMAqD2Kr9ZJyh8NFohqhtlm9umir//2LvO4k9A+58yEnph68ZIN"></script>
-    <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-ZGMsM74141CQWdyknfkfd1bTxRCKY83A2f1xPK0haYNwrkiaAa2Uz0eoBEvbmNuB"></script>
+    <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-twhi90qYKLsHy8NjR3nXRw6Do/NaEaSUIwOAJcIjDpaa5Mn9t4xXgsdQC1eCFlTn"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-jmbs2WN52h9SkRpJ2lohLmqnjamiu0nRINJYMpKj/EKMWER0/mZayY6LAgZQK00K"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-yokDKyM3jzIjbD9WP5dawsHfzvYK1NiysIfEUvObI7lwV3BdlYYCx2ojlF5nB2s1"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-zPGCk0WbtXhxsvfaVJrvOZN+6bSpzMcfELt2wmLlyyn8ZL5ETUdcm/wsJEsW2yoR"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-WzDsRuOwgy9WT7z+OLRHu0oRgsEGVSNNowbM+OJZpb/OBCgdstG08sCtd6WGlfcU"></script>
-    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-WBzNtjfK5VjXycJgNAMT3KP4I2SEz6e5T304qNlmhHfsTI1aegPcvlefDcwbRWur"></script>
+    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-eyhXvDLHytvcy7Bzjdd9ufPgSBOJuE0KRFA4GKLznx8sFhWKNzxJ8EsdDrblLuO8"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-4ejmHnrXtYaNI3bsYQdn8kgGUK464t8L37n0fkWEcNSY2t2OYJUHfPX/k/5TAhhC"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -828,7 +828,23 @@
 
 
         async function handleSenderPublicKey(msg) {
-            // Sender sent their ECDH public key - derive shared secret
+            // Sender sent their ECDH public key - derive shared secret.
+            //
+            // Defense-in-depth: a fresh sender-public-key always closes the
+            // verified-fingerprint gate SYNCHRONOUSLY before any await, so a
+            // hostile already-verified peer cannot rotate keys and slip files
+            // through under the new shared key before the user reacts to the
+            // re-shown modal. Any encrypted-file / transform / batch message
+            // that arrives between this point and the user's confirm click
+            // is blocked by VERIFIED_GATED_HANDLERS. Clearing sharedKey here
+            // also means decryption would fail even if the gate were bypassed.
+            const isRekey = sharedKey !== null;
+            if (isRekey) {
+                logger.warn('Sender re-keyed mid-session; re-verification required before further files');
+            }
+            weConfirmed = false;
+            theyConfirmed = false;
+            sharedKey = null;
             logger.info('Received sender public key, deriving shared secret...');
             try {
                 const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);

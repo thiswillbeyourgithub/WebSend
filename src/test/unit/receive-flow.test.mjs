@@ -111,6 +111,43 @@ test('decryptIncomingFile classifies application/pdf as fileType=pdf', async () 
     assert.equal(decoded.fileType, 'pdf');
 });
 
+test('sanitizeMetadataName strips Unicode bidi/format chars (filename-extension spoof defense)', async () => {
+    // A hostile peer can send a filename with U+202E (RIGHT-TO-LEFT
+    // OVERRIDE) so the displayed text reverses around it, presenting
+    // "harmless‮gpj.exe" as "harmlessexe.jpg" on the receive card.
+    // The sanitiser must drop all bidi/format/zero-width chars before
+    // either display or downstream filename use.
+    const spoof = 'harmless' + '‮' + 'gpj.exe';
+    const win = loadIntoJsdom({
+        decryptResult: {
+            metadata: { name: spoof, mimeType: 'application/octet-stream', originalSize: 1 },
+            data: new ArrayBuffer(4),
+        },
+    });
+    const { opts } = makeDeps();
+    win.ReceiveFlow.attach(opts);
+    const decoded = await win.ReceiveFlow.decryptIncomingFile({ arrayBuffer: async () => new ArrayBuffer(0) });
+    assert.equal(decoded.fileName.includes('‮'), false,
+        'RLO must be stripped');
+    assert.equal(decoded.fileName, 'harmlessgpj.exe',
+        'sanitised name should be the literal characters minus the bidi control');
+});
+
+test('sanitizeMetadataName strips zero-width and other bidi controls', async () => {
+    // ZWSP + LRO + RLI + BOM + WJ in a single name
+    const spoof = 'a​' + 'b‭' + 'c⁧' + 'd﻿' + 'e⁠' + 'f.txt';
+    const win = loadIntoJsdom({
+        decryptResult: {
+            metadata: { name: spoof, mimeType: 'text/plain', originalSize: 1 },
+            data: new ArrayBuffer(4),
+        },
+    });
+    const { opts } = makeDeps();
+    win.ReceiveFlow.attach(opts);
+    const decoded = await win.ReceiveFlow.decryptIncomingFile({ arrayBuffer: async () => new ArrayBuffer(0) });
+    assert.equal(decoded.fileName, 'abcdef.txt');
+});
+
 test('decryptIncomingFile classifies generic mime as fileType=other and synthesizes a filename', async () => {
     const win = loadIntoJsdom({
         decryptResult: {

@@ -15,6 +15,14 @@
     let _onKeydown = null;
 
     function show({ onConfirm, onDeny }) {
+        // If a previous show() was not paired with hide() (e.g. a sender
+        // rekey re-opens the modal), tear the prior listener down first so
+        // we never accumulate more than one keydown handler on document.
+        if (_onKeydown) {
+            document.removeEventListener('keydown', _onKeydown);
+            _onKeydown = null;
+        }
+
         const modal = document.getElementById('verification-modal');
         modal.classList.remove('hidden');
         modal.style.display = 'flex';

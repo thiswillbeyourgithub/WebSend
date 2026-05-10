@@ -71,7 +71,13 @@ function makeLog(verbose) {
 
 function safeFilename(name) {
     if (typeof name !== 'string' || !name) return 'unnamed';
-    return path.basename(name).replace(/[\x00-\x1f/\\]/g, '_').slice(0, 200) || 'unnamed';
+    // Mirror the browser receiver: strip control chars, path separators,
+    // and Unicode bidi/format chars that would otherwise let a hostile peer
+    // visually spoof the file extension in terminals that render them.
+    const cleaned = path.basename(name)
+        .replace(/[\x00-\x1f/\\]/g, '_')
+        .replace(/[​-‏‪-‮⁠⁦-⁩﻿]/g, '');
+    return cleaned.slice(0, 200) || 'unnamed';
 }
 
 function uniquePath(dir, name) {

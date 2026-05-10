@@ -46,15 +46,26 @@
     }
 
     /**
-     * The sender controls metadata.name. Strip control chars and path
-     * separators, cap at 255, drop to empty string if nothing remains.
-     * Downstream code falls back to a generated filename when empty.
+     * The sender controls metadata.name. Strip control chars, path
+     * separators, and Unicode bidi/format characters that would let a
+     * hostile peer visually spoof the file extension (e.g. U+202E
+     * RIGHT-TO-LEFT OVERRIDE turning "harmlessgpj.exe" into
+     * "harmlessexe.jpg" on the card). Cap at 255, drop to empty string
+     * if nothing remains. Downstream code falls back to a generated
+     * filename when empty.
      */
     function sanitizeMetadataName(name) {
         if (typeof name !== 'string') return '';
         // eslint-disable-next-line no-control-regex
-        const cleaned = name.replace(/[\x00-\x1F\x7F/\\]/g, '').trim().slice(0, 255);
-        return cleaned;
+        let cleaned = name.replace(/[\x00-\x1F\x7F/\\]/g, '');
+        // Strip Unicode bidi controls (RLO/LRO/PDF/LRE/RLE/LRI/RLI/FSI/PDI),
+        // zero-width chars (ZWSP/ZWNJ/ZWJ/LRM/RLM/WJ), and the BOM. These
+        // are invisible in rendered text but reverse the displayed order
+        // of surrounding characters, so a peer-supplied filename can
+        // otherwise present a fake extension on the receive card.
+        // ZWSP..RLM           bidi embed/override  WJ      isolates   BOM
+        cleaned = cleaned.replace(/[​-‏‪-‮⁠⁦-⁩﻿]/g, '');
+        return cleaned.trim().slice(0, 255);
     }
 
     async function decryptIncomingFile(blob) {
