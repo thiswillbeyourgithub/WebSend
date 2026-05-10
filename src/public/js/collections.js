@@ -15,6 +15,12 @@
 (function () {
     'use strict';
 
+    // -- Constants --
+    // Defense-in-depth: cap collections per session. A verified peer that
+    // floods 'batch-start' would otherwise allocate unbounded DOM/state on
+    // the receiver until the tab OOMs.
+    const MAX_COLLECTIONS_PER_SESSION = 64;
+
     // -- State --
     let collections = []; // [{id, name, timeStr, images: [{data, mimeType, name, ...}], renamed?}]
     let nextCollectionId = 0;
@@ -434,6 +440,12 @@
     function activeId() { return activeCollectionId; }
 
     function createNew() {
+        if (collections.length >= MAX_COLLECTIONS_PER_SESSION) {
+            if (window.logger) {
+                window.logger.warn(`Refused to create new collection: cap of ${MAX_COLLECTIONS_PER_SESSION} reached`);
+            }
+            return activeCollectionId;
+        }
         const now = new Date();
         const pad = n => String(n).padStart(2, '0');
         const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
@@ -640,6 +652,7 @@
         list,
         activeId,
         createNew,
+        MAX_COLLECTIONS_PER_SESSION,
         getActive,
         peekActive,
         getById,

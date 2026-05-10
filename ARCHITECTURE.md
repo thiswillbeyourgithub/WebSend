@@ -418,7 +418,18 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     counter caps total in-flight waiters across all rooms with 503. Each
     settle path (timeout, send, roomGone, client-abort) decrements the
     counter so it stays consistent across normal and TTL-expiry paths.
-19. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+19. **Receiver UI DoS hardening (anti-DoS)**: Two independent caps prevent a
+    verified-but-hostile peer (or any pre-verification flooder) from growing
+    receiver-side DOM/state without bound. (a) `Collections.createNew()`
+    refuses past `MAX_COLLECTIONS_PER_SESSION = 64`, so flooding `batch-start`
+    cannot allocate unbounded collection sections. The cap resets on
+    `Collections.reset()` (cross-session shred). (b) `logger.js` no longer
+    appends DOM nodes to `#logs-panel` while it is hidden, and when visible
+    trims `panel.children` to `logger.maxLogs = 500`; on next open
+    `renderLogs()` rebuilds from the bounded in-memory buffer. This blocks
+    the pre-verification log-flood OOM where each invalid wire message
+    triggered `logger.warn`/`error` and grew the panel forever.
+20. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

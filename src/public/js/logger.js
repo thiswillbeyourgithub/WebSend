@@ -192,15 +192,30 @@ function initLogsPanel() {
         div.innerHTML = `<span class="log-time">[${entry.time}]</span> <span class="${levelClass}">${escapeHtml(entry.message)}</span>`;
         panel.appendChild(div);
 
+        // Defense-in-depth DoS cap: window.logger.logs is already trimmed to
+        // maxLogs, but the panel DOM is appended to unconditionally (even
+        // while hidden, via the listener below). A hostile peer that floods
+        // pre-verification garbage would otherwise grow this panel without
+        // bound until the tab OOMs. Mirror the in-memory cap on the DOM.
+        const cap = (window.logger && window.logger.maxLogs) || 500;
+        while (panel.childNodes.length > cap) {
+            panel.removeChild(panel.firstChild);
+        }
+
         // Auto-scroll to bottom if panel is visible
         if (panel.classList.contains('visible')) {
             panel.scrollTop = panel.scrollHeight;
         }
     }
 
-    // Listen for new logs
+    // Listen for new logs. We only mutate the DOM when the panel is visible;
+    // when closed, renderLogs() will rebuild from the bounded in-memory log
+    // buffer on next open. This prevents any DOM growth during the hostile
+    // pre-verification window when the user has not opened the panel.
     window.logger.addListener(entry => {
-        appendLogEntry(entry);
+        if (panel.classList.contains('visible')) {
+            appendLogEntry(entry);
+        }
     });
 }
 
