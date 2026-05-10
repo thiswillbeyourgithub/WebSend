@@ -93,8 +93,12 @@
             BgOcr.queue(replaceIdx);
 
         } catch (e) {
+            // Local logger gets the full message; the peer only sees a
+            // constant tag so a hostile sender cannot use the receiver
+            // as an oracle for distinguishing canvas / image-decode /
+            // image-transforms internal failure modes.
             logger.error(`transform-image failed: ${e.message}`);
-            sendNack(oldHash, e?.message || 'transform-replay-failed');
+            sendNack(oldHash, 'transform-replay-failed');
         }
     }
 

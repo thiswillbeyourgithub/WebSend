@@ -233,8 +233,14 @@
                 await addNewReceivedImage(decoded);
             }
         } catch (e) {
+            // Local logger gets the full message; the peer only sees a
+            // constant. A peer-facing string would otherwise turn the
+            // receiver into an oracle for distinguishing AES-GCM tag
+            // failures from JSON parse errors / metadata-length
+            // overflows / missing keys, which lets a hostile sender
+            // narrow down probing attacks against the crypto layer.
             _logger.error('Failed to decrypt photo: ' + e.message);
-            if (!_getRtc().sendMessage(window.Protocol.build.fileNack(e.message))) {
+            if (!_getRtc().sendMessage(window.Protocol.build.fileNack('decrypt-failed'))) {
                 _logger.warn('Nack could not be sent (channel closed) — sender will time out');
             }
         }

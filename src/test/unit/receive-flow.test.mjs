@@ -263,13 +263,17 @@ test('handleEncryptedFile: missing sharedKey aborts without crash', async () => 
     // No throw, no calls into rtc — implicit assertion.
 });
 
-test('handleEncryptedFile: decryption failure sends file-nack', async () => {
+test('handleEncryptedFile: decryption failure sends generic file-nack (no message leak)', async () => {
     const win = loadIntoJsdom();
-    win.WebSendCrypto.decryptWithMetadata = async () => { throw new Error('bad tag'); };
+    // Specific internal error string MUST NOT round-trip back to the
+    // peer — that would let a hostile sender oracle-probe the crypto
+    // layer (tag-fail vs IV-len vs JSON-parse vs missing-key).
+    win.WebSendCrypto.decryptWithMetadata = async () => { throw new Error('AES-GCM tag check failed at offset 7'); };
     const { opts, sent } = makeDeps();
     win.ReceiveFlow.attach(opts);
     await win.ReceiveFlow.handleEncryptedFile({ blob: { arrayBuffer: async () => new ArrayBuffer(0) } });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].type, 'file-nack');
-    assert.match(sent[0].message, /bad tag/);
+    assert.equal(sent[0].message, 'decrypt-failed',
+        'peer-facing reason must be a constant, not the raw error message');
 });
