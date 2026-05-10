@@ -294,8 +294,8 @@
         editImg.src = URL.createObjectURL(photo.blob);
         editView.classList.remove('hidden');
 
-        // Reset B&W state
-        document.getElementById('gallery-bw-btn').classList.remove('active');
+        // Reflect persisted B&W toggle state for this photo
+        document.getElementById('gallery-bw-btn').classList.toggle('active', !!photo.preBWBlob);
     }
 
     function closeGalleryEdit() {
@@ -332,24 +332,62 @@
         }
     }
 
+    function _invalidateBWUndo(photo) {
+        // A non-BW transform breaks the undo chain: the saved pre-BW blob no
+        // longer matches the current pixel state, so a subsequent BW press
+        // must apply fresh rather than restore.
+        photo.preBWBlob = null;
+        document.getElementById('gallery-bw-btn').classList.remove('active');
+    }
+
     async function galleryRotateCW() {
         if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
-            galleryPhotos[galleryEditIndex].transforms.push({ op: 'rotateCW' });
+            const photo = galleryPhotos[galleryEditIndex];
+            photo.transforms.push({ op: 'rotateCW' });
+            _invalidateBWUndo(photo);
         }
         await applyGalleryTransform(blob => window.ImageTransforms.rotateImage(blob, { degrees: 90 }));
     }
 
     async function galleryFlipH() {
         if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
-            galleryPhotos[galleryEditIndex].transforms.push({ op: 'flipH' });
+            const photo = galleryPhotos[galleryEditIndex];
+            photo.transforms.push({ op: 'flipH' });
+            _invalidateBWUndo(photo);
         }
         await applyGalleryTransform(blob => window.ImageTransforms.flipImage(blob, { axis: 'h' }));
     }
 
     async function galleryApplyBW() {
-        if (galleryEditIndex >= 0 && galleryEditIndex < galleryPhotos.length) {
-            galleryPhotos[galleryEditIndex].transforms.push({ op: 'bw' });
+        if (galleryEditIndex < 0 || galleryEditIndex >= galleryPhotos.length) return;
+        const photo = galleryPhotos[galleryEditIndex];
+
+        // Toggle off: restore the pre-BW blob and pop the trailing bw op
+        if (photo.preBWBlob) {
+            const restored = photo.preBWBlob;
+            photo.preBWBlob = null;
+            if (photo.transforms.length > 0 && photo.transforms[photo.transforms.length - 1].op === 'bw') {
+                photo.transforms.pop();
+            }
+            if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
+            photo.blob = restored;
+            photo.thumbUrl = URL.createObjectURL(restored);
+
+            const editImg = document.getElementById('gallery-edit-image');
+            if (editImg.src && editImg.src.startsWith('blob:')) URL.revokeObjectURL(editImg.src);
+            editImg.src = URL.createObjectURL(restored);
+
+            document.getElementById('gallery-bw-btn').classList.remove('active');
+
+            if (photo.sentHash) {
+                _logger.info(`Sending transform commands for ${photo.sentHash.substring(0, 8)}... (B&W undone, ${photo.transforms.length} ops)`);
+                _getRtc().sendMessage(Protocol.build.transformImage(photo.sentHash, photo.transforms));
+            }
+            return;
         }
+
+        photo.preBWBlob = photo.blob;
+        photo.transforms.push({ op: 'bw' });
         await applyGalleryTransform(blob => window.ImageTransforms.binarize(blob));
         document.getElementById('gallery-bw-btn').classList.add('active');
     }
@@ -369,6 +407,7 @@
         photo.originalBlob = blob;
         photo.thumbUrl = URL.createObjectURL(blob);
         photo.transforms.push({ op: 'crop', corners });
+        _invalidateBWUndo(photo);
 
         if (photo.sentHash) {
             const oldHash = photo.sentHash;
