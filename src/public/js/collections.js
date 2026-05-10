@@ -422,6 +422,8 @@
             mainContainerEl.querySelectorAll('.received-image-item').forEach(card => {
                 try { window.ReceiveCard.revokeCardUrls(card); } catch (_) {}
             });
+            // Clear the DOM so dead cards don't linger after a shred.
+            mainContainerEl.replaceChildren();
         }
         collections = [];
         nextCollectionId = 0;

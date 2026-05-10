@@ -124,6 +124,18 @@
         ocrQueueSet.clear();
         bgOcrAbortController?.abort();
         currentOcrIndex = null;
+        ocrProcessing = false;
+        if (bgOcrScribe && bgOcrScribe.isAlive) {
+            try { bgOcrScribe.dispose(); } catch (_) {}
+        }
+        bgOcrScribe = null;
+        if (Array.isArray(receivedImagesRef)) {
+            for (const img of receivedImagesRef) {
+                if (!img) continue;
+                img.ocrPageData = null;
+                settleOcrPromise(img);
+            }
+        }
     }
 
     /**

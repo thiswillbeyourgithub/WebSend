@@ -66,7 +66,18 @@
     function reset() {
         exportCollectionId = null;
         clientZipPreloaded = null;
-        scribePreloaded = null;
+        // Dispose the preloaded scribe (if any) best-effort so its WASM
+        // worker doesn't keep recognized text or fonts in memory after the
+        // session is shredded. Fire-and-forget: callers don't await reset().
+        if (scribePreloaded) {
+            const p = scribePreloaded;
+            scribePreloaded = null;
+            Promise.resolve(p).then(handle => {
+                if (handle && handle.isAlive) {
+                    try { handle.dispose(); } catch (_) {}
+                }
+            }).catch(() => {});
+        }
         mupdfInstance = null;
     }
 

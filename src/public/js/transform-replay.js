@@ -98,5 +98,11 @@
         }
     }
 
-    window.TransformReplay = { attach, handle, applyTransformToData };
+    function reset() {
+        if (preBWData && typeof preBWData === 'object') {
+            for (const k of Object.keys(preBWData)) delete preBWData[k];
+        }
+    }
+
+    window.TransformReplay = { attach, handle, applyTransformToData, reset };
 })();
