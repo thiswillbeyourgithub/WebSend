@@ -66,9 +66,9 @@ WebSend/
     ├── healthcheck.js      # Tiny HTTP health probe used by the Dockerfile HEALTHCHECK
     ├── package.json        # Runtime dep: express ^5. Dev deps: @playwright/test,
     │                       #   canvas, jsdom (used by unit / e2e tests only)
-    ├── update-sri.js       # SRI hash generator for script/link integrity attributes;
-    │                       #   also bumps the service-worker CACHE_NAME timestamp so
-    │                       #   clients auto-reload after every deploy
+    ├── update-sri.js       # SRI hash generator for script/link integrity attributes:
+    │                       #   recomputes SHA-384 for every js/* and css/* file and
+    │                       #   patches the integrity="..." values in the HTML files
     ├── check-sri.js        # Verifier counterpart to update-sri.js: recomputes hashes
     │                       #   and fails CI / pre-push if any HTML integrity attribute
     │                       #   is stale
@@ -83,10 +83,10 @@ WebSend/
         ├── send.html       # Sender flow: QR scanning (jsQR), room joining, key exchange,
         │                   #   camera capture or file picker, encryption, chunked sending
         ├── manifest.json   # PWA manifest (installable as app on mobile)
-        ├── service-worker.js # PWA service worker: caches static assets for fast reload
-        │                   #   (stale-while-revalidate strategy; API calls bypass cache).
-        │                   #   CACHE_NAME is timestamped by update-sri.js on each deploy,
-        │                   #   triggering auto-reload via controllerchange in the clients
+        ├── service-worker.js # PWA service worker: network-first with cache fallback
+        │                   #   for static assets; API calls bypass the cache. Because
+        │                   #   the network is always tried first, a fresh deploy is
+        │                   #   picked up automatically without any cache-name bump
         │
         ├── css/
         │   └── style.css   # All styles: dark theme, large touch targets for accessibility,
