@@ -41,7 +41,8 @@ const stubDocument = {
 
 const win = await loadBrowserModule(modulePath, { document: stubDocument });
 const { applyOtsu, perspectiveTransform, distance,
-        rotateImage, flipImage, binarize, cropPerspective } = win.ImageTransforms;
+        rotateImage, flipImage, binarize, cropPerspective,
+        CROP_MAX_DIM } = win.ImageTransforms;
 
 // ---- applyOtsu ----
 
@@ -98,4 +99,11 @@ test('rotateImage / flipImage / binarize / cropPerspective are exported as funct
     assert.equal(typeof flipImage, 'function');
     assert.equal(typeof binarize, 'function');
     assert.equal(typeof cropPerspective, 'function');
+});
+
+test('CROP_MAX_DIM is exported as a sensible defensive ceiling', () => {
+    assert.equal(typeof CROP_MAX_DIM, 'number');
+    // Big enough to fit a 4K-class crop, small enough to bound a worst-case
+    // peer-driven createImageData allocation (8192*8192*4 = 256 MiB).
+    assert.ok(CROP_MAX_DIM >= 4096 && CROP_MAX_DIM <= 16384);
 });

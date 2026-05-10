@@ -96,6 +96,11 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - The `file-start` size validator enforces a 16 KiB floor (the smallest legitimate padded ciphertext) so a hostile peer cannot smuggle a tiny declared size to keep the receive buffer growing under the radar.
 - These caps fire at the WebRTC layer, before fingerprint verification, so a not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
 
+### Transform-Replay Hardening (Anti-DoS)
+- The `transform-image` validator caps `transforms[]` length (32 ops max) and, for `op:'crop'`, requires four `{tl, tr, br, bl}` corners with normalized `{x, y}` in `[0, 1]`. Peer-supplied corners outside that range are rejected before any pixel work happens.
+- `cropPerspective` defensively clamps its output dimensions to `min(srcDim * 2, 8192)` so even a validator bypass cannot drive a multi-GiB `createImageData` allocation or freeze the main thread on the inverse-mapping loop.
+- Peer-mutating handlers (`encrypted-file`, `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind both-sides fingerprint confirmation, so an unverified peer cannot push files, replay transforms, or rearrange the gallery while the verification modal is still up.
+
 ### Metadata Protection
 - File metadata (name, MIME type, original size) is **encrypted inside the payload**, not sent in plaintext over the data channel
 - Encrypted payloads are **padded to fixed bucket sizes** (16 KB to 32 MB, power-of-2) to hide the exact file size from network observers

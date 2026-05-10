@@ -394,7 +394,17 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     validator so a hostile peer cannot smuggle a tiny declared size to keep the buffer
     growing under the radar. These caps fire before fingerprint verification, so a
     not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
-17. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+17. **Transform-replay hardening (anti-DoS)**: `Protocol.isTransformArray` caps
+    `transforms[]` length at `MAX_TRANSFORMS_PER_MSG` (32) and, for `op:'crop'`,
+    requires `corners` to be `{tl,tr,br,bl}` with each `{x,y}` being a finite number
+    in `[0, 1]`. `cropPerspective` defensively clamps its output dimensions to
+    `min(srcDim * 2, CROP_MAX_DIM=8192)` so even a validator bypass cannot drive a
+    multi-GiB `createImageData` allocation or freeze the main thread on the inverse
+    mapping loop. Peer-mutating handlers in `receive.html` (`encrypted-file`,
+    `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind
+    `weConfirmed && theyConfirmed` so an unverified peer cannot push files, replay
+    transforms, or rearrange the gallery while the verification modal is still up.
+18. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

@@ -294,9 +294,22 @@ async function binarize(input) {
     return _canvasToBytes(canvas, 'image/png');
 }
 
+// Defensive ceiling on cropPerspective output dimensions. A legitimate crop
+// is by construction smaller than (or equal to) the source image, so anything
+// pushing past this is malformed or hostile (peer-supplied corners outside
+// [0, 1] would otherwise drive a giant createImageData allocation). Also
+// caps the inverse-mapping loop so the receiver main thread cannot be frozen.
+const CROP_MAX_DIM = 8192;
+
+function _clampCropDim(want, src) {
+    if (!Number.isFinite(want) || want <= 0) return Math.max(1, src);
+    return Math.min(Math.round(want), Math.max(1, src) * 2, CROP_MAX_DIM);
+}
+
 /**
  * Perspective-crop using normalized corner coordinates (each in [0,1]).
- * Output dimensions are derived from the longer of the parallel edges.
+ * Output dimensions are derived from the longer of the parallel edges,
+ * clamped to CROP_MAX_DIM and to twice the source dimension.
  * JPEG @0.92.
  * @param {Blob|{data,mimeType}} input
  * @param {{corners: {tl,tr,br,bl}}} opts - corners as {x,y} normalized to [0,1]
@@ -325,8 +338,8 @@ async function cropPerspective(input, opts) {
         const botW = distance(srcCorners[3], srcCorners[2]);
         const leftH = distance(srcCorners[0], srcCorners[3]);
         const rightH = distance(srcCorners[1], srcCorners[2]);
-        const dstW = Math.round(Math.max(topW, botW));
-        const dstH = Math.round(Math.max(leftH, rightH));
+        const dstW = _clampCropDim(Math.max(topW, botW), srcW);
+        const dstH = _clampCropDim(Math.max(leftH, rightH), srcH);
         const resultCanvas = perspectiveTransform(imgEl, srcCorners, dstW, dstH);
         return _canvasToBytes(resultCanvas, 'image/jpeg', 0.92);
     } finally {
@@ -348,6 +361,7 @@ function toBlob(result, fallbackMime = 'image/jpeg') {
 
 window.ImageTransforms = {
     applyOtsu, perspectiveTransform, distance,
-    rotateImage, flipImage, binarize, cropPerspective, toBlob
+    rotateImage, flipImage, binarize, cropPerspective, toBlob,
+    CROP_MAX_DIM,
 };
 })();

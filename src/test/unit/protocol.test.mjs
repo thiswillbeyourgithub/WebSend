@@ -8,9 +8,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const modulePath = path.resolve(__dirname, '../../public/js/protocol.js');
 const win = await loadBrowserModule(modulePath);
 const { validate, build, VERSION, MIN_FILE_START_SIZE, MAX_FILE_SIZE,
-        MAX_TOTAL_SESSION_BYTES } = win.Protocol;
+        MAX_TOTAL_SESSION_BYTES, MAX_TRANSFORMS_PER_MSG } = win.Protocol;
 
 const VALID_HASH = 'a'.repeat(64);
+const VALID_CROP_CORNERS = {
+    tl: { x: 0, y: 0 },
+    tr: { x: 1, y: 0 },
+    br: { x: 1, y: 1 },
+    bl: { x: 0, y: 1 },
+};
 
 // ---- VERSION ----
 
@@ -56,11 +62,85 @@ test('validate: file-start with size above MAX_FILE_SIZE is rejected', () => {
     assert.equal(validate({ type: 'file-start', size: Number.MAX_SAFE_INTEGER }).ok, false);
 });
 
-test('Protocol exposes MIN_FILE_START_SIZE and MAX_TOTAL_SESSION_BYTES', () => {
+test('Protocol exposes MIN_FILE_START_SIZE, MAX_TOTAL_SESSION_BYTES, MAX_TRANSFORMS_PER_MSG', () => {
     assert.equal(typeof MIN_FILE_START_SIZE, 'number');
     assert.ok(MIN_FILE_START_SIZE >= 16 * 1024);
     assert.equal(typeof MAX_TOTAL_SESSION_BYTES, 'number');
     assert.ok(MAX_TOTAL_SESSION_BYTES >= MAX_FILE_SIZE);
+    assert.equal(typeof MAX_TRANSFORMS_PER_MSG, 'number');
+    assert.ok(MAX_TRANSFORMS_PER_MSG >= 1 && MAX_TRANSFORMS_PER_MSG <= 1024);
+});
+
+// ---- transform-image bounds (Finding 2 / iteration 1) ----
+
+test('validate: transform-image with crop and valid corners is ok', () => {
+    const r = validate({
+        type: 'transform-image', oldHash: VALID_HASH,
+        transforms: [{ op: 'crop', corners: VALID_CROP_CORNERS }],
+    });
+    assert.equal(r.ok, true);
+});
+
+test('validate: transform-image rejects crop without corners', () => {
+    const r = validate({
+        type: 'transform-image', oldHash: VALID_HASH,
+        transforms: [{ op: 'crop' }],
+    });
+    assert.equal(r.ok, false);
+});
+
+test('validate: transform-image rejects crop with corners outside [0,1]', () => {
+    const corners = { ...VALID_CROP_CORNERS, br: { x: 50000, y: 50000 } };
+    const r = validate({
+        type: 'transform-image', oldHash: VALID_HASH,
+        transforms: [{ op: 'crop', corners }],
+    });
+    assert.equal(r.ok, false);
+});
+
+test('validate: transform-image rejects crop with negative corner', () => {
+    const corners = { ...VALID_CROP_CORNERS, tl: { x: -0.1, y: 0 } };
+    const r = validate({
+        type: 'transform-image', oldHash: VALID_HASH,
+        transforms: [{ op: 'crop', corners }],
+    });
+    assert.equal(r.ok, false);
+});
+
+test('validate: transform-image rejects crop with NaN corner', () => {
+    const corners = { ...VALID_CROP_CORNERS, tr: { x: NaN, y: 0 } };
+    const r = validate({
+        type: 'transform-image', oldHash: VALID_HASH,
+        transforms: [{ op: 'crop', corners }],
+    });
+    assert.equal(r.ok, false);
+});
+
+test('validate: transform-image rejects crop missing one corner key', () => {
+    const corners = { tl: { x: 0, y: 0 }, tr: { x: 1, y: 0 }, br: { x: 1, y: 1 } };
+    const r = validate({
+        type: 'transform-image', oldHash: VALID_HASH,
+        transforms: [{ op: 'crop', corners }],
+    });
+    assert.equal(r.ok, false);
+});
+
+test('validate: transform-image accepts MAX_TRANSFORMS_PER_MSG entries', () => {
+    const transforms = Array.from({ length: MAX_TRANSFORMS_PER_MSG }, () => ({ op: 'rotateCW' }));
+    const r = validate({ type: 'transform-image', oldHash: VALID_HASH, transforms });
+    assert.equal(r.ok, true);
+});
+
+test('validate: transform-image rejects MAX_TRANSFORMS_PER_MSG + 1 entries', () => {
+    const transforms = Array.from({ length: MAX_TRANSFORMS_PER_MSG + 1 }, () => ({ op: 'rotateCW' }));
+    const r = validate({ type: 'transform-image', oldHash: VALID_HASH, transforms });
+    assert.equal(r.ok, false);
+});
+
+test('validate: transform-image rejects huge transforms array (10^6 ops)', () => {
+    const transforms = new Array(1000000).fill({ op: 'rotateCW' });
+    const r = validate({ type: 'transform-image', oldHash: VALID_HASH, transforms });
+    assert.equal(r.ok, false);
 });
 
 test('validate: file-end (no fields) is ok', () => {

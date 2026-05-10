@@ -26,16 +26,38 @@
     // session of dozens of high-res photos rarely exceeds a few hundred MB).
     const MAX_TOTAL_SESSION_BYTES = 4 * 1024 * 1024 * 1024;
 
+    // Hard ceiling on transforms[] length per transform-image message. A
+    // legitimate sender batches at most a handful of edits (rotate/flip/bw/crop
+    // chained); 32 leaves comfortable headroom while bounding receiver CPU.
+    const MAX_TRANSFORMS_PER_MSG = 32;
+
     // Predicates used in schemas
     function isHex64(v) { return typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v); }
     function isBoundedSize(v) {
         return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v)
             && v >= MIN_FILE_START_SIZE && v <= MAX_FILE_SIZE;
     }
+    function isNormalizedCoord(v) {
+        return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
+    }
+    function isCornerObj(c) {
+        return c && typeof c === 'object' && isNormalizedCoord(c.x) && isNormalizedCoord(c.y);
+    }
+    function isCornersForCrop(corners) {
+        return corners && typeof corners === 'object'
+            && isCornerObj(corners.tl) && isCornerObj(corners.tr)
+            && isCornerObj(corners.br) && isCornerObj(corners.bl);
+    }
     function isTransformArray(v) {
-        if (!Array.isArray(v) || v.length === 0) return false;
+        if (!Array.isArray(v) || v.length === 0 || v.length > MAX_TRANSFORMS_PER_MSG) return false;
         const validOps = new Set(['rotateCW', 'flipH', 'bw', 'crop']);
-        return v.every(t => t && validOps.has(t.op));
+        return v.every(t => {
+            if (!t || !validOps.has(t.op)) return false;
+            // crop carries normalized corners that must be in [0, 1]; other ops
+            // have no parameters so any extra fields are ignored (forward-compat).
+            if (t.op === 'crop') return isCornersForCrop(t.corners);
+            return true;
+        });
     }
 
     // Schema: { required: { field: 'string'|'number'|'boolean'|predicateFn } }
@@ -110,6 +132,7 @@
         MAX_FILE_SIZE,
         MIN_FILE_START_SIZE,
         MAX_TOTAL_SESSION_BYTES,
+        MAX_TRANSFORMS_PER_MSG,
         validate,
         build,
         _schemas: schemas,
