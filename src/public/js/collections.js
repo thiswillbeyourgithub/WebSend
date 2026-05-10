@@ -597,7 +597,13 @@
         }
 
         receivedImagesRef[idx] = null;
-        if (card) card.remove();
+        // Drop the per-card DOM element if it's still mounted. Prior code
+        // referenced an undeclared `card` here, which threw ReferenceError
+        // under strict mode and left the node in the DOM after the underlying
+        // image was nulled. Same selector pattern as receive-card.js's
+        // revokeCardUrls / move helpers.
+        const cardEl = document.querySelector(`.received-image-item[data-image-index="${idx}"]`);
+        if (cardEl) cardEl.remove();
         onUpdateExportButton();
         window.logger.success('Deleted image with hash ' + hash.substring(0, 8) + '...');
     }
