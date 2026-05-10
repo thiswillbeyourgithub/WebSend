@@ -22,6 +22,7 @@
   - [Metadata Protection](#metadata-protection)
   - [Transfer Verification](#transfer-verification)
   - [No Phone Storage](#no-phone-storage)
+  - [Cross-Session Data Isolation](#cross-session-data-isolation)
   - [Docker Hardening](#docker-hardening)
   - [Subresource Integrity (SRI)](#subresource-integrity-sri)
   - [TURN Relay Security](#turn-relay-security)
@@ -104,6 +105,12 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - Photos are captured directly in the browser (no camera app) and **stay in browser memory only**
 - Photos are never written to the phone's gallery, filesystem, or local storage
 - Photos are kept in memory until the receiver confirms successful receipt — only then are they cleared
+
+### Cross-Session Data Isolation
+- A **new pairing on either device shreds all in-memory user data** (decrypted images, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, crypto keys) before establishing the new session
+- **Sender**: scanning a QR with a different `roomId` triggers a confirm prompt (when the gallery is non-empty) and then a local shred. The same-room reconnect path keeps the gallery intact, so a phone can re-pair after a network blip without losing unsent photos
+- **Receiver**: a sender disconnect keeps the same room and QR alive (so the same phone can re-scan and reconnect with data preserved). A deliberate **"Start new pairing"** button in the disconnect banner rotates to a fresh room and shreds everything
+- The signaling relay stores **only ephemeral SDP + ICE in an in-memory `Map`** with a 10-minute TTL and complete deletion on expiry — no database, no filesystem writes for room data, no cross-room caching
 
 ### Docker Hardening
 - Runs as a **non-root user** (UID 1001)

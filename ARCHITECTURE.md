@@ -384,6 +384,17 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
 15. **TURN relay security**: Time-based HMAC-SHA1 credentials with configurable TTL. Even
     when relayed through TURN, photos remain end-to-end encrypted — the TURN server only
     sees encrypted blobs.
+16. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+    user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
+    keys before establishing the new session. On the **sender**, scanning a QR with a
+    different roomId triggers a confirm prompt (when the gallery is non-empty) and then
+    a local shred; the same-room reconnect path keeps the gallery intact so a phone can
+    re-pair after a network blip without losing unsent photos. On the **receiver**, a
+    sender disconnect keeps the same room/QR alive (so the same phone can re-scan and
+    reconnect with data preserved), and a deliberate "Start new pairing" button rotates
+    to a fresh room and shreds everything. The signaling relay stores **only** ephemeral
+    SDP + ICE in an in-memory `Map` with a 10-minute TTL and complete deletion on expiry —
+    no database, no filesystem writes for room data, and no cross-room caching.
 
 ## SSO (Experimental)
 
