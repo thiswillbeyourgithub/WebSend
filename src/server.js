@@ -106,6 +106,58 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 // This ensures X-Forwarded-For cannot be spoofed by external clients.
 app.set('trust proxy', 'loopback');
 
+// ============ Defensive HTTP Headers ============
+// Defense-in-depth headers applied to every response. These do not replace
+// any existing protection (encryption, SRI, origin validation, CSRF-via-
+// custom-header) but are the cheap belts-and-braces layer that buys us
+// resilience against XSS / clickjacking / cross-origin leak vectors that
+// future code changes could otherwise re-introduce silently.
+//
+// Notes:
+//  - script-src includes 'unsafe-inline' because receive.html / send.html
+//    still have large inline <script> blocks. Removing those is a separate
+//    refactor (move them to dedicated .js files with SRI) that would let
+//    us drop 'unsafe-inline'. Even with it, CSP still blocks remote script
+//    injection (cross-origin), object/embed, framing, form posts, etc.
+//  - style-src 'unsafe-inline' is needed because the HTML uses inline
+//    style="..." attributes and a <style> block; same future cleanup path.
+//  - blob: is allowed in img-src/media-src/worker-src because the
+//    receiver builds blob: URLs from decrypted-then-octet-stream-wrapped
+//    bytes, and scribe.js ships a worker bundle that loads via blob:.
+//  - frame-ancestors 'none' replaces X-Frame-Options for browsers that
+//    honour CSP; we still set X-Frame-Options for older clients.
+//  - The COOP/CORP pair isolates this origin's window from cross-origin
+//    openers and prevents other origins from embedding our resources.
+const CSP_DIRECTIVES = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' blob: data:",
+    "media-src 'self' blob:",
+    "connect-src 'self'",
+    "worker-src 'self' blob:",
+    "child-src 'self' blob:",
+    "font-src 'self' data:",
+    "manifest-src 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'none'",
+].join('; ');
+
+app.use((req, res, next) => {
+    res.setHeader('Content-Security-Policy', CSP_DIRECTIVES);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    // Hash fragment carries the room secret; suppress full-URL leaks
+    // even though most browsers already strip fragments from Referer.
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Permissions-Policy', 'interest-cohort=(), browsing-topics=()');
+    next();
+});
+
 // Parse JSON bodies
 app.use(express.json({ limit: '50kb' }));
 

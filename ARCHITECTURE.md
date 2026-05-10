@@ -444,7 +444,22 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     truth is `ReceiveCard.makeSafeBlobUrl()` (`js/receive-card.js`); all
     receiver paths (decrypted files, transform replay, in-place rotate /
     B&W / crop) flow through it.
-21. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+21. **Defensive HTTP headers**: Every response carries a baseline header
+    set so a future code mistake (or compromised third-party asset) is
+    constrained by the browser even if it slips past application-level
+    checks: a Content-Security-Policy with `default-src 'self'`,
+    `object-src 'none'`, `frame-ancestors 'none'`, `form-action 'none'`,
+    `base-uri 'self'` and a `connect-src 'self'` confined to our own
+    origin; `X-Content-Type-Options: nosniff`; `X-Frame-Options: DENY`;
+    `Referrer-Policy: no-referrer` (defends the room secret in the URL
+    hash); `Cross-Origin-Opener-Policy: same-origin` and
+    `Cross-Origin-Resource-Policy: same-origin` to isolate our window
+    from cross-origin openers and embedders; and a `Permissions-Policy`
+    that disables the FLoC / Topics tracking surfaces. Inline
+    `<script>`/`<style>` in the HTML are still allowed via
+    `'unsafe-inline'` because the page logic is currently inline; moving
+    that out is a follow-up that lets us drop the exception.
+22. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then
