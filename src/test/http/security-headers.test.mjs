@@ -46,6 +46,28 @@ test('Static vendor asset carries the full security-header set', async () => {
     await assertAllPresent(`${srv.baseUrl}/vendor/client-zip.js`);
 });
 
+test('CSP includes the Umami origin in script-src/connect-src when configured', async () => {
+    // Spin up a second server with Umami env wired so we can confirm the
+    // CSP rewrite path: without this the analytics tracker (loaded from
+    // a different origin and POSTing back) is silently blocked by our
+    // strict default `script-src 'self'` / `connect-src 'self'`.
+    const srv2 = await startServer({
+        UMAMI_URL: 'https://umami.example.org',
+        UMAMI_WEBSITE_ID: 'abc-123',
+        UMAMI_DNT: 'true',
+    });
+    try {
+        const res = await fetch(`${srv2.baseUrl}/api/config`);
+        const csp = res.headers.get('content-security-policy') || '';
+        assert.match(csp, /script-src [^;]*https:\/\/umami\.example\.org/,
+            `script-src must include the Umami origin (got: "${csp}")`);
+        assert.match(csp, /connect-src [^;]*https:\/\/umami\.example\.org/,
+            `connect-src must include the Umami origin (got: "${csp}")`);
+    } finally {
+        await stopServer(srv2.proc);
+    }
+});
+
 test('404 response carries a CSP at least as restrictive as ours', async () => {
     // serve-static's built-in 404 page sets its own (stricter) CSP
     // (default-src 'none') so the body is rendered with no powers at

@@ -25,6 +25,16 @@ const UMAMI_WEBSITE_ID = process.env.UMAMI_WEBSITE_ID || '';
 // UMAMI_DNT: whether to respect Do Not Track browser setting ("true" or "false", default: "true")
 const UMAMI_DNT = process.env.UMAMI_DNT || 'true';
 
+// Pre-compute the Umami origin (scheme + host + port, no path) so we can
+// extend the CSP script-src / connect-src / img-src to allow loading the
+// tracker and posting events back to it. If UMAMI_URL is malformed,
+// `new URL` throws and we leave UMAMI_ORIGIN empty; the strict validation
+// below (UMAMI_URL_RE) will then exit() before any request is served.
+let UMAMI_ORIGIN = '';
+if (UMAMI_URL) {
+    try { UMAMI_ORIGIN = new URL(UMAMI_URL).origin; } catch { /* validated later */ }
+}
+
 // OCR settings (scribe.js)
 const OCR_LANGS = process.env.OCR_LANGS || 'eng,fra';
 const OCR_PSM = process.env.OCR_PSM || '12';
@@ -128,13 +138,18 @@ app.set('trust proxy', 'loopback');
 //    honour CSP; we still set X-Frame-Options for older clients.
 //  - The COOP/CORP pair isolates this origin's window from cross-origin
 //    openers and prevents other origins from embedding our resources.
+// Extend script-src + connect-src + img-src with the Umami origin only
+// when configured. Tracker loads from `${UMAMI_URL}/getinfo` (script) and
+// POSTs events to the same origin (connect); some Umami themes also use
+// 1px image beacons, so include img-src for safety.
+const _umamiSrc = UMAMI_ORIGIN ? ` ${UMAMI_ORIGIN}` : '';
 const CSP_DIRECTIVES = [
     "default-src 'self'",
-    "script-src 'self' 'unsafe-inline'",
+    `script-src 'self' 'unsafe-inline'${_umamiSrc}`,
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' blob: data:",
+    `img-src 'self' blob: data:${_umamiSrc}`,
     "media-src 'self' blob:",
-    "connect-src 'self'",
+    `connect-src 'self'${_umamiSrc}`,
     "worker-src 'self' blob:",
     "child-src 'self' blob:",
     "font-src 'self' data:",
