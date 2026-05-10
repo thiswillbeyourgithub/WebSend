@@ -240,6 +240,12 @@
         }
     }
 
+    function revokeAllThumbs() {
+        galleryPhotos.forEach(p => {
+            if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
+        });
+    }
+
     function clearGallery() {
         galleryPhotos.forEach(p => {
             if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
@@ -253,6 +259,27 @@
         galleryPhotos = [];
         updateGalleryBadge();
         closeGallery();
+    }
+
+    /**
+     * Local-only shred. Same as clearGallery() but does NOT send deleteImage
+     * messages to the receiver — used when the connection is being torn down
+     * for a brand-new pairing (where the receiver we'd notify is about to be
+     * a different device, or the channel is already gone). Also drops any
+     * queued-but-not-yet-sent photos via the SenderSend queue.
+     */
+    function shredLocal() {
+        revokeAllThumbs();
+        galleryPhotos.forEach(p => {
+            try { _removeQueuedPhotoById(p.id); } catch (_) {}
+        });
+        galleryPhotos = [];
+        galleryEditIndex = -1;
+        updateGalleryBadge();
+        closeGallery();
+        if (window.SenderSend && typeof window.SenderSend.clear === 'function') {
+            try { window.SenderSend.clear(); } catch (_) {}
+        }
     }
 
     function openGalleryEdit(idx) {
@@ -381,6 +408,7 @@
         renderGalleryGrid,
         deleteGalleryPhoto,
         clearGallery,
+        shredLocal,
         openGalleryEdit,
         closeGalleryEdit,
         galleryRotateCW,

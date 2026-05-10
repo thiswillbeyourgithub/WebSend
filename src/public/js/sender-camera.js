@@ -142,6 +142,15 @@
         const video = document.getElementById('capture-video');
         const container = video.parentElement;
 
+        // Guard: if a prior capture stream is still alive (possible if the caller
+        // forgot stopCapture() or a re-entry races), stop its tracks before
+        // grabbing a new one so the camera doesn't end up with two live
+        // MediaStreams running in the background.
+        if (captureStream) {
+            try { captureStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+            captureStream = null;
+        }
+
         try {
             captureStream = await navigator.mediaDevices.getUserMedia({
                 video: {

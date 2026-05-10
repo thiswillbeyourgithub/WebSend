@@ -44,6 +44,36 @@
     // ============ Room Joining ============
 
     async function join(roomId, secret) {
+        // If we're switching to a different roomId (i.e. a brand-new pairing,
+        // not a same-room reconnect), shred any in-memory user data first.
+        // Confirm with the user only when the gallery is non-empty so we don't
+        // silently drop unsent or recently sent photos.
+        if (lastRoomId && lastRoomId !== roomId) {
+            if (window.Gallery && window.Gallery.size() > 0) {
+                const msg = _i18n.t('send.confirmShredOnNewPairing');
+                if (!confirm(msg)) {
+                    _logger.info('User declined new pairing; staying on current room');
+                    if (_onScanRequested) _onScanRequested();
+                    return;
+                }
+            }
+            _logger.info('Switching to new pairing — shredding local state');
+            if (window.Gallery && typeof window.Gallery.shredLocal === 'function') {
+                window.Gallery.shredLocal();
+            }
+            if (window.SenderSend && typeof window.SenderSend.clear === 'function') {
+                window.SenderSend.clear();
+            }
+            keyPair = null;
+            sharedKey = null;
+            weConfirmed = false;
+            theyConfirmed = false;
+            if (rtc) {
+                try { rtc.close(); } catch (_) {}
+                rtc = null;
+            }
+        }
+
         lastRoomId = roomId;
         lastSecret = secret;
         const statusEl = document.getElementById('connection-status');
@@ -257,8 +287,19 @@
             rtc.receiveBuffer = [];
             try { rtc.close(); } catch (_) {}
         }
+        rtc = null;
         keyPair = null;
         sharedKey = null;
+        weConfirmed = false;
+        theyConfirmed = false;
+        lastRoomId = null;
+        lastSecret = null;
+        if (window.Gallery && typeof window.Gallery.shredLocal === 'function') {
+            try { window.Gallery.shredLocal(); } catch (_) {}
+        }
+        if (window.wakeLockMgr && typeof window.wakeLockMgr.release === 'function') {
+            try { window.wakeLockMgr.release(); } catch (_) {}
+        }
     }
 
     /** Pre-room initialization so getRtc()/getSharedKey() are stable. */
