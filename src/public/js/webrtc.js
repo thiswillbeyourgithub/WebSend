@@ -33,6 +33,13 @@ class WebSendRTC {
         this.receivedSize = 0;
         this.expectedSize = 0;
         this._lastLoggedDecile = -1;
+        // Cumulative bytes received across the entire data-channel session.
+        // Bounded by Protocol.MAX_TOTAL_SESSION_BYTES so a hostile peer cannot
+        // loop file-start/binary/file-end forever and exhaust the receiver.
+        this._sessionTotalBytes = 0;
+        // Latched once we tear down for protocol abuse, so further chunks land
+        // in a no-op instead of re-firing onDisconnected.
+        this._abusiveTeardown = false;
 
         // ICE candidate handling
         this.pendingIceCandidates = [];
@@ -342,9 +349,34 @@ class WebSendRTC {
                 logger.error('Failed to parse message: ' + e.message);
             }
         } else {
-            // Binary data (file chunk)
+            // Binary data (file chunk).
+            // Defense-in-depth bounds: drop and tear down on any of:
+            //   1. chunk arrives before a valid file-start (expectedSize <= 0)
+            //   2. cumulative receivedSize would exceed expectedSize
+            //   3. session aggregate would exceed Protocol.MAX_TOTAL_SESSION_BYTES
+            // Without these checks a peer can stream arbitrary binary forever
+            // and OOM the tab before the manual fingerprint ceremony completes.
+            if (this._abusiveTeardown) return;
+            const len = data.byteLength | 0;
+            if (this.expectedSize <= 0) {
+                this._abortAbusiveStream('binary chunk before file-start');
+                return;
+            }
+            if (this.receivedSize + len > this.expectedSize) {
+                this._abortAbusiveStream(
+                    `chunk overflow: received ${this.receivedSize} + ${len} > expected ${this.expectedSize}`
+                );
+                return;
+            }
+            if (this._sessionTotalBytes + len > Protocol.MAX_TOTAL_SESSION_BYTES) {
+                this._abortAbusiveStream(
+                    `session byte cap exceeded (${this._sessionTotalBytes + len} > ${Protocol.MAX_TOTAL_SESSION_BYTES})`
+                );
+                return;
+            }
             this.receiveBuffer.push(data);
-            this.receivedSize += data.byteLength;
+            this.receivedSize += len;
+            this._sessionTotalBytes += len;
             const decile = Math.floor((this.receivedSize / this.expectedSize) * 10) * 10;
             if (decile !== this._lastLoggedDecile) {
                 this._lastLoggedDecile = decile;
@@ -357,6 +389,27 @@ class WebSendRTC {
                     total: this.expectedSize
                 });
             }
+        }
+    }
+
+    /**
+     * Tear down the data channel on detected protocol abuse and surface a
+     * disconnect to the application. Latched via _abusiveTeardown so any
+     * trailing chunks already in the queue become no-ops.
+     */
+    _abortAbusiveStream(reason) {
+        if (this._abusiveTeardown) return;
+        this._abusiveTeardown = true;
+        logger.error(`Aborting peer connection: ${reason}`);
+        // Discard any partially-buffered file so the assembled blob never reaches
+        // the application layer with truncated/poisoned bytes.
+        this.receiveBuffer = [];
+        this.receivedSize = 0;
+        this.expectedSize = 0;
+        try { if (this.dataChannel) this.dataChannel.close(); } catch (_) {}
+        try { if (this.pc) this.pc.close(); } catch (_) {}
+        if (this.onDisconnected) {
+            try { this.onDisconnected(); } catch (_) {}
         }
     }
 
@@ -1154,6 +1207,8 @@ class WebSendRTC {
         this.receivedSize = 0;
         this.expectedSize = 0;
         this._lastLoggedDecile = -1;
+        this._sessionTotalBytes = 0;
+        this._abusiveTeardown = false;
         this.pendingIceCandidates = [];
         if (this.dataChannel) {
             this.dataChannel.close();

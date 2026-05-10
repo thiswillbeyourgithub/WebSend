@@ -384,7 +384,17 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
 15. **TURN relay security**: Time-based HMAC-SHA1 credentials with configurable TTL. Even
     when relayed through TURN, photos remain end-to-end encrypted — the TURN server only
     sees encrypted blobs.
-16. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+16. **Receiver-side payload bounding (anti-DoS)**: The data-channel binary branch refuses
+    chunks that arrive before a valid `file-start`, refuses any chunk that would push the
+    in-flight file past its declared `expectedSize`, and refuses any chunk that would
+    push the cumulative session bytes past `Protocol.MAX_TOTAL_SESSION_BYTES` (4 GiB).
+    On any of those, the data channel and peer connection are torn down immediately and
+    the application is notified via `onDisconnected`. `Protocol.MIN_FILE_START_SIZE`
+    (16 KiB, the smallest legitimate padded ciphertext) tightens the file-start size
+    validator so a hostile peer cannot smuggle a tiny declared size to keep the buffer
+    growing under the radar. These caps fire before fingerprint verification, so a
+    not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
+17. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

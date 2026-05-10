@@ -91,6 +91,11 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - **Origin header validation** blocks cross-origin API requests from unauthorized websites (CSRF-like protection)
 - Express **trusts proxy headers only from loopback**, so `X-Forwarded-For` cannot be spoofed by external clients (designed to run behind [Caddy](https://caddyserver.com/))
 
+### Receiver Payload Bounding (Anti-DoS)
+- The data-channel binary branch refuses chunks that arrive before a valid `file-start`, refuses any chunk that would push the in-flight file past its declared size, and refuses any chunk that would push the cumulative session bytes past 4 GiB. On any of those, the data channel and peer connection are torn down immediately.
+- The `file-start` size validator enforces a 16 KiB floor (the smallest legitimate padded ciphertext) so a hostile peer cannot smuggle a tiny declared size to keep the receive buffer growing under the radar.
+- These caps fire at the WebRTC layer, before fingerprint verification, so a not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
+
 ### Metadata Protection
 - File metadata (name, MIME type, original size) is **encrypted inside the payload**, not sent in plaintext over the data channel
 - Encrypted payloads are **padded to fixed bucket sizes** (16 KB to 32 MB, power-of-2) to hide the exact file size from network observers

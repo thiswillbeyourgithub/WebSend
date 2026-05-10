@@ -7,7 +7,8 @@ import path from 'node:path';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const modulePath = path.resolve(__dirname, '../../public/js/protocol.js');
 const win = await loadBrowserModule(modulePath);
-const { validate, build, VERSION } = win.Protocol;
+const { validate, build, VERSION, MIN_FILE_START_SIZE, MAX_FILE_SIZE,
+        MAX_TOTAL_SESSION_BYTES } = win.Protocol;
 
 const VALID_HASH = 'a'.repeat(64);
 
@@ -39,8 +40,27 @@ test('validate: ready (no fields) is ok', () => {
     assert.equal(validate({ type: 'ready' }).ok, true);
 });
 
-test('validate: file-start with number size is ok', () => {
-    assert.equal(validate({ type: 'file-start', size: 1024 }).ok, true);
+test('validate: file-start with number size at the bucket floor is ok', () => {
+    assert.equal(validate({ type: 'file-start', size: MIN_FILE_START_SIZE }).ok, true);
+});
+
+test('validate: file-start with size below MIN_FILE_START_SIZE is rejected', () => {
+    assert.equal(validate({ type: 'file-start', size: MIN_FILE_START_SIZE - 1 }).ok, false);
+    assert.equal(validate({ type: 'file-start', size: 1024 }).ok, false);
+    assert.equal(validate({ type: 'file-start', size: 0 }).ok, false);
+    assert.equal(validate({ type: 'file-start', size: -1 }).ok, false);
+});
+
+test('validate: file-start with size above MAX_FILE_SIZE is rejected', () => {
+    assert.equal(validate({ type: 'file-start', size: MAX_FILE_SIZE + 1 }).ok, false);
+    assert.equal(validate({ type: 'file-start', size: Number.MAX_SAFE_INTEGER }).ok, false);
+});
+
+test('Protocol exposes MIN_FILE_START_SIZE and MAX_TOTAL_SESSION_BYTES', () => {
+    assert.equal(typeof MIN_FILE_START_SIZE, 'number');
+    assert.ok(MIN_FILE_START_SIZE >= 16 * 1024);
+    assert.equal(typeof MAX_TOTAL_SESSION_BYTES, 'number');
+    assert.ok(MAX_TOTAL_SESSION_BYTES >= MAX_FILE_SIZE);
 });
 
 test('validate: file-end (no fields) is ok', () => {
@@ -173,8 +193,8 @@ test('build.fingerprintConfirmed produces valid message', () => {
 });
 
 test('build.fileStart produces valid message', () => {
-    const m = build.fileStart(2048);
-    assert.equal(m.size, 2048);
+    const m = build.fileStart(MIN_FILE_START_SIZE);
+    assert.equal(m.size, MIN_FILE_START_SIZE);
     assert.equal(validate(m).ok, true);
 });
 

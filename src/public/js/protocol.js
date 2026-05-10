@@ -12,10 +12,25 @@
     // request a multi-GB allocation or break progress arithmetic.
     const MAX_FILE_SIZE = 1024 * 1024 * 1024;
 
+    // Hard lower bound on a single encrypted-file payload. The smallest legitimate
+    // ciphertext is one padding bucket (16 KiB) plus AES-GCM IV (12 B) and tag
+    // (16 B). Anything below this is a malformed or hostile file-start that
+    // upstream callers should drop. Defense-in-depth alongside the receiver-side
+    // actual-byte cap.
+    const MIN_FILE_START_SIZE = 16 * 1024;
+
+    // Hard ceiling on the cumulative bytes a single peer may push across the
+    // entire data-channel session. Even with the per-file expectedSize cap a
+    // hostile peer could otherwise loop file-start/binary/file-end forever and
+    // exhaust the receiver tab. 4 GiB is well above legitimate use (a camera
+    // session of dozens of high-res photos rarely exceeds a few hundred MB).
+    const MAX_TOTAL_SESSION_BYTES = 4 * 1024 * 1024 * 1024;
+
     // Predicates used in schemas
     function isHex64(v) { return typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v); }
     function isBoundedSize(v) {
-        return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v >= 0 && v <= MAX_FILE_SIZE;
+        return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v)
+            && v >= MIN_FILE_START_SIZE && v <= MAX_FILE_SIZE;
     }
     function isTransformArray(v) {
         if (!Array.isArray(v) || v.length === 0) return false;
@@ -90,5 +105,13 @@
         batchEnd:              ()                        => stamp({ type: 'batch-end' }),
     };
 
-    window.Protocol = { VERSION: PROTOCOL_VERSION, MAX_FILE_SIZE, validate, build, _schemas: schemas };
+    window.Protocol = {
+        VERSION: PROTOCOL_VERSION,
+        MAX_FILE_SIZE,
+        MIN_FILE_START_SIZE,
+        MAX_TOTAL_SESSION_BYTES,
+        validate,
+        build,
+        _schemas: schemas,
+    };
 })();
