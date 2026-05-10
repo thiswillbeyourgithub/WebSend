@@ -394,6 +394,9 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     validator so a hostile peer cannot smuggle a tiny declared size to keep the buffer
     growing under the radar. These caps fire before fingerprint verification, so a
     not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
+    The CLI shim (`src/cli/shim.js`) mirrors the same three bound checks plus a
+    verified-fingerprint gate on `file-start`/`file-end`/`batch-end` and binary chunks,
+    so the optional Node CLI receiver path enjoys the same protection as the browser path.
 17. **Transform-replay hardening (anti-DoS)**: `Protocol.isTransformArray` caps
     `transforms[]` length at `MAX_TRANSFORMS_PER_MSG` (32) and, for `op:'crop'`,
     requires `corners` to be `{tl,tr,br,bl}` with each `{x,y}` being a finite number

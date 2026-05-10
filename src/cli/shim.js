@@ -185,26 +185,68 @@
 
         let sharedKey = null;
         let buffer = [], bufSize = 0, expected = 0;
+        // Verified-fingerprint gate. Mirrors VERIFIED_GATED_HANDLERS in
+        // receive.html: state-mutating peer messages and binary chunks are
+        // dropped until both sides confirm the ECDH fingerprint.
+        let weConfirmed = false, theyConfirmed = false;
+        // Cumulative bytes since dc opened, bounded by Protocol.MAX_TOTAL_SESSION_BYTES.
+        // Mirrors WebSendRTC._sessionTotalBytes (src/public/js/webrtc.js).
+        let sessionTotalBytes = 0;
+        // Latched once we tear down for protocol abuse so trailing chunks no-op.
+        let abusiveTeardown = false;
         const state = { savedCount: 0, savedBytes: 0 };
 
         const send = (m) => dc.send(JSON.stringify(m));
 
+        // Tear down on detected protocol abuse. Same shape as
+        // WebSendRTC._abortAbusiveStream: latch, close channel + pc, surface
+        // the abort to the Node side via __nodeDone so receive.js can exit
+        // with a non-zero status instead of a confused stack trace.
+        const abortAbusive = (reason) => {
+            if (abusiveTeardown) return;
+            abusiveTeardown = true;
+            log('err', `Aborting peer connection: ${reason}`);
+            buffer = []; bufSize = 0; expected = 0;
+            try { dc.close(); } catch (_) {}
+            try { pc.close(); } catch (_) {}
+            try { window.__nodeDone({ ...state, abusive: true, reason }); } catch (_) {}
+        };
+
         dc.onmessage = async (ev) => {
             try {
+                if (abusiveTeardown) return;
                 const d = ev.data;
                 if (typeof d === 'string') {
                     const msg = JSON.parse(d);
                     const vr = P.validate(msg);
                     if (!vr.ok) { log('warn', `drop: ${vr.error}`); return; }
+                    // Peer-controlled handlers that mutate state or run heavy
+                    // work on peer-supplied parameters: drop until both sides
+                    // confirm the fingerprint. Mirrors
+                    // VERIFIED_GATED_HANDLERS in src/public/receive.html.
+                    const verifiedGated = (
+                        msg.type === 'file-start' ||
+                        msg.type === 'file-end' ||
+                        msg.type === 'batch-end'
+                    );
+                    if (verifiedGated && !(weConfirmed && theyConfirmed)) {
+                        log('warn', `Dropping ${msg.type} from unverified peer`);
+                        return;
+                    }
                     if (msg.type === 'sender-public-key') {
                         const theirPub = await C.importPublicKey(msg.key);
                         sharedKey = await C.deriveSharedKey(keyPair.privateKey, theirPub);
                         const myFp    = await C.getKeyFingerprint(keyPair.publicKey, fpLen);
                         const theirFp = await C.getKeyFingerprint(theirPub, fpLen);
                         const ok = autoAccept ? true : await window.__nodePromptFp(myFp, theirFp);
-                        if (ok) { send(P.build.fingerprintConfirmed()); log('ok', 'Fingerprint confirmed'); }
+                        if (ok) {
+                            weConfirmed = true;
+                            send(P.build.fingerprintConfirmed());
+                            log('ok', 'Fingerprint confirmed');
+                        }
                         else { send(P.build.fingerprintDenied()); log('err', 'Denied'); try { dc.close(); } catch {} }
                     } else if (msg.type === 'fingerprint-confirmed') {
+                        theyConfirmed = true;
                         log('dbg', 'sender confirmed');
                     } else if (msg.type === 'fingerprint-denied') {
                         log('err', 'sender denied');
@@ -215,7 +257,7 @@
                     } else if (msg.type === 'file-end') {
                         const blob = new Blob(buffer);
                         const arr = await blob.arrayBuffer();
-                        buffer = []; bufSize = 0;
+                        buffer = []; bufSize = 0; expected = 0;
                         if (!sharedKey) { log('err', 'file-end before key derived'); return; }
                         try {
                             const dec = await C.decryptWithMetadata(arr, sharedKey);
@@ -236,9 +278,30 @@
                         log('dbg', `(ignored) ${msg.type}`);
                     }
                 } else {
-                    // Binary chunk (ArrayBuffer because dc.binaryType = 'arraybuffer')
+                    // Binary chunk (ArrayBuffer because dc.binaryType = 'arraybuffer').
+                    // Defense-in-depth bounds — mirror webrtc.js:351-379 so the CLI
+                    // does not absorb unbounded peer-controlled bytes before
+                    // fingerprint verification completes.
+                    if (!(weConfirmed && theyConfirmed)) {
+                        return abortAbusive('binary chunk from unverified peer');
+                    }
+                    const len = d.byteLength | 0;
+                    if (expected <= 0) {
+                        return abortAbusive('binary chunk before file-start');
+                    }
+                    if (bufSize + len > expected) {
+                        return abortAbusive(
+                            `chunk overflow: received ${bufSize} + ${len} > expected ${expected}`
+                        );
+                    }
+                    if (sessionTotalBytes + len > P.MAX_TOTAL_SESSION_BYTES) {
+                        return abortAbusive(
+                            `session byte cap exceeded (${sessionTotalBytes + len} > ${P.MAX_TOTAL_SESSION_BYTES})`
+                        );
+                    }
                     buffer.push(d);
-                    bufSize += d.byteLength;
+                    bufSize += len;
+                    sessionTotalBytes += len;
                 }
             } catch (e) {
                 log('err', `handler: ${e.message}`);
