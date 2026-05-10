@@ -459,7 +459,18 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     `<script>`/`<style>` in the HTML are still allowed via
     `'unsafe-inline'` because the page logic is currently inline; moving
     that out is a follow-up that lets us drop the exception.
-22. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+22. **Signaling-API hardening**: every `/api/*` response carries
+    `Cache-Control: no-store` so a misbehaving CDN or browser cache
+    cannot replay another session's offer / TURN credentials / room
+    state to a different user. Both ICE-poll endpoints
+    (`GET /api/rooms/:id/ice/offer` and `.../ice/answer`) sit behind the
+    same per-IP rate limiter as their POST counterparts so a peer
+    cannot turn the room secret into an unbounded read amplifier. Room
+    creation re-tries collisions at most `MAX_ROOM_ID_TRIES` (32) times
+    before returning 503, capping the worst-case allocation cost so a
+    pathological state (huge live-room set, broken RNG) cannot peg the
+    event loop.
+23. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

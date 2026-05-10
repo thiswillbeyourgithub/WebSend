@@ -357,6 +357,18 @@ function validateOrigin(req, res, next) {
 // Apply origin validation to all API routes
 app.use('/api', validateOrigin);
 
+// /api/* responses are per-request signaling state (room offer/answer/ICE,
+// active-room counts, TURN credentials) and must not be cached anywhere
+// downstream. Without this a misbehaving CDN or browser cache could serve
+// stale offers / re-issue expired TURN credentials, or surface another
+// session's state to a different user. Setting it here (before the route
+// handlers) ensures every /api/* response carries the directive even if a
+// future handler forgets.
+app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+});
+
 /**
  * Middleware to validate room secret from X-Room-Secret header.
  *
@@ -606,8 +618,18 @@ app.get('/api/config', (req, res) => {
  */
 app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
     let roomId;
-    // Ensure unique room ID
+    // Ensure unique room ID. Bounded by MAX_ROOM_ID_TRIES so a future
+    // pathological state (huge live-room set, broken RNG, etc.) cannot
+    // turn this into an unbounded loop that pegs the event loop and
+    // takes the server down. The roomId space (32^6 ≈ 10^9) plus the
+    // 10-minute TTL means we should never hit this in practice.
+    const MAX_ROOM_ID_TRIES = 32;
+    let tries = 0;
     do {
+        if (++tries > MAX_ROOM_ID_TRIES) {
+            console.warn(`Room ID collision after ${MAX_ROOM_ID_TRIES} tries, refusing`);
+            return res.status(503).json({ error: 'Server temporarily unable to allocate room id' });
+        }
         roomId = helpers.generateRoomId();
     } while (rooms.has(roomId));
 
@@ -860,7 +882,7 @@ app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoo
  * GET /api/rooms/:id/ice/offer
  * Headers: X-Room-Secret required
  */
-app.get('/api/rooms/:id/ice/offer', validateRoomSecret, (req, res) => {
+app.get('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
     debugLog('ICE', `Offer ICE candidates retrieved for room ${req.params.id}`, {
         count: req.room.iceCandidatesOffer.length
     });
@@ -892,7 +914,7 @@ app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRo
  * GET /api/rooms/:id/ice/answer
  * Headers: X-Room-Secret required
  */
-app.get('/api/rooms/:id/ice/answer', validateRoomSecret, (req, res) => {
+app.get('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
     debugLog('ICE', `Answer ICE candidates retrieved for room ${req.params.id}`, {
         count: req.room.iceCandidatesAnswer.length
     });
