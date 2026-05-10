@@ -307,21 +307,23 @@ app.use('/api', validateOrigin);
 
 /**
  * Middleware to validate room secret from X-Room-Secret header.
- * Returns 401 if secret is missing or invalid.
+ *
+ * Defense-in-depth: returns the same 401 status and generic message for
+ * three distinct failure modes (room missing, secret missing, secret
+ * mismatch) so an attacker without the secret cannot enumerate which
+ * roomIds are live by probing. We still run secureCompare against a
+ * dummy when the room is missing so the timing of the response does not
+ * leak room existence either. The 22-char base64url secret is the real
+ * defense; this just removes the cheap oracle in front of it.
  */
+const _DUMMY_SECRET = 'dummy-secret-for-constant-time-compare';
 function validateRoomSecret(req, res, next) {
     const room = rooms.get(req.params.id);
-    if (!room) {
-        return res.status(404).json({ error: 'Room not found' });
-    }
-
-    const providedSecret = req.headers['x-room-secret'];
-    if (!providedSecret) {
-        return res.status(401).json({ error: 'Room secret required' });
-    }
-
-    if (!helpers.secureCompare(providedSecret, room.secret)) {
-        return res.status(401).json({ error: 'Invalid room secret' });
+    const providedSecret = req.headers['x-room-secret'] || '';
+    const compareTarget = room ? room.secret : _DUMMY_SECRET;
+    const ok = providedSecret && helpers.secureCompare(providedSecret, compareTarget);
+    if (!room || !ok) {
+        return res.status(401).json({ error: 'Invalid or missing room secret' });
     }
 
     // Attach room to request for use in handler

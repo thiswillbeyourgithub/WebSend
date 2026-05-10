@@ -41,9 +41,23 @@ test('GET /api/rooms/:id reports existence and offer/answer state', async () => 
     assert.deepEqual(await res.json(), { exists: true, hasOffer: true, hasAnswer: false });
 });
 
-test('GET /api/rooms/:id on nonexistent room returns 404', async () => {
+test('GET /api/rooms/:id on nonexistent room returns 401 (no enumeration oracle)', async () => {
+    // Defense-in-depth: validateRoomSecret returns 401 (not 404) when the
+    // room is missing, so an attacker without the room secret cannot probe
+    // a roomId to learn whether it exists.
     const res = await get(`${srv.baseUrl}/api/rooms/ZZZZZZ`, 'anysecret');
-    assert.equal(res.status, 404);
+    assert.equal(res.status, 401);
+});
+
+test('Probing nonexistent vs existing-with-bad-secret yields the same 401', async () => {
+    const { roomId } = await newRoom();
+    const wrongOnExisting = await get(`${srv.baseUrl}/api/rooms/${roomId}`, 'wrongsecret');
+    const onMissing = await get(`${srv.baseUrl}/api/rooms/ZZZZZZ`, 'wrongsecret');
+    assert.equal(wrongOnExisting.status, 401);
+    assert.equal(onMissing.status, 401);
+    // Body shape must match too — the error message should not give away
+    // whether the room exists.
+    assert.deepEqual(await wrongOnExisting.json(), await onMissing.json());
 });
 
 test('GET /api/rooms/:id/offer returns 404 when no offer posted yet', async () => {
