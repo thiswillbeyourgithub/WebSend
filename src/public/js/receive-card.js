@@ -14,6 +14,35 @@
 (function () {
     'use strict';
 
+    // Defense-in-depth: every blob: URL this module hands to <img>, the
+    // download <a>, the lightbox, or the crop modal is allocated with the
+    // application/octet-stream MIME, regardless of what the peer claimed.
+    //
+    // Why: the receiver gets file bytes + a peer-controlled MIME from the
+    // encrypted metadata. If we put that MIME on the URL-bound Blob, then
+    //   1. middle-click / Ctrl+click / right-click "Open in New Tab" on the
+    //      download link bypasses the `download` attribute and navigates to
+    //      the blob: URL,
+    //   2. blob: URLs inherit the document's origin,
+    //   3. so an attacker who reaches the file-delivery stage with
+    //      mimeType: 'text/html' (or 'image/svg+xml') gets their bytes
+    //      rendered as a same-origin document and can read the room secret
+    //      from location.hash, exfiltrate other received files, or hijack
+    //      the WebRTC peer.
+    // Forcing octet-stream tells the browser to download rather than render
+    // when the URL is opened directly. <img> tags content-sniff bytes
+    // regardless of the blob MIME, so thumbnails still display correctly.
+    const SAFE_BLOB_TYPE = 'application/octet-stream';
+
+    /** Wrap arbitrary file bytes (or an existing Blob) into an octet-stream
+     *  Blob and return its blob: URL. Free with URL.revokeObjectURL when done. */
+    function makeSafeBlobUrl(dataOrBlob) {
+        const safeBlob = (dataOrBlob instanceof Blob)
+            ? new Blob([dataOrBlob], { type: SAFE_BLOB_TYPE })
+            : new Blob([dataOrBlob], { type: SAFE_BLOB_TYPE });
+        return URL.createObjectURL(safeBlob);
+    }
+
     function renderCard(opts) {
         const {
             url, filename, imageIndex, collectionId, fileType, fileSize, mimeType,
@@ -216,12 +245,16 @@
     /**
      * Replace a card's img src and download href with a fresh blob URL created
      * from `blob`. Revokes the previous URL. Returns the new URL string.
+     *
+     * The input Blob's MIME (often peer-controlled or transform-derived) is
+     * always replaced with application/octet-stream before allocating the
+     * URL — see SAFE_BLOB_TYPE rationale at the top of this file.
      */
     function setCardImage(imageIndex, blob, opts = {}) {
         const img = document.getElementById(`img-${imageIndex}`);
         const dl  = document.getElementById(`download-${imageIndex}`);
         const oldUrl = img ? img.src : (dl ? dl.href : '');
-        const newUrl = URL.createObjectURL(blob);
+        const newUrl = makeSafeBlobUrl(blob);
         if (img) img.src = newUrl;
         if (dl)  dl.href = newUrl;
         if (dl && opts.filename) dl.download = opts.filename;
@@ -246,5 +279,5 @@
         }
     }
 
-    window.ReceiveCard = { renderCard, setCardImage, revokeCardUrls };
+    window.ReceiveCard = { renderCard, setCardImage, revokeCardUrls, makeSafeBlobUrl, SAFE_BLOB_TYPE };
 })();

@@ -44,7 +44,11 @@ function loadIntoJsdom({ decryptResult } = {}) {
         setName: () => {},
         addReceivedFile: () => {},
     };
-    win.ReceiveCard = { setCardImage: () => {} };
+    win.ReceiveCard = {
+        setCardImage: () => {},
+        makeSafeBlobUrl: () => 'blob:test/safe',
+        SAFE_BLOB_TYPE: 'application/octet-stream',
+    };
     win.ReceiveExport = { preloadClientZip: () => {} };
     win.BgOcr = { queue: () => {}, cancel: () => {} };
 

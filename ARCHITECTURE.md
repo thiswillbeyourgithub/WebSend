@@ -429,7 +429,22 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     `renderLogs()` rebuilds from the bounded in-memory buffer. This blocks
     the pre-verification log-flood OOM where each invalid wire message
     triggered `logger.warn`/`error` and grew the panel forever.
-20. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+20. **Octet-stream blob URLs (anti-XSS)**: Every `blob:` URL the receiver
+    hands to an `<img>`, the download `<a>`, the lightbox, or the crop
+    modal is allocated with `application/octet-stream`, regardless of the
+    peer-supplied `metadata.mimeType`. Without this, a verified peer could
+    deliver a file with `mimeType: 'text/html'` (or `image/svg+xml`) and a
+    user middle-click / right-click "Open in New Tab" on the download
+    link or thumbnail would bypass the `download` attribute and navigate
+    to the `blob:` URL — which inherits the document's origin — letting
+    the peer execute JavaScript in the receiver origin and exfiltrate the
+    room secret, other received files, or the WebRTC peer. Forcing
+    octet-stream tells the browser to download instead of render. `<img>`
+    tags content-sniff so thumbnails still display. The single source of
+    truth is `ReceiveCard.makeSafeBlobUrl()` (`js/receive-card.js`); all
+    receiver paths (decrypted files, transform replay, in-place rotate /
+    B&W / crop) flow through it.
+21. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

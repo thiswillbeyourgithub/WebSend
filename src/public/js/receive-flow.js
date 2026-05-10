@@ -122,7 +122,11 @@
 
     async function addNewReceivedImage(decoded) {
         const { metadata, data, fileData, fileMimeType, fileBlob, fileType, fileName } = decoded;
-        const fileUrl = URL.createObjectURL(fileBlob);
+        // makeSafeBlobUrl always wraps in application/octet-stream so that
+        // navigating to the URL (right-click "Open in New Tab" on the
+        // download link or the thumbnail) cannot render peer-supplied
+        // text/html or image/svg+xml inside our origin.
+        const fileUrl = window.ReceiveCard.makeSafeBlobUrl(fileData);
         const imageIndex = receivedImages.length;
         const imgObj = {
             data: fileData,

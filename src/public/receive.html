@@ -161,11 +161,11 @@
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-YrOsZ+KNCRdbEqMAqD2Kr9ZJyh8NFohqhtlm9umir//2LvO4k9A+58yEnph68ZIN"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-twhi90qYKLsHy8NjR3nXRw6Do/NaEaSUIwOAJcIjDpaa5Mn9t4xXgsdQC1eCFlTn"></script>
-    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-jmbs2WN52h9SkRpJ2lohLmqnjamiu0nRINJYMpKj/EKMWER0/mZayY6LAgZQK00K"></script>
+    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-x2IPsyTNA0IAWiquN0jJdEsjyWrFhwGY+kMAxUf7at0wDscTVzn2qfmxTKwrgi8l"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-yokDKyM3jzIjbD9WP5dawsHfzvYK1NiysIfEUvObI7lwV3BdlYYCx2ojlF5nB2s1"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-zPGCk0WbtXhxsvfaVJrvOZN+6bSpzMcfELt2wmLlyyn8ZL5ETUdcm/wsJEsW2yoR"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-WzDsRuOwgy9WT7z+OLRHu0oRgsEGVSNNowbM+OJZpb/OBCgdstG08sCtd6WGlfcU"></script>
-    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-eyhXvDLHytvcy7Bzjdd9ufPgSBOJuE0KRFA4GKLznx8sFhWKNzxJ8EsdDrblLuO8"></script>
+    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-JwN5yp8rDFZbtc/xLnMzxSEkphON8beEnald5QpNHXJrKmXlh1breAkUz1luMpRr"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-4ejmHnrXtYaNI3bsYQdn8kgGUK464t8L37n0fkWEcNSY2t2OYJUHfPX/k/5TAhhC"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -1317,7 +1317,11 @@
             logger.info(`Opening crop modal for image ${imageIndex}`);
             const imgData = receivedImages[imageIndex];
             if (!imgData) return;
-            const sourceBlob = new Blob([imgData.data], { type: imgData.mimeType });
+            // Force application/octet-stream so the crop modal's blob: URL
+            // cannot render peer-controlled HTML/SVG when navigated to via
+            // context-menu "Open Image in New Tab". <img> tags content-sniff
+            // so the displayed crop preview still renders.
+            const sourceBlob = new Blob([imgData.data], { type: ReceiveCard.SAFE_BLOB_TYPE });
 
             CropModal.open({
                 sourceBlob,
