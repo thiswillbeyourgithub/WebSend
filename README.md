@@ -87,9 +87,10 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - This prevents room enumeration and unauthorized room access even if an attacker guesses or brute-forces the short room ID
 
 ### Rate Limiting and Origin Validation
-- **Per-IP rate limiting** on room creation (5/min), room lookups (30/min), and general API calls (100/min) to prevent DoS and enumeration
+- **Per-IP rate limiting** on room creation (5/min), room lookups (30/min), and general API calls (100/min) to prevent DoS and enumeration. The general 100/min cap also covers `GET /api/rooms/:id/answer?wait=true` so a peer holding a valid secret cannot pipeline long-polls to exhaust memory.
 - **Origin header validation** blocks cross-origin API requests from unauthorized websites (CSRF-like protection)
 - Express **trusts proxy headers only from loopback**, so `X-Forwarded-For` cannot be spoofed by external clients (designed to run behind [Caddy](https://caddyserver.com/))
+- **Long-poll waiter caps**: layered defense for `?wait=true`. A per-room cap (4 concurrent waiters) refuses extras with 429, and a process-wide ceiling (10000 in-flight waiters) refuses extras with 503, before any socket / closure / timer is allocated.
 
 ### Receiver Payload Bounding (Anti-DoS)
 - The data-channel binary branch refuses chunks that arrive before a valid `file-start`, refuses any chunk that would push the in-flight file past its declared size, and refuses any chunk that would push the cumulative session bytes past 4 GiB. On any of those, the data channel and peer connection are torn down immediately.

@@ -76,3 +76,39 @@ test('aborting a pending long-poll does not crash the server', async () => {
     const ok = await fetch(`${srv.baseUrl}/api/config`);
     assert.equal(ok.status, 200);
 });
+
+test('long-poll: per-room waiter cap rejects 5th concurrent waiter with 429', async () => {
+    const { roomId, secret } = await newRoom();
+    const url = `${srv.baseUrl}/api/rooms/${roomId}/answer?wait=true`;
+    const headers = { 'X-Room-Secret': secret };
+    const acs = [];
+    const pendings = [];
+
+    // Open MAX_WAITERS_PER_ROOM (4) concurrent long-polls. None should resolve
+    // immediately; they all park on the waiter queue.
+    for (let i = 0; i < 4; i++) {
+        const ac = new AbortController();
+        acs.push(ac);
+        pendings.push(fetch(url, { headers, signal: ac.signal }));
+    }
+    // Give the server a tick to register all four waiters.
+    await new Promise(r => setTimeout(r, 100));
+
+    // The 5th call must be rejected with 429 before allocating a waiter.
+    const overflow = await fetch(url, { headers });
+    assert.equal(overflow.status, 429);
+    assert.ok(overflow.headers.get('retry-after'));
+
+    // Tear down: abort the 4 in-flight long-polls so they don't keep the test
+    // hanging for 30s.
+    acs.forEach(ac => ac.abort());
+    await Promise.allSettled(pendings);
+
+    // After abort, the cap clears and a new waiter can register again.
+    await new Promise(r => setTimeout(r, 200));
+    const ac = new AbortController();
+    const reopen = fetch(url, { headers, signal: ac.signal });
+    await new Promise(r => setTimeout(r, 100));
+    ac.abort();
+    await assert.rejects(reopen, /aborted|abort/i);
+});

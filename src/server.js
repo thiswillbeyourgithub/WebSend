@@ -337,6 +337,8 @@ function cleanupRooms() {
     for (const [id, room] of rooms.entries()) {
         if (now - room.created > ROOM_TTL) {
             // Drain pending long-pollers with 404 before deleting the room.
+            // Each waiter's settle() decrements _totalWaiters, so the global
+            // counter stays consistent across normal and TTL-expiry paths.
             if (room.answerWaiters && room.answerWaiters.length) {
                 const waiters = room.answerWaiters.splice(0);
                 for (const w of waiters) w.roomGone();
@@ -346,6 +348,20 @@ function cleanupRooms() {
         }
     }
 }
+
+// Long-poll waiter caps. Each waiter on /api/rooms/:id/answer pins a TCP
+// socket, an Express response, a setTimeout handle, and a closure for up to
+// TIMEOUT_MS. Without a cap, any client holding a valid room secret can
+// pipeline thousands of `?wait=true` requests over a single HTTP/2 connection
+// and exhaust server memory and FDs. Three layered caps:
+//   - MAX_WAITERS_PER_ROOM bounds a single attacker focusing on one room.
+//   - MAX_TOTAL_WAITERS bounds a many-room or many-IP attacker.
+//   - rateLimitMiddleware('general') bounds the request rate per IP.
+// Legitimate use is at most one in-flight long-poll per peer, with a brief
+// transient overlap during reconnect, so 4 per room is generous.
+const MAX_WAITERS_PER_ROOM = 4;
+const MAX_TOTAL_WAITERS = 10_000;
+let _totalWaiters = 0;
 
 // Run cleanup every minute
 setInterval(cleanupRooms, 60 * 1000);
@@ -715,13 +731,26 @@ app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSe
  * Headers: X-Room-Secret required
  * Query: ?wait=true for long-polling (up to 30 seconds)
  */
-app.get('/api/rooms/:id/answer', validateRoomSecret, (req, res) => {
+app.get('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
     // Fast path: answer already available, or caller didn't ask to wait.
     if (req.room.answer) {
         return res.json(req.room.answer);
     }
     if (req.query.wait !== 'true') {
         return res.status(204).send();
+    }
+
+    // Defense-in-depth caps: bound the live waiter count both per-room and
+    // process-wide. Refuse new long-polls (429 / 503) before allocating any
+    // socket / closure / timer. The rate limit middleware above is the third
+    // independent layer (per-IP request rate).
+    if (req.room.answerWaiters.length >= MAX_WAITERS_PER_ROOM) {
+        res.set('Retry-After', '5');
+        return res.status(429).json({ error: 'Too many concurrent long-polls on this room' });
+    }
+    if (_totalWaiters >= MAX_TOTAL_WAITERS) {
+        res.set('Retry-After', '5');
+        return res.status(503).json({ error: 'Server temporarily overloaded' });
     }
 
     // Long-polling: register a one-shot waiter on the room. POST /answer
@@ -735,6 +764,7 @@ app.get('/api/rooms/:id/answer', validateRoomSecret, (req, res) => {
         const idx = req.room.answerWaiters.indexOf(waiter);
         if (idx !== -1) req.room.answerWaiters.splice(idx, 1);
         if (waiter.timer) clearTimeout(waiter.timer);
+        _totalWaiters--;
         fn();
     };
     const waiter = {
@@ -745,6 +775,7 @@ app.get('/api/rooms/:id/answer', validateRoomSecret, (req, res) => {
     };
     waiter.timer = setTimeout(waiter.timeout, TIMEOUT_MS);
     req.room.answerWaiters.push(waiter);
+    _totalWaiters++;
 
     // If the client disconnects, drop the waiter without writing a response.
     req.on('close', () => settle(() => {}));

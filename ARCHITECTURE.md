@@ -404,7 +404,18 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind
     `weConfirmed && theyConfirmed` so an unverified peer cannot push files, replay
     transforms, or rearrange the gallery while the verification modal is still up.
-18. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+18. **Long-poll waiter caps (anti-DoS)**: `GET /api/rooms/:id/answer?wait=true`
+    is layered behind three independent caps so a peer holding a valid room
+    secret cannot exhaust server memory or file descriptors by pipelining
+    `?wait=true` requests over HTTP/2: (a) `rateLimitMiddleware('general')`
+    caps per-IP request rate at 100/min, the same policy already applied to
+    every other room-scoped endpoint; (b) `MAX_WAITERS_PER_ROOM = 4` rejects
+    excess concurrent long-polls per room with 429 before allocating any
+    socket / closure / timer; (c) a process-wide `MAX_TOTAL_WAITERS = 10000`
+    counter caps total in-flight waiters across all rooms with 503. Each
+    settle path (timeout, send, roomGone, client-abort) decrements the
+    counter so it stays consistent across normal and TTL-expiry paths.
+19. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then
