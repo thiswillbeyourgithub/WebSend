@@ -146,7 +146,7 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-tvGVrnUklP2w6gHGZOWvIktlEb6qOVl4HbLIZvX9W7jSsVOpXJptovcF6aYtnL2i"></script>
-    <script src="/js/i18n.js" integrity="sha384-AsIU49CV6rvgS/Dbjr043q0owQE77aNXRAAydcKB/ubxC5gFFVZ/P3gN91t2jKEd"></script>
+    <script src="/js/i18n.js" integrity="sha384-EFagEtoWbXRJpXaspebze8cu+RBcsufVQnaHTF/5pCydW5kPVF+qT8g7uHDR7Ihq"></script>
     <script src="/js/logger.js" integrity="sha384-fD+ze2xMp4Zu9H/36Ch7gkthgMXBfZr1waSWv88i+tUjSfU/0zydXMyKGDrEr3VL"></script>
     <script src="/js/sidebar.js" integrity="sha384-/U8SVvkBBZP3hrcOKPfuVac0ZA9lxVlHl5fc3TqgI9565wo2JOMwG+OGf3thdosd"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-/gzZ7L0lKHe10PNpEnyyj/UyaNEl2woHG4WQz11dIRiPcWpbspO25nS1aCJl0FYd"></script>
@@ -281,7 +281,7 @@
                 const state = rtc.pc.connectionState;
                 if (state === 'failed' || state === 'disconnected') {
                     logger.info('Page visible again — connection lost, restarting...');
-                    reconnectReceiver();
+                    reconnectReceiverSameRoom();
                 }
             }
         });
@@ -333,7 +333,10 @@
                 rtc.waitForAnswer().catch(e => {
                     logger.error('Failed waiting for answer: ' + e.message);
                     if (e && e.name === 'RoomGoneError') {
-                        reconnectReceiver();
+                        // Server-side room expired: the QR is no longer valid, so a
+                        // brand-new room is mandatory. Treat this as a new pairing
+                        // and shred any in-memory data first.
+                        startNewPairing();
                         return;
                     }
                     document.getElementById('status-waiting').textContent = i18n.t('receive.expired');
@@ -543,12 +546,19 @@
             logger.warn('Disconnected from sender');
             wakeLockMgr.release();
 
-            // If we already have images, keep them visible and show a reconnect banner
-            // instead of jumping back to the QR code screen
+            // If we already have images, keep them visible and show a reconnect
+            // banner so the SAME phone can re-scan the SAME QR. The banner also
+            // exposes a deliberate "new pairing" action that shreds everything
+            // and rotates to a fresh QR.
             if (receivedImages.filter(img => img !== null).length > 0) {
                 showReconnectBanner();
+                // Re-prepare the same-room offer in the background so the QR
+                // immediately works again for the same sender.
+                reconnectReceiverSameRoom();
             } else {
-                reconnectReceiver();
+                // No data to preserve: same-room reconnect (still no shred,
+                // since there is nothing to shred).
+                reconnectReceiverSameRoom();
             }
         }
 
@@ -578,8 +588,18 @@
             bannerBtn.className = 'btn btn-action btn-primary';
             bannerBtn.style.width = '100%';
             bannerBtn.textContent = i18n.t('receive.showQRCode');
-            bannerBtn.addEventListener('click', reconnectReceiver);
-            banner.replaceChildren(bannerMsg, bannerBtn);
+            bannerBtn.addEventListener('click', () => {
+                document.getElementById('step-qr').classList.remove('hidden');
+            });
+            const newPairingBtn = document.createElement('button');
+            newPairingBtn.className = 'btn btn-action';
+            newPairingBtn.style.cssText = 'width: 100%; margin-top: 10px; background: #c62828; color: white;';
+            newPairingBtn.textContent = i18n.t('receive.startNewPairing');
+            newPairingBtn.addEventListener('click', () => {
+                if (!confirm(i18n.t('receive.startNewPairingConfirm'))) return;
+                startNewPairing();
+            });
+            banner.replaceChildren(bannerMsg, bannerBtn, newPairingBtn);
             banner.classList.remove('hidden');
         }
 
@@ -589,14 +609,28 @@
             if (banner) banner.classList.add('hidden');
         }
 
-        async function reconnectReceiver() {
-            logger.info('Reconnecting receiver...');
-            // Show reconnecting status on whichever step is currently visible
+        /**
+         * Same-room reconnect: keep the existing roomId/roomSecret (and therefore
+         * the displayed QR), but tear down the per-pairing crypto + RTC state and
+         * publish a fresh SDP offer so the same sender can re-scan the same QR.
+         * Does NOT shred user data — that's the explicit "new pairing" path.
+         */
+        async function reconnectReceiverSameRoom() {
+            logger.info('Reconnecting receiver (same room, preserving data)...');
             const statusEl = document.querySelector('#step-connected .status') ||
                              document.querySelector('#step-qr .status');
             if (statusEl) {
                 statusEl.textContent = i18n.t('receive.reconnecting');
                 statusEl.className = 'status status-info';
+            }
+
+            // Capture room identity before tearing down rtc.
+            const keepRoomId = rtc?.roomId;
+            const keepRoomSecret = roomSecret;
+            if (!keepRoomId || !keepRoomSecret) {
+                // No room identity to preserve — fall back to a fresh pairing.
+                // (This should only happen if reconnect is called before init().)
+                return startNewPairing();
             }
 
             // Close existing connection
@@ -605,11 +639,13 @@
                 rtc = null;
             }
 
-            // Reset crypto state
+            // Reset per-pairing crypto state. User data (receivedImages, OCR,
+            // preBWData, collections) is intentionally preserved.
             keyPair = null;
             sharedKey = null;
             weConfirmed = false;
             theyConfirmed = false;
+            pendingReplaceHash = null;
 
             // If we have images, keep step-connected visible and show QR inline
             const hasImages = receivedImages.filter(img => img !== null).length > 0;
@@ -628,17 +664,24 @@
                 rtc.onStateChange = onStateChange;
                 rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
 
-                const roomInfo = await rtc.createRoom();
-                roomSecret = roomInfo.secret;
+                // Reuse the same roomId/secret so the displayed QR stays valid.
+                rtc.roomId = keepRoomId;
+                rtc.roomSecret = keepRoomSecret;
+                roomSecret = keepRoomSecret;
                 await rtc.createOfferAndStore();
-                await generateQRCode();
 
-                // Acquire wake lock while waiting for new sender
+                // Acquire wake lock while waiting for sender to reconnect
                 wakeLockMgr.desired = true;
                 await wakeLockMgr.acquire();
 
                 rtc.waitForAnswer().catch(e => {
                     logger.error('Failed waiting for answer: ' + e.message);
+                    if (e && e.name === 'RoomGoneError') {
+                        // Same-room reconnect raced the 10-min server TTL —
+                        // the QR is no longer valid. Shred and rotate.
+                        startNewPairing();
+                        return;
+                    }
                     const statusWaiting = document.getElementById('status-waiting');
                     if (statusWaiting) {
                         statusWaiting.textContent = i18n.t('receive.expired');
@@ -655,17 +698,108 @@
         }
 
         /**
+         * Explicit new-pairing: shred ALL in-memory user data (decrypted images,
+         * OCR text, preBWData, collections, blob URLs, scribe instance, crypto
+         * keys), then create a fresh room and QR. Used by the "Start new pairing"
+         * banner button and as the fallback when the server-side room is gone.
+         */
+        async function startNewPairing() {
+            logger.info('Starting new pairing — shredding all in-memory data');
+            cleanupAllData();
+            hideReconnectBanner();
+
+            // Reset connected-step UI back to its initial state.
+            document.getElementById('step-connected').classList.add('hidden');
+            const connectedStatus = document.querySelector('#step-connected .status');
+            if (connectedStatus) {
+                connectedStatus.textContent = i18n.t('receive.connectedWaiting');
+                connectedStatus.className = 'status status-connected';
+            }
+            const exportSection = document.getElementById('export-section');
+            if (exportSection) exportSection.classList.add('hidden');
+            const photosPlaceholder = document.getElementById('received-images');
+            if (photosPlaceholder) {
+                const ph = document.createElement('p');
+                ph.style.cssText = 'color: #888; text-align: center; grid-column: 1 / -1;';
+                ph.setAttribute('data-i18n', 'receive.photosPlaceholder');
+                ph.textContent = i18n.t('receive.photosPlaceholder');
+                photosPlaceholder.replaceChildren(ph);
+            }
+            document.getElementById('step-qr').classList.remove('hidden');
+            const statusWaiting = document.getElementById('status-waiting');
+            if (statusWaiting) {
+                statusWaiting.textContent = i18n.t('receive.reconnecting');
+                statusWaiting.className = 'status status-info';
+            }
+
+            try {
+                keyPair = await WebSendCrypto.generateKeyPair();
+                rtc = new WebSendRTC();
+                await rtc.init();
+                rtc.onConnected = onConnected;
+                rtc.onDisconnected = onDisconnected;
+                rtc.onMessage = onMessage;
+                rtc.onStateChange = onStateChange;
+                rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
+
+                const roomInfo = await rtc.createRoom();
+                roomSecret = roomInfo.secret;
+                await rtc.createOfferAndStore();
+                await generateQRCode();
+
+                wakeLockMgr.desired = true;
+                await wakeLockMgr.acquire();
+
+                rtc.waitForAnswer().catch(e => {
+                    logger.error('Failed waiting for answer: ' + e.message);
+                    if (e && e.name === 'RoomGoneError') {
+                        startNewPairing();
+                        return;
+                    }
+                    if (statusWaiting) {
+                        statusWaiting.textContent = i18n.t('receive.expired');
+                        statusWaiting.className = 'status status-error';
+                    }
+                });
+            } catch (e) {
+                logger.error('New pairing failed: ' + e.message);
+                if (statusWaiting) {
+                    statusWaiting.textContent = i18n.t('receive.reconnectFailed');
+                    statusWaiting.className = 'status status-error';
+                }
+            }
+        }
+
+        /**
          * Clean up all sensitive data: revoke object URLs, clear image data,
-         * and close the WebRTC connection. Called on page unload and can be
-         * called manually for a full cleanup.
+         * and close the WebRTC connection. Called on page unload and on the
+         * explicit "new pairing" path (startNewPairing). After this returns,
+         * no decrypted user data, OCR text, preBW pixels, blob URLs, or
+         * crypto state should remain in memory.
          */
         function cleanupAllData() {
             // Revoke all object URLs from displayed images
             document.querySelectorAll('.received-image-item').forEach(c => ReceiveCard.revokeCardUrls(c));
-            // Cancel all background OCR
+            // Cancel all background OCR + dispose scribe + null per-image OCR
             BgOcr.reset();
-            // Clear image data from memory
+            // Empty the preBWData map (transform-replay's pre-binarization buffers)
+            if (window.TransformReplay && typeof TransformReplay.reset === 'function') {
+                TransformReplay.reset();
+            }
+            // Dispose the preloaded export scribe handle
+            if (window.ReceiveExport && typeof ReceiveExport.reset === 'function') {
+                ReceiveExport.reset();
+            }
+            // Defence in depth: null decrypted byte buffers on each image
+            // before dropping the array entries.
             for (let i = 0; i < receivedImages.length; i++) {
+                const img = receivedImages[i];
+                if (img && typeof img === 'object') {
+                    img.data = null;
+                    img.originalData = null;
+                    img.ocrPageData = null;
+                    img.pendingOcr = null;
+                }
                 receivedImages[i] = null;
             }
             // Clear in place to preserve the array reference held by Collections.
@@ -676,9 +810,16 @@
                 rtc.receiveBuffer = [];
                 rtc.close();
             }
-            // Clear crypto keys
+            // Clear crypto + per-pairing state
             keyPair = null;
             sharedKey = null;
+            weConfirmed = false;
+            theyConfirmed = false;
+            pendingReplaceHash = null;
+            photoCount = 0;
+            receiveXferStart = null;
+            receiveLastStatsUpdate = 0;
+            receiveLastTotal = 0;
             // Release wake lock
             wakeLockMgr.release();
         }

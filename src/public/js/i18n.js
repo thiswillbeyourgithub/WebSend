@@ -222,9 +222,12 @@ const i18n = (function() {
             'receive.reconnectFailed': 'Reconnection failed. Reload the page to restart.',
             'receive.senderDisconnected': 'Sender disconnected',
             'receive.showQRCode': 'Show QR Code to reconnect',
+            'receive.startNewPairing': 'Start new pairing (deletes photos)',
+            'receive.startNewPairingConfirm': 'Starting a new pairing will permanently delete the photos received so far. Continue?',
             'send.disconnectedHint': 'Connection lost. Reload the page or click Back to restart.',
             'send.reconnecting': 'Reconnecting...',
             'send.reconnectFailed': 'Reconnection failed. Reload the page or click Back to restart.',
+            'send.confirmShredOnNewPairing': 'You have unsent or recently sent photos in this gallery. Connecting to a new receiver will delete them. Continue?',
 
             // Errors
             'error.noPhotoOrKey': 'No photo or key exchange not complete',
@@ -440,9 +443,12 @@ const i18n = (function() {
             'receive.reconnectFailed': 'Reconnexion échouée. Rechargez la page pour recommencer.',
             'receive.senderDisconnected': 'Expéditeur déconnecté',
             'receive.showQRCode': 'Afficher le QR Code pour reconnecter',
+            'receive.startNewPairing': 'Nouvel appairage (supprime les photos)',
+            'receive.startNewPairingConfirm': 'Démarrer un nouvel appairage supprimera définitivement les photos reçues. Continuer ?',
             'send.disconnectedHint': 'Connexion perdue. Rechargez la page ou cliquez sur Retour pour redémarrer.',
             'send.reconnecting': 'Reconnexion en cours...',
             'send.reconnectFailed': 'Reconnexion échouée. Rechargez la page ou cliquez sur Retour pour recommencer.',
+            'send.confirmShredOnNewPairing': 'Des photos non envoyées ou récemment envoyées sont dans la galerie. Se connecter à un nouveau récepteur les supprimera. Continuer ?',
 
             // Errors
             'error.noPhotoOrKey': 'Pas de photo ou échange de clés incomplet',
