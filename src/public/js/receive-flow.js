@@ -68,11 +68,47 @@
         return cleaned.trim().slice(0, 255);
     }
 
+    /**
+     * Validate a peer-supplied MIME type.
+     *
+     * Defense-in-depth: even though we already wrap blob: URLs as
+     * application/octet-stream, the raw mimeType value flows into
+     *   - fileType discrimination (isImage / isPdf branches),
+     *   - the synthesized fallback filename's extension,
+     *   - downstream UI text that's read by users deciding whether to open
+     *     the file in an external app.
+     * Allowing arbitrary peer bytes here lets a hostile sender lie about
+     * the type to bypass UI checks ("looks like a PDF, actually JS that
+     * tricks me into double-clicking it") or smuggle weird chars into the
+     * generated filename. RFC 6838 token chars are [A-Za-z0-9!#$&^_.+-];
+     * we accept a slightly tighter subset and bound the length.
+     */
+    const MIME_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$/i;
+    function sanitizeMimeType(mt) {
+        if (typeof mt !== 'string') return 'application/octet-stream';
+        const trimmed = mt.trim().toLowerCase();
+        if (trimmed.length === 0 || trimmed.length > 128) return 'application/octet-stream';
+        if (!MIME_RE.test(trimmed)) return 'application/octet-stream';
+        return trimmed;
+    }
+
+    /** Strip mime down to a short, filesystem-safe extension (≤8 chars, alnum). */
+    function safeExtFromMime(mimeType) {
+        const tail = (mimeType.split('/').pop() || '').split('+')[0] || '';
+        const cleaned = tail.replace(/[^a-z0-9]/gi, '').slice(0, 8);
+        return cleaned || 'bin';
+    }
+
     async function decryptIncomingFile(blob) {
         const sharedKey = _getSharedKey();
         const encryptedData = await blob.arrayBuffer();
         const { metadata, data } = await window.WebSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
         metadata.name = sanitizeMetadataName(metadata.name);
+        // Replace the peer-supplied mimeType with a sanitised value before
+        // anything else reads it, so the rest of the pipeline (fileType
+        // discrimination, fallback filename, BgOcr / Collections / cards)
+        // can never see a malformed or oversized string.
+        metadata.mimeType = sanitizeMimeType(metadata.mimeType);
         _logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${metadata.originalSize} bytes)`);
 
         const fileData = new Uint8Array(data);
@@ -81,7 +117,7 @@
         const isImage = fileMimeType.startsWith('image/');
         const isPdf = fileMimeType === 'application/pdf';
         const fileType = isImage ? 'image' : isPdf ? 'pdf' : 'other';
-        const ext = fileMimeType.split('/').pop().split('+')[0] || 'bin';
+        const ext = safeExtFromMime(fileMimeType);
         // photoCount is read here only to seed a fallback filename; the real
         // index is allocated below from receivedImages.length.
         const seq = receivedImages.length + 1;

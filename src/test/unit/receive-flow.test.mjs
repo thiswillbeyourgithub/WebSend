@@ -152,6 +152,51 @@ test('sanitizeMetadataName strips zero-width and other bidi controls', async () 
     assert.equal(decoded.fileName, 'abcdef.txt');
 });
 
+test('sanitizeMimeType: malformed peer mimeType collapses to octet-stream', async () => {
+    // Peer-supplied junk with HTML-like chars must NOT round-trip into
+    // the receiver pipeline. We accept only RFC-token-shaped types.
+    const win = loadIntoJsdom({
+        decryptResult: {
+            metadata: { name: 'a', mimeType: 'image/png<script>alert(1)</script>', originalSize: 1 },
+            data: new ArrayBuffer(4),
+        },
+    });
+    const { opts } = makeDeps();
+    win.ReceiveFlow.attach(opts);
+    const decoded = await win.ReceiveFlow.decryptIncomingFile({ arrayBuffer: async () => new ArrayBuffer(0) });
+    assert.equal(decoded.fileMimeType, 'application/octet-stream',
+        'unsafe mime falls back to octet-stream');
+    assert.equal(decoded.fileType, 'other');
+});
+
+test('sanitizeMimeType: mimeType length is bounded', async () => {
+    const win = loadIntoJsdom({
+        decryptResult: {
+            metadata: { name: '', mimeType: 'a/' + 'b'.repeat(500), originalSize: 1 },
+            data: new ArrayBuffer(4),
+        },
+    });
+    const { opts } = makeDeps();
+    win.ReceiveFlow.attach(opts);
+    const decoded = await win.ReceiveFlow.decryptIncomingFile({ arrayBuffer: async () => new ArrayBuffer(0) });
+    assert.equal(decoded.fileMimeType, 'application/octet-stream');
+});
+
+test('safeExtFromMime: ext is bounded to ≤8 alnum chars', async () => {
+    const win = loadIntoJsdom({
+        decryptResult: {
+            metadata: { name: '', mimeType: 'application/x-some-very-long-subtype', originalSize: 1 },
+            data: new ArrayBuffer(4),
+        },
+    });
+    const { opts } = makeDeps();
+    win.ReceiveFlow.attach(opts);
+    const decoded = await win.ReceiveFlow.decryptIncomingFile({ arrayBuffer: async () => new ArrayBuffer(0) });
+    const tail = decoded.fileName.split('.').pop();
+    assert.ok(tail.length <= 8, `ext should be ≤8 chars, got "${tail}"`);
+    assert.match(tail, /^[a-z0-9]+$/i, 'ext should be alnum only');
+});
+
 test('decryptIncomingFile classifies generic mime as fileType=other and synthesizes a filename', async () => {
     const win = loadIntoJsdom({
         decryptResult: {

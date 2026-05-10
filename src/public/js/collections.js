@@ -514,7 +514,16 @@
             if (globalIdx < 0) return;
             const dlLink = document.getElementById(`download-${globalIdx}`);
             if (!dlLink) return;
-            const ext = img.name ? img.name.split('.').pop() : (img.mimeType.split('/').pop().split('+')[0] || 'bin');
+            // Bound the extension to alnum, ≤8 chars. img.name is already
+            // sanitised but its trailing chunk after '.' can still be
+            // arbitrary user text; img.mimeType has been narrowed to RFC
+            // tokens by receive-flow.js's sanitizeMimeType, but defense
+            // in depth: re-bound here so a future caller that bypasses
+            // the pipeline cannot inject weird chars into the download
+            // attribute.
+            const tail = img.name ? (img.name.split('.').pop() || '') :
+                ((img.mimeType || '').split('/').pop() || '').split('+')[0];
+            const ext = (tail || '').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'bin';
             const suffix = col.images.length > 1 ? `_${idx + 1}` : '';
             dlLink.setAttribute('download', `${safeName}${suffix}.${ext}`);
         });
