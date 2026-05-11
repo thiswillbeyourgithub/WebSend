@@ -470,7 +470,31 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     before returning 503, capping the worst-case allocation cost so a
     pathological state (huge live-room set, broken RNG) cannot peg the
     event loop.
-23. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+23. **Sender-side mutual-verification gate**: the sender refuses to
+    advance into capture mode (or transmit any photo) until BOTH sides
+    have actually confirmed the fingerprint. `handleReady` checks
+    `sharedKey && weConfirmed && theyConfirmed` and ignores premature
+    `ready` messages, so a hostile receiver cannot fast-forward the
+    sender UI by sending `ready` without ever sending
+    `fingerprint-confirmed`. `sender-send.sendOnePhoto` adds a second
+    independent gate via `SenderConnect.isVerified()` so a future code
+    path that reaches the queue without going through the fingerprint
+    flow still cannot leak plaintext. The two gates mirror the
+    receiver's `VERIFIED_GATED_HANDLERS`.
+24. **Sender-side re-key block**: once a shared key has been derived,
+    `handlePublicKey` refuses any further `public-key` messages from
+    the receiver. Accepting one would silently rotate the encryption
+    key to a peer-chosen value while `weConfirmed`/`theyConfirmed`
+    remain `true` from the original handshake (the user would think
+    they had verified the peer, but every subsequent photo would be
+    encrypted to the attacker's key). The legitimate re-key path goes
+    through `SenderConnect.reconnect()`, which clears `sharedKey`,
+    `weConfirmed`, and `theyConfirmed` synchronously before the new
+    handshake. The receiver side allows re-key but forces re-
+    verification synchronously before any await; the sender side
+    blocks outright because the sender never asks for a new key in
+    the protocol.
+25. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

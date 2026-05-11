@@ -182,6 +182,19 @@
     // ============ Key exchange + fingerprint verification ============
 
     async function handlePublicKey(msg) {
+        // Refuse mid-session re-key. Once a shared key has been derived,
+        // accepting a new `public-key` message would silently rotate the
+        // encryption key to whatever the (possibly hostile) peer chose,
+        // while weConfirmed/theyConfirmed remain true from the previous
+        // handshake. The user would think they had verified the peer,
+        // but every subsequent photo would actually be encrypted to the
+        // attacker's new key. Force a clean reconnect to roll the
+        // verification state if a re-key is legitimately needed.
+        if (sharedKey) {
+            _logger.warn('Ignoring unexpected public-key after key exchange already completed');
+            _showToast(_i18n.t('send.unexpectedRekey') || 'Unexpected re-key attempt blocked', { type: 'error', duration: 5000 });
+            return;
+        }
         _logger.info('Received receiver public key, performing key exchange...');
         try {
             const receiverPublicKey = await window.WebSendCrypto.importPublicKey(msg.key);
