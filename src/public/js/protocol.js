@@ -31,6 +31,14 @@
     // chained); 32 leaves comfortable headroom while bounding receiver CPU.
     const MAX_TRANSFORMS_PER_MSG = 32;
 
+    // Hard ceiling on the raw JSON-string size of any control message on
+    // the data channel. The largest legitimate message is sender-public-key
+    // whose `key` field is the base64 of an ECDH P-256 public key (~91
+    // chars); 16 KiB is comfortable headroom for protocol growth and stops
+    // a hostile peer from forcing a multi-MB allocation in JSON.parse on
+    // the receiver before validate() ever runs.
+    const MAX_CONTROL_MSG_BYTES = 16 * 1024;
+
     // Predicates used in schemas
     function isHex64(v) { return typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v); }
     function isBoundedSize(v) {
@@ -133,6 +141,7 @@
         MIN_FILE_START_SIZE,
         MAX_TOTAL_SESSION_BYTES,
         MAX_TRANSFORMS_PER_MSG,
+        MAX_CONTROL_MSG_BYTES,
         validate,
         build,
         _schemas: schemas,

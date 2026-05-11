@@ -8,7 +8,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const modulePath = path.resolve(__dirname, '../../public/js/protocol.js');
 const win = await loadBrowserModule(modulePath);
 const { validate, build, VERSION, MIN_FILE_START_SIZE, MAX_FILE_SIZE,
-        MAX_TOTAL_SESSION_BYTES, MAX_TRANSFORMS_PER_MSG } = win.Protocol;
+        MAX_TOTAL_SESSION_BYTES, MAX_TRANSFORMS_PER_MSG,
+        MAX_CONTROL_MSG_BYTES } = win.Protocol;
 
 const VALID_HASH = 'a'.repeat(64);
 const VALID_CROP_CORNERS = {
@@ -69,6 +70,15 @@ test('Protocol exposes MIN_FILE_START_SIZE, MAX_TOTAL_SESSION_BYTES, MAX_TRANSFO
     assert.ok(MAX_TOTAL_SESSION_BYTES >= MAX_FILE_SIZE);
     assert.equal(typeof MAX_TRANSFORMS_PER_MSG, 'number');
     assert.ok(MAX_TRANSFORMS_PER_MSG >= 1 && MAX_TRANSFORMS_PER_MSG <= 1024);
+});
+
+test('Protocol exposes MAX_CONTROL_MSG_BYTES as a bounded value', () => {
+    // Cap exists so a hostile peer cannot force a multi-MB JSON.parse
+    // allocation on the receiver. 16 KiB is comfortable headroom for the
+    // largest legitimate control message (sender-public-key ~200 bytes).
+    assert.equal(typeof MAX_CONTROL_MSG_BYTES, 'number');
+    assert.ok(MAX_CONTROL_MSG_BYTES >= 4 * 1024);
+    assert.ok(MAX_CONTROL_MSG_BYTES <= 1024 * 1024);
 });
 
 // ---- transform-image bounds (Finding 2 / iteration 1) ----

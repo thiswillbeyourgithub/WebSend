@@ -520,7 +520,19 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     `X-Room-Secret` header. Note: this is a defense-in-depth layer on
     top of fingerprint verification, which remains the primary safeguard
     against ending up in a hostile peer's room.
-27. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+27. **Data-channel control-message size cap**: `webrtc.js handleMessage`
+    refuses any JSON string whose byte size exceeds
+    `Protocol.MAX_CONTROL_MSG_BYTES` (16 KiB) BEFORE calling
+    `JSON.parse`. The largest legitimate control message
+    (sender-public-key carrying a base64 ECDH P-256 key) is a few
+    hundred bytes; the cap is comfortable headroom while denying a
+    hostile peer the ability to force a multi-MB allocation in
+    `JSON.parse` by sending a giant string. UTF-16 byte size is
+    approximated as `string.length * 2` so an attacker cannot use
+    astral codepoints to balloon memory at half the apparent character
+    cost. This is the control-plane analogue of the existing
+    `MAX_TOTAL_SESSION_BYTES` cap on the binary path.
+28. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

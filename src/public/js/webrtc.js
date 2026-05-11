@@ -300,6 +300,17 @@ class WebSendRTC {
      */
     handleMessage(data) {
         if (typeof data === 'string') {
+            // Wire-level size cap: refuse before JSON.parse so a hostile
+            // peer cannot force a multi-MB allocation by sending a huge
+            // JSON string. Legitimate control messages top out around a
+            // few hundred bytes (sender-public-key is the largest). We
+            // also approximate UTF-16 byte size as 2x string length for
+            // the comparison so an attacker cannot use astral codepoints
+            // to balloon memory at half the apparent character cost.
+            if (data.length * 2 > Protocol.MAX_CONTROL_MSG_BYTES) {
+                logger.error(`Dropping oversized control message (${data.length} chars)`);
+                return;
+            }
             try {
                 const msg = JSON.parse(data);
                 // Validate wire messages. 'progress' and 'encrypted-file' are local
