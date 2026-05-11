@@ -227,6 +227,16 @@
     }
 
     function handleReady() {
+        // Defense in depth: a malicious receiver can send `ready` without
+        // ever sending `fingerprint-confirmed` (or before the user has
+        // clicked "match" locally), trying to fast-forward the sender UI
+        // past verification and into capture mode. Only honour `ready`
+        // when BOTH sides have explicitly confirmed and a shared key was
+        // actually derived.
+        if (!sharedKey || !weConfirmed || !theyConfirmed) {
+            _logger.warn(`Ignoring premature 'ready' (sharedKey=${!!sharedKey}, weConfirmed=${weConfirmed}, theyConfirmed=${theyConfirmed})`);
+            return;
+        }
         _logger.success('Both parties verified, can now send photos');
         window.PeerUI.showVerifiedInSidebar();
         if (_onReadyToCapture) _onReadyToCapture();
@@ -320,6 +330,11 @@
         cleanup,
         getRtc: () => rtc,
         getSharedKey: () => sharedKey,
+        // True only when key exchange completed AND both sides confirmed
+        // the fingerprint. Callers on the send path must consult this
+        // before encrypting/transmitting a photo, so a future code change
+        // that advances UI without verification cannot leak user data.
+        isVerified: () => !!sharedKey && weConfirmed && theyConfirmed,
         // For visibilitychange — quick state probe without exposing internals
         connectionLost: () => rtc && rtc.pc && (rtc.pc.connectionState === 'failed' || rtc.pc.connectionState === 'disconnected'),
     };

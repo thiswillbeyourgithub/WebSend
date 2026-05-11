@@ -300,8 +300,8 @@
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-uMrESk94t8vNbYOfNElA05X6xrtx22R84sVmUFOPMhOuJMf3kxW9EW+Ccpm/O4v0"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-YrOsZ+KNCRdbEqMAqD2Kr9ZJyh8NFohqhtlm9umir//2LvO4k9A+58yEnph68ZIN"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-twhi90qYKLsHy8NjR3nXRw6Do/NaEaSUIwOAJcIjDpaa5Mn9t4xXgsdQC1eCFlTn"></script>
-    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-bO8089J3hTnxkteLrsohdT8ThfRiDz/207AqFYxvrsS7NA5ETB7d/KBZuJlJVNzx"></script>
-    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-ETJpelsqECUCJ1PLi4Hs3Nf05FwdnGniPvAzCocEY36tdPoqTW1ZYW2MDm3kGnde"></script>
+    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-1XHduJHsXO7kX0PPzmtKWmm+/Hv3S3Y4v92NjoYbejf0pAHvJl9hPDVQhk7s1mod"></script>
+    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-fjZ0j2hT+T97ptbHwYTEwBbAuDk4d7EH+UDaWeqVwojRoG6JL354qoJNiQC8pMVb"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-fcGrrLyX4p4ezy27wAN+wf7dd2a42zAkTHbILlB6rjauzOh70XuQJIrzWSHKlee2"></script>
     <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-FswQQCZnOdEDc4CTFf3AG/vBJEW6Hc+I5V6RjG/jRovXFiWTuMKtKFRpab/VEBMF"></script>
     <script>
@@ -480,6 +480,7 @@
             SenderSend.attach({
                 getRtc: SenderConnect.getRtc,
                 getSharedKey: SenderConnect.getSharedKey,
+                isVerified: SenderConnect.isVerified,
                 i18n,
                 logger,
                 showToast,

@@ -22,6 +22,7 @@
     // -- Wired-in deps (set by attach) --
     let _getRtc = null;
     let _getSharedKey = null;
+    let _isVerified = null;
     let _i18n = null;
     let _logger = null;
     let _showToast = null;
@@ -30,6 +31,7 @@
     function attach(deps) {
         _getRtc = deps.getRtc;
         _getSharedKey = deps.getSharedKey;
+        _isVerified = deps.isVerified || (() => true);
         _i18n = deps.i18n;
         _logger = deps.logger;
         _showToast = deps.showToast;
@@ -158,6 +160,14 @@
      * on nack or timeout.
      */
     async function sendOnePhoto(blob) {
+        // Hard gate: refuse to encrypt/transmit unless both sides have
+        // confirmed the fingerprint and a shared key was derived. This
+        // is independent of the UI gate in handleReady so a future bug
+        // that advances the capture flow without verification cannot
+        // leak user data over the wire.
+        if (!_isVerified()) {
+            throw new Error('Refusing to send: peer not verified');
+        }
         const photoData = await blob.arrayBuffer();
         _logger.info(`Sending queued photo: ${photoData.byteLength} bytes`);
 
