@@ -553,7 +553,17 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     photo) flows through `_loadBitmap` so it is also bounded. Crops
     were already capped via `CROP_MAX_DIM`; this closes the matching
     hole for the other three transforms.
-30. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+30. **Sender transform-nack re-send cap**: a verified-but-hostile
+    receiver could otherwise spam `transform-nack` for the same
+    `oldHash` and drive the sender into an infinite re-encrypt /
+    re-send loop (the plaintext SHA-256, and therefore `photo.sentHash`,
+    doesn't change between attempts, so each nack matches the same
+    gallery photo). The sender now stamps each photo with a
+    `nackRetries` counter and refuses any nack past
+    `MAX_NACK_RETRIES_PER_PHOTO` (2) with an error log and an
+    unmistakable user toast. 2 is enough for a legitimate retry plus
+    a one-off transient failure.
+31. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

@@ -139,3 +139,41 @@ test('handlePublicKey blocks mid-session re-key after sharedKey established', as
         `a user-visible toast should fire, got: ${JSON.stringify(ctx.toasts)}`
     );
 });
+
+test('handleTransformNack caps per-photo re-sends (anti-pin)', async () => {
+    const ctx = setup();
+    // Stand up a fake gallery with one already-sent photo. The hostile
+    // peer will spam transform-nack for its hash; we expect at most
+    // MAX_NACK_RETRIES_PER_PHOTO (2) pushes before the sender refuses.
+    const photo = {
+        id: 1,
+        blob: new ctx.win.Blob([new Uint8Array([1, 2, 3])], { type: 'image/jpeg' }),
+        sentHash: 'a'.repeat(64),
+        sendStatus: 'sent',
+        transforms: [],
+    };
+    ctx.win.Gallery.photos = () => [photo];
+
+    let pushCount = 0;
+    ctx.win.SenderSend = {
+        push: () => { pushCount++; },
+        size: () => 0,
+        drain: () => {},
+    };
+
+    await ctx.win.SenderConnect.init();
+    const rtc = ctx.win.SenderConnect.getRtc();
+
+    // Fire transform-nack 5 times in a row; only the first 2 should
+    // result in a re-queue, the rest must be refused with an error log.
+    for (let i = 0; i < 5; i++) {
+        await rtc.onMessage({ type: 'transform-nack', oldHash: photo.sentHash, reason: 'spam' });
+    }
+
+    assert.equal(pushCount, 2,
+        `expected at most 2 re-queues, got ${pushCount}`);
+    assert.ok(
+        ctx.logs.error.some(m => /refusing to re-send.*more than/i.test(m)),
+        `error log should mention the cap, got: ${JSON.stringify(ctx.logs.error)}`
+    );
+});

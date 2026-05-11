@@ -255,6 +255,14 @@
         if (_onReadyToCapture) _onReadyToCapture();
     }
 
+    // Per-photo cap on transform-nack-driven re-sends. A verified-but-
+    // hostile receiver could otherwise spam transform-nack for the same
+    // oldHash and drive the sender into infinite re-encrypt/re-send
+    // loops (the plaintext hash, and therefore photo.sentHash, doesn't
+    // change between sends). 2 is enough for a legitimate retry plus
+    // a one-off transient failure.
+    const MAX_NACK_RETRIES_PER_PHOTO = 2;
+
     function handleTransformNack(msg) {
         const reason = msg.reason || 'unknown';
         _logger.warn(`transform-nack received for ${msg.oldHash?.substring(0, 8)}... (${reason})`);
@@ -262,6 +270,14 @@
         const photo = window.Gallery.photos().find(p => p && p.sentHash === msg.oldHash);
         if (!photo) {
             _logger.warn('transform-nack: no local photo matches oldHash, cannot recover');
+            _showToast(_i18n.t('send.transformFailedUnknown'), { type: 'error' });
+            return;
+        }
+
+        // Cap re-sends per photo so a hostile peer cannot pin the queue.
+        photo.nackRetries = (photo.nackRetries || 0) + 1;
+        if (photo.nackRetries > MAX_NACK_RETRIES_PER_PHOTO) {
+            _logger.error(`transform-nack: refusing to re-send photo ${msg.oldHash?.substring(0, 8)} more than ${MAX_NACK_RETRIES_PER_PHOTO} times`);
             _showToast(_i18n.t('send.transformFailedUnknown'), { type: 'error' });
             return;
         }
