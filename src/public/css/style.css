@@ -754,6 +754,14 @@ h1 {
     border: 1px solid rgba(255, 152, 0, 0.3);
 }
 
+/* App version line shown under the DEV/production badge */
+.sidebar-version {
+    margin-top: 8px;
+    text-align: center;
+    color: #888;
+    font-size: 0.75rem;
+}
+
 /* Fullscreen logs panel (replaces old half-height panel) */
 .logs-panel {
     position: fixed;

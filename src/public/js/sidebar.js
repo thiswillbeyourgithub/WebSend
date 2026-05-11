@@ -77,6 +77,7 @@ function buildSidebar({ showLogs = true } = {}) {
         <!-- DEV mode indicator (updated after fetching /api/config) -->
         <div class="sidebar-section" id="sidebar-dev-section">
             <div class="sidebar-dev-badge" id="sidebar-dev-badge" data-i18n="menu.prodMode">Production mode</div>
+            <div class="sidebar-version" id="sidebar-version"></div>
         </div>
     </div>`;
 
@@ -174,31 +175,43 @@ function initSidebar() {
 }
 
 /**
- * Update the DEV-mode badge in the sidebar after fetching /api/config.
+ * Update the DEV-mode badge and version line in the sidebar after fetching /api/config.
  * Also shows the maintenance banner when in DEV mode (the banner text is set by i18n).
  *
- * @param {boolean} isDev - Whether the server is running with DEV=1
+ * Accepts either the full config object ({dev, version, ...}) or just the legacy
+ * boolean isDev. Passing the full config also fills in the sidebar version line.
+ *
+ * @param {object|boolean} config - The /api/config response, or just its `dev` flag.
  */
-function updateDevBadge(isDev) {
+function updateDevBadge(config) {
+    const isDev   = typeof config === 'object' && config !== null ? !!config.dev : !!config;
+    const version = typeof config === 'object' && config !== null ? config.version : null;
+
     const badge = document.getElementById('sidebar-dev-badge');
-    if (!badge) return;
-    if (isDev) {
-        badge.textContent = i18n.t('menu.devMode');
-        badge.setAttribute('data-i18n', 'menu.devMode');
-        badge.classList.add('dev-active');
-        const banner = document.getElementById('maintenance-banner');
-        if (banner) {
-            banner.textContent = i18n.t('maintenance.banner');
-            banner.classList.add('visible');
-            banner.addEventListener('click', () => {
-                banner.style.opacity = '0';
-                setTimeout(() => banner.classList.remove('visible'), 300);
-            });
+    if (badge) {
+        if (isDev) {
+            badge.textContent = i18n.t('menu.devMode');
+            badge.setAttribute('data-i18n', 'menu.devMode');
+            badge.classList.add('dev-active');
+            const banner = document.getElementById('maintenance-banner');
+            if (banner) {
+                banner.textContent = i18n.t('maintenance.banner');
+                banner.classList.add('visible');
+                banner.addEventListener('click', () => {
+                    banner.style.opacity = '0';
+                    setTimeout(() => banner.classList.remove('visible'), 300);
+                });
+            }
+        } else {
+            badge.textContent = i18n.t('menu.prodMode');
+            badge.setAttribute('data-i18n', 'menu.prodMode');
+            badge.classList.remove('dev-active');
         }
-    } else {
-        badge.textContent = i18n.t('menu.prodMode');
-        badge.setAttribute('data-i18n', 'menu.prodMode');
-        badge.classList.remove('dev-active');
+    }
+
+    const versionEl = document.getElementById('sidebar-version');
+    if (versionEl && version) {
+        versionEl.textContent = 'v' + version;
     }
 }
 

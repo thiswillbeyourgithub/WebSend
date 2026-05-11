@@ -218,9 +218,11 @@ WebSend/
         │   │               #   gallery status updates, sticky progress banner, and
         │   │               #   the optional batch-end signal. Exposes window.SenderSend
         │   ├── sidebar.js # Shared sidebar (kebab button, overlay, language selector,
-        │   │               #   connection info, logs/about actions, DEV badge) used by
-        │   │               #   index/receive/send. Exposes buildSidebar(), initSidebar(),
-        │   │               #   updateDevBadge() (also on window) so each page only wires once
+        │   │               #   connection info, logs/about actions, DEV badge, app version)
+        │   │               #   used by index/receive/send. Exposes buildSidebar(),
+        │   │               #   initSidebar(), updateDevBadge() (also on window) so each
+        │   │               #   page only wires once. updateDevBadge() accepts the full
+        │   │               #   /api/config object and also fills the sidebar version line
         │   ├── transfer-stats.js # Pure helpers to format transfer progress (rate,
         │   │               #   percent, ETA) into "42%  1.2 MB/s  14s" labels. Used by
         │   │               #   both send.html and receive.html

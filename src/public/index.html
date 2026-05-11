@@ -11,7 +11,7 @@
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/svg+xml" href="/icons/icon.svg">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-A/fGTp+lx0ip5iNlhCZ+zv7vcDGONC3YskjWQ56WC5TGlVCBtDyh5S6gmLdPD11Y" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-pAg5w4J2p3+obt+PySBepQgXiTdbwO1EHWHwhTCdnR7hdZs9/fe6tMl48e3Z+8M8" crossorigin="anonymous">
 </head>
 <body>
     <!-- Sidebar markup and wiring injected by sidebar.js (shared with receive/send pages) -->
@@ -36,9 +36,6 @@
             </a>
         </div>
 
-        <footer>
-            <div style="margin-top: 10px; color: #999; font-size: 0.75rem;" id="app-version"></div>
-        </footer>
     </div>
 
     <!-- About Modal -->
@@ -96,7 +93,7 @@
 
     <script src="/js/eruda-loader.js" integrity="sha384-tvGVrnUklP2w6gHGZOWvIktlEb6qOVl4HbLIZvX9W7jSsVOpXJptovcF6aYtnL2i"></script>
     <script src="/js/i18n.js" integrity="sha384-Fhfe/9gcit9Q+22gHBRU14pNd9Kk5k1PfYG8JbNvqNNXjTZliY+mL0NAgArZyLeY"></script>
-    <script src="/js/sidebar.js" integrity="sha384-/U8SVvkBBZP3hrcOKPfuVac0ZA9lxVlHl5fc3TqgI9565wo2JOMwG+OGf3thdosd"></script>
+    <script src="/js/sidebar.js" integrity="sha384-aYkZ1w9YE74ls+xjYvpD+F8uPd255ZIbLqxn1DD0pjh+5EeACudM0OTtjT/Dz6Sk"></script>
     <script>
         // Initialize i18n (detect locale and apply translations), then build shared sidebar
         i18n.init();
@@ -139,13 +136,9 @@
             }
         });
 
-        // Fetch server config to update DEV badge and show version
+        // Fetch server config to update DEV badge and sidebar version
         fetch('/api/config').then(r => r.json()).then(config => {
-            updateDevBadge(config.dev); // defined in sidebar.js
-            const versionEl = document.getElementById('app-version');
-            if (versionEl && config.version) {
-                versionEl.textContent = 'v' + config.version;
-            }
+            updateDevBadge(config); // defined in sidebar.js — also fills version
         }).catch(() => {}); // Non-fatal
 
         // Open about modal if URL has #about (from sidebar on other pages)
