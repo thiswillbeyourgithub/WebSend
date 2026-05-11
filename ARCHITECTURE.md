@@ -506,7 +506,21 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     place. The cache version was bumped (`websend-v1` → `websend-v2`)
     so the activate handler evicts any cross-origin junk that earlier
     SW versions may already have stored.
-26. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+26. **QR foreign-origin refusal**: the sender's scan / paste path runs
+    every input through `QrParse.parseSendInvite(data, currentOrigin)`
+    in `js/qr-parse.js`. If the input parses as a URL whose origin is
+    not `window.location.origin`, the join is refused with a clear
+    user-facing toast (i18n key `send.invalidQR.foreignOrigin`). This
+    blocks a phishing variant in which an attacker prints or social-
+    engineers a QR encoding `https://attacker.example/send/ABC123#xxx`
+    expecting the user to scan it on the legitimate WebSend page: the
+    visible-URL signal is now enforced, not ornamental. Bare relative
+    paths (manual entry) still work, and an oversized secret is
+    rejected so a crafted QR cannot smuggle junk into the
+    `X-Room-Secret` header. Note: this is a defense-in-depth layer on
+    top of fingerprint verification, which remains the primary safeguard
+    against ending up in a hostile peer's room.
+27. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

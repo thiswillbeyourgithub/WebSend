@@ -288,7 +288,7 @@
 
     <script src="/js/doc-detect.js" integrity="sha384-N2bbAmoSf0KZ/LzmlpB4IK1FxNdPVTiF2Thmx7EBpMMCBzFRlHFG6oqteI6bd3cF" crossorigin="anonymous"></script>
     <script src="/js/eruda-loader.js" integrity="sha384-tvGVrnUklP2w6gHGZOWvIktlEb6qOVl4HbLIZvX9W7jSsVOpXJptovcF6aYtnL2i"></script>
-    <script src="/js/i18n.js" integrity="sha384-mFuK90UuB3xD+Q3TP9C0DppQ31uQy0Am3gSEVuzSa1jjyNfKg/BCs1U5wpsAnf0J"></script>
+    <script src="/js/i18n.js" integrity="sha384-Fhfe/9gcit9Q+22gHBRU14pNd9Kk5k1PfYG8JbNvqNNXjTZliY+mL0NAgArZyLeY"></script>
     <script src="/js/logger.js" integrity="sha384-nZYBuW3Q6LPry7Wxbv0S0ohxl8l4wiNXWR5df+hnvjn0raKqFnUhNFwF+wcEoqh4"></script>
     <script src="/js/sidebar.js" integrity="sha384-/U8SVvkBBZP3hrcOKPfuVac0ZA9lxVlHl5fc3TqgI9565wo2JOMwG+OGf3thdosd"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-/gzZ7L0lKHe10PNpEnyyj/UyaNEl2woHG4WQz11dIRiPcWpbspO25nS1aCJl0FYd"></script>
@@ -303,6 +303,7 @@
     <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-1XHduJHsXO7kX0PPzmtKWmm+/Hv3S3Y4v92NjoYbejf0pAHvJl9hPDVQhk7s1mod"></script>
     <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-Ey9nHJrwQfDXXbnD8o2m82mSZd0sb2fDw8nwJ3oozvjWCpglf/BN9bQTq7/ODQoD"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-fcGrrLyX4p4ezy27wAN+wf7dd2a42zAkTHbILlB6rjauzOh70XuQJIrzWSHKlee2"></script>
+    <script src="/js/qr-parse.js" crossorigin="anonymous" integrity="sha384-Xwpb3B8c83Cdd3DzckDZSbFPkxIeN6pSZ2jPjorYlZIru04ePvR1gCU2Yfoa0OSP"></script>
     <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-FswQQCZnOdEDc4CTFf3AG/vBJEW6Hc+I5V6RjG/jRovXFiWTuMKtKFRpab/VEBMF"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -593,34 +594,23 @@
          */
         async function processScannedQR(data) {
             logger.info('Processing scanned QR: ' + data);
-
-            // Try to extract room ID and secret from URL
-            let roomId = null;
-            let secret = null;
-
-            // Check if it's a URL with /send/ROOMID#SECRET pattern.
-            // Secret is base64url-encoded 16 random bytes (server-helpers.js
-            // generateRoomSecret) → 22 chars from [A-Za-z0-9_-]. Bound the
-            // capture so a malicious QR can't smuggle CR/LF or other junk
-            // into the X-Room-Secret header.
-            const urlMatch = data.match(/\/send\/([A-Z0-9]{6})#([A-Za-z0-9_-]{20,32})$/i);
-            if (urlMatch) {
-                roomId = urlMatch[1].toUpperCase();
-                secret = urlMatch[2];
-            }
-
-            if (roomId && secret) {
+            const r = QrParse.parseSendInvite(data, window.location.origin);
+            if (r.ok) {
                 showStep(stepConnecting);
-                await SenderConnect.join(roomId, secret);
-            } else if (roomId) {
+                await SenderConnect.join(r.roomId, r.secret);
+                return;
+            }
+            if (r.reason === 'foreign-origin') {
+                logger.error(`Refusing scanned QR for foreign origin: ${r.foreignOrigin}`);
+                showToast(i18n.t('send.invalidQR.foreignOrigin'), { type: 'error' });
+            } else if (r.reason === 'secret-missing') {
                 logger.error('Invalid QR code - room secret missing');
                 showToast(i18n.t('send.invalidQR.secretMissing'));
-                showStep(stepScan);
             } else {
                 logger.error('Invalid QR code - no room ID found');
                 showToast(i18n.t('send.invalidQR.noRoom'));
-                showStep(stepScan);
             }
+            showStep(stepScan);
         }
 
         // Connection lifecycle (WebRTC state, key exchange, fingerprint
