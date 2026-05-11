@@ -183,6 +183,21 @@
         const blob = new Blob([img.data], { type: img.mimeType });
         const bmp = await createImageBitmap(blob);
         const { width, height } = bmp;
+        // Mirror the image-transforms cap on bitmap dimensions: a
+        // verified-but-hostile peer's 30000x30000 image would survive
+        // createImageBitmap in some browsers and then drive a large
+        // OffscreenCanvas allocation downstream. Refuse and skip the
+        // image rather than blocking the background OCR queue on a
+        // pathological allocation. Fall back to ImageTransforms's
+        // constant when available, otherwise hard-code the same 150 MP
+        // ceiling for symmetry.
+        const MAX_OCR_INPUT_PIXELS = (window.ImageTransforms && window.ImageTransforms.MAX_TRANSFORM_PIXELS) || (150 * 1024 * 1024);
+        if (width * height > MAX_OCR_INPUT_PIXELS) {
+            const w = width, h = height;
+            bmp.close();
+            window.logger.warn(`[BG-OCR] Skipping image #${idx + 1}: too large for OCR (${w}x${h}, ${w * h} pixels; max ${MAX_OCR_INPUT_PIXELS})`);
+            return null;
+        }
         const longest = Math.max(width, height);
         if (longest <= OCR_MAX_PX) {
             bmp.close();

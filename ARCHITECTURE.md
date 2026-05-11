@@ -563,7 +563,17 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     `MAX_NACK_RETRIES_PER_PHOTO` (2) with an error log and an
     unmistakable user toast. 2 is enough for a legitimate retry plus
     a one-off transient failure.
-31. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+31. **Background-OCR input pixel cap**: `bg-ocr.downscaleForOcr` runs
+    `createImageBitmap` on peer-supplied bytes and would otherwise
+    drive a large `OffscreenCanvas` allocation on a 30000x30000
+    image (which some browsers will still decode). It now refuses any
+    bitmap whose pixel count exceeds
+    `window.ImageTransforms.MAX_TRANSFORM_PIXELS` (150 MP) and skips
+    the image with a warning log, so the background OCR queue is
+    never blocked on a pathological allocation. Falls back to the
+    same hard-coded 150 MP if `ImageTransforms` happens to be absent
+    at load time.
+32. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then
