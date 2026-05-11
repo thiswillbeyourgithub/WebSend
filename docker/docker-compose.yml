@@ -130,20 +130,19 @@ services:
       - "3478:3478/udp"
       - "3478:3478/tcp"
       - "49152-49161:49152-49161/udp"
-    # To enable TURNS (TURN-over-TLS), remove --no-tls and add:
-    #   --tls-listening-port=${TURNS_PORT:-8443}
-    #   --cert=/etc/coturn/certs/cert.pem
-    #   --pkey=/etc/coturn/certs/key.pem
-    # Then mount the certificate files via a volume:
-    #   volumes:
-    #     - /path/to/certs:/etc/coturn/certs:ro
-    # If you use Caddy, you can reuse its managed certificates. Caddy stores them
-    # under its data directory; the exact path depends on the ACME issuer and domain.
-    # Example (adjust to your domain and Caddy data path):
-    #   volumes:
-    #     - /path/to/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/your.domain:/certs:ro
-    # And expose the TURNS port:
-    #     - "${TURNS_PORT:-8443}:${TURNS_PORT:-8443}/tcp"
+    # TURNS (TURN-over-TLS) is fronted by the reverse proxy on port 443: the
+    # proxy matches SNI=turn.<DOMAIN>, terminates TLS itself, and forwards the
+    # plaintext TURN stream to this container's 3478/tcp listener. coturn
+    # therefore does NOT need its own TLS listener or certificate files, which
+    # is why --no-tls is set below and no cert volume is mounted.
+    #
+    # The benefit of this setup (vs. having coturn terminate TLS directly) is
+    # that TURNS traffic shares the reverse proxy's TLS stack with regular
+    # HTTPS on the same IP, so middleboxes cannot fingerprint coturn's TLS
+    # stack (different JA3S / ALPN behaviour) and selectively block TURNS.
+    #
+    # See the README "TURN Relay Security" section for a Caddy + caddy-l4
+    # snippet that performs the SNI-routed TLS termination.
     #
     # Docker NAT: --external-ip format is PUBLIC_IP/INTERNAL_IP.
     # 0.0.0.0 as internal means "all container interfaces" (correct for Docker).
@@ -180,7 +179,6 @@ services:
     privileged: false
     # Note: coturn image runs as root by default; running as non-root
     # may break startup. The other hardening measures mitigate this.
-    # We run coturn as root so it can read TLS certificate files mounted from Caddy.
     user: "0:0"
     restart: unless-stopped
     deploy:

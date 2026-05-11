@@ -686,3 +686,28 @@ A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and abort
 Expected to run behind **Caddy** reverse proxy which handles HTTPS termination.
 Docker Compose exposes port 7395 mapped to internal 8080. Configure via `env` file
 (copy from `docker/env.example`).
+
+### TURNS data path
+
+coturn ships with `--no-tls` and only listens on `3478/udp`, `3478/tcp`, and
+the relay UDP range `49152-49161`. It does NOT have its own TLS listener and
+does NOT need certificate files mounted in.
+
+The public `turns:` URL advertised to clients (port from `TURNS_PORT`,
+typically `443`) points at the **reverse proxy**, not at coturn directly. The
+reverse proxy (Caddy with the [caddy-l4 plugin](https://github.com/mholt/caddy-l4))
+matches `SNI=turn.<DOMAIN>` on its 443 listener, terminates TLS itself
+(reusing the same TLS stack as regular HTTPS), and proxies the resulting
+plaintext TURN stream to `coturn:3478/tcp`.
+
+```
+TURNS client ──TLS:443──▶ Caddy (caddy-l4, SNI=turn.<DOMAIN>) ──plaintext──▶ coturn:3478/tcp
+                          │
+                          └── same TLS stack as the regular HTTPS site,
+                              so middleboxes cannot fingerprint coturn's
+                              TLS server hello / ALPN and selectively
+                              block TURNS while letting HTTPS through.
+```
+
+The reverse proxy owns the certificate; coturn is unaware that TLS is
+involved at all. See README "TURN Relay Security" for the Caddyfile snippet.

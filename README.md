@@ -144,7 +144,32 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 ### TURN Relay Security
 - TURN credentials are **time-based** (HMAC-SHA1, standard coturn ephemeral credentials) and expire after a configurable TTL (default: 1 hour, see `TURN_CREDENTIAL_TTL`)
 - Even when relayed through TURN, photos are still **end-to-end encrypted** -- the TURN server only sees encrypted blobs
-- TURNS (TURN-over-TLS) requires TLS certificates; if you use **Caddy**, you can mount its managed certificates into the coturn container (see the commented example in `docker-compose.yml`)
+- **TURNS (TURN-over-TLS)** is enabled by:
+  1. Setting `TURNS_PORT=443` in `.env` (this is the public port the reverse proxy listens on, not coturn's port)
+  2. Configuring your reverse proxy to terminate TLS for `turn.<DOMAIN>` on 443 and proxy the plaintext TURN stream to coturn's `3478/tcp` listener
+  - coturn itself runs with `--no-tls` and does not need any certificate files (the reverse proxy owns the TLS material)
+- **Why front coturn behind the reverse proxy** instead of letting coturn terminate TLS itself: coturn's TLS stack has a different JA3S fingerprint and ALPN behaviour from a regular HTTPS server, so middleboxes that allow your normal HTTPS traffic may still selectively drop a direct TURNS connection. Fronting coturn behind the same TLS stack as your HTTPS site makes TURNS traffic indistinguishable from regular HTTPS on the wire
+- **Caddy example** (requires the [caddy-l4 plugin](https://github.com/mholt/caddy-l4), built with `xcaddy build --with github.com/mholt/caddy-l4`):
+  ```caddy
+  {
+      servers {
+          listener_wrappers {
+              layer4 {
+                  @turns tls sni turn.<DOMAIN>
+                  route @turns {
+                      tls {
+                          connection_policy {
+                              alpn h2 http/1.1
+                          }
+                      }
+                      proxy localhost:3478
+                  }
+              }
+              tls
+          }
+      }
+  }
+  ```
 
 ## Non-Security Features
 
@@ -220,7 +245,7 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `TURN_SERVER` | TURN relay server (`host:port`) | _(empty -- no relay)_ |
 | `TURN_SECRET` | Shared secret for TURN time-based credentials | _(empty)_ |
 | `TURN_CREDENTIAL_TTL` | TURN credential validity in seconds | `3600` (1h) |
-| `TURNS_PORT` | TURN-over-TLS (TURNS) port; enables `turns:` ICE candidates | _(empty -- TURNS disabled)_ |
+| `TURNS_PORT` | Public TURN-over-TLS (TURNS) port advertised to clients; this is the port the reverse proxy listens on (typically `443`), not coturn's internal port. Enables `turns:` ICE candidates | _(empty -- TURNS disabled)_ |
 | `UMAMI_URL` | Base URL of your [Umami](https://umami.is/) analytics instance | _(empty -- analytics disabled)_ |
 | `UMAMI_WEBSITE_ID` | Website ID from your Umami dashboard (UUID) | _(empty)_ |
 | `UMAMI_DNT` | Respect browser Do Not Track setting (`true` or `false`) | `true` |
@@ -241,11 +266,11 @@ It is recommended to use [ufw-docker](https://github.com/chaifeng/ufw-docker) wh
 
 ```bash
 # TURN listening port (UDP + TCP)
+# Note: when TURNS is enabled, it is fronted by the reverse proxy on port 443
+# (see the "TURN Relay Security" section) and the proxy forwards plaintext to
+# coturn:3478/tcp. There is no separate TURNS port to open on coturn.
 sudo ufw-docker allow coturn 3478/udp
 sudo ufw-docker allow coturn 3478/tcp
-
-# TURNS (TURN-over-TLS) -- only if you enabled TURNS
-sudo ufw-docker allow coturn 8443/tcp
 
 # TURN relay ports -- ufw-docker does not support port ranges,
 # so each port in the relay range must be allowed individually.
