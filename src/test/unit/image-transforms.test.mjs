@@ -42,7 +42,7 @@ const stubDocument = {
 const win = await loadBrowserModule(modulePath, { document: stubDocument });
 const { applyOtsu, perspectiveTransform, distance,
         rotateImage, flipImage, binarize, cropPerspective,
-        CROP_MAX_DIM } = win.ImageTransforms;
+        CROP_MAX_DIM, MAX_TRANSFORM_PIXELS } = win.ImageTransforms;
 
 // ---- applyOtsu ----
 
@@ -106,4 +106,70 @@ test('CROP_MAX_DIM is exported as a sensible defensive ceiling', () => {
     // Big enough to fit a 4K-class crop, small enough to bound a worst-case
     // peer-driven createImageData allocation (8192*8192*4 = 256 MiB).
     assert.ok(CROP_MAX_DIM >= 4096 && CROP_MAX_DIM <= 16384);
+});
+
+test('MAX_TRANSFORM_PIXELS bounds the rotate/flip/binarize canvas allocation', () => {
+    // 4 bytes per pixel on the receiver canvas; the cap should bound the
+    // worst-case allocation to a single-digit-GB or less. 150 MP * 4 B/px
+    // ~= 600 MB which is well under the multi-GB OOM threshold for the
+    // receiver tab. The cap also must be above any legitimate stills
+    // camera output (Phase One IQ4 ~150 MP is the upper bound of
+    // legitimate medium-format sensors).
+    assert.equal(typeof MAX_TRANSFORM_PIXELS, 'number');
+    assert.ok(MAX_TRANSFORM_PIXELS >= 50 * 1024 * 1024);
+    assert.ok(MAX_TRANSFORM_PIXELS <= 500 * 1024 * 1024);
+});
+
+// Drive rotateImage through a stubbed createImageBitmap so we can verify
+// the dimension gate triggers on a pathological peer-supplied bitmap.
+// We swap the global before each invocation so the module's reference
+// to `createImageBitmap` resolves to our stub.
+async function withFakeBitmap({ width, height }, fn) {
+    const { createContext, runInContext } = await import('node:vm');
+    // Re-evaluate the module in a context whose createImageBitmap returns
+    // a bitmap of the requested dimensions. This is the cleanest way to
+    // exercise _loadBitmap's gate without poking at module-private state.
+    const { readFileSync } = await import('node:fs');
+    const code = readFileSync(modulePath, 'utf8');
+    const fakeBitmap = { width, height, close: () => {} };
+    const ctx = {
+        window: { logger: { info(){}, error(){}, warn(){}, success(){}, debug(){} } },
+        logger: { info(){}, error(){}, warn(){}, success(){}, debug(){} },
+        document: stubDocument,
+        createImageBitmap: async () => fakeBitmap,
+        Blob: globalThis.Blob,
+        Uint8Array: globalThis.Uint8Array,
+        Promise: globalThis.Promise,
+        console,
+    };
+    runInContext(code, createContext(ctx));
+    return fn(ctx.window.ImageTransforms);
+}
+
+test('rotateImage throws when bitmap dimensions exceed MAX_TRANSFORM_PIXELS', async () => {
+    // 20000 x 20000 = 400 MP, well above the 150 MP cap.
+    await withFakeBitmap({ width: 20000, height: 20000 }, async (IT) => {
+        const fakeInput = { data: new Uint8Array([1, 2, 3]), mimeType: 'image/jpeg' };
+        await assert.rejects(
+            () => IT.rotateImage(fakeInput, { degrees: 90 }),
+            /image too large for transform/,
+            'rotateImage must refuse a pathologically large peer bitmap'
+        );
+    });
+});
+
+test('rotateImage accepts a bitmap at the cap boundary', async () => {
+    // 12000 x 12000 = 144 MP, just under 150 MP.
+    await withFakeBitmap({ width: 12000, height: 12000 }, async (IT) => {
+        const fakeInput = { data: new Uint8Array([1, 2, 3]), mimeType: 'image/jpeg' };
+        // The stub canvas + drawImage path is benign and will resolve;
+        // we only assert that the dimension gate does NOT trip here.
+        // toBlob will throw because the stub canvas doesn't implement it,
+        // but that happens AFTER the gate (which is what we're testing).
+        await assert.rejects(
+            () => IT.rotateImage(fakeInput, { degrees: 90 }),
+            (e) => !/image too large for transform/.test(e.message),
+            'rotateImage must NOT trip the dimension gate at 144 MP'
+        );
+    });
 });

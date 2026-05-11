@@ -541,7 +541,19 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     until the tab OOMs. We free the MuPDF document and throw with a
     clear "PDF has N pages, refusing to render more than 1000" error
     that surfaces as a user-visible toast.
-29. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+29. **Image-transform pixel cap**: `image-transforms._loadBitmap` now
+    refuses any decoded `ImageBitmap` whose pixel count exceeds
+    `MAX_TRANSFORM_PIXELS` (150 megapixels). Previously `rotateImage`,
+    `flipImage` and `binarize` inherited the source bitmap's
+    dimensions unconditionally, so a 1 GB peer-supplied JPEG at
+    ~30000x30000 (900 MP) would attempt a ~3.6 GB `ImageData`
+    allocation on the main thread and reliably OOM the receiver tab.
+    The cap is well above any consumer or medium-format stills camera
+    output, and the transform-replay path (peer mutates an already-sent
+    photo) flows through `_loadBitmap` so it is also bounded. Crops
+    were already capped via `CROP_MAX_DIM`; this closes the matching
+    hole for the other three transforms.
+30. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

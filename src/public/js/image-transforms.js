@@ -216,11 +216,35 @@ function _toBlob(input) {
     return new Blob([input.data], { type: input.mimeType });
 }
 
+// Hard ceiling on total pixel count for transformed images. Subsequent
+// canvas allocation costs 4 bytes per pixel, so a 1 GB peer-supplied
+// image at, say, 30000x30000 (900 MP) would attempt a ~3.6 GB ImageData
+// allocation on the main thread and reliably OOM the tab. 150 MP is
+// well above any consumer/medium-format camera output (Phase One IQ4
+// ~150 MP is the absolute upper bound of legitimate stills) and bounds
+// the worst-case canvas allocation to ~600 MB. The transform-replay
+// path (peer mutates an already-sent photo) flows through here, so this
+// also caps the receiver's exposure to a hostile sender. Honest crops
+// already cap via CROP_MAX_DIM, but rotate/flip/binarize used to
+// inherit the source bitmap's dimensions unconditionally.
+const MAX_TRANSFORM_PIXELS = 150 * 1024 * 1024;
+
 /**
  * Load input into an ImageBitmap. Caller is responsible for .close()ing it.
+ * Throws if the decoded image exceeds MAX_TRANSFORM_PIXELS so a
+ * pathologically large peer-supplied image cannot drive a multi-GB
+ * canvas allocation downstream.
  */
 async function _loadBitmap(input) {
-    return await createImageBitmap(_toBlob(input));
+    const bitmap = await createImageBitmap(_toBlob(input));
+    if (bitmap.width * bitmap.height > MAX_TRANSFORM_PIXELS) {
+        const w = bitmap.width, h = bitmap.height;
+        try { bitmap.close(); } catch (_) {}
+        throw new Error(
+            `image too large for transform (${w}x${h}, ${w * h} pixels; max ${MAX_TRANSFORM_PIXELS})`
+        );
+    }
+    return bitmap;
 }
 
 /**
@@ -363,5 +387,6 @@ window.ImageTransforms = {
     applyOtsu, perspectiveTransform, distance,
     rotateImage, flipImage, binarize, cropPerspective, toBlob,
     CROP_MAX_DIM,
+    MAX_TRANSFORM_PIXELS,
 };
 })();
