@@ -439,5 +439,8 @@ const WebSendCrypto = {
     }
 };
 
-// Export for use in other modules
-window.WebSendCrypto = WebSendCrypto;
+// Export for use in other modules. Frozen so a hostile script (XSS, malicious
+// browser extension, or compromised dependency loaded after this file) cannot
+// monkey-patch deriveSharedKey / encryptWithMetadata / getKeyFingerprint to
+// subvert the E2EE handshake at runtime.
+window.WebSendCrypto = Object.freeze(WebSendCrypto);

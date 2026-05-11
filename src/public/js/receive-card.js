@@ -279,5 +279,8 @@
         }
     }
 
-    window.ReceiveCard = { renderCard, setCardImage, revokeCardUrls, makeSafeBlobUrl, SAFE_BLOB_TYPE };
+    // Frozen so a hostile script cannot swap makeSafeBlobUrl with a
+    // variant that emits text/html blob URLs, undoing the anti-XSS
+    // mime forcing that ReceiveCard exists to provide.
+    window.ReceiveCard = Object.freeze({ renderCard, setCardImage, revokeCardUrls, makeSafeBlobUrl, SAFE_BLOB_TYPE });
 })();

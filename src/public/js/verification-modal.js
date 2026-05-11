@@ -53,5 +53,5 @@
         modal.style.display = 'none';
     }
 
-    window.VerificationModal = { show, hide };
+    window.VerificationModal = Object.freeze({ show, hide });
 })();

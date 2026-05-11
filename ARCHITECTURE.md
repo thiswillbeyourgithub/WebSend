@@ -584,6 +584,26 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     to a fresh room and shreds everything. The signaling relay stores **only** ephemeral
     SDP + ICE in an in-memory `Map` with a 10-minute TTL and complete deletion on expiry —
     no database, no filesystem writes for room data, and no cross-room caching.
+33. **Frozen security-critical globals**: `Object.freeze` is applied at
+    export time to every namespace object that holds a cryptographic
+    primitive, a protocol builder, the verification gate, or the safe
+    blob-URL helper: `window.WebSendCrypto`, `window.Protocol` (and its
+    nested `build` sub-object), `window.QrParse`, `window.SenderConnect`,
+    `window.SenderSend`, `window.ReceiveCard`, and
+    `window.VerificationModal`. Without this, a hostile script reaching
+    the page (XSS via an inline-script CSP escape, a compromised browser
+    extension, a future tampered third-party load) could monkey-patch
+    `WebSendCrypto.deriveSharedKey` to return an attacker-known key,
+    swap `Protocol.build.fingerprintConfirmed` to spoof verification,
+    flip `SenderConnect.isVerified` to `() => true` to bypass the
+    send-path gate, or rewrite `ReceiveCard.makeSafeBlobUrl` to emit
+    `text/html` blob URLs and re-open the blob-XSS path that #20
+    closes. Freezing the objects means any such write is a silent no-
+    op (or a `TypeError` in strict mode) instead of a successful
+    tampering. The non-security-bearing exports (`Collections`,
+    `CropModal`, `Gallery`, etc.) are left mutable on purpose so
+    tests / future refactors can stub them; the frozen set is exactly
+    the surface where a swap would break the security model.
 
 ## SSO (Experimental)
 

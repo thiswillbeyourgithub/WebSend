@@ -349,7 +349,9 @@
         wireRtcCallbacks();
     }
 
-    window.SenderConnect = {
+    // Frozen so a hostile script cannot swap isVerified / getSharedKey
+    // / confirmFingerprint to bypass the verification gate from outside.
+    window.SenderConnect = Object.freeze({
         attach,
         init,
         join,
@@ -364,7 +366,7 @@
         // before encrypting/transmitting a photo, so a future code change
         // that advances UI without verification cannot leak user data.
         isVerified: () => !!sharedKey && weConfirmed && theyConfirmed,
-        // For visibilitychange — quick state probe without exposing internals
+        // For visibilitychange, quick state probe without exposing internals
         connectionLost: () => rtc && rtc.pc && (rtc.pc.connectionState === 'failed' || rtc.pc.connectionState === 'disconnected'),
-    };
+    });
 })();

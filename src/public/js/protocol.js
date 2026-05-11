@@ -135,7 +135,11 @@
         batchEnd:              ()                        => stamp({ type: 'batch-end' }),
     };
 
-    window.Protocol = {
+    // Freeze the build sub-object so a hostile script cannot swap
+    // build.fingerprintConfirmed / build.transformNack with a tampering
+    // variant after this module has been loaded.
+    Object.freeze(build);
+    window.Protocol = Object.freeze({
         VERSION: PROTOCOL_VERSION,
         MAX_FILE_SIZE,
         MIN_FILE_START_SIZE,
@@ -145,5 +149,5 @@
         validate,
         build,
         _schemas: schemas,
-    };
+    });
 })();

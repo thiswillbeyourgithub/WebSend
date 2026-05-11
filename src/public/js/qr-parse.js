@@ -50,5 +50,5 @@
         return { ok: true, roomId, secret };
     }
 
-    window.QrParse = { parseSendInvite };
+    window.QrParse = Object.freeze({ parseSendInvite });
 })();

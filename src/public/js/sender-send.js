@@ -207,7 +207,10 @@
         return localHash;
     }
 
-    window.SenderSend = {
+    // Frozen so a hostile script cannot swap `push` / `drain` with a
+    // tampering variant that exfiltrates plaintext or bypasses the
+    // SenderConnect.isVerified() gate enforced inside sendOnePhoto.
+    window.SenderSend = Object.freeze({
         attach,
         push,
         markBatchEndPending,
@@ -217,5 +220,5 @@
         isActive,
         drain,
         updateBanner,
-    };
+    });
 })();
