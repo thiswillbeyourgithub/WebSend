@@ -494,7 +494,19 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     verification synchronously before any await; the sender side
     blocks outright because the sender never asks for a new key in
     the protocol.
-25. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+25. **Service-worker scope hardening**: the SW intercepts ONLY same-
+    origin GET requests, and only writes responses to the cache when
+    `response.type === 'basic'` (200, same-origin, non-opaque). Cross-
+    origin requests (e.g. an admin-configured Umami tracker) pass
+    straight through to the browser without SW involvement so a future
+    upstream compromise cannot persist a malicious response in every
+    user's PWA cache. Browser-level SRI on `<script integrity>` still
+    rejects any tampered cached body at execution time; the SW filter
+    is the belt-and-braces layer that avoids storing it in the first
+    place. The cache version was bumped (`websend-v1` → `websend-v2`)
+    so the activate handler evicts any cross-origin junk that earlier
+    SW versions may already have stored.
+26. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then

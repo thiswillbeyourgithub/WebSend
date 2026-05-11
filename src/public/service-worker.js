@@ -10,7 +10,11 @@
  * the freshest assets from network costs nothing extra.
  */
 
-const CACHE_NAME = 'websend-v1';
+// Bumping CACHE_NAME forces the activate handler below to drop every
+// pre-existing cache, which is the only way to clear out cross-origin
+// responses that earlier SW versions may have stored before this
+// version restricted caching to same-origin basic responses.
+const CACHE_NAME = 'websend-v2';
 
 // Static assets to cache on install
 const STATIC_ASSETS = [
@@ -60,12 +64,24 @@ self.addEventListener('activate', (event) => {
     self.clients.claim();
 });
 
-// Fetch event: network-first for all assets
+// Fetch event: network-first for same-origin assets only.
+//
+// Cross-origin requests (e.g. an admin-configured Umami tracker) are
+// deliberately NOT intercepted: if upstream is ever compromised and the
+// SW had cached the bad response, every user would keep running the
+// compromised script offline even after the upstream is fixed. Letting
+// the browser handle cross-origin directly means a fix at the source is
+// effective for everyone on their next online load.
 self.addEventListener('fetch', (event) => {
-    const url = new URL(event.request.url);
-
     // Skip non-GET requests (WebSocket upgrades, POST, etc.)
     if (event.request.method !== 'GET') {
+        return;
+    }
+
+    const url = new URL(event.request.url);
+
+    // Skip cross-origin entirely (see comment above).
+    if (url.origin !== self.location.origin) {
         return;
     }
 
@@ -75,11 +91,17 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
-    // All assets: network-first, cache fallback
+    // Same-origin assets: network-first, cache fallback.
     event.respondWith(
         fetch(event.request).then((networkResponse) => {
-            // Update cache with fresh response
-            if (networkResponse.ok) {
+            // Only cache successful, same-origin, non-opaque responses.
+            // `response.type === 'basic'` rules out opaque/cors/error
+            // responses so we never persist something we cannot validate.
+            // Browser-level SRI on <script integrity> still rejects any
+            // tampered cached body at execution time; this is the
+            // belt-and-braces layer that prevents storing it in the
+            // first place.
+            if (networkResponse.ok && networkResponse.type === 'basic') {
                 const responseClone = networkResponse.clone();
                 caches.open(CACHE_NAME).then((cache) => {
                     cache.put(event.request, responseClone);
