@@ -604,6 +604,27 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     `CropModal`, `Gallery`, etc.) are left mutable on purpose so
     tests / future refactors can stub them; the frozen set is exactly
     the surface where a swap would break the security model.
+34. **Server error-handler scrubbing**: every Express response now
+    flows through a final 4-arg error middleware and a final 404
+    middleware before falling off the end of the chain. Express 4's
+    stock error handler emits the full server stack trace in the
+    response body whenever `NODE_ENV` is not exactly `"production"`,
+    and the stock 404 handler echoes the requested path into a
+    text/html "Cannot GET /x" page. WebSend does not set `NODE_ENV`
+    anywhere (Docker image, CI, local dev all leave it unset), so
+    without these handlers a thrown exception or a probe of an unknown
+    URL would leak absolute source paths, the in-memory data shape,
+    and Express / body-parser version fingerprints. The custom handler
+    logs the real stack server-side, preserves well-formed 4xx status
+    codes set by upstream middleware (e.g. body-parser's 413 for
+    payloads over 50 kB, 400 for malformed JSON), but replaces
+    `err.message` with a fixed phrase per status (`Payload too large`,
+    `Bad request`, ...) so parser-fingerprint strings like "Unexpected
+    token } in JSON at position 17" never reach the network. Any error
+    outside `400..499` collapses to a generic 500 JSON. The 404
+    handler returns `{"error":"Not found"}` and crucially does not echo
+    the requested path, denying an attacker the ability to smuggle
+    HTML or ANSI into log scrapers via the URL.
 
 ## SSO (Experimental)
 

@@ -964,6 +964,59 @@ app.get('/send/:roomId', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'send.html'));
 });
 
+// Final 404 handler: keep the response body generic so a probe of
+// unknown paths cannot fingerprint our routing tree (which would
+// otherwise leak through Express's default text/html "Cannot GET /x"
+// page). Logging here is deliberately low-noise: noise on 404 is the
+// path of least resistance for log-injection too.
+app.use((req, res) => {
+    res.status(404).json({ error: 'Not found' });
+});
+
+// Final error handler: Express 4's default handler returns the full
+// stack trace in the response body whenever NODE_ENV is not exactly
+// "production". We do NOT set NODE_ENV anywhere (Docker, CI, local),
+// so a thrown exception or `next(err)` from any current or future
+// handler would leak server-side paths, dependency versions, and our
+// in-memory data shape to the network. This middleware forces a
+// generic 500 JSON regardless of env, while still logging the real
+// error server-side for operators. The 4-arg signature (err, req,
+// res, next) is what tells Express this is the error path.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    console.error(`[error] ${req.method} ${req.path}:`, err && err.stack ? err.stack : err);
+    if (res.headersSent) {
+        return res.end();
+    }
+    // Preserve well-formed status codes set by middleware (body-parser
+    // raises PayloadTooLargeError with statusCode 413 for bodies over
+    // the 50kb cap, and similar for malformed JSON). Anything outside
+    // 400..499 collapses to a generic 500 so internal bugs cannot leak
+    // arbitrary status text.
+    const status = (err && Number.isInteger(err.status) && err.status >= 400 && err.status < 500)
+        ? err.status
+        : (err && Number.isInteger(err.statusCode) && err.statusCode >= 400 && err.statusCode < 500)
+            ? err.statusCode
+            : 500;
+    if (status === 500) {
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+    // For 4xx originating in middleware, surface a short generic
+    // message tied to the status code, never `err.message` (which can
+    // include "SyntaxError: Unexpected token } in JSON at position 17"
+    // and similar parser fingerprints).
+    const messages = {
+        400: 'Bad request',
+        401: 'Unauthorized',
+        403: 'Forbidden',
+        404: 'Not found',
+        413: 'Payload too large',
+        415: 'Unsupported media type',
+        429: 'Too many requests',
+    };
+    res.status(status).json({ error: messages[status] || 'Request error' });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log('='.repeat(60));
     console.log('  WebSend - Startup Configuration');
