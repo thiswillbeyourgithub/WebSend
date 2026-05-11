@@ -128,6 +128,19 @@ class WebSendRTC {
                 this._CONNECTION_TIMEOUT_MS = config.turnTimeout * 1000;
             }
             logger.success(`Got ${this.iceServers.length} ICE servers (transport policy: ${this.iceTransportPolicy})`);
+            // Surface protocol breakdown in plain logs so the user can tell at
+            // a glance whether TURNS was actually offered for this session.
+            const breakdown = { stun: 0, turn: 0, turns: 0 };
+            this.iceServers.forEach(s => {
+                const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+                urls.forEach(u => {
+                    if (typeof u !== 'string') return;
+                    if (u.startsWith('turns:')) breakdown.turns++;
+                    else if (u.startsWith('turn:')) breakdown.turn++;
+                    else if (u.startsWith('stun:')) breakdown.stun++;
+                });
+            });
+            logger.info(`ICE breakdown: STUN=${breakdown.stun}, TURN=${breakdown.turn}, TURNS=${breakdown.turns}`);
             logger.debug('CONFIG', 'ICE servers loaded', { servers: this.iceServers, iceTransportPolicy: this.iceTransportPolicy });
             // Fire-and-forget ICE server reachability check (DEV mode only)
             this.diagnoseIceServers();
@@ -156,17 +169,34 @@ class WebSendRTC {
         // so lost POSTs or timing gaps in polling are harmless.
         this.pc.onicecandidate = (event) => {
             // Browsers emit an "end-of-candidates" signal as a non-null
-            // RTCIceCandidate whose .candidate string is empty. Skip it —
+            // RTCIceCandidate whose .candidate string is empty. Skip it:
             // the server rejects empty candidate strings with a 400.
             if (event.candidate && event.candidate.candidate) {
-                const candidateInfo = event.candidate.type || 'unknown';
-                logger.info(`ICE candidate: ${candidateInfo}`);
+                const cand = event.candidate;
+                // cand.url (Firefox) / event.url (Chromium) names the ICE server
+                // that produced this candidate. Surfacing it makes TURN vs TURNS
+                // visible in the gather log without needing getStats().
+                const sourceUrl = cand.url || event.url || '';
+                let label = cand.type || 'unknown';
+                if (cand.type === 'relay' && sourceUrl) {
+                    if (sourceUrl.startsWith('turns:')) {
+                        label = `relay via TURNS(TLS) ${sourceUrl}`;
+                    } else if (sourceUrl.startsWith('turn:')) {
+                        label = `relay via TURN/${cand.protocol || '?'} ${sourceUrl}`;
+                    }
+                } else if ((cand.type === 'srflx' || cand.type === 'prflx') && sourceUrl) {
+                    label = `${cand.type} via ${sourceUrl}`;
+                }
+                logger.info(`ICE candidate: ${label}`);
                 logger.debug('ICE', 'Local candidate generated', {
-                    type: event.candidate.type,
-                    protocol: event.candidate.protocol,
-                    address: event.candidate.address,
-                    port: event.candidate.port,
-                    candidateStr: event.candidate.candidate?.substring(0, 80)
+                    type: cand.type,
+                    protocol: cand.protocol,
+                    address: cand.address,
+                    port: cand.port,
+                    url: sourceUrl || null,
+                    relatedAddress: cand.relatedAddress,
+                    relatedPort: cand.relatedPort,
+                    candidateStr: cand.candidate?.substring(0, 120)
                 });
 
                 // Send to server with room secret for authorization
@@ -175,13 +205,34 @@ class WebSendRTC {
                     fetch(`/api/rooms/${this.roomId}/ice/${endpoint}`, {
                         method: 'POST',
                         headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
-                        body: JSON.stringify(event.candidate.toJSON())
+                        body: JSON.stringify(cand.toJSON())
                     }).catch(e => logger.warn('Failed to send ICE candidate: ' + e.message));
                 }
             } else {
                 logger.info('ICE gathering complete');
                 logger.debug('ICE', 'Gathering finished, all candidates sent');
             }
+        };
+
+        // onicecandidateerror fires once per STUN/TURN/TURNS server that fails
+        // to produce a candidate. errorCode + url + address/port let us tell
+        // coturn-auth failures (401) apart from DNS (701), network (>=700),
+        // or coturn-side errors (5xx). Without this handler the user only
+        // sees "no relay candidate gathered" with no clue why.
+        this.pc.onicecandidateerror = (event) => {
+            const url = event.url || '(unknown server)';
+            const code = event.errorCode;
+            const text = event.errorText || '';
+            const hint = this._explainIceError(code, url);
+            logger.error(`ICE error from ${url}: code=${code} "${text}" :: ${hint}`);
+            logger.debug('ICE', 'ICE candidate error', {
+                url,
+                errorCode: code,
+                errorText: text,
+                address: event.address,
+                port: event.port,
+                hostCandidate: event.hostCandidate
+            });
         };
 
         // Monitor connection state
@@ -235,8 +286,8 @@ class WebSendRTC {
             });
 
             if (iceState === 'failed') {
-                logger.error('ICE connection failed — no network path found between peers');
-                logger.error('This typically means: both peers are behind symmetric NATs and no TURN server is configured');
+                logger.error('ICE connection failed: no working network path between peers');
+                logger.error('Likely causes: (1) symmetric NATs and no TURN/TURNS relay reachable, (2) coturn down or wrong port, (3) coturn rejected credentials. See preceding "ICE error from ..." lines for the precise per-server failure.');
             }
         };
 
@@ -874,7 +925,7 @@ class WebSendRTC {
             if (state !== 'connected' && state !== 'failed' && state !== 'closed') {
                 logger.error(`Connection timed out after ${this._CONNECTION_TIMEOUT_MS / 1000}s — WebRTC never connected`);
                 logger.error(`Final states: connectionState=${state}, iceConnectionState=${iceState}`);
-                logger.error('Likely causes: TURN server unreachable, bad TURN credentials, or firewall blocking UDP/TCP relay ports');
+                logger.error('Likely causes: TURN/TURNS server unreachable, coturn rejected credentials, or firewall blocking the relay ports. Check earlier "ICE error from ..." lines for the precise failure.');
                 this._logConnectionFailure();
                 this.stopIceCandidatePolling();
                 if (this.onDisconnected) this.onDisconnected();
@@ -935,57 +986,139 @@ class WebSendRTC {
         logger.error(`ICE gathering state: ${this.pc.iceGatheringState}`);
         logger.error(`Signaling state: ${this.pc.signalingState}`);
 
-        // Log configured ICE servers
+        // Split configured servers by protocol so the user can immediately
+        // see whether TURNS was actually in the offered set (the old log
+        // collapsed turn: and turns: into a single "TURN: yes" flag).
         const config = this.pc.getConfiguration();
-        const serverCount = config.iceServers?.length || 0;
-        const hasStun = config.iceServers?.some(s => {
+        const counts = { stun: 0, turn: 0, turns: 0 };
+        const urlsByKind = { stun: [], turn: [], turns: [] };
+        (config.iceServers || []).forEach(s => {
             const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-            return urls.some(u => u.startsWith('stun:'));
+            urls.forEach(u => {
+                if (typeof u !== 'string') return;
+                if (u.startsWith('turns:')) { counts.turns++; urlsByKind.turns.push(u); }
+                else if (u.startsWith('turn:')) { counts.turn++; urlsByKind.turn.push(u); }
+                else if (u.startsWith('stun:')) { counts.stun++; urlsByKind.stun.push(u); }
+            });
         });
-        const hasTurn = config.iceServers?.some(s => {
-            const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-            return urls.some(u => u.startsWith('turn:') || u.startsWith('turns:'));
-        });
-        logger.error(`ICE servers configured: ${serverCount} (STUN: ${hasStun ? 'yes' : 'NO'}, TURN: ${hasTurn ? 'yes' : 'NO'})`);
-
-        if (!hasTurn) {
-            logger.error('No TURN server configured — connection will fail if both peers are behind symmetric NATs');
+        logger.error(`ICE servers configured: STUN=${counts.stun}, TURN=${counts.turn}, TURNS=${counts.turns}`);
+        if (counts.stun)  logger.error(`  STUN URLs:  ${urlsByKind.stun.join(', ')}`);
+        if (counts.turn)  logger.error(`  TURN URLs:  ${urlsByKind.turn.join(', ')}`);
+        if (counts.turns) logger.error(`  TURNS URLs: ${urlsByKind.turns.join(', ')}`);
+        if (counts.turn === 0 && counts.turns === 0) {
+            logger.error('No TURN nor TURNS in the offered list: symmetric-NAT peers will not connect.');
+        } else if (counts.turns === 0) {
+            logger.error('No TURNS in the offered list: networks that block UDP and plain-TCP TURN (default 3478) will fail. Set TURNS_PORT on the server.');
         }
 
-        // Gather candidate pair stats to show what was attempted
         try {
             const stats = await this.pc.getStats();
-            let localCandidateTypes = [];
-            let remoteCandidateTypes = [];
-            let pairStates = [];
-
+            const localById = new Map();
+            const remoteById = new Map();
+            const pairs = [];
             stats.forEach(report => {
-                if (report.type === 'local-candidate') {
-                    localCandidateTypes.push(`${report.candidateType}/${report.protocol || '?'}/${report.address || '?'}:${report.port || '?'}`);
-                }
-                if (report.type === 'remote-candidate') {
-                    remoteCandidateTypes.push(`${report.candidateType}/${report.protocol || '?'}/${report.address || '?'}:${report.port || '?'}`);
-                }
-                if (report.type === 'candidate-pair') {
-                    pairStates.push(`${report.state} (nominated:${report.nominated})`);
-                }
+                if (report.type === 'local-candidate') localById.set(report.id, report);
+                else if (report.type === 'remote-candidate') remoteById.set(report.id, report);
+                else if (report.type === 'candidate-pair') pairs.push(report);
             });
 
-            logger.error(`Local candidates gathered: ${localCandidateTypes.length > 0 ? localCandidateTypes.join(', ') : 'NONE'}`);
-            logger.error(`Remote candidates received: ${remoteCandidateTypes.length > 0 ? remoteCandidateTypes.join(', ') : 'NONE'}`);
-            logger.error(`Candidate pairs tried: ${pairStates.length > 0 ? pairStates.join(', ') : 'NONE'}`);
+            // Bucket local relay candidates by relayProtocol so the user can
+            // see whether TURNS specifically produced anything, vs plain TURN.
+            const localSummary = { host: 0, srflx: 0, prflx: 0, 'relay/udp': 0, 'relay/tcp': 0, 'relay/tls': 0 };
+            localById.forEach(c => {
+                if (c.candidateType === 'relay') {
+                    const key = `relay/${(c.relayProtocol || '?').toLowerCase()}`;
+                    localSummary[key] = (localSummary[key] || 0) + 1;
+                } else if (c.candidateType in localSummary) {
+                    localSummary[c.candidateType]++;
+                }
+            });
+            logger.error(`Local candidates: ${JSON.stringify(localSummary)}`);
 
-            if (localCandidateTypes.length === 0) {
-                logger.error('No local candidates — STUN server may be unreachable or blocked by firewall');
+            if (counts.turns > 0 && localSummary['relay/tls'] === 0) {
+                logger.error('TURNS was offered but no relay/tls candidate was gathered. Likely: coturn TLS port unreachable, TLS handshake failed (cert?), or TURN_SECRET mismatch. Look for an "ICE error from turns:..." line above for the exact reason.');
             }
-            if (remoteCandidateTypes.length === 0) {
-                logger.error('No remote candidates — the other peer may have failed to gather candidates');
+            const anyRelay = localSummary['relay/udp'] + localSummary['relay/tcp'] + localSummary['relay/tls'];
+            if ((counts.turn > 0 || counts.turns > 0) && anyRelay === 0) {
+                logger.error('Relay was offered but zero relay candidates were gathered. coturn did not allocate (auth, network, or coturn down).');
+            }
+            if (localSummary.host === 0 && localSummary.srflx === 0 && anyRelay === 0) {
+                logger.error('No local candidates of any kind: browser could not gather (permission, network interface, or transport policy too restrictive).');
+            }
+
+            const remoteSummary = { host: 0, srflx: 0, prflx: 0, relay: 0 };
+            remoteById.forEach(c => {
+                if (c.candidateType in remoteSummary) remoteSummary[c.candidateType]++;
+            });
+            logger.error(`Remote candidates: ${JSON.stringify(remoteSummary)}`);
+            if (remoteSummary.host + remoteSummary.srflx + remoteSummary.prflx + remoteSummary.relay === 0) {
+                logger.error('No remote candidates received: the other peer failed to gather, or signaling never delivered them.');
+            }
+
+            // Dump every pair so the user can see whether a path was tried,
+            // got STUN binding responses, or never moved past "waiting".
+            if (pairs.length === 0) {
+                logger.error('No candidate pairs were formed: the two sides did not exchange compatible candidates.');
+            } else {
+                logger.error(`Candidate pairs (${pairs.length}):`);
+                pairs.forEach((p, i) => {
+                    const l = localById.get(p.localCandidateId);
+                    const r = remoteById.get(p.remoteCandidateId);
+                    const lDesc = l ? `${l.candidateType}/${l.protocol || '?'}${l.relayProtocol ? `(relay=${l.relayProtocol})` : ''}` : '?';
+                    const rDesc = r ? `${r.candidateType}/${r.protocol || '?'}` : '?';
+                    const rtt = p.currentRoundTripTime !== undefined ? `${Math.round(p.currentRoundTripTime * 1000)}ms` : '-';
+                    logger.error(`  [${i}] ${lDesc} -> ${rDesc} state=${p.state} nominated=${!!p.nominated} reqSent=${p.requestsSent || 0} respRcvd=${p.responsesReceived || 0} reqRcvd=${p.requestsReceived || 0} respSent=${p.responsesSent || 0} rtt=${rtt}`);
+                });
+                const anySucceeded = pairs.some(p => p.state === 'succeeded');
+                const anyInFlight = pairs.some(p => p.requestsSent > 0 && p.responsesReceived === 0);
+                if (!anySucceeded && anyInFlight) {
+                    logger.error('At least one pair sent STUN binding requests but got no response: peer side dropped them (firewall on the peer, or its TURN allocation never reached us).');
+                }
             }
         } catch (e) {
             logger.error('Could not gather stats: ' + e.message);
         }
 
         logger.error('=== END DIAGNOSTICS ===');
+
+        // Probe each configured ICE server now so the user gets a per-server
+        // reachability report even outside DEV mode. Once per session: probes
+        // can take ~12s and we do not want to spam on every disconnect.
+        if (!this._diagnosticsAlreadyRun) {
+            this._diagnosticsAlreadyRun = true;
+            this.diagnoseIceServers({ force: true });
+        }
+    }
+
+    /**
+     * Map an RTCPeerConnectionIceErrorEvent.errorCode to a human-readable
+     * cause hint, tailored by whether the failing URL was STUN, TURN, or TURNS.
+     * STUN codes (300-699) and TURN codes (4xx) follow RFC 5389/5766/8489;
+     * codes >=700 are reserved by the spec for host-level network failures.
+     */
+    _explainIceError(code, url) {
+        const isTurns = !!url && url.startsWith('turns:');
+        const isTurn = !!url && url.startsWith('turn:');
+        const family = isTurns ? 'TURNS' : isTurn ? 'TURN' : 'STUN';
+        if (code === 401) return `${family}: credentials rejected by server. Check that TURN_SECRET on WebSend matches coturn's static-auth-secret and that coturn's clock is in sync.`;
+        if (code === 403) return `${family}: forbidden. coturn ACL denies this user (denied-peer-ip / allowed-peer-ip?).`;
+        if (code === 437) return `${family}: server lost allocation state (transient, usually clears on retry).`;
+        if (code === 438) return `${family}: stale nonce (transient).`;
+        if (code === 441) return `${family}: wrong credentials for the server's realm. Realm mismatch between WebSend and coturn?`;
+        if (code === 442) return `${family}: unsupported transport requested by client.`;
+        if (code === 486) return `${family}: server at allocation capacity.`;
+        if (code === 508) return `${family}: server insufficient capacity.`;
+        if (code === 701) return `${family}: DNS lookup for the server hostname failed.`;
+        if (code === 702) return `${family}: cannot reach server address (firewall, wrong port, or no route).`;
+        if (code >= 300 && code < 400) return `${family}: server redirected or temporarily unavailable.`;
+        if (code >= 700) {
+            if (isTurns) return `TURNS: network-level failure (TCP connect refused, TLS handshake failed, cert invalid, or TURNS_PORT blocked by firewall).`;
+            if (isTurn)  return `TURN: network-level failure (UDP relay blocked AND TCP-3478 unreachable).`;
+            return `${family}: network-level failure (host unreachable or port blocked).`;
+        }
+        if (code >= 400 && code < 500) return `${family}: protocol or auth error from server.`;
+        if (code >= 500) return `${family}: server-side error.`;
+        return `${family}: unrecognised error code ${code}.`;
     }
 
     /**
@@ -1084,14 +1217,16 @@ class WebSendRTC {
      * and checks whether the expected candidate type appears within a timeout.
      * Results are logged to help diagnose firewall/configuration issues.
      */
-    async diagnoseIceServers() {
-        if (!this._devMode) return;
+    async diagnoseIceServers(opts = {}) {
+        // DEV mode runs probes on init for proactive feedback; failure
+        // paths pass {force:true} so the report shows up in prod too.
+        if (!opts.force && !this._devMode) return;
         if (!this.iceServers || this.iceServers.length === 0) {
             logger.debug('DIAG', 'No ICE servers to diagnose');
             return;
         }
 
-        logger.info('=== ICE SERVER REACHABILITY CHECK (DEV) ===');
+        logger.info(`=== ICE SERVER REACHABILITY CHECK${opts.force ? ' (post-failure)' : ' (DEV)'} ===`);
 
         // Build a list of individual probes: one per URL
         const probes = [];
