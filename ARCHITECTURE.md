@@ -59,7 +59,9 @@ WebSend/
     ├── server.js           # Express server: signaling API, ICE config, static serving,
     │                       #   serves vendored libs at /vendor/, /scribe/, /tessdata/.
     │                       #   Also exposes GET /send/:roomId as a pretty-URL redirect
-    │                       #   for the sender flow
+    │                       #   for the sender flow. Startup banner prints the exact
+    │                       #   STUN / TURN / TURNS URL list /api/config will hand out
+    │                       #   (credentials masked) so missing TURNS_PORT is obvious
     ├── server-helpers.js   # Pure server-side helpers (origin parsing, rate-limit
     │                       #   sliding-window logic, TURN HMAC-SHA1 credential
     │                       #   derivation, fingerprint-length sizing). Unit-tested
@@ -114,7 +116,15 @@ WebSend/
         │   │               #   SDP offer/answer exchange via server API, trickle ICE
         │   │               #   candidate relay, data channel setup, chunked file transfer,
         │   │               #   connection type detection (direct vs TURN relay).
-        │   │               #   Validates all inbound/outbound JSON messages via Protocol
+        │   │               #   Validates all inbound/outbound JSON messages via Protocol.
+        │   │               #   Diagnostics: onicecandidateerror maps errorCode to a
+        │   │               #   cause hint per STUN/TURN/TURNS server (401 = coturn auth,
+        │   │               #   701 = DNS, >=700 = network/TLS); _logConnectionFailure
+        │   │               #   splits STUN/TURN/TURNS counts, buckets local relay
+        │   │               #   candidates by relayProtocol (udp/tcp/tls), and dumps
+        │   │               #   every candidate-pair with reqSent/respRcvd/RTT.
+        │   │               #   diagnoseIceServers({force:true}) runs per-server
+        │   │               #   reachability probes even outside DEV mode on failure.
         │   ├── logger.js   # In-memory log buffer with UI panel (slide-up overlay).
         │   │               #   Supports info/success/warn/error/debug levels.
         │   │               #   DEV mode (toggled via server config) enables verbose output

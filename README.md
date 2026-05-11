@@ -273,6 +273,13 @@ sudo ufw-docker allow coturn 49161/udp
   uv run misc/check_turn.py --turns-server myrelay.example.com 5349
   uv run misc/check_turn.py --turn-server  myrelay.example.com 3478
   ```
+- **Diagnosing failed sessions from the logs**: the in-page logs panel (Logs button on sender and receiver) now distinguishes STUN / TURN / TURNS individually instead of lumping them. Useful lines to look for:
+  - **Startup of the server**: `ICE URLs offered to clients: STUN=N, TURN=N, TURNS=N` followed by every URL. If `TURNS=0`, no `turns:` will be offered to clients (set `TURNS_PORT`).
+  - **Client init**: `ICE breakdown: STUN=N, TURN=N, TURNS=N`. Tells you what the server handed this session.
+  - **Per-candidate gather**: `ICE candidate: relay via TURNS(TLS) turns:host:5349` confirms TURNS actually produced a candidate.
+  - **Per-server failure**: `ICE error from turns:host:5349: code=401 "Unauthorized" :: TURNS: credentials rejected by server. Check that TURN_SECRET on WebSend matches coturn's static-auth-secret`. The code maps to a tailored cause (401 = coturn auth, 403 = ACL, 701 = DNS, >=700 = network unreachable / TLS handshake / port blocked).
+  - **On disconnect**: a `CONNECTION FAILURE DIAGNOSTICS` block lists configured URLs, gathered local candidates (with `relay/udp`, `relay/tcp`, `relay/tls` broken out), remote candidates, and every candidate pair with `state`, `nominated`, `requestsSent`, `responsesReceived`, and RTT. A pair with `reqSent>0 respRcvd=0` means the peer dropped our STUN probes (firewall on their side).
+  - Whenever a session fails, a per-server probe report (`[DIAG] turns:host:5349 -- reachable / UNREACHABLE`) is appended even outside `DEV=1`.
 - **QR code not scanning**: ensure good lighting and that the QR code is fully visible. The QR code contains a URL with a security token.
 - **Click "Logs" button**: both sender and receiver pages have a logs panel for detailed connection debugging. Set `DEV=1` in `.env` for verbose output.
 
