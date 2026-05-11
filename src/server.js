@@ -1061,5 +1061,29 @@ app.listen(PORT, '0.0.0.0', () => {
         console.log('  DEV MODE ENABLED - verbose debug logging active');
     }
 
+    // Print the exact ICE URL list that /api/config will hand out (without
+    // credentials). Without this the operator has to mentally compose the
+    // URLs from STUN_SERVER / TURN_SERVER / TURNS_PORT and can miss e.g.
+    // TURNS not being offered because TURNS_PORT was unset.
+    const previewUrls = { stun: [], turn: [], turns: [] };
+    if (STUN_SERVER) previewUrls.stun.push(`stun:${STUN_SERVER}`);
+    if (STUN_GOOGLE_FALLBACK) previewUrls.stun.push('stun:stun.l.google.com:19302');
+    if (TURN_SERVER && TURN_SECRET) {
+        previewUrls.turn.push(`turn:${TURN_SERVER}?transport=udp`);
+        previewUrls.turn.push(`turn:${TURN_SERVER}?transport=tcp`);
+        if (TURNS_PORT) {
+            const turnHost = TURN_SERVER.replace(/:\d+$/, '');
+            previewUrls.turns.push(`turns:${turnHost}:${TURNS_PORT}`);
+        }
+    }
+    console.log('-'.repeat(60));
+    console.log(`  ICE URLs offered to clients: STUN=${previewUrls.stun.length}, TURN=${previewUrls.turn.length}, TURNS=${previewUrls.turns.length}`);
+    for (const u of previewUrls.stun)  console.log(`    STUN:  ${u}`);
+    for (const u of previewUrls.turn)  console.log(`    TURN:  ${u}`);
+    for (const u of previewUrls.turns) console.log(`    TURNS: ${u}`);
+    if (TURN_SERVER && TURN_SECRET && !TURNS_PORT) {
+        console.log('  Note: TURNS_PORT not set, so no turns: URL will be offered. Networks that block UDP and TCP-3478 will fail.');
+    }
+
     console.log('='.repeat(60));
 });
