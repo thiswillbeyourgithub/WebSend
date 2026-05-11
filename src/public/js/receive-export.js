@@ -716,16 +716,32 @@
         return mupdfInstance;
     }
 
+    // Hard ceiling on the number of pages we will render from a peer-
+    // supplied PDF. Legitimate documents are typically <100 pages and
+    // virtually never exceed a few hundred. A malicious PDF can declare
+    // millions of pages; rendering each one at 150-300 DPI to a PNG
+    // would chain large allocations on the receiver main thread until
+    // the tab OOMs. 1000 is comfortable headroom for legit use while
+    // still bounding worst-case cost.
+    const MAX_PDF_RENDER_PAGES = 1000;
+
     /**
      * Render all pages of a PDF to PNG data URLs using MuPDF.
      * @param {Uint8Array} pdfData - Raw PDF bytes
      * @param {number} dpi - Render DPI (default 150)
      * @returns {Promise<string[]>} Array of data:image/png;base64,... URLs
+     * @throws Error if pageCount > MAX_PDF_RENDER_PAGES
      */
     async function renderPdfPages(pdfData, dpi = 150) {
         const mupdf = await getMuPDF();
         const doc = await mupdf.openDocument(pdfData.buffer);
         const pageCount = await mupdf.countPages(doc);
+        if (pageCount > MAX_PDF_RENDER_PAGES) {
+            await mupdf.freeDocument(doc);
+            throw new Error(
+                `PDF has ${pageCount} pages, refusing to render more than ${MAX_PDF_RENDER_PAGES}`
+            );
+        }
         const pages = [];
         for (let i = 1; i <= pageCount; i++) {
             const dataUrl = await mupdf.drawPageAsPNG(doc, { page: i, dpi });
@@ -856,5 +872,6 @@
         exportPdfAsImages,
         exportPdfAsOcr,
         claimScribePreloaded,
+        MAX_PDF_RENDER_PAGES,  // see comment above the constant
     };
 })();

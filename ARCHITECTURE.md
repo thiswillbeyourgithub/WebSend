@@ -532,7 +532,16 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     astral codepoints to balloon memory at half the apparent character
     cost. This is the control-plane analogue of the existing
     `MAX_TOTAL_SESSION_BYTES` cap on the binary path.
-28. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
+28. **PDF page-render cap**: `receive-export.renderPdfPages` refuses
+    to render more than `MAX_PDF_RENDER_PAGES` (1000) pages from any
+    peer-supplied PDF. The "Export as images" and "Export as OCR PDF"
+    per-card actions feed `file.data` directly into MuPDF; a malicious
+    PDF can declare millions of pages, and rendering each one at 150
+    or 300 DPI to a PNG chains large allocations on the main thread
+    until the tab OOMs. We free the MuPDF document and throw with a
+    clear "PDF has N pages, refusing to render more than 1000" error
+    that surfaces as a user-visible toast.
+29. **Cross-session data isolation**: A new pairing on either device shreds all in-memory
     user data, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, and crypto
     keys before establishing the new session. On the **sender**, scanning a QR with a
     different roomId triggers a confirm prompt (when the gallery is non-empty) and then
