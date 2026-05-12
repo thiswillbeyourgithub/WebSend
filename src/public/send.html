@@ -720,23 +720,49 @@
                 return;
             }
 
-            // Multiple files: strip metadata on all, queue them directly for sending
+            // Multiple files: pipeline strip+queue so we never hold more than
+            // one PNG-stripped blob in memory at a time (the queued one).
+            // The previous "strip-all-then-drain" path peaked at N x ~30MB on
+            // Android Chrome and killed the renderer, which dropped the data
+            // channel and forced both peers to reconnect.
             if (!SenderConnect.getSharedKey()) {
                 showToast(i18n.t('error.selectImage'), { type: 'warn' });
                 return;
             }
 
-            logger.info(`Selected ${files.length} files, processing and queuing...`);
+            // Hard cap on selection size. PNG re-encoding bloats each phone
+            // photo to ~20-40MB, so even with pipelining a runaway selection
+            // (e.g. "select all" in the gallery) can OOM the renderer or the
+            // receiver. 50 is well above any realistic single-share but low
+            // enough to keep total resident bytes bounded.
+            const MAX_FILES = 50;
+            if (files.length > MAX_FILES) {
+                logger.warn(`Selection of ${files.length} files exceeds cap of ${MAX_FILES}; rejecting`);
+                showToast(`Too many files (${files.length}). Please select ${MAX_FILES} or fewer at a time.`, { type: 'warn' });
+                event.target.value = '';
+                return;
+            }
+
+            logger.info(`Selected ${files.length} files, processing and queuing one at a time...`);
             let queued = 0;
             let failed = 0;
+            let batchStarted = false;
             for (const file of files) {
                 const processed = await stripFileMetadata(file);
-                if (processed) {
-                    SenderSend.push({ blob: processed, photoId: null });
-                    queued++;
-                } else {
+                if (!processed) {
                     failed++;
+                    continue;
                 }
+                if (!batchStarted) {
+                    SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
+                    batchStarted = true;
+                }
+                SenderSend.push({ blob: processed, photoId: null });
+                queued++;
+                // drain() is idempotent; calling it here lets the previous
+                // photo upload in parallel with stripping the next one, so
+                // the queue never builds up to N stripped blobs.
+                SenderSend.drain();
             }
 
             logger.info(`Queued ${queued} photos${failed ? `, ${failed} failed` : ''}`);
@@ -745,7 +771,10 @@
             }
             if (queued > 0) {
                 showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
-                SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
+                // markBatchEndPending + drain() flushes batch-end whether
+                // drain is still mid-flight (the flag is picked up after the
+                // last queued item finishes) or already idle (a fresh drain
+                // sees the empty queue, fires batch-end, exits).
                 SenderSend.markBatchEndPending();
                 SenderSend.drain();
             }

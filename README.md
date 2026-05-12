@@ -107,6 +107,10 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - `cropPerspective` defensively clamps its output dimensions to `min(srcDim * 2, 8192)` so even a validator bypass cannot drive a multi-GiB `createImageData` allocation or freeze the main thread on the inverse-mapping loop.
 - Peer-mutating handlers (`encrypted-file`, `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind both-sides fingerprint confirmation, so an unverified peer cannot push files, replay transforms, or rearrange the gallery while the verification modal is still up.
 
+### Sender Picker Bounding (Anti-OOM)
+- The send-page file picker (`#file-input` / `#dir-input`) refuses selections larger than 50 files in one go. EXIF stripping re-encodes every image to PNG, which inflates a typical phone photo from ~5 MB to ~30 MB; a "select all" against a full gallery would otherwise pile up hundreds of MB of stripped blobs before the first byte hit the wire and kill the renderer on Android Chrome.
+- Selected files are processed and queued one-at-a-time (strip → push → drain in a loop), so peak resident memory is bounded by ~1 stripped blob in the queue plus 1 in flight regardless of selection size.
+
 ### Receiver UI DoS Hardening (Anti-DoS)
 - `Collections.createNew()` refuses to allocate past 64 collections per session, so a verified-but-hostile peer flooding `batch-start` cannot grow receiver-side DOM/state without bound. The cap is reset on cross-session shred.
 - The logs panel does not append DOM nodes while it is hidden, and when visible trims its children to `logger.maxLogs` (500). On next open it rebuilds from the bounded in-memory log buffer. A pre-verification flood of invalid wire messages (each producing a `logger.warn`/`error`) can no longer grow the panel forever and OOM the tab.
