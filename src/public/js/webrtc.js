@@ -212,14 +212,30 @@ class WebSendRTC {
             const url = event.url || '(unknown server)';
             const code = event.errorCode;
             const text = event.errorText || '';
+            // event.address is the LOCAL interface Chrome used to reach the
+            // STUN/TURN server. Its address family implies which family of the
+            // remote endpoint was queried (Chrome picks a local interface per
+            // family, then resolves the matching A/AAAA on the remote).
+            // Surfacing IPv4/IPv6 explicitly disambiguates dual-stack 701s
+            // where one family works and the other does not.
+            const localAddr = event.address || '';
+            let family = '';
+            if (localAddr.includes(':')) family = 'IPv6';
+            else if (/\d+\.\d+\.\d+\.\d+/.test(localAddr)) family = 'IPv4';
+            const familyTag = family ? ` [${family}]` : '';
             const hint = this._explainIceError(code, url);
-            logger.error(`ICE error from ${url}: code=${code} "${text}" :: ${hint}`);
+            // 701 (host lookup error) routinely fires for the failing half of
+            // a dual-stack gather while the other half succeeds. Logging it at
+            // ERROR makes benign noise look fatal; warn is the right level.
+            const logFn = code === 701 ? logger.warn : logger.error;
+            logFn.call(logger, `ICE error from ${url}${familyTag}: code=${code} "${text}" :: ${hint}`);
             logger.debug('ICE', 'ICE candidate error', {
                 url,
                 errorCode: code,
                 errorText: text,
                 address: event.address,
                 port: event.port,
+                family: family || null,
                 hostCandidate: event.hostCandidate
             });
         };
