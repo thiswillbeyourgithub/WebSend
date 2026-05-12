@@ -210,8 +210,8 @@ const i18n = (function() {
             // could read as "insecure".
             'connection.relayHttpDetails': 'Relayed via HTTP fallback',
             'connection.relayHttpSecureDetails': 'Relayed via HTTPS fallback',
-            'connection.relayHttpHint': 'Using HTTP fallback relay. Slower than a direct P2P link, but still end-to-end encrypted.',
-            'connection.relayHttpSecureHint': 'Using HTTPS fallback relay. Slower than a direct P2P link, but still end-to-end encrypted.',
+            'connection.relayHttpHint': 'Your network blocks the direct path. WebSend is using an HTTP relay; transfers are slower. End-to-end encryption is always on.',
+            'connection.relayHttpSecureHint': 'Your network blocks the direct path. WebSend is using an HTTPS relay; transfers are slower. End-to-end encryption is always on.',
             'connection.directLocalDetails': 'Direct (local network)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
             'connection.verified': '✓ Verified by both parties',
@@ -441,8 +441,8 @@ const i18n = (function() {
             // voit jamais le clair, d\'où le nom du protocole "HTTPS".
             'connection.relayHttpDetails': 'Relayé via HTTP de secours',
             'connection.relayHttpSecureDetails': 'Relayé via HTTPS de secours',
-            'connection.relayHttpHint': 'Utilisation du relais HTTP de secours. Plus lent qu\'une liaison P2P directe, mais toujours chiffré de bout en bout.',
-            'connection.relayHttpSecureHint': 'Utilisation du relais HTTPS de secours. Plus lent qu\'une liaison P2P directe, mais toujours chiffré de bout en bout.',
+            'connection.relayHttpHint': 'Votre réseau bloque la voie directe. WebSend utilise un relais HTTP ; les transferts sont plus lents. Le chiffrement de bout en bout est toujours actif.',
+            'connection.relayHttpSecureHint': 'Votre réseau bloque la voie directe. WebSend utilise un relais HTTPS ; les transferts sont plus lents. Le chiffrement de bout en bout est toujours actif.',
             'connection.directLocalDetails': 'Direct (réseau local)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
             'connection.verified': '✓ Vérifié par les deux parties',
