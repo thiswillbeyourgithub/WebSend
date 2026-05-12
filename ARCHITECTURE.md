@@ -350,9 +350,17 @@ the matching photo, it surfaces an error toast and gives up.
 | GET    | `/api/rooms/:id/ice/offer`   | Get receiver ICE candidates          | Room secret | None            |
 | POST   | `/api/rooms/:id/ice/answer`  | Add sender ICE candidate             | Room secret | 100/min per IP  |
 | GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | None            |
+| WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket)      | `?secret=...` query | 100/min per IP |
+| POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 100/min per IP |
+| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay  | Room secret + `X-Slot-Token` | 100/min per IP |
+| GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | 100/min per IP |
+| POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Room secret + `X-Slot-Token` | 100/min per IP |
 
 All `/api/*` endpoints validate the `Origin` header against `ALLOWED_ORIGINS`.
 Room endpoints require an `X-Room-Secret` header (constant-time comparison).
+The HTTP-relay endpoints additionally require a per-slot token issued by
+`/relay/handshake` so the room secret alone cannot be used to hijack a live
+relay slot.
 
 ## Security Layers
 
@@ -384,7 +392,9 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
    is vanilla HTML/CSS/JS with zero `node_modules` in the browser. All third-party
    client-side libraries (jsQR, qrcode.js, client-zip, scribe.js-ocr, Tesseract WASM +
    language models, eruda) are vendored directly in the repository — no CDN fetches at runtime.
-   The server-side dependency footprint is minimal (Express.js only).
+   The server-side dependency footprint is minimal (Express.js plus `ws`
+   for the HTTP-relay fallback transport added in v3.7.0; `ws` is the
+   canonical Node WebSocket library, zero transitive deps, ~200 KB).
 10. **SRI**: All `<script>` and `<link>` tags use `integrity` attributes (Subresource
    Integrity), ensuring even a compromised server cannot silently swap in tampered files.
 11. **Rate limiting**: Per-IP sliding window limits on room creation (5/min), room lookup
@@ -637,6 +647,31 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
     handler returns `{"error":"Not found"}` and crucially does not echo
     the requested path, denying an attacker the ability to smuggle
     HTML or ANSI into log scrapers via the URL.
+35. **HTTP-relay fallback transport**: Corporate networks that block UDP
+    and strip TURNS-over-TCP at the proxy used to leave WebSend with no
+    working path. v3.7.0 adds an HTTPS-only fallback that runs over the
+    same Caddy port 443 as the rest of the app. The client opens a
+    WebSocket against `/api/rooms/:id/relay` in parallel with the WebRTC
+    handshake; a 10-second race-grace window lets WebRTC win when it can
+    (P2P / TURN / TURNS all still preferred), and the WS path wins
+    afterwards when WebRTC has not connected. If the WS upgrade itself
+    is refused or torn down, an on-demand long-poll transport
+    (`/relay/handshake`, `/relay/up`, `/relay/down`, `/relay/close`)
+    joins the race using pure HTTPS POST/GET so the path is
+    indistinguishable from regular web traffic. The relay forwards
+    opaque ciphertext between the two paired peers; the existing ECDH +
+    AES-GCM + fingerprint stack is transport-agnostic, so the server
+    never sees plaintext. Anti-DoS caps mirror the WebRTC bounds:
+    `MAX_TOTAL_SESSION_BYTES` (4 GiB) and `MAX_CONTROL_MSG_BYTES`
+    (16 KiB) enforced server-side, plus a bounded per-slot queue
+    (32 frames) and idle timeout (60 s) on the long-poll path. The
+    long-poll slot tokens are 128-bit randoms compared in constant time
+    so the room secret alone cannot hijack a live slot. The sidebar
+    surfaces the active path (Direct / Relay (TURN/TURNS) / Relay (HTTP/
+    HTTPS)) and a one-time toast reminds the user that the relay is
+    slower than P2P. Disabled by setting `RELAY_ENABLE=false` on the
+    server, in which case the WS upgrade returns 404 and the long-poll
+    endpoints return 404 too.
 
 ## SSO (Experimental)
 
@@ -711,3 +746,38 @@ TURNS client ──TLS:443──▶ Caddy (caddy-l4, SNI=turn.<DOMAIN>) ──pl
 
 The reverse proxy owns the certificate; coturn is unaware that TLS is
 involved at all. See README "TURN Relay Security" for the Caddyfile snippet.
+
+### HTTP-relay fallback data path
+
+For corporate networks that block UDP and strip TURNS at the proxy, v3.7.0
+adds a pure-HTTPS fallback that runs through the same `:443` reverse-proxy
+listener as the rest of the app. There is no separate container or port:
+Caddy upgrades the WebSocket to the Node process and proxies HTTP
+POST/GET for the long-poll endpoints, all on the existing signaling
+surface.
+
+```
+                  ┌──── /api/rooms/:id/relay  (WS)  ──┐
+client ──TLS:443──▶ Caddy ───────────────────────────▶ Node Express
+                  └──── /api/rooms/:id/relay/*  (HTTP)┘
+```
+
+The client races three transports in parallel from the start:
+
+1. **WebRTC** — P2P, then TURN, then TURNS. Always preferred.
+2. **WebSocket** to `/api/rooms/:id/relay` — preferred over LP. A 10 s
+   grace window lets WebRTC win when it can.
+3. **Long-poll** over `/api/rooms/:id/relay/{handshake,up,down,close}` —
+   spawned on demand if the WS path disconnects before either side wins.
+
+A `relay-hello` handshake on top of the wire signals that both peers
+have actually joined before the racer fires `onConnected`. The 4 GiB
+session cap and 16 KiB control-message cap are mirrored server-side so
+a malicious client cannot ignore the receiver-side bounds.
+
+Disabled by setting `RELAY_ENABLE=false` on the server (the WS upgrade
+and all `/relay/*` endpoints return 404, and `/api/config` reports
+`relayEnabled:false` so the client never even tries).
+
+This feature was added with assistance from
+[Claude Code](https://claude.ai/claude-code).

@@ -173,6 +173,14 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
   }
   ```
 
+### HTTP-Relay Fallback (Corporate Networks)
+- On networks that block UDP and strip TURNS at the proxy, WebSend now falls back to a pure-HTTPS path that runs through the same `:443` reverse-proxy listener as the rest of the app. No separate container or port; the same Caddy reverse proxy upgrades the WebSocket and handles the long-poll endpoints to the Node process.
+- The client races three transports in parallel: WebRTC (preferred), WebSocket to `/api/rooms/:id/relay`, and an on-demand long-poll over `/api/rooms/:id/relay/{handshake,up,down,close}` (auto-spawned when the WS path is refused). A 10 s grace window lets WebRTC win when it can; afterwards the relay path wins.
+- The relay forwards opaque ciphertext between two paired peers. The existing ECDH + AES-GCM + fingerprint stack is transport-agnostic, so the server never sees plaintext on this path either.
+- Anti-DoS caps are mirrored server-side: 4 GiB `MAX_TOTAL_SESSION_BYTES`, 16 KiB `MAX_CONTROL_MSG_BYTES`, plus a 32-frame bounded queue and 60 s idle timeout on the long-poll slots. Long-poll slot tokens (128-bit random) are validated in constant time alongside the room secret.
+- The sidebar shows the active path: **Direct**, **Relay (TURN)**, **Relay (TURNS)**, **Relay (HTTP)**, or **Relay (HTTPS)**.
+- Disable by setting `RELAY_ENABLE=false` on the server (default is `true`).
+
 ## Non-Security Features
 
 - **PWA (Progressive Web App)**: installable on mobile home screens, with service worker for fast UI shell loading and an auto-reload on each deploy (the cache name is timestamped during SRI regeneration)

@@ -45,6 +45,10 @@
     // so a lucky TURN handshake on a cold cache can still win, while a
     // permanently blocked TURN gives up fast enough to surprise no one.
     const RACE_GRACE_MS = 10_000;
+    // Effective grace window when the server has forced the relay path
+    // via DEV_FORCE_CONNECTION=RELAY_HTTPS. Letting WebRTC even try here
+    // just wastes the test's wall clock.
+    const RACE_GRACE_FORCED_RELAY_MS = 0;
 
     class RacingTransport {
         constructor(role) {
@@ -66,6 +70,11 @@
             this._relayEnabled = false;
             this._lpEnabled = false;
             this._lpSpawned = false;
+            // True when the server has forced the relay path. Suppresses
+            // the WebRTC racer's onConnected so the relay wins immediately
+            // even if WebRTC briefly connects over loopback.
+            this._relayForced = false;
+            this._raceGraceMs = RACE_GRACE_MS;
             // Cached so we can openSlotA / openSlotB on the LP inner when
             // we spawn it after WS already had its turn at room setup.
             this._roomId = null;
@@ -134,6 +143,10 @@
         _handleInnerConnected(name) {
             if (this._closed || this.winner) return;
             if (name === 'webrtc') {
+                if (this._relayForced) {
+                    logger.info('[Race] WebRTC connected but relay forced — ignoring');
+                    return;
+                }
                 // WebRTC always wins immediately when it connects. The
                 // grace window only protects WebRTC from being beaten by
                 // a fast relay — it doesn't keep WebRTC waiting.
@@ -143,13 +156,13 @@
                 // Start (or reuse) the grace timer; if WebRTC doesn't
                 // connect before it fires, this relay wins.
                 if (!this._raceTimer) {
-                    logger.info(`[Race] ${name.toUpperCase()} reached relay-hello; giving WebRTC ${RACE_GRACE_MS}ms grace window`);
+                    logger.info(`[Race] ${name.toUpperCase()} reached relay-hello; giving WebRTC ${this._raceGraceMs}ms grace window`);
                     this._pendingRelay = name;
                     this._raceTimer = setTimeout(() => {
                         if (this._closed || this.winner) return;
                         logger.info(`[Race] WebRTC did not connect within grace window — using ${this._pendingRelay.toUpperCase()} relay`);
                         this._lockWinner(this._pendingRelay);
-                    }, RACE_GRACE_MS);
+                    }, this._raceGraceMs);
                 } else if (this._pendingRelay !== 'webrtc') {
                     // A second relay finished its hello while we were
                     // waiting on WebRTC. Prefer WS over LP (lower overhead).
@@ -242,6 +255,11 @@
                 if (res.ok) {
                     const cfg = await res.json();
                     this._relayEnabled = !!cfg.relayEnabled;
+                    if (cfg.forceConnection === 'RELAY_HTTPS') {
+                        this._relayForced = true;
+                        this._raceGraceMs = RACE_GRACE_FORCED_RELAY_MS;
+                        logger.warn('[Race] DEV_FORCE_CONNECTION=RELAY_HTTPS — WebRTC suppressed, relay wins on hello');
+                    }
                 }
             } catch (_) { this._relayEnabled = false; }
             this._lpEnabled = this._relayEnabled && (typeof window.LPTransport === 'function');

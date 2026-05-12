@@ -99,6 +99,11 @@ const FORCE_FILTERS = {
     GOOGLE_STUN: { filter: filterStunString(u => u.includes('stun.l.google.com')),                  forceRelay: false },
     TURN:        { filter: filterTurnArray(u => u.startsWith('turn:') && !u.startsWith('turns:')),  forceRelay: true  },
     TURNS:       { filter: filterTurnArray(u => u.startsWith('turns:')),                            forceRelay: true  },
+    // RELAY_HTTPS: forces the HTTP-relay fallback path (WS / LP) to win
+    // the transport race by suppressing every ICE server so WebRTC has
+    // no path to connect. The client side reads forceConnection in
+    // /api/config and short-circuits the race-grace window.
+    RELAY_HTTPS: { filter: () => [],                                                                forceRelay: false },
 };
 FORCE_FILTERS.TURN_TLS = FORCE_FILTERS.TURNS;
 
