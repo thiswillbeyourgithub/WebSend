@@ -158,7 +158,20 @@
                 // the two peers. Once we receive one, both halves of the
                 // relay are live and frames will be forwarded.
                 if (msg && msg.type === 'relay-hello') {
-                    if (!this._connected) this._markConnected();
+                    if (!this._connected) {
+                        // Echo back: the peer that opened its slot first
+                        // sent its hello while we were absent and the
+                        // server dropped it on the floor (no peer yet).
+                        // Without this echo, only the second-to-join peer
+                        // ever marks connected. The !_connected guard
+                        // prevents ping-pong.
+                        try {
+                            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                                this.ws.send(JSON.stringify({ type: 'relay-hello' }));
+                            }
+                        } catch (_) {}
+                        this._markConnected();
+                    }
                     return;
                 }
 
