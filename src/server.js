@@ -1317,6 +1317,17 @@ function teardownPeer(peer, reason) {
     if (!peer) return;
     if (peer.kind === 'lp') {
         closeLpSlot(peer, reason);
+        // Also null out the LP slot's room.relay reference so a fresh
+        // /relay/handshake can reclaim it immediately. Without this the
+        // closed LP slot lingers in room.relay until the idle timer
+        // (LP_SLOT_IDLE_TIMEOUT_MS, 60s) fires, which makes the room
+        // appear "slots full" (409) and rejects up/down with 410 for
+        // up to a minute after a cross-kind disconnect (e.g. a WS half
+        // closing while its LP peer is still nominally present).
+        const room = peer.roomRef && peer.roomRef.deref && peer.roomRef.deref();
+        if (room && room.relay && peer.slotName && room.relay[peer.slotName] === peer) {
+            room.relay[peer.slotName] = null;
+        }
     } else if (peer.readyState !== peer.CLOSED) {
         try { peer.close(1000, reason); } catch (_) {}
     }

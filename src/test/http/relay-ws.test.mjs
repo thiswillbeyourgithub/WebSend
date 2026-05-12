@@ -184,6 +184,41 @@ test('peer disconnect closes the partner socket', async () => {
     assert.equal(r.code, 1000);
 });
 
+test('cross-kind WS+LP teardown frees the LP slot for a fresh handshake', async () => {
+    // Regression: when a WS half closes its onclose fires teardownPeer on
+    // its LP partner. closeLpSlot used to leave the LP slot reference in
+    // room.relay until LP_SLOT_IDLE_TIMEOUT_MS (60s), so a fresh handshake
+    // saw "slots full" and returned 409. teardownPeer now nulls the LP
+    // slot reference too, letting a fresh handshake reclaim 'a' immediately.
+    const { roomId, secret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, secret));
+
+    // Claim slot b via long-poll handshake.
+    const h1 = await fetch(`${srv.baseUrl}/api/rooms/${roomId}/relay/handshake`, {
+        method: 'POST',
+        headers: { 'X-Room-Secret': secret, 'Content-Type': 'application/json' },
+        body: '{}',
+    });
+    assert.equal(h1.status, 200);
+    const h1Body = await h1.json();
+    assert.equal(h1Body.slot, 'b');
+
+    // Close the WS half and give the server a moment to run onclose.
+    a.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    // A fresh handshake must succeed (both slots should be free now):
+    // it must NOT return 409 "slots full".
+    const h2 = await fetch(`${srv.baseUrl}/api/rooms/${roomId}/relay/handshake`, {
+        method: 'POST',
+        headers: { 'X-Room-Secret': secret, 'Content-Type': 'application/json' },
+        body: '{}',
+    });
+    assert.equal(h2.status, 200);
+    const h2Body = await h2.json();
+    assert.equal(h2Body.slot, 'a');
+});
+
 test('RELAY_ENABLE=false rejects upgrade with 404', async () => {
     const altSrv = await startServer({ TEST_DISABLE_RATE_LIMIT: '1', RELAY_ENABLE: 'false' });
     try {
