@@ -208,7 +208,11 @@ const MAX_CONTROL_MSG_BYTES = 16 * 1024; // 16 KiB
 const LP_DOWN_TIMEOUT_MS = 25_000;          // long-poll hold time
 const LP_QUEUE_MAX_FRAMES = 32;             // bounded per-slot incoming queue
 const LP_SLOT_TOKEN_BYTES = 16;             // 128-bit slot token
-const LP_FRAME_BODY_LIMIT = '1mb';          // raw-body cap for /relay/up
+// Per-frame body cap on /relay/up. 256 KiB gives ~16x headroom over
+// CHUNK_SIZE (16 KiB) for future protocol additions while keeping a
+// hostile peer's max-body footprint bounded. MAX_TOTAL_SESSION_BYTES
+// (4 GiB) is the session-level ceiling on top of this.
+const LP_FRAME_BODY_LIMIT = '256kb';
 const LP_SLOT_IDLE_TIMEOUT_MS = 60_000;     // close LP slot after this idle
 
 // ============ Rate Limiting ============
