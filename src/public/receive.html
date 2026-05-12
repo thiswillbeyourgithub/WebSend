@@ -506,9 +506,20 @@
          * event once the channel object exists. The brief 200 ms poll only
          * covers the gap until ondatachannel fires (receiver side); after that
          * it's fully event-driven, no busy-waiting.
+         *
+         * `rtc` is a RacingTransport; the WebRTC data channel lives on its
+         * inner `webrtc` instance. If a relay transport (WS/LP) won the race
+         * there is no data channel to wait for: sendMessage is usable as soon
+         * as onConnected fires, so resolve immediately.
          */
         function waitForDataChannel() {
             return new Promise((resolve, reject) => {
+                const innerWebrtc = rtc.webrtc;
+                if (!innerWebrtc || (rtc.winner && rtc.winner !== 'webrtc')) {
+                    resolve();
+                    return;
+                }
+
                 const MAX_WAIT_MS = 10000;
                 let timeoutId = null;
                 let channelPollId = null;
@@ -532,15 +543,15 @@
                     dc.addEventListener('open', () => { cleanup(); resolve(); }, { once: true });
                 };
 
-                if (rtc.dataChannel) {
-                    attachOpenListener(rtc.dataChannel);
+                if (innerWebrtc.dataChannel) {
+                    attachOpenListener(innerWebrtc.dataChannel);
                 } else {
-                    // Wait for ondatachannel to assign rtc.dataChannel.
+                    // Wait for setupDataChannel to assign webrtc.dataChannel.
                     channelPollId = setInterval(() => {
-                        if (rtc.dataChannel) {
+                        if (innerWebrtc.dataChannel) {
                             clearInterval(channelPollId);
                             channelPollId = null;
-                            attachOpenListener(rtc.dataChannel);
+                            attachOpenListener(innerWebrtc.dataChannel);
                         }
                     }, 200);
                 }
