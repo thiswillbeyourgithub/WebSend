@@ -14,6 +14,7 @@ import { JSDOM } from 'jsdom';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const protocolSrc = readFileSync(path.resolve(__dirname, '../../public/js/protocol.js'), 'utf8');
+const assemblerSrc = readFileSync(path.resolve(__dirname, '../../public/js/transport-assembler.js'), 'utf8');
 const webrtcSrc = readFileSync(path.resolve(__dirname, '../../public/js/webrtc.js'), 'utf8');
 
 function setup() {
@@ -29,8 +30,9 @@ function setup() {
         debug: (m) => logs.debug.push(m),
         success: (m) => logs.success.push(m),
     };
-    // Protocol must be on window before webrtc.js executes.
+    // Protocol and PayloadAssembler must be on window before webrtc.js executes.
     new win.Function(protocolSrc).call(win);
+    new win.Function(assemblerSrc).call(win);
     new win.Function(webrtcSrc).call(win);
     return { win, logs };
 }

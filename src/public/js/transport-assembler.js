@@ -1,28 +1,23 @@
 /**
- * transport-assembler.js, shared receive-state machine for relay transports.
+ * transport-assembler.js, shared receive-state machine for all transports.
  *
- * The WS and LP relay transports both need the same chunk-assembly state
+ * The WS, LP, and WebRTC transports all need the same chunk-assembly state
  * machine (file-start / binary chunks / file-end / file-ack / file-nack)
  * plus the same anti-DoS bounds (MAX_TOTAL_SESSION_BYTES, MAX_CONTROL_MSG_BYTES,
  * MIN_FILE_START_SIZE indirectly via expectedSize). Without a shared module
- * this code lived in two places verbatim, which is fragile (a fix in one
- * transport can silently miss the other).
- *
- * Note: webrtc.js still has its own copy of this logic, tangled with the
- * data-channel-specific code. Extracting it from webrtc.js is a larger
- * refactor and is deliberately out of scope here, but a future cleanup
- * should pull webrtc.js into this same module so there is one source of
- * truth across all three transports.
+ * this code lived in three places verbatim, which is fragile (a fix in one
+ * transport can silently miss the others).
  *
  * Design: pure-function API operating on a `host` instance (the transport
  * itself). The host must provide:
- *   - tag (string)                          for log lines, e.g. 'WS' / 'LP'
+ *   - tag (string)                          for log lines, e.g. 'WS' / 'LP' / 'RTC'
  *   - onMessage(msg)                        the caller's message sink
  *   - _abortTransport(reason)               tear down the transport (close
- *                                           socket, cancel polling, etc.).
- *                                           Called when a protocol-violation
- *                                           or session-byte-cap event aborts
- *                                           the stream.
+ *                                           socket, cancel polling, close
+ *                                           data channel + peer connection,
+ *                                           etc.). Called when a protocol
+ *                                           violation or session-byte-cap
+ *                                           event aborts the stream.
  * After PayloadAssembler.initState(host), the host gains these fields:
  *   receiveBuffer, receivedSize, expectedSize, _lastLoggedDecile,
  *   _sessionTotalBytes, _abusiveTeardown, _fileAckResolve, _fileAckReject,
@@ -124,7 +119,7 @@
     function abortAbusiveStream(host, reason) {
         if (host._abusiveTeardown) return;
         host._abusiveTeardown = true;
-        logger.error(`[${host.tag}] aborting relay session: ${reason}`);
+        logger.error(`[${host.tag}] aborting transport: ${reason}`);
         host.receiveBuffer = [];
         host.receivedSize = 0;
         host.expectedSize = 0;

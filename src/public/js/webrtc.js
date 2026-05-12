@@ -14,6 +14,7 @@ class RoomGoneError extends Error {
 
 class WebSendRTC {
     constructor() {
+        this.tag = 'RTC';
         this.pc = null;
         this.dataChannel = null;
         this.iceServers = [];
@@ -28,30 +29,18 @@ class WebSendRTC {
         this.onStateChange = null;
         this.onConnectionTypeDetected = null; // Called when we know if direct or relay
 
-        // For chunked file transfer
-        this.receiveBuffer = [];
-        this.receivedSize = 0;
-        this.expectedSize = 0;
-        this._lastLoggedDecile = -1;
-        // Cumulative bytes received across the entire data-channel session.
-        // Bounded by Protocol.MAX_TOTAL_SESSION_BYTES so a hostile peer cannot
-        // loop file-start/binary/file-end forever and exhaust the receiver.
-        this._sessionTotalBytes = 0;
-        // Latched once we tear down for protocol abuse, so further chunks land
-        // in a no-op instead of re-firing onDisconnected.
-        this._abusiveTeardown = false;
+        // Receive state + file-ack state are managed by PayloadAssembler so
+        // WS, LP, and WebRTC all share a single chunk-assembly implementation
+        // (see transport-assembler.js). The host fields installed here are:
+        //   receiveBuffer, receivedSize, expectedSize, _lastLoggedDecile,
+        //   _sessionTotalBytes, _abusiveTeardown, _fileAckResolve,
+        //   _fileAckReject, _fileAckTimeout.
+        window.PayloadAssembler.initState(this);
+        this._FILE_ACK_TIMEOUT_MS = 30000; // 30s timeout for receiver to ack
 
         // ICE candidate handling
         this.pendingIceCandidates = [];
         this.remoteDescriptionSet = false;
-
-        // Transfer acknowledgment state — sendFile() returns a Promise that
-        // resolves only when the receiver sends file-ack (or rejects on file-nack/timeout).
-        // This ensures the sender knows the receiver successfully decrypted the data.
-        this._fileAckResolve = null;
-        this._fileAckReject = null;
-        this._fileAckTimeout = null;
-        this._FILE_ACK_TIMEOUT_MS = 30000; // 30s timeout for receiver to ack
 
         // ICE candidate polling state
         // After the initial fetch of remote candidates, we poll for newly trickled
@@ -323,17 +312,17 @@ class WebSendRTC {
         this.dataChannel.onclose = () => {
             logger.info('Data channel closed');
             logger.debug('DATACHANNEL', 'Channel closed');
-            // Fail any in-flight sendFile waiting on an ack — without this the
+            // Fail any in-flight sendFile waiting on an ack. Without this the
             // sender would otherwise time out 30s later for a transfer that is
             // already known-doomed.
-            this._rejectFileAck(new Error('Data channel closed before file-ack arrived'));
+            window.PayloadAssembler.rejectFileAck(this, new Error('Data channel closed before file-ack arrived'));
         };
 
         this.dataChannel.onerror = (event) => {
             const errorMsg = event.error ? event.error.message : (event.message || 'Unknown error');
             logger.error('Data channel error: ' + errorMsg);
             logger.debug('DATACHANNEL', 'Channel error', { error: errorMsg });
-            this._rejectFileAck(new Error('Data channel error: ' + errorMsg));
+            window.PayloadAssembler.rejectFileAck(this, new Error('Data channel error: ' + errorMsg));
         };
 
         this.dataChannel.onmessage = (event) => {
@@ -362,117 +351,49 @@ class WebSendRTC {
                 logger.error(`Dropping oversized control message (${data.length} chars)`);
                 return;
             }
+            let msg;
             try {
-                const msg = JSON.parse(data);
-                // Validate wire messages. 'progress' and 'encrypted-file' are local
-                // synthetic events (never on the wire) so they bypass this path.
-                const vr = Protocol.validate(msg);
-                if (!vr.ok) {
-                    logger.error('Dropping inbound message: ' + vr.error);
-                    return;
-                }
-                logger.info(`Received message type: ${msg.type}`);
-
-                if (msg.type === 'file-start') {
-                    // File-start now only contains encrypted size (padded).
-                    // Metadata is encrypted inside the payload.
-                    this.receiveBuffer = [];
-                    this.receivedSize = 0;
-                    this.expectedSize = msg.size;
-                    this._lastLoggedDecile = -1;
-                    logger.info(`Receiving encrypted file (${msg.size} bytes, padded)`);
-                } else if (msg.type === 'file-end') {
-                    logger.info('File transfer complete, assembling...');
-                    // Create blob with generic binary type - actual type is encrypted
-                    const blob = new Blob(this.receiveBuffer, { type: 'application/octet-stream' });
-                    if (this.onMessage) {
-                        // Pass blob to application layer for decryption and metadata extraction
-                        this.onMessage({
-                            type: 'encrypted-file',
-                            blob: blob
-                        });
-                    }
-                    this.receiveBuffer = [];
-                    this.receivedSize = 0;
-                } else if (msg.type === 'file-ack') {
-                    // Receiver confirmed successful decryption with their computed hash
-                    logger.info(`Received file-ack with SHA-256: ${msg.sha256}`);
-                    this._resolveFileAck({ acknowledged: true, sha256: msg.sha256 });
-                } else if (msg.type === 'file-nack') {
-                    // Receiver reported decryption failure
-                    logger.error(`Received file-nack: ${msg.error}`);
-                    this._rejectFileAck(new Error(`Receiver decryption failed: ${msg.error}`));
-                } else {
-                    if (this.onMessage) {
-                        this.onMessage(msg);
-                    }
-                }
+                msg = JSON.parse(data);
             } catch (e) {
                 logger.error('Failed to parse message: ' + e.message);
-            }
-        } else {
-            // Binary data (file chunk).
-            // Defense-in-depth bounds: drop and tear down on any of:
-            //   1. chunk arrives before a valid file-start (expectedSize <= 0)
-            //   2. cumulative receivedSize would exceed expectedSize
-            //   3. session aggregate would exceed Protocol.MAX_TOTAL_SESSION_BYTES
-            // Without these checks a peer can stream arbitrary binary forever
-            // and OOM the tab before the manual fingerprint ceremony completes.
-            if (this._abusiveTeardown) return;
-            const len = data.byteLength | 0;
-            if (this.expectedSize <= 0) {
-                this._abortAbusiveStream('binary chunk before file-start');
                 return;
             }
-            if (this.receivedSize + len > this.expectedSize) {
-                this._abortAbusiveStream(
-                    `chunk overflow: received ${this.receivedSize} + ${len} > expected ${this.expectedSize}`
-                );
+            // Validate wire messages. 'progress' and 'encrypted-file' are local
+            // synthetic events (never on the wire) so they bypass this path.
+            const vr = Protocol.validate(msg);
+            if (!vr.ok) {
+                logger.error('Dropping inbound message: ' + vr.error);
                 return;
             }
-            if (this._sessionTotalBytes + len > Protocol.MAX_TOTAL_SESSION_BYTES) {
-                this._abortAbusiveStream(
-                    `session byte cap exceeded (${this._sessionTotalBytes + len} > ${Protocol.MAX_TOTAL_SESSION_BYTES})`
-                );
-                return;
+            logger.info(`Received message type: ${msg.type}`);
+
+            // file-start / file-end / file-ack / file-nack are handled by the
+            // shared PayloadAssembler. Anything else is dispatched to onMessage.
+            if (!window.PayloadAssembler.handleControl(this, msg)) {
+                if (this.onMessage) this.onMessage(msg);
             }
-            this.receiveBuffer.push(data);
-            this.receivedSize += len;
-            this._sessionTotalBytes += len;
-            const decile = Math.floor((this.receivedSize / this.expectedSize) * 10) * 10;
-            if (decile !== this._lastLoggedDecile) {
-                this._lastLoggedDecile = decile;
-                logger.info(`Receiving: ${decile}%`);
-            }
-            if (this.onMessage) {
-                this.onMessage({
-                    type: 'progress',
-                    received: this.receivedSize,
-                    total: this.expectedSize
-                });
-            }
+            return;
         }
+        // Binary data (file chunk). PayloadAssembler enforces the same
+        // defense-in-depth bounds the WS/LP transports use:
+        //   1. chunk arrives before a valid file-start (expectedSize <= 0)
+        //   2. cumulative receivedSize would exceed expectedSize
+        //   3. session aggregate would exceed Protocol.MAX_TOTAL_SESSION_BYTES
+        // On any breach it calls back into _abortTransport(reason) below.
+        const buf = (data instanceof ArrayBuffer) ? data : (data && data.buffer) || data;
+        window.PayloadAssembler.handleBinary(this, buf);
     }
 
     /**
-     * Tear down the data channel on detected protocol abuse and surface a
-     * disconnect to the application. Latched via _abusiveTeardown so any
-     * trailing chunks already in the queue become no-ops.
+     * PayloadAssembler hook: tear down the WebRTC transport on detected
+     * protocol abuse. The assembler has already discarded the partial
+     * receive buffer and latched _abusiveTeardown; we just need to close
+     * the data channel and peer connection. onDisconnected is fired by
+     * the assembler after this returns, so we do not call it here.
      */
-    _abortAbusiveStream(reason) {
-        if (this._abusiveTeardown) return;
-        this._abusiveTeardown = true;
-        logger.error(`Aborting peer connection: ${reason}`);
-        // Discard any partially-buffered file so the assembled blob never reaches
-        // the application layer with truncated/poisoned bytes.
-        this.receiveBuffer = [];
-        this.receivedSize = 0;
-        this.expectedSize = 0;
+    _abortTransport(_reason) {
         try { if (this.dataChannel) this.dataChannel.close(); } catch (_) {}
         try { if (this.pc) this.pc.close(); } catch (_) {}
-        if (this.onDisconnected) {
-            try { this.onDisconnected(); } catch (_) {}
-        }
     }
 
     /**
@@ -509,7 +430,7 @@ class WebSendRTC {
         }
 
         if (this._fileAckInFlight) {
-            throw new Error('sendFile already in progress — wait for the previous transfer to finish');
+            throw new Error('sendFile already in progress, wait for the previous transfer to finish');
         }
         this._fileAckInFlight = true;
 
@@ -549,43 +470,18 @@ class WebSendRTC {
             logger.info('All chunks sent, waiting for receiver acknowledgment...');
 
             // Wait for file-ack / file-nack from receiver, or timeout.
-            // The handler in handleMessage() and the timeout below all funnel
-            // through _resolveFileAck()/_rejectFileAck() so the in-flight flag
-            // and ack state are cleared exactly once.
+            // PayloadAssembler.handleControl routes the ack messages into
+            // resolveFileAck/rejectFileAck so the in-flight flag and ack
+            // state are cleared exactly once across all three transports.
             return await new Promise((resolve, reject) => {
-                this._fileAckResolve = resolve;
-                this._fileAckReject = reject;
-                this._fileAckTimeout = setTimeout(() => {
-                    this._rejectFileAck(new Error('Transfer acknowledgment timeout — no confirmation from receiver after 30s'));
-                }, this._FILE_ACK_TIMEOUT_MS);
+                window.PayloadAssembler.setupFileAck(this, resolve, reject, this._FILE_ACK_TIMEOUT_MS);
             });
         } finally {
             // Clear in-flight flag in every exit path. Ack-state pointers are
-            // already null after _resolveFileAck/_rejectFileAck; if we threw
+            // already null after resolveFileAck/rejectFileAck; if we threw
             // before installing them, there is nothing to clear.
             this._fileAckInFlight = false;
         }
-    }
-
-    _clearFileAckState() {
-        if (this._fileAckTimeout) {
-            clearTimeout(this._fileAckTimeout);
-            this._fileAckTimeout = null;
-        }
-        this._fileAckResolve = null;
-        this._fileAckReject = null;
-    }
-
-    _resolveFileAck(value) {
-        const resolve = this._fileAckResolve;
-        this._clearFileAckState();
-        if (resolve) resolve(value);
-    }
-
-    _rejectFileAck(err) {
-        const reject = this._fileAckReject;
-        this._clearFileAckState();
-        if (reject) reject(err);
     }
 
     // ============ Server-based Signaling ============
@@ -1339,22 +1235,13 @@ class WebSendRTC {
             clearTimeout(this._disconnectTimer);
             this._disconnectTimer = null;
         }
-        if (this._fileAckTimeout) {
-            clearTimeout(this._fileAckTimeout);
-            this._fileAckTimeout = null;
-        }
         if (this._fileAckReject) {
-            this._fileAckReject(new Error('Connection closed before receiver acknowledged transfer'));
-            this._fileAckResolve = null;
-            this._fileAckReject = null;
+            window.PayloadAssembler.rejectFileAck(this, new Error(
+                'Connection closed before receiver acknowledged transfer'));
         }
-        // Clear any in-progress receive buffers
-        this.receiveBuffer = [];
-        this.receivedSize = 0;
-        this.expectedSize = 0;
+        // Clear any in-progress receive buffers via the shared assembler.
+        window.PayloadAssembler.resetReceive(this);
         this._lastLoggedDecile = -1;
-        this._sessionTotalBytes = 0;
-        this._abusiveTeardown = false;
         this.pendingIceCandidates = [];
         if (this.dataChannel) {
             this.dataChannel.close();

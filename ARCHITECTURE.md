@@ -116,6 +116,10 @@ WebSend/
         │   │               #   SDP offer/answer exchange via server API, trickle ICE
         │   │               #   candidate relay, data channel setup, chunked file transfer,
         │   │               #   connection type detection (direct vs TURN relay).
+        │   │               #   Receive state machine (file-start/binary/file-end/file-ack/
+        │   │               #   file-nack assembly + anti-DoS bounds) is delegated to
+        │   │               #   transport-assembler.js so WS, LP, and WebRTC share one
+        │   │               #   implementation.
         │   │               #   Validates all inbound/outbound JSON messages via Protocol.
         │   │               #   Diagnostics: onicecandidateerror maps errorCode to a
         │   │               #   cause hint per STUN/TURN/TURNS server (401 = coturn auth,
