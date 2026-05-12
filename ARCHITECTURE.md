@@ -764,10 +764,10 @@ client ──TLS:443──▶ Caddy ──────────────�
 
 The client races three transports in parallel from the start:
 
-1. **WebRTC** — P2P, then TURN, then TURNS. Always preferred.
-2. **WebSocket** to `/api/rooms/:id/relay` — preferred over LP. A 10 s
+1. **WebRTC**: P2P, then TURN, then TURNS. Always preferred.
+2. **WebSocket** to `/api/rooms/:id/relay`: preferred over LP. A 10 s
    grace window lets WebRTC win when it can.
-3. **Long-poll** over `/api/rooms/:id/relay/{handshake,up,down,close}` —
+3. **Long-poll** over `/api/rooms/:id/relay/{handshake,up,down,close}`:
    spawned on demand if the WS path disconnects before either side wins.
 
 A `relay-hello` handshake on top of the wire signals that both peers

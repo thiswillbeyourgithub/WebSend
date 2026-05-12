@@ -1,5 +1,5 @@
 /**
- * transport.js — transport-agnostic abstraction over the peer connection.
+ * transport.js, transport-agnostic abstraction over the peer connection.
  *
  * The receiver and sender flows talk to a "Transport" instance rather than
  * directly to a WebRTC peer connection. This lets us swap or race multiple
@@ -11,16 +11,16 @@
  * webrtc.js (WebSendRTC) has always exposed:
  *
  *   Lifecycle
- *     async init()                       — fetch /api/config, prepare both inners
- *     async createRoom()                 — receiver: POST /api/rooms
- *     async createOfferAndStore()        — receiver: store SDP and open WS slot A
- *     async waitForAnswer()              — receiver: long-poll until peer joins
- *     async joinRoom(roomId, secret)     — sender flow + open WS slot B
- *     close()                            — tear down both inners
+ *     async init()                      , fetch /api/config, prepare both inners
+ *     async createRoom()                , receiver: POST /api/rooms
+ *     async createOfferAndStore()       , receiver: store SDP and open WS slot A
+ *     async waitForAnswer()             , receiver: long-poll until peer joins
+ *     async joinRoom(roomId, secret)    , sender flow + open WS slot B
+ *     close()                           , tear down both inners
  *
  *   Data plane
- *     sendMessage(obj) -> boolean        — JSON control message via the winner
- *     async sendFile(bytes, onProgress)  — chunked binary via the winner, awaits ack
+ *     sendMessage(obj) -> boolean       , JSON control message via the winner
+ *     async sendFile(bytes, onProgress) , chunked binary via the winner, awaits ack
  *
  *   Event callbacks (set by caller)
  *     onConnected, onDisconnected, onStateChange, onMessage,
@@ -52,7 +52,7 @@
 
     class RacingTransport {
         constructor(role) {
-            this._role = role; // 'receiver' or 'sender' — informational
+            this._role = role; // 'receiver' or 'sender', informational
             this.webrtc = new window.WebSendRTC();
             // WSTransport / LPTransport are loaded by the same HTML page;
             // if not present (e.g. a unit test that only stubs WebSendRTC)
@@ -83,7 +83,7 @@
             // doesn't try to fire onConnected on a torn-down transport.
             this._closed = false;
 
-            // Event callbacks — set by the caller after construction.
+            // Event callbacks, set by the caller after construction.
             this.onConnected = null;
             this.onDisconnected = null;
             this.onMessage = null;
@@ -144,12 +144,12 @@
             if (this._closed || this.winner) return;
             if (name === 'webrtc') {
                 if (this._relayForced) {
-                    logger.info('[Race] WebRTC connected but relay forced — ignoring');
+                    logger.info('[Race] WebRTC connected but relay forced, ignoring');
                     return;
                 }
                 // WebRTC always wins immediately when it connects. The
                 // grace window only protects WebRTC from being beaten by
-                // a fast relay — it doesn't keep WebRTC waiting.
+                // a fast relay, it doesn't keep WebRTC waiting.
                 this._lockWinner('webrtc');
             } else if (name === 'ws' || name === 'lp') {
                 // A relay transport reached the relay-hello handshake.
@@ -160,7 +160,7 @@
                     this._pendingRelay = name;
                     this._raceTimer = setTimeout(() => {
                         if (this._closed || this.winner) return;
-                        logger.info(`[Race] WebRTC did not connect within grace window — using ${this._pendingRelay.toUpperCase()} relay`);
+                        logger.info(`[Race] WebRTC did not connect within grace window, using ${this._pendingRelay.toUpperCase()} relay`);
                         this._lockWinner(this._pendingRelay);
                     }, this._raceGraceMs);
                 } else if (this._pendingRelay !== 'webrtc') {
@@ -187,10 +187,10 @@
             // the grace window: the race is already decided.
             if (!this.winner && name === 'webrtc') {
                 if (this.ws && this.ws.isConnected && this.ws.isConnected()) {
-                    logger.info('[Race] WebRTC failed; WS already ready — switching to HTTPS relay');
+                    logger.info('[Race] WebRTC failed; WS already ready, switching to HTTPS relay');
                     this._lockWinner('ws');
                 } else if (this.lp && this.lp.isConnected && this.lp.isConnected()) {
-                    logger.info('[Race] WebRTC failed; LP already ready — switching to HTTPS relay');
+                    logger.info('[Race] WebRTC failed; LP already ready, switching to HTTPS relay');
                     this._lockWinner('lp');
                 }
             }
@@ -258,7 +258,7 @@
                     if (cfg.forceConnection === 'RELAY_HTTPS') {
                         this._relayForced = true;
                         this._raceGraceMs = RACE_GRACE_FORCED_RELAY_MS;
-                        logger.warn('[Race] DEV_FORCE_CONNECTION=RELAY_HTTPS — WebRTC suppressed, relay wins on hello');
+                        logger.warn('[Race] DEV_FORCE_CONNECTION=RELAY_HTTPS, WebRTC suppressed, relay wins on hello');
                     }
                 }
             } catch (_) { this._relayEnabled = false; }

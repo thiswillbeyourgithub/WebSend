@@ -1,5 +1,5 @@
 /**
- * ws-transport.js — HTTP-relay fallback transport over WebSocket.
+ * ws-transport.js, HTTP-relay fallback transport over WebSocket.
  *
  * Mirrors the duck-typed Transport surface that webrtc.js (WebSendRTC) has
  * always exposed, so receive.html and sender-connect.js do not need to
@@ -194,7 +194,7 @@
 
         _markConnected() {
             this._connected = true;
-            logger.success('[WS] both peers paired on the relay — connection ready');
+            logger.success('[WS] both peers paired on the relay, connection ready');
             if (this.onStateChange) this.onStateChange('connected');
             if (this.onConnected) this.onConnected();
             if (this.onConnectionTypeDetected) {
@@ -232,7 +232,7 @@
                 return false;
             }
             if (this._fileAckInFlight) {
-                throw new Error('sendFile already in progress — wait for the previous transfer to finish');
+                throw new Error('sendFile already in progress, wait for the previous transfer to finish');
             }
             this._fileAckInFlight = true;
 

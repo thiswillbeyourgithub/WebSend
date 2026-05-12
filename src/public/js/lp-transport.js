@@ -1,5 +1,5 @@
 /**
- * lp-transport.js — long-poll HTTP-relay fallback transport.
+ * lp-transport.js, long-poll HTTP-relay fallback transport.
  *
  * Used when the WS upgrade is refused or silently torn down by a hostile
  * proxy. Wire format is identical to ws-transport.js (same control
@@ -186,7 +186,7 @@
 
         _markConnected() {
             this._connected = true;
-            logger.success('[LP] both peers paired on the relay — connection ready');
+            logger.success('[LP] both peers paired on the relay, connection ready');
             if (this.onStateChange) this.onStateChange('connected');
             if (this.onConnected) this.onConnected();
             if (this.onConnectionTypeDetected) {
@@ -296,7 +296,7 @@
                 return false;
             }
             if (this._fileAckInFlight) {
-                throw new Error('sendFile already in progress — wait for the previous transfer to finish');
+                throw new Error('sendFile already in progress, wait for the previous transfer to finish');
             }
             this._fileAckInFlight = true;
             try {

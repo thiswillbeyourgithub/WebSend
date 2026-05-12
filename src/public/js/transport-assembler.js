@@ -1,5 +1,5 @@
 /**
- * transport-assembler.js — shared receive-state machine for relay transports.
+ * transport-assembler.js, shared receive-state machine for relay transports.
  *
  * The WS and LP relay transports both need the same chunk-assembly state
  * machine (file-start / binary chunks / file-end / file-ack / file-nack)
@@ -10,7 +10,7 @@
  *
  * Note: webrtc.js still has its own copy of this logic, tangled with the
  * data-channel-specific code. Extracting it from webrtc.js is a larger
- * refactor and is deliberately out of scope here — but a future cleanup
+ * refactor and is deliberately out of scope here, but a future cleanup
  * should pull webrtc.js into this same module so there is one source of
  * truth across all three transports.
  *
@@ -141,7 +141,7 @@
         host._fileAckReject = reject;
         host._fileAckTimeout = setTimeout(() => {
             rejectFileAck(host, new Error(
-                'Transfer acknowledgment timeout — no confirmation from receiver after 30s'
+                'Transfer acknowledgment timeout, no confirmation from receiver after 30s'
             ));
         }, timeoutMs);
     }
