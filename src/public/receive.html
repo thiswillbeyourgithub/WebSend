@@ -154,6 +154,7 @@
     <script src="/js/crypto.js" integrity="sha384-lKrKDbFrsukBPckQYpWoVbkgmIica+mO2feavcC/acfRsxPZvDcWK6fkPps0ZaVJ"></script>
     <script src="/js/protocol.js" integrity="sha384-Z5AyuTCeHFC16tPEcu+arMqFvOXTwDSAorKV9KxcHEjGsujxvzNzr29kPBkQQIP4"></script>
     <script src="/js/webrtc.js" integrity="sha384-ed0CPcbNHVVSWyHsIio59S7l8nt8Hm9XMtDcQfLVt/mg7TMD/h2wDbk2LwZGORJb"></script>
+    <script src="/js/transport.js" integrity="sha384-Al52djBKUspO7u7U0r0NWEYOScY/QELvdIp4uUm2rKzVHZO+IkFHPj1gAnZEK3JO"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-WW/PDR2LrwH+LDPGHOqpr1zEZ2ittN4of22aRMSuLRiKCNw+1aSkOP6mHNGwCaW8"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-uMrESk94t8vNbYOfNElA05X6xrtx22R84sVmUFOPMhOuJMf3kxW9EW+Ccpm/O4v0"></script>
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
@@ -305,7 +306,7 @@
                 keyPair = await WebSendCrypto.generateKeyPair();
 
                 // Initialize WebRTC
-                rtc = new WebSendRTC();
+                rtc = Transport.createForReceiver();
                 await rtc.init();
 
                 // Set up connection handlers
@@ -656,7 +657,7 @@
 
             try {
                 keyPair = await WebSendCrypto.generateKeyPair();
-                rtc = new WebSendRTC();
+                rtc = Transport.createForReceiver();
                 await rtc.init();
                 rtc.onConnected = onConnected;
                 rtc.onDisconnected = onDisconnected;
@@ -734,7 +735,7 @@
 
             try {
                 keyPair = await WebSendCrypto.generateKeyPair();
-                rtc = new WebSendRTC();
+                rtc = Transport.createForReceiver();
                 await rtc.init();
                 rtc.onConnected = onConnected;
                 rtc.onDisconnected = onDisconnected;

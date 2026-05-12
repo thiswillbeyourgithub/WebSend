@@ -47,6 +47,13 @@ function setup({ deriveSharedKeyCallback } = {}) {
         sendMessage() {}
         close() {}
     };
+    // sender-connect.js now obtains its transport through window.Transport
+    // (commit 1 extraction) so we stub the factory to keep returning the
+    // existing WebSendRTC test double.
+    win.Transport = {
+        createForSender: () => new win.WebSendRTC(),
+        createForReceiver: () => new win.WebSendRTC(),
+    };
     win.Protocol = {
         build: {
             senderPublicKey: (k) => ({ type: 'sender-public-key', key: k }),

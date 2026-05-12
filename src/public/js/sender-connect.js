@@ -82,7 +82,7 @@
 
         if (!rtc) {
             keyPair = await window.WebSendCrypto.generateKeyPair();
-            rtc = new window.WebSendRTC();
+            rtc = window.Transport.createForSender();
             await rtc.init();
             wireRtcCallbacks();
         }
@@ -172,7 +172,7 @@
         theyConfirmed = false;
         window.SenderSend.clear();
 
-        rtc = new window.WebSendRTC();
+        rtc = window.Transport.createForSender();
         await rtc.init();
         wireRtcCallbacks();
 
@@ -344,7 +344,7 @@
     /** Pre-room initialization so getRtc()/getSharedKey() are stable. */
     async function init() {
         keyPair = await window.WebSendCrypto.generateKeyPair();
-        rtc = new window.WebSendRTC();
+        rtc = window.Transport.createForSender();
         await rtc.init();
         wireRtcCallbacks();
     }
