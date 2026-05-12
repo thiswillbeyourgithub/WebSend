@@ -119,6 +119,25 @@ class Logger {
 // Create and export singleton instance
 window.logger = new Logger();
 
+// Route uncaught errors and unhandled promise rejections into the in-app
+// logger. Without this, throws in setInterval/event-handler callbacks only
+// surface in the browser DevTools console, which is invisible on mobile
+// unless eruda is loaded. See doc-detect regression in commit 232818d.
+window.addEventListener('error', (e) => {
+    try {
+        const src = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
+        const detail = (e.error && e.error.stack) || e.message || 'unknown error';
+        window.logger.warn(`uncaught error${src}: ${detail}`);
+    } catch (_) { /* never let the error sink itself throw */ }
+});
+window.addEventListener('unhandledrejection', (e) => {
+    try {
+        const r = e.reason;
+        const detail = (r && r.stack) || (r && r.message) || String(r);
+        window.logger.warn(`unhandled promise rejection: ${detail}`);
+    } catch (_) { /* never let the error sink itself throw */ }
+});
+
 /**
  * Initialize the logs panel UI
  * Should be called after DOM is ready
