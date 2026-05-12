@@ -202,6 +202,14 @@ const i18n = (function() {
             'connection.direct': '⚡ {details}',
             'connection.relayDetails': 'Relayed via TURN server',
             'connection.relaySecureDetails': 'Relayed via TURNS server (TLS)',
+            // HTTP-relay fallback transport (commit 3): used when WebRTC
+            // is blocked by a corporate network and the WS racer wins.
+            // Bytes still travel end-to-end encrypted (ECDH + AES-GCM);
+            // the relay never sees plaintext, hence the label uses the
+            // protocol name "HTTPS" rather than a "fallback" tag that
+            // could read as "insecure".
+            'connection.relayHttpDetails': 'Relayed via HTTP fallback',
+            'connection.relayHttpSecureDetails': 'Relayed via HTTPS fallback',
             'connection.directLocalDetails': 'Direct (local network)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
             'connection.verified': '✓ Verified by both parties',
@@ -425,6 +433,12 @@ const i18n = (function() {
             'connection.direct': '⚡ {details}',
             'connection.relayDetails': 'Relayé via le serveur TURN',
             'connection.relaySecureDetails': 'Relayé via le serveur TURNS (TLS)',
+            // Relais HTTPS de secours (commit 3) : utilisé quand WebRTC
+            // est bloqué par un réseau d\'entreprise. Le contenu reste
+            // chiffré de bout en bout (ECDH + AES-GCM) ; le relais ne
+            // voit jamais le clair, d\'où le nom du protocole "HTTPS".
+            'connection.relayHttpDetails': 'Relayé via HTTP de secours',
+            'connection.relayHttpSecureDetails': 'Relayé via HTTPS de secours',
             'connection.directLocalDetails': 'Direct (réseau local)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
             'connection.verified': '✓ Vérifié par les deux parties',
