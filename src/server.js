@@ -144,6 +144,9 @@ app.set('trust proxy', 'loopback');
 //    refactor (move them to dedicated .js files with SRI) that would let
 //    us drop 'unsafe-inline'. Even with it, CSP still blocks remote script
 //    injection (cross-origin), object/embed, framing, form posts, etc.
+//  - 'wasm-unsafe-eval' is required so scribe.js-ocr's tesseract-core
+//    WebAssembly modules can be compiled/instantiated. It permits WASM
+//    compilation only, NOT general eval() (much narrower than 'unsafe-eval').
 //  - style-src 'unsafe-inline' is needed because the HTML uses inline
 //    style="..." attributes and a <style> block; same future cleanup path.
 //  - blob: is allowed in img-src/media-src/worker-src because the
@@ -160,7 +163,7 @@ app.set('trust proxy', 'loopback');
 const _umamiSrc = UMAMI_ORIGIN ? ` ${UMAMI_ORIGIN}` : '';
 const CSP_DIRECTIVES = [
     "default-src 'self'",
-    `script-src 'self' 'unsafe-inline'${_umamiSrc}`,
+    `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'${_umamiSrc}`,
     "style-src 'self' 'unsafe-inline'",
     `img-src 'self' blob: data:${_umamiSrc}`,
     "media-src 'self' blob:",
