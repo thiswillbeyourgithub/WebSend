@@ -130,7 +130,7 @@
             ws.onclose = (event) => {
                 if (this._closed) return; // close() initiated by us
                 if (this._abusiveTeardown) return;
-                logger.warn(`[WS] relay socket closed (code=${event.code} reason=${event.reason || '?'})`);
+                this._logRelayFailure(event.code, event.reason);
                 this._connected = false;
                 if (this.onStateChange) this.onStateChange('failed');
                 if (this.onDisconnected) this.onDisconnected();
@@ -179,6 +179,17 @@
 
         _abortTransport(_reason) {
             try { if (this.ws) this.ws.close(1008, 'Protocol violation'); } catch (_) {}
+        }
+
+        _logRelayFailure(code, reason) {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const url = this.roomId ? `${proto}//${location.host}/api/rooms/${this.roomId}/relay` : '(no room)';
+            logger.warn('=== RELAY FAILURE DIAGNOSTICS (WS) ===');
+            logger.warn(`  URL: ${url}`);
+            logger.warn(`  Close: code=${code} reason=${reason || '?'}`);
+            logger.warn(`  Session bytes received: ${this._sessionTotalBytes}`);
+            logger.warn(`  Last expected/received: ${this.receivedSize}/${this.expectedSize}`);
+            logger.warn(`  Buffered amount on close: ${this.ws ? this.ws.bufferedAmount : '?'}`);
         }
 
         _markConnected() {

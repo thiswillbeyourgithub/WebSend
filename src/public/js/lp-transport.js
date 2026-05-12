@@ -204,11 +204,22 @@
             }
         }
 
-        _handleDisconnect(_reason) {
+        _handleDisconnect(reason) {
             if (this._closed) return;
+            this._logRelayFailure(reason);
             this._connected = false;
             if (this.onStateChange) this.onStateChange('failed');
             if (this.onDisconnected) this.onDisconnected();
+        }
+
+        _logRelayFailure(reason) {
+            const proto = location.protocol;
+            const url = this.roomId ? `${proto}//${location.host}/api/rooms/${this.roomId}/relay/{up,down}` : '(no room)';
+            logger.warn('=== RELAY FAILURE DIAGNOSTICS (LP) ===');
+            logger.warn(`  URL: ${url}`);
+            logger.warn(`  Slot: ${this._slot || '?'} reason=${reason || '?'}`);
+            logger.warn(`  Session bytes received: ${this._sessionTotalBytes}`);
+            logger.warn(`  Last expected/received: ${this.receivedSize}/${this.expectedSize}`);
         }
 
         _abortTransport(_reason) {

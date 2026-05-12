@@ -210,6 +210,8 @@ const i18n = (function() {
             // could read as "insecure".
             'connection.relayHttpDetails': 'Relayed via HTTP fallback',
             'connection.relayHttpSecureDetails': 'Relayed via HTTPS fallback',
+            'connection.relayHttpHint': 'Using HTTP fallback relay. Slower than a direct P2P link, but still end-to-end encrypted.',
+            'connection.relayHttpSecureHint': 'Using HTTPS fallback relay. Slower than a direct P2P link, but still end-to-end encrypted.',
             'connection.directLocalDetails': 'Direct (local network)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
             'connection.verified': '✓ Verified by both parties',
@@ -439,6 +441,8 @@ const i18n = (function() {
             // voit jamais le clair, d\'où le nom du protocole "HTTPS".
             'connection.relayHttpDetails': 'Relayé via HTTP de secours',
             'connection.relayHttpSecureDetails': 'Relayé via HTTPS de secours',
+            'connection.relayHttpHint': 'Utilisation du relais HTTP de secours. Plus lent qu\'une liaison P2P directe, mais toujours chiffré de bout en bout.',
+            'connection.relayHttpSecureHint': 'Utilisation du relais HTTPS de secours. Plus lent qu\'une liaison P2P directe, mais toujours chiffré de bout en bout.',
             'connection.directLocalDetails': 'Direct (réseau local)',
             'connection.directP2PDetails': 'Direct P2P (via STUN)',
             'connection.verified': '✓ Vérifié par les deux parties',
