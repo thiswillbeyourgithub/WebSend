@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/thiswillbeyourgithub/WebSend)only
+
 <p align="center">
   <img src="src/public/icons/icon.svg" alt="WebSend" width="128" height="128">
 </p>
