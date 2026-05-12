@@ -1575,8 +1575,11 @@ httpServer.listen(PORT, '0.0.0.0', () => {
     // window if WebRTC has not connected. Surface the URL operators
     // should expect to see at Caddy / reverse-proxy time.
     if (RELAY_ENABLE) {
-        const scheme = DOMAIN === 'localhost' ? 'ws' : 'wss';
-        console.log(`  HTTP-relay fallback: ENABLED at ${scheme}://${DOMAIN}/api/rooms/:id/relay`);
+        const wsScheme = DOMAIN === 'localhost' ? 'ws' : 'wss';
+        const httpScheme = DOMAIN === 'localhost' ? 'http' : 'https';
+        console.log('  HTTP-relay fallback: ENABLED');
+        console.log(`    WS:  ${wsScheme}://${DOMAIN}/api/rooms/:id/relay`);
+        console.log(`    LP:  ${httpScheme}://${DOMAIN}/api/rooms/:id/relay/{handshake,up,down,close}`);
     } else {
         console.log('  HTTP-relay fallback: DISABLED (RELAY_ENABLE=false)');
     }
