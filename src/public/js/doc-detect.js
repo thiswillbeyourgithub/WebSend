@@ -784,3 +784,5 @@ const DocDetect = (function () {
 
     return { detectFromVideo, detectFromCanvas, detectFromImage };
 })();
+
+window.DocDetect = DocDetect;
