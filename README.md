@@ -197,7 +197,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - **B&W document mode**: Otsu's automatic binarization for crisp scanned documents
 - **QR code scanning**: in-browser QR code scanning (jsQR) and generation (qrcode.js)
 - **Connection type detection**: shows whether the connection is direct (local network or via STUN) or relayed (TURN/TURNS)
-- **Debug logging**: "Logs" button on both sender and receiver pages for troubleshooting, with optional verbose DEV mode. A vendored [eruda](https://github.com/liriliri/eruda) mobile devtools console can be opened on demand by appending `?debug=1` to any page URL or by 5-tapping the DEV badge in the sidebar
+- **Debug logging**: "Logs" button on both sender and receiver pages for troubleshooting, with optional verbose DEV mode. A vendored [eruda](https://github.com/liriliri/eruda) mobile devtools console can be opened on demand by appending `?debug=1` to any page URL or by 5-tapping the DEV badge in the sidebar. Once opened it stays on across reloads (sticky `eruda-persist` flag in localStorage); append `?debug=0` once to turn the auto-load back off
 - **Configurable file types**: `ALLOWED_FILE_TYPES` env var restricts uploads to images (`ONLY_IMAGES`), images + PDFs (`IMAGE_OR_PDF`), or anything (`ANY`, default)
 - **Large button UI**: designed for usability by non-technical users
 - **No heavy frameworks**: vanilla HTML5 + CSS + JavaScript only

@@ -195,7 +195,10 @@ WebSend/
         │   │               #   mobile devtools console. Defines window.loadEruda
         │   │               #   (used by sidebar.js's 5-tap gesture and the DEV-mode
         │   │               #   bootstrap in send/receive) and auto-loads eruda when
-        │   │               #   the URL contains ?debug=1. Loaded by index/send/receive
+        │   │               #   the URL contains ?debug=1 OR a sticky localStorage flag
+        │   │               #   ("eruda-persist") is set (persists across reloads once
+        │   │               #   eruda has been opened; clear with ?debug=0).
+        │   │               #   Loaded by index/send/receive
         │   ├── peer-ui.js  # Shared sidebar helpers (onConnectionTypeDetected,
         │   │               #   showVerifiedInSidebar; re-exports loadEruda from
         │   │               #   eruda-loader) used identically by send.html and
