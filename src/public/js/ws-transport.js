@@ -22,14 +22,10 @@
  *     The server (server.js, commit 2) also enforces the cumulative caps
  *     so a malicious client cannot ignore them.
  *
- * IMPORTANT — duplication flag:
- *   The receive-side state machine (file-start / file-end / file-ack /
- *   file-nack / binary chunk assembly / bounds checks) and the chunked-
- *   send-with-bufferedAmount-backpressure loop are duplicated from
- *   webrtc.js. A future cleanup commit should extract a shared
- *   TransportBase (or PayloadAssembler) so both transports share one
- *   source of truth. Today the two implementations are intentionally
- *   kept in sync by hand; if you change one, change the other.
+ * Receive-state-machine: delegated to window.PayloadAssembler so the
+ * WS and LP transports share one implementation (see transport-assembler.js).
+ * webrtc.js still keeps its own copy entangled with the data-channel code;
+ * a future cleanup commit should pull that into PayloadAssembler too.
  *
  * Generated with the help of Claude Code.
  */
@@ -46,6 +42,7 @@
 
     class WSTransport {
         constructor() {
+            this.tag = 'WS';
             this.ws = null;
             this.roomId = null;
             this.roomSecret = null;
@@ -64,20 +61,9 @@
             this.onStateChange = null;
             this.onConnectionTypeDetected = null;
 
-            // Receive state — kept in lockstep with webrtc.js. See header
-            // duplication flag above.
-            this.receiveBuffer = [];
-            this.receivedSize = 0;
-            this.expectedSize = 0;
-            this._lastLoggedDecile = -1;
-            this._sessionTotalBytes = 0;
-            this._abusiveTeardown = false;
-
-            // File-ack state — mirrors webrtc.js sendFile() ack tracking.
+            // Receive state + file-ack state are managed by PayloadAssembler.
+            window.PayloadAssembler.initState(this);
             this._fileAckInFlight = false;
-            this._fileAckResolve = null;
-            this._fileAckReject = null;
-            this._fileAckTimeout = null;
 
             this._connected = false;
             this._closed = false;
@@ -160,9 +146,6 @@
 
         _handleFrame(data) {
             if (typeof data === 'string') {
-                // Wire-level cap, same as webrtc.js. UTF-16 byte size is
-                // approximated as 2*length so astral codepoints cannot
-                // halve the apparent cost.
                 if (data.length * 2 > window.Protocol.MAX_CONTROL_MSG_BYTES) {
                     logger.error(`[WS] dropping oversized control msg (${data.length} chars)`);
                     return;
@@ -185,71 +168,17 @@
                     return;
                 }
                 logger.info(`[WS] received message type: ${msg.type}`);
-
-                // Same file-control branches as webrtc.js handleMessage.
-                if (msg.type === 'file-start') {
-                    this.receiveBuffer = [];
-                    this.receivedSize = 0;
-                    this.expectedSize = msg.size;
-                    this._lastLoggedDecile = -1;
-                    logger.info(`[WS] receiving encrypted file (${msg.size} bytes, padded)`);
-                } else if (msg.type === 'file-end') {
-                    logger.info('[WS] file transfer complete, assembling...');
-                    const blob = new Blob(this.receiveBuffer, { type: 'application/octet-stream' });
-                    if (this.onMessage) this.onMessage({ type: 'encrypted-file', blob });
-                    this.receiveBuffer = [];
-                    this.receivedSize = 0;
-                } else if (msg.type === 'file-ack') {
-                    logger.info(`[WS] received file-ack with SHA-256: ${msg.sha256}`);
-                    this._resolveFileAck({ acknowledged: true, sha256: msg.sha256 });
-                } else if (msg.type === 'file-nack') {
-                    logger.error(`[WS] received file-nack: ${msg.error}`);
-                    this._rejectFileAck(new Error(`Receiver decryption failed: ${msg.error}`));
-                } else if (this.onMessage) {
-                    this.onMessage(msg);
+                if (!window.PayloadAssembler.handleControl(this, msg)) {
+                    if (this.onMessage) this.onMessage(msg);
                 }
                 return;
             }
-
-            // Binary chunk path. Defense-in-depth bounds mirror webrtc.js:
-            //   1) chunk before file-start
-            //   2) cumulative chunk overflow past expectedSize
-            //   3) session aggregate past MAX_TOTAL_SESSION_BYTES
-            // Each tears down the WS and notifies the app via onDisconnected.
-            if (this._abusiveTeardown) return;
             const buf = (data instanceof ArrayBuffer) ? data : (data && data.buffer) || data;
-            const len = (buf && buf.byteLength) | 0;
-            if (this.expectedSize <= 0) {
-                this._abortAbusiveStream('binary chunk before file-start');
-                return;
-            }
-            if (this.receivedSize + len > this.expectedSize) {
-                this._abortAbusiveStream(
-                    `chunk overflow: received ${this.receivedSize} + ${len} > expected ${this.expectedSize}`
-                );
-                return;
-            }
-            if (this._sessionTotalBytes + len > window.Protocol.MAX_TOTAL_SESSION_BYTES) {
-                this._abortAbusiveStream(
-                    `session byte cap exceeded (${this._sessionTotalBytes + len} > ${window.Protocol.MAX_TOTAL_SESSION_BYTES})`
-                );
-                return;
-            }
-            this.receiveBuffer.push(buf);
-            this.receivedSize += len;
-            this._sessionTotalBytes += len;
-            const decile = Math.floor((this.receivedSize / this.expectedSize) * 10) * 10;
-            if (decile !== this._lastLoggedDecile) {
-                this._lastLoggedDecile = decile;
-                logger.info(`[WS] receiving: ${decile}%`);
-            }
-            if (this.onMessage) {
-                this.onMessage({
-                    type: 'progress',
-                    received: this.receivedSize,
-                    total: this.expectedSize,
-                });
-            }
+            window.PayloadAssembler.handleBinary(this, buf);
+        }
+
+        _abortTransport(_reason) {
+            try { if (this.ws) this.ws.close(1008, 'Protocol violation'); } catch (_) {}
         }
 
         _markConnected() {
@@ -270,17 +199,6 @@
                     remoteType: 'relay',
                 });
             }
-        }
-
-        _abortAbusiveStream(reason) {
-            if (this._abusiveTeardown) return;
-            this._abusiveTeardown = true;
-            logger.error(`[WS] aborting relay session: ${reason}`);
-            this.receiveBuffer = [];
-            this.receivedSize = 0;
-            this.expectedSize = 0;
-            try { if (this.ws) this.ws.close(1008, 'Protocol violation'); } catch (_) {}
-            if (this.onDisconnected) { try { this.onDisconnected(); } catch (_) {} }
         }
 
         sendMessage(message) {
@@ -343,38 +261,11 @@
                 logger.info('[WS] all chunks sent, waiting for receiver acknowledgment...');
 
                 return await new Promise((resolve, reject) => {
-                    this._fileAckResolve = resolve;
-                    this._fileAckReject = reject;
-                    this._fileAckTimeout = setTimeout(() => {
-                        this._rejectFileAck(new Error(
-                            'Transfer acknowledgment timeout — no confirmation from receiver after 30s'
-                        ));
-                    }, FILE_ACK_TIMEOUT_MS);
+                    window.PayloadAssembler.setupFileAck(this, resolve, reject, FILE_ACK_TIMEOUT_MS);
                 });
             } finally {
                 this._fileAckInFlight = false;
             }
-        }
-
-        _clearFileAckState() {
-            if (this._fileAckTimeout) {
-                clearTimeout(this._fileAckTimeout);
-                this._fileAckTimeout = null;
-            }
-            this._fileAckResolve = null;
-            this._fileAckReject = null;
-        }
-
-        _resolveFileAck(value) {
-            const resolve = this._fileAckResolve;
-            this._clearFileAckState();
-            if (resolve) resolve(value);
-        }
-
-        _rejectFileAck(err) {
-            const reject = this._fileAckReject;
-            this._clearFileAckState();
-            if (reject) reject(err);
         }
 
         _isOpen() {
@@ -386,18 +277,14 @@
         close() {
             this._closed = true;
             if (this._fileAckReject) {
-                this._fileAckReject(new Error('Connection closed before receiver acknowledged transfer'));
-                this._clearFileAckState();
+                window.PayloadAssembler.rejectFileAck(this, new Error(
+                    'Connection closed before receiver acknowledged transfer'));
             }
             if (this.ws) {
                 try { this.ws.close(1000, 'Client closing'); } catch (_) {}
                 this.ws = null;
             }
-            this.receiveBuffer = [];
-            this.receivedSize = 0;
-            this.expectedSize = 0;
-            this._sessionTotalBytes = 0;
-            this._abusiveTeardown = false;
+            window.PayloadAssembler.resetReceive(this);
             this._connected = false;
         }
     }

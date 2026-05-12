@@ -50,16 +50,26 @@
         constructor(role) {
             this._role = role; // 'receiver' or 'sender' — informational
             this.webrtc = new window.WebSendRTC();
-            // WSTransport is loaded by the same HTML page; if not present
-            // (e.g. a unit test that only stubs WebSendRTC) we fall back
-            // to WebRTC-only behaviour gracefully.
+            // WSTransport / LPTransport are loaded by the same HTML page;
+            // if not present (e.g. a unit test that only stubs WebSendRTC)
+            // we fall back to WebRTC-only behaviour gracefully.
             this.ws = (typeof window.WSTransport === 'function')
                 ? new window.WSTransport()
                 : null;
+            // LP is spawned on-demand when the WS path fails before either
+            // side wins: a proxy that silently drops the upgrade is the
+            // common failure mode this transport exists for.
+            this.lp = null;
 
             this.winner = null;
             this._raceTimer = null;
             this._relayEnabled = false;
+            this._lpEnabled = false;
+            this._lpSpawned = false;
+            // Cached so we can openSlotA / openSlotB on the LP inner when
+            // we spawn it after WS already had its turn at room setup.
+            this._roomId = null;
+            this._roomSecret = null;
             // Latched once close() runs so a late inner-connect callback
             // doesn't try to fire onConnected on a torn-down transport.
             this._closed = false;
@@ -90,24 +100,60 @@
             }
         }
 
+        _wireLp() {
+            if (!this.lp) return;
+            this.lp.onConnected = () => this._handleInnerConnected('lp');
+            this.lp.onDisconnected = () => this._handleInnerDisconnected('lp');
+            this.lp.onMessage = (m) => this._handleInnerMessage('lp', m);
+            this.lp.onStateChange = (s) => this._handleInnerStateChange('lp', s);
+            this.lp.onConnectionTypeDetected = (t) => this._handleInnerCT('lp', t);
+        }
+
+        // Spawn the LP fallback transport. Called when WS disconnects
+        // before either side wins (proxies stripping the upgrade, etc).
+        _spawnLp() {
+            if (this._lpSpawned || this._closed || this.winner) return;
+            if (!this._lpEnabled) return;
+            if (typeof window.LPTransport !== 'function') return;
+            if (!this._roomId || !this._roomSecret) return;
+            this._lpSpawned = true;
+            logger.info('[Race] WS disconnected pre-winner; spawning LP fallback');
+            this.lp = new window.LPTransport();
+            this._wireLp();
+            this.lp.init().then(() => {
+                if (this._closed || this.winner) return;
+                if (this._role === 'receiver') {
+                    this.lp.setRoom(this._roomId, this._roomSecret);
+                    this.lp.openSlotA();
+                } else {
+                    this.lp.openSlotB(this._roomId, this._roomSecret);
+                }
+            }).catch((e) => logger.warn('[Race] LP init failed: ' + e.message));
+        }
+
         _handleInnerConnected(name) {
             if (this._closed || this.winner) return;
             if (name === 'webrtc') {
                 // WebRTC always wins immediately when it connects. The
                 // grace window only protects WebRTC from being beaten by
-                // a fast WS — it doesn't keep WebRTC waiting.
+                // a fast relay — it doesn't keep WebRTC waiting.
                 this._lockWinner('webrtc');
-            } else if (name === 'ws') {
-                // WS reached the relay-hello handshake. Start (or
-                // reuse) the grace timer; if WebRTC doesn't connect
-                // before it fires, the WS wins.
+            } else if (name === 'ws' || name === 'lp') {
+                // A relay transport reached the relay-hello handshake.
+                // Start (or reuse) the grace timer; if WebRTC doesn't
+                // connect before it fires, this relay wins.
                 if (!this._raceTimer) {
-                    logger.info(`[Race] WS reached relay-hello; giving WebRTC ${RACE_GRACE_MS}ms grace window`);
+                    logger.info(`[Race] ${name.toUpperCase()} reached relay-hello; giving WebRTC ${RACE_GRACE_MS}ms grace window`);
+                    this._pendingRelay = name;
                     this._raceTimer = setTimeout(() => {
                         if (this._closed || this.winner) return;
-                        logger.info('[Race] WebRTC did not connect within grace window — using HTTPS relay');
-                        this._lockWinner('ws');
+                        logger.info(`[Race] WebRTC did not connect within grace window — using ${this._pendingRelay.toUpperCase()} relay`);
+                        this._lockWinner(this._pendingRelay);
                     }, RACE_GRACE_MS);
+                } else if (this._pendingRelay !== 'webrtc') {
+                    // A second relay finished its hello while we were
+                    // waiting on WebRTC. Prefer WS over LP (lower overhead).
+                    if (name === 'ws' && this._pendingRelay === 'lp') this._pendingRelay = 'ws';
                 }
             }
         }
@@ -118,12 +164,22 @@
                 if (this.onDisconnected) this.onDisconnected();
                 return;
             }
-            // If WebRTC fails before connecting and WS has already reached
-            // relay-hello, lock in WS now instead of waiting out the
-            // grace window: the race is already decided.
-            if (!this.winner && name === 'webrtc' && this.ws && this.ws.isConnected && this.ws.isConnected()) {
-                logger.info('[Race] WebRTC failed; WS already ready — switching to HTTPS relay');
-                this._lockWinner('ws');
+            // WS failed before winning: try the LP fallback. Common cause
+            // is a proxy that silently strips the WebSocket upgrade.
+            if (!this.winner && name === 'ws' && !this._lpSpawned) {
+                this._spawnLp();
+            }
+            // If WebRTC fails before connecting and a relay is already
+            // hello-ready, lock that relay in now instead of waiting out
+            // the grace window: the race is already decided.
+            if (!this.winner && name === 'webrtc') {
+                if (this.ws && this.ws.isConnected && this.ws.isConnected()) {
+                    logger.info('[Race] WebRTC failed; WS already ready — switching to HTTPS relay');
+                    this._lockWinner('ws');
+                } else if (this.lp && this.lp.isConnected && this.lp.isConnected()) {
+                    logger.info('[Race] WebRTC failed; LP already ready — switching to HTTPS relay');
+                    this._lockWinner('lp');
+                }
             }
         }
 
@@ -152,23 +208,33 @@
             }
         }
 
+        _innerByName(name) {
+            if (name === 'webrtc') return this.webrtc;
+            if (name === 'ws') return this.ws;
+            if (name === 'lp') return this.lp;
+            return null;
+        }
+
         _lockWinner(name) {
             if (this.winner || this._closed) return;
             this.winner = name;
             if (this._raceTimer) { clearTimeout(this._raceTimer); this._raceTimer = null; }
-            // Close the loser so it stops consuming resources (and so
-            // any late messages from it cannot leak through any race
+            // Close the losers so they stop consuming resources (and so
+            // any late messages from them cannot leak through any race
             // condition into onMessage).
-            const loser = name === 'webrtc' ? this.ws : this.webrtc;
-            if (loser) { try { loser.close(); } catch (_) {} }
+            for (const other of ['webrtc', 'ws', 'lp']) {
+                if (other === name) continue;
+                const inner = this._innerByName(other);
+                if (inner) { try { inner.close(); } catch (_) {} }
+            }
             logger.success(`[Race] Winner: ${name}`);
             if (this.onConnected) this.onConnected();
         }
 
         async init() {
             await this.webrtc.init();
-            // Decide whether to engage the WS racer. /api/config has the
-            // relayEnabled flag set by the server (RELAY_ENABLE env).
+            // Decide whether to engage the relay racer(s). /api/config has
+            // the relayEnabled flag set by the server (RELAY_ENABLE env).
             // webrtc.init() already fetched /api/config; refetch is cheap
             // and avoids a coupling to its internals.
             try {
@@ -178,9 +244,10 @@
                     this._relayEnabled = !!cfg.relayEnabled;
                 }
             } catch (_) { this._relayEnabled = false; }
+            this._lpEnabled = this._relayEnabled && (typeof window.LPTransport === 'function');
             if (this._relayEnabled && this.ws) {
                 await this.ws.init();
-                logger.info('[Race] HTTP-relay fallback transport enabled');
+                logger.info('[Race] HTTP-relay fallback transport enabled (WS primary, LP on-demand)');
             } else {
                 logger.info('[Race] HTTP-relay fallback transport disabled (RELAY_ENABLE=false on server)');
             }
@@ -188,6 +255,8 @@
 
         async createRoom() {
             const r = await this.webrtc.createRoom();
+            this._roomId = r.roomId;
+            this._roomSecret = r.secret;
             if (this._relayEnabled && this.ws) this.ws.setRoom(r.roomId, r.secret);
             return r;
         }
@@ -205,6 +274,8 @@
         }
 
         async joinRoom(roomId, secret) {
+            this._roomId = roomId;
+            this._roomSecret = secret;
             // Spawn WS slot 'b' in parallel with the WebRTC join sequence.
             if (this._relayEnabled && this.ws) {
                 try { this.ws.openSlotB(roomId, secret); } catch (e) { logger.warn('[Race] openSlotB failed: ' + e.message); }
@@ -217,14 +288,12 @@
                 logger.error('[Race] sendMessage before connection established');
                 return false;
             }
-            const winner = this.winner === 'webrtc' ? this.webrtc : this.ws;
-            return winner.sendMessage(message);
+            return this._innerByName(this.winner).sendMessage(message);
         }
 
         async sendFile(bytes, onProgress) {
             if (!this.winner) throw new Error('Not connected yet');
-            const winner = this.winner === 'webrtc' ? this.webrtc : this.ws;
-            return winner.sendFile(bytes, onProgress);
+            return this._innerByName(this.winner).sendFile(bytes, onProgress);
         }
 
         close() {
@@ -232,6 +301,7 @@
             if (this._raceTimer) { clearTimeout(this._raceTimer); this._raceTimer = null; }
             try { this.webrtc.close(); } catch (_) {}
             if (this.ws) { try { this.ws.close(); } catch (_) {} }
+            if (this.lp) { try { this.lp.close(); } catch (_) {} }
         }
 
         // ---- Compat properties read by receive.html and sender-connect.js ----
@@ -244,23 +314,27 @@
         set roomId(v) {
             this.webrtc.roomId = v;
             if (this.ws) this.ws.roomId = v;
+            if (this.lp) this.lp.roomId = v;
         }
 
         get roomSecret() { return this.webrtc.roomSecret; }
         set roomSecret(v) {
             this.webrtc.roomSecret = v;
             if (this.ws) this.ws.roomSecret = v;
+            if (this.lp) this.lp.roomSecret = v;
         }
 
         get pc() { return this.webrtc.pc; }
         get iceServers() { return this.webrtc.iceServers || []; }
 
         get receiveBuffer() {
-            return (this.winner === 'ws' && this.ws) ? this.ws.receiveBuffer : this.webrtc.receiveBuffer;
+            const w = this._innerByName(this.winner);
+            return w ? w.receiveBuffer : this.webrtc.receiveBuffer;
         }
         set receiveBuffer(v) {
             this.webrtc.receiveBuffer = v;
             if (this.ws) this.ws.receiveBuffer = v;
+            if (this.lp) this.lp.receiveBuffer = v;
         }
     }
 

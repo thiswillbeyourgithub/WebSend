@@ -197,6 +197,15 @@ const ROOM_TTL = 10 * 60 * 1000; // 10 minutes TTL
 const MAX_TOTAL_SESSION_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB
 const MAX_CONTROL_MSG_BYTES = 16 * 1024; // 16 KiB
 
+// Long-poll relay constants (commit 4). The LP transport uses two HTTP
+// endpoints (POST /relay/up, GET /relay/down) per slot. Each slot is
+// claimed by a one-shot token issued by the /relay/handshake endpoint.
+const LP_DOWN_TIMEOUT_MS = 25_000;          // long-poll hold time
+const LP_QUEUE_MAX_FRAMES = 32;             // bounded per-slot incoming queue
+const LP_SLOT_TOKEN_BYTES = 16;             // 128-bit slot token
+const LP_FRAME_BODY_LIMIT = '1mb';          // raw-body cap for /relay/up
+const LP_SLOT_IDLE_TIMEOUT_MS = 60_000;     // close LP slot after this idle
+
 // ============ Rate Limiting ============
 // Simple sliding window rate limiter to prevent DoS and room enumeration attacks.
 // Uses in-memory storage; in production, use Redis for distributed rate limiting.
@@ -441,13 +450,16 @@ function cleanupRooms() {
                 const waiters = room.answerWaiters.splice(0);
                 for (const w of waiters) w.roomGone();
             }
-            // Close any relay sockets on TTL expiry so dangling WS pairs
-            // do not outlive the room map entry they reference.
+            // Close any relay slots on TTL expiry so dangling WS or LP
+            // peers do not outlive the room map entry they reference.
             if (room.relay) {
-                for (const slot of ['a', 'b']) {
-                    const ws = room.relay[slot];
-                    if (ws && ws.readyState !== ws.CLOSED) {
-                        try { ws.close(1001, 'Room expired'); } catch (_) {}
+                for (const slotName of ['a', 'b']) {
+                    const s = room.relay[slotName];
+                    if (!s) continue;
+                    if (s.kind === 'lp') {
+                        closeLpSlot(s, 'Room expired');
+                    } else if (s.readyState !== s.CLOSED) {
+                        try { s.close(1001, 'Room expired'); } catch (_) {}
                     }
                 }
                 room.relay = null;
@@ -988,6 +1000,204 @@ app.get('/api/rooms/:id', rateLimitMiddleware('roomLookup'), validateRoomSecret,
     });
 });
 
+// ============ HTTP-relay long-poll fallback (commit 4) ============
+// Used when even the WS upgrade is refused or torn down by a proxy. The
+// client hits these three endpoints over plain HTTPS POST/GET. Frames
+// are forwarded between paired peers exactly like the WS relay, and
+// share the same room.relay state and 4 GiB / 16 KiB caps. A slot can
+// be a WS or an LP slot interchangeably: deliverToPeer() dispatches on
+// peer.kind so an LP sender can talk to a WS receiver and vice versa.
+
+/**
+ * Claim a long-poll relay slot for this room.
+ * POST /api/rooms/:id/relay/handshake
+ * Returns { slot: 'a'|'b', token: '<hex>' }. The token is required on
+ * subsequent up/down calls and is compared with constant-time secureCompare.
+ */
+app.post('/api/rooms/:id/relay/handshake', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    if (!RELAY_ENABLE) return res.status(404).json({ error: 'Relay disabled' });
+    const room = req.room;
+    const r = room.relay || (room.relay = { a: null, b: null, sessionBytes: 0 });
+    let slotName;
+    if (!r.a) slotName = 'a';
+    else if (!r.b) slotName = 'b';
+    else return res.status(409).json({ error: 'Room relay slots full' });
+
+    const token = require('crypto').randomBytes(LP_SLOT_TOKEN_BYTES).toString('hex');
+    const slot = {
+        kind: 'lp',
+        token,
+        slotName,
+        queue: [],
+        waiters: [],
+        closed: false,
+        idleTimer: null,
+        // WeakRef so the cleanup timer doesn't prevent the room from being
+        // GC'd if it expires through TTL while the LP slot is idle.
+        roomRef: typeof WeakRef === 'function' ? new WeakRef(room) : { deref: () => room },
+    };
+    r[slotName] = slot;
+    armLpIdleTimer(slot);
+    debugLog('RELAY-LP', `Slot ${slotName} claimed for room ${req.params.id}`, {});
+    res.json({ slot: slotName, token });
+});
+
+/**
+ * Forward a frame from this slot to its peer.
+ * POST /api/rooms/:id/relay/up
+ * Headers: X-Room-Secret, X-Slot-Token, Content-Type
+ *   application/octet-stream -> binary frame
+ *   anything else            -> text/control frame
+ * Body: the frame bytes (raw). Capped at LP_FRAME_BODY_LIMIT by express.raw.
+ */
+app.post(
+    '/api/rooms/:id/relay/up',
+    rateLimitMiddleware('general'),
+    validateRoomSecret,
+    express.raw({ type: '*/*', limit: LP_FRAME_BODY_LIMIT }),
+    (req, res) => {
+        if (!RELAY_ENABLE) return res.status(404).json({ error: 'Relay disabled' });
+        const room = req.room;
+        const r = room.relay;
+        if (!r) return res.status(409).json({ error: 'No relay session' });
+        const providedToken = req.headers['x-slot-token'] || '';
+        let slot = null, slotName = null;
+        for (const name of ['a', 'b']) {
+            const s = r[name];
+            if (s && s.kind === 'lp' && helpers.secureCompare(providedToken, s.token)) {
+                slot = s; slotName = name; break;
+            }
+        }
+        if (!slot || slot.closed) return res.status(401).json({ error: 'Invalid slot token' });
+
+        const data = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        const isBinary = (req.headers['content-type'] || '').toLowerCase().includes('application/octet-stream');
+        const len = data.length;
+        if (!isBinary && len > MAX_CONTROL_MSG_BYTES) {
+            closeLpSlot(slot, 'Control message too large');
+            r[slotName] = null;
+            return res.status(413).json({ error: 'Control message too large' });
+        }
+        r.sessionBytes += len;
+        if (r.sessionBytes > MAX_TOTAL_SESSION_BYTES) {
+            closeLpSlot(slot, 'Session byte cap exceeded');
+            r[slotName] = null;
+            const peer = slotName === 'a' ? r.b : r.a;
+            teardownPeer(peer, 'Session byte cap exceeded');
+            return res.status(413).json({ error: 'Session byte cap exceeded' });
+        }
+        armLpIdleTimer(slot);
+        const peer = slotName === 'a' ? r.b : r.a;
+        deliverToPeer(peer, data, isBinary);
+        res.status(204).send();
+    }
+);
+
+/**
+ * Long-poll for the next incoming frame on this slot.
+ * GET /api/rooms/:id/relay/down?wait=true
+ * Headers: X-Room-Secret, X-Slot-Token
+ * Response:
+ *   200 application/octet-stream  -> binary frame in body
+ *   200 application/json          -> control frame in body
+ *   204                           -> no frame within LP_DOWN_TIMEOUT_MS
+ *   410                           -> slot closed by server (peer gone, etc)
+ */
+app.get('/api/rooms/:id/relay/down', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    if (!RELAY_ENABLE) return res.status(404).json({ error: 'Relay disabled' });
+    const room = req.room;
+    const r = room.relay;
+    if (!r) return res.status(409).json({ error: 'No relay session' });
+    const providedToken = req.headers['x-slot-token'] || '';
+    let slot = null;
+    for (const name of ['a', 'b']) {
+        const s = r[name];
+        if (s && s.kind === 'lp' && helpers.secureCompare(providedToken, s.token)) {
+            slot = s; break;
+        }
+    }
+    if (!slot) return res.status(401).json({ error: 'Invalid slot token' });
+    if (slot.closed) return res.status(410).json({ error: 'Slot closed' });
+
+    armLpIdleTimer(slot);
+
+    const sendFrame = (frame) => {
+        if (frame.isBinary) {
+            res.set('Content-Type', 'application/octet-stream');
+            res.status(200).send(Buffer.isBuffer(frame.data) ? frame.data : Buffer.from(frame.data));
+        } else {
+            // Forward as-is. The client side treats text frames as JSON
+            // control messages identical to the WS path.
+            const body = Buffer.isBuffer(frame.data) ? frame.data.toString('utf8') : String(frame.data);
+            res.set('Content-Type', 'application/json');
+            res.status(200).send(body);
+        }
+    };
+
+    // Fast path: a frame is already queued.
+    if (slot.queue.length > 0) {
+        return sendFrame(slot.queue.shift());
+    }
+    if (req.query.wait !== 'true') return res.status(204).send();
+
+    // Long-poll path: bound the live waiter count per-room AND globally,
+    // mirroring the /answer waiter caps. An LP peer should only have one
+    // in-flight down request; we allow a small overlap for the reconnect
+    // case.
+    if (slot.waiters.length >= MAX_WAITERS_PER_ROOM) {
+        res.set('Retry-After', '5');
+        return res.status(429).json({ error: 'Too many concurrent down-polls on this slot' });
+    }
+    if (_totalWaiters >= MAX_TOTAL_WAITERS) {
+        res.set('Retry-After', '5');
+        return res.status(503).json({ error: 'Server temporarily overloaded' });
+    }
+    let settled = false;
+    const settle = (fn) => {
+        if (settled) return;
+        settled = true;
+        const idx = slot.waiters.indexOf(waiter);
+        if (idx !== -1) slot.waiters.splice(idx, 1);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        _totalWaiters--;
+        fn();
+    };
+    const waiter = {
+        timer: null,
+        send: (frame) => settle(() => sendFrame(frame)),
+        timeout: () => settle(() => res.status(204).send()),
+        gone: (reason) => settle(() => res.status(410).json({ error: reason || 'Slot closed' })),
+    };
+    waiter.timer = setTimeout(waiter.timeout, LP_DOWN_TIMEOUT_MS);
+    slot.waiters.push(waiter);
+    _totalWaiters++;
+    req.on('close', () => settle(() => {}));
+});
+
+/**
+ * Explicitly tear down this slot.
+ * POST /api/rooms/:id/relay/close
+ * Lets the client signal a clean shutdown so the peer is closed
+ * immediately instead of waiting for the LP idle timeout.
+ */
+app.post('/api/rooms/:id/relay/close', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+    if (!RELAY_ENABLE) return res.status(404).json({ error: 'Relay disabled' });
+    const r = req.room.relay;
+    if (!r) return res.status(204).send();
+    const providedToken = req.headers['x-slot-token'] || '';
+    for (const name of ['a', 'b']) {
+        const s = r[name];
+        if (s && s.kind === 'lp' && helpers.secureCompare(providedToken, s.token)) {
+            closeLpSlot(s, 'Client closed');
+            r[name] = null;
+            const peer = name === 'a' ? r.b : r.a;
+            teardownPeer(peer, 'Peer closed');
+            break;
+        }
+    }
+    res.status(204).send();
+});
+
 /**
  * Get server stats (active room count) for adaptive fingerprint length.
  * GET /api/stats
@@ -1070,11 +1280,72 @@ const wss = new WebSocketServer({ noServer: true });
 // interval (ping/pong) only walks live entries.
 const relayPings = new Set();
 
+function deliverToPeer(peerSlot, data, isBinary) {
+    if (!peerSlot) return;
+    if (peerSlot.kind === 'lp') {
+        if (peerSlot.closed) return;
+        if (peerSlot.queue.length >= LP_QUEUE_MAX_FRAMES) {
+            // Bounded queue: a stalled consumer must not be able to pin
+            // server memory. We drop the oldest frame, not the newest,
+            // because the newest is more useful to the live receiver.
+            peerSlot.queue.shift();
+        }
+        peerSlot.queue.push({ data, isBinary });
+        const w = peerSlot.waiters.shift();
+        if (w) {
+            const next = peerSlot.queue.shift();
+            w.send(next);
+        }
+        return;
+    }
+    // ws slot
+    if (peerSlot.readyState === peerSlot.OPEN) {
+        peerSlot.send(data, { binary: isBinary });
+    }
+}
+
+function teardownPeer(peer, reason) {
+    if (!peer) return;
+    if (peer.kind === 'lp') {
+        closeLpSlot(peer, reason);
+    } else if (peer.readyState !== peer.CLOSED) {
+        try { peer.close(1000, reason); } catch (_) {}
+    }
+}
+
+function closeLpSlot(slot, reason) {
+    if (slot.closed) return;
+    slot.closed = true;
+    if (slot.idleTimer) { clearTimeout(slot.idleTimer); slot.idleTimer = null; }
+    // Drain pending waiters with a 410 Gone signal so the client knows
+    // the slot is dead and can stop polling.
+    const waiters = slot.waiters.splice(0);
+    for (const w of waiters) w.gone(reason);
+}
+
+function armLpIdleTimer(slot) {
+    if (slot.idleTimer) clearTimeout(slot.idleTimer);
+    slot.idleTimer = setTimeout(() => {
+        // The peer has gone silent for LP_SLOT_IDLE_TIMEOUT_MS, which is
+        // long after any reasonable retry window. Tear down to free
+        // resources; if the client comes back it can re-handshake.
+        const room = slot.roomRef && slot.roomRef.deref && slot.roomRef.deref();
+        closeLpSlot(slot, 'idle');
+        if (room && room.relay && room.relay[slot.slotName] === slot) {
+            room.relay[slot.slotName] = null;
+            const peer = slot.slotName === 'a' ? room.relay.b : room.relay.a;
+            teardownPeer(peer, 'Peer idle');
+        }
+    }, LP_SLOT_IDLE_TIMEOUT_MS);
+    slot.idleTimer.unref && slot.idleTimer.unref();
+}
+
 function attachRelay(room, ws, slot) {
     if (!room.relay) {
         room.relay = { a: null, b: null, sessionBytes: 0 };
     }
     const r = room.relay;
+    ws.kind = 'ws';
     r[slot] = ws;
     relayPings.add(ws);
     ws.isAlive = true;
@@ -1096,13 +1367,11 @@ function attachRelay(room, ws, slot) {
             // session is over end-to-end, not just on the hostile peer.
             const peer = slot === 'a' ? r.b : r.a;
             try { ws.close(4413, 'Session byte cap exceeded'); } catch (_) {}
-            if (peer) { try { peer.close(4413, 'Session byte cap exceeded'); } catch (_) {} }
+            teardownPeer(peer, 'Session byte cap exceeded');
             return;
         }
         const peer = slot === 'a' ? r.b : r.a;
-        if (peer && peer.readyState === peer.OPEN) {
-            peer.send(data, { binary: isBinary });
-        }
+        deliverToPeer(peer, data, isBinary);
         // If the peer hasn't joined yet, the frame is dropped on the
         // floor. We don't buffer because the protocol is interactive:
         // dropped pre-handshake frames are renegotiated by the client.
@@ -1116,9 +1385,7 @@ function attachRelay(room, ws, slot) {
             // half is gone the connection is dead. The receiver will
             // re-pair via createForReceiver if it wants to try again.
             const peer = slot === 'a' ? room.relay.b : room.relay.a;
-            if (peer && peer.readyState !== peer.CLOSED) {
-                try { peer.close(1000, 'Peer disconnected'); } catch (_) {}
-            }
+            teardownPeer(peer, 'Peer disconnected');
         }
     });
 
