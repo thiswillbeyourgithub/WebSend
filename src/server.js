@@ -7,6 +7,8 @@
 const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 const { version: APP_VERSION } = require('./package.json');
 const helpers = require('./server-helpers');
 
@@ -61,6 +63,14 @@ const TURN_TIMEOUT = parseInt(process.env.TURN_TIMEOUT, 10) || 15;
 // TURNS_PORT: if set, a turns: (TURN-over-TLS) URL is added to ICE candidates,
 // allowing WebRTC to traverse corporate firewalls that block non-HTTPS ports.
 const TURNS_PORT = process.env.TURNS_PORT || '';
+// RELAY_ENABLE: when truthy (default), expose the HTTP-relay fallback transport
+// at /api/rooms/:id/relay (WebSocket) and the long-poll variants (commit 4).
+// The relay forwards opaque encrypted bytes between two paired peers; the same
+// end-to-end ECDH+AES-GCM crypto is used, so the server never sees plaintext.
+// This is the corporate-network fallback path when both UDP and TURNS are
+// blocked. Set RELAY_ENABLE=false to disable (back to WebRTC-only behavior).
+// TODO: revisit default before production rollout once soak-tested.
+const RELAY_ENABLE = (process.env.RELAY_ENABLE || 'true').toLowerCase() !== 'false';
 // DEV_FORCE_CONNECTION: force a specific ICE transport for debugging.
 // Valid values: DIRECT, STUN, GOOGLE_STUN, TURN, TURNS, ALL (default).
 // DIRECT = no ICE servers (LAN host candidates only)
@@ -179,6 +189,13 @@ app.use(express.json({ limit: '50kb' }));
 // In-memory room storage (in production, use Redis or similar)
 const rooms = new Map();
 const ROOM_TTL = 10 * 60 * 1000; // 10 minutes TTL
+
+// Server-side mirror of the protocol.js anti-DoS caps. These are enforced on
+// the HTTP-relay transport (commits 2 + 4) so a hostile client cannot ignore
+// the client-side bounds and force the relay container to forward unbounded
+// bytes between paired peers. Keep these in sync with public/js/protocol.js.
+const MAX_TOTAL_SESSION_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB
+const MAX_CONTROL_MSG_BYTES = 16 * 1024; // 16 KiB
 
 // ============ Rate Limiting ============
 // Simple sliding window rate limiter to prevent DoS and room enumeration attacks.
@@ -424,6 +441,17 @@ function cleanupRooms() {
                 const waiters = room.answerWaiters.splice(0);
                 for (const w of waiters) w.roomGone();
             }
+            // Close any relay sockets on TTL expiry so dangling WS pairs
+            // do not outlive the room map entry they reference.
+            if (room.relay) {
+                for (const slot of ['a', 'b']) {
+                    const ws = room.relay[slot];
+                    if (ws && ws.readyState !== ws.CLOSED) {
+                        try { ws.close(1001, 'Room expired'); } catch (_) {}
+                    }
+                }
+                room.relay = null;
+            }
             rooms.delete(id);
             console.log(`Room ${id} expired and removed`);
         }
@@ -619,7 +647,13 @@ app.get('/api/config', (req, res) => {
         version: APP_VERSION,
         ocrLangs: OCR_LANGS.split(',').map(l => l.trim()),
         ocrPsm: OCR_PSM,
-        allowedFileTypes: ALLOWED_FILE_TYPES
+        allowedFileTypes: ALLOWED_FILE_TYPES,
+        // HTTP-relay fallback transport flag (commit 2). Clients open
+        // a WebSocket to /api/rooms/:id/relay?secret=... when WebRTC
+        // fails to connect within the 10s race window. The relay
+        // forwards encrypted bytes verbatim; payload is still ECDH+
+        // AES-GCM end-to-end encrypted.
+        relayEnabled: RELAY_ENABLE
     });
 });
 
@@ -660,7 +694,11 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
         iceCandidatesAnswer: [],
         // Pending long-poll resolvers waiting for `answer` to arrive.
         // Each entry: { send: (room) => void, timer: Timeout|null }.
-        answerWaiters: []
+        answerWaiters: [],
+        // HTTP-relay fallback transport state. Lazily initialised by the
+        // first /api/rooms/:id/relay WS upgrade (commit 2) or long-poll
+        // handshake (commit 4). Shape: { a, b, sessionBytes, ... }.
+        relay: null
     });
 
     console.log(`Room ${roomId} created`);
@@ -1017,7 +1055,177 @@ app.use((err, req, res, next) => {
     res.status(status).json({ error: messages[status] || 'Request error' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+// ============ HTTP-Relay Fallback Transport (commit 2) ============
+// When TURNS gets blocked or stripped on hostile corporate networks, the
+// client races a WebSocket to /api/rooms/:id/relay against WebRTC. The
+// relay forwards opaque encrypted bytes between two paired peers; the
+// payload remains ECDH+AES-GCM end-to-end encrypted, so the server never
+// sees plaintext. Three slots per room: 'a' (first connector), 'b' (second
+// connector), and a 4409 close code for a third connector. Bounded by the
+// mirrored MAX_TOTAL_SESSION_BYTES / MAX_CONTROL_MSG_BYTES caps.
+
+const RELAY_PATH_RE = /^\/api\/rooms\/([A-Z0-9]{6})\/relay$/;
+const wss = new WebSocketServer({ noServer: true });
+// Track the relay rooms with at least one open socket so the heartbeat
+// interval (ping/pong) only walks live entries.
+const relayPings = new Set();
+
+function attachRelay(room, ws, slot) {
+    if (!room.relay) {
+        room.relay = { a: null, b: null, sessionBytes: 0 };
+    }
+    const r = room.relay;
+    r[slot] = ws;
+    relayPings.add(ws);
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    ws.on('message', (data, isBinary) => {
+        const len = Buffer.isBuffer(data) ? data.length : (data && data.byteLength) || 0;
+        if (!isBinary && len > MAX_CONTROL_MSG_BYTES) {
+            // Mirrors the client-side handleMessage cap in webrtc.js so
+            // a hostile peer cannot force the relay container to forward
+            // multi-MB control messages.
+            try { ws.close(4413, 'Control message too large'); } catch (_) {}
+            return;
+        }
+        r.sessionBytes += len;
+        if (r.sessionBytes > MAX_TOTAL_SESSION_BYTES) {
+            // 4 GiB cap shared with the receiver-side cap (protocol.js
+            // MAX_TOTAL_SESSION_BYTES). Tear down both sides so the
+            // session is over end-to-end, not just on the hostile peer.
+            const peer = slot === 'a' ? r.b : r.a;
+            try { ws.close(4413, 'Session byte cap exceeded'); } catch (_) {}
+            if (peer) { try { peer.close(4413, 'Session byte cap exceeded'); } catch (_) {} }
+            return;
+        }
+        const peer = slot === 'a' ? r.b : r.a;
+        if (peer && peer.readyState === peer.OPEN) {
+            peer.send(data, { binary: isBinary });
+        }
+        // If the peer hasn't joined yet, the frame is dropped on the
+        // floor. We don't buffer because the protocol is interactive:
+        // dropped pre-handshake frames are renegotiated by the client.
+    });
+
+    ws.on('close', () => {
+        relayPings.delete(ws);
+        if (room.relay) {
+            room.relay[slot] = null;
+            // Tear down the peer too: the pair is symmetric; once one
+            // half is gone the connection is dead. The receiver will
+            // re-pair via createForReceiver if it wants to try again.
+            const peer = slot === 'a' ? room.relay.b : room.relay.a;
+            if (peer && peer.readyState !== peer.CLOSED) {
+                try { peer.close(1000, 'Peer disconnected'); } catch (_) {}
+            }
+        }
+    });
+
+    ws.on('error', () => {
+        try { ws.close(1011, 'Server error'); } catch (_) {}
+    });
+}
+
+// Heartbeat: any client that fails to pong within one interval is treated
+// as dead and force-closed. Without this, a proxy that silently drops a
+// connection leaves the peer holding an open socket for the room TTL.
+const RELAY_PING_INTERVAL_MS = 20_000;
+setInterval(() => {
+    for (const ws of relayPings) {
+        if (ws.isAlive === false) {
+            try { ws.terminate(); } catch (_) {}
+            relayPings.delete(ws);
+            continue;
+        }
+        ws.isAlive = false;
+        try { ws.ping(); } catch (_) {}
+    }
+}, RELAY_PING_INTERVAL_MS).unref();
+
+const httpServer = http.createServer(app);
+
+httpServer.on('upgrade', (req, socket, head) => {
+    if (!RELAY_ENABLE) {
+        socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+    // Parse URL with a synthetic base so URL() works for the relative path.
+    let url;
+    try {
+        url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    } catch (_) {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    const match = RELAY_PATH_RE.exec(url.pathname);
+    if (!match) {
+        socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    // Origin validation mirrors validateOrigin() for the HTTP API. No
+    // Origin header = not a browser; we let it through (curl / test
+    // clients). The room-secret check below is the real defense; this
+    // just enforces the same surface area for free.
+    const origin = req.headers.origin;
+    if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    // Per-IP rate limit. Reuses the existing 'general' category (100/min)
+    // so a hostile client cannot pin slots by reconnecting in a tight
+    // loop. We can't go through the Express middleware on upgrade so we
+    // call checkRateLimit directly.
+    const ip = req.socket.remoteAddress || 'unknown';
+    if (!RATE_LIMIT_DISABLED) {
+        const rl = checkRateLimit(ip, 'general');
+        if (!rl.allowed) {
+            socket.write(`HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${rl.retryAfter}\r\n\r\n`);
+            socket.destroy();
+            return;
+        }
+    }
+
+    const roomId = match[1];
+    const room = rooms.get(roomId);
+    const providedSecret = url.searchParams.get('secret') || '';
+    // Same constant-time secret check as validateRoomSecret(), including
+    // the dummy compare when the room is missing so an attacker cannot
+    // tell from response timing whether a roomId exists.
+    const compareTarget = room ? room.secret : _DUMMY_SECRET;
+    const ok = providedSecret && helpers.secureCompare(providedSecret, compareTarget);
+    if (!room || !ok) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    // Slot assignment: first connector becomes 'a', second 'b', third
+    // gets a 4409 close. We have to commit to the slot BEFORE handleUpgrade
+    // resolves so a concurrent third upgrade can't slip in.
+    const r = room.relay || { a: null, b: null, sessionBytes: 0 };
+    let slot;
+    if (!r.a) slot = 'a';
+    else if (!r.b) slot = 'b';
+    else {
+        socket.write('HTTP/1.1 409 Conflict\r\n\r\nRoom relay slots full');
+        socket.destroy();
+        return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+        attachRelay(room, ws, slot);
+    });
+});
+
+httpServer.listen(PORT, '0.0.0.0', () => {
     console.log('='.repeat(60));
     console.log('  WebSend - Startup Configuration');
     console.log('='.repeat(60));
@@ -1033,6 +1241,7 @@ app.listen(PORT, '0.0.0.0', () => {
         { name: 'TURN_TIMEOUT',          value: process.env.TURN_TIMEOUT,         used: String(TURN_TIMEOUT) },
         { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
         { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
+        { name: 'RELAY_ENABLE',          value: process.env.RELAY_ENABLE,         used: String(RELAY_ENABLE) },
         { name: 'DEV_FORCE_CONNECTION',  value: process.env.DEV_FORCE_CONNECTION, used: DEV_FORCE_CONNECTION },
         { name: 'UMAMI_URL',             value: process.env.UMAMI_URL,            used: UMAMI_URL || '(none)' },
         { name: 'UMAMI_WEBSITE_ID',      value: process.env.UMAMI_WEBSITE_ID,     used: UMAMI_WEBSITE_ID || '(none)' },
@@ -1083,6 +1292,17 @@ app.listen(PORT, '0.0.0.0', () => {
     for (const u of previewUrls.turns) console.log(`    TURNS: ${u}`);
     if (TURN_SERVER && TURN_SECRET && !TURNS_PORT) {
         console.log('  Note: TURNS_PORT not set, so no turns: URL will be offered. Networks that block UDP and TCP-3478 will fail.');
+    }
+
+    // HTTP-relay fallback transport (commit 2): the client races a
+    // WebSocket against WebRTC and switches over after a 10s grace
+    // window if WebRTC has not connected. Surface the URL operators
+    // should expect to see at Caddy / reverse-proxy time.
+    if (RELAY_ENABLE) {
+        const scheme = DOMAIN === 'localhost' ? 'ws' : 'wss';
+        console.log(`  HTTP-relay fallback: ENABLED at ${scheme}://${DOMAIN}/api/rooms/:id/relay`);
+    } else {
+        console.log('  HTTP-relay fallback: DISABLED (RELAY_ENABLE=false)');
     }
 
     console.log('='.repeat(60));
