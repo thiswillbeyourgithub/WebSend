@@ -152,8 +152,121 @@ const DocDetect = (function () {
         const quad = _findLargestQuad(contours, w, h, gx, gy, magScale);
         if (!quad) return null;
 
-        // 10. Normalize to 0-1 and sort corners
-        return _sortCorners(quad.map(p => ({ x: p.x / w, y: p.y / h })));
+        // 10. Snap each side to its strongest local Sobel edge. The contour-derived
+        //     quad is usually within ~5-15% of the real page boundary, but Otsu /
+        //     dilation morphology can pull a side inward when a shadow falls on the
+        //     page or push it outward when nearby glare merges with the foreground
+        //     mask. Per-side refinement is purely geometric (math + edge detection,
+        //     no colour classifier): sample along the side, slide ±maxOffset
+        //     perpendicular, take the location of max |grad · sideNormal|, then
+        //     refit the side as the principal axis of those refined points.
+        // Two refinement passes: the first moves sides ±12% to fix coarse
+        // misalignments; the second runs at ±3% to lock onto the page edge
+        // without grabbing distant floor-pattern gradients.
+        let refined = _snapQuadToEdges(quad, gx, gy, w, h, Math.min(w, h) * 0.12);
+        if (refined) {
+            const second = _snapQuadToEdges(refined, gx, gy, w, h, Math.min(w, h) * 0.03);
+            if (second) refined = second;
+        }
+        const finalQuad = refined || quad;
+
+        // 11. Normalize to 0-1 and sort corners
+        return _sortCorners(finalQuad.map(p => ({ x: p.x / w, y: p.y / h })));
+    }
+
+    /**
+     * Refine a 4-corner quad so each side lies on the strongest perpendicular
+     * Sobel edge in its neighbourhood. Returns a new quad, or null if refinement
+     * fails (parallel sides, too few refined samples, or large displacement).
+     */
+    function _snapQuadToEdges(quad, gx, gy, w, h, maxOffset) {
+        if (maxOffset === undefined) maxOffset = Math.min(w, h) * 0.12;
+        const sideLines = new Array(4);
+
+        for (let e = 0; e < 4; e++) {
+            const a = quad[e], b = quad[(e + 1) % 4];
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 4) return null;
+            const tx = dx / len, ty = dy / len;       // along-side tangent
+            const nx = -ty,     ny =  tx;             // outward-ish normal
+
+            const nSamples = Math.max(16, Math.round(len / 3));
+            const pts = [];
+            // Extend the search slightly past each corner so a refined side can
+            // continue beyond where the original quad's corner sat — the real
+            // corner is found later by intersecting refined adjacent sides.
+            const overshoot = 0.10;
+            for (let i = 0; i < nSamples; i++) {
+                const t = -overshoot + (1 + 2 * overshoot) * ((i + 0.5) / nSamples);
+                const px = a.x + dx * t, py = a.y + dy * t;
+                let best = 0, bestD = 0;
+                for (let d = -maxOffset; d <= maxOffset; d += 1) {
+                    const sx = px + nx * d, sy = py + ny * d;
+                    if (sx < 1 || sy < 1 || sx >= w - 1 || sy >= h - 1) continue;
+                    const idx = (sy | 0) * w + (sx | 0);
+                    const proj = Math.abs(gx[idx] * nx + gy[idx] * ny);
+                    if (proj > best) { best = proj; bestD = d; }
+                }
+                if (best > 0) pts.push({ x: px + nx * bestD, y: py + ny * bestD, w: best });
+            }
+            if (pts.length < 6) return null;
+
+            // Drop outliers: residuals to the original side, keep the inner ~70%.
+            // Stops a few stray strong edges (page interior text, floor pattern)
+            // from dragging the PCA fit off the page boundary.
+            const sideC = { x: a.x + dx * 0.5, y: a.y + dy * 0.5 };
+            const residuals = pts.map(p => Math.abs((p.x - sideC.x) * nx + (p.y - sideC.y) * ny));
+            const sortedR = residuals.slice().sort((u, v) => u - v);
+            const cutoff = sortedR[Math.floor(sortedR.length * 0.7)];
+            const kept = pts.filter((_, i) => residuals[i] <= cutoff);
+            if (kept.length < 6) return null;
+
+            // Weighted PCA on `kept`. Largest-eigenvalue eigenvector = line direction.
+            let sw = 0, swx = 0, swy = 0;
+            for (const p of kept) { sw += p.w; swx += p.w * p.x; swy += p.w * p.y; }
+            const mx = swx / sw, my = swy / sw;
+            let sxx = 0, sxy = 0, syy = 0;
+            for (const p of kept) {
+                const ux = p.x - mx, uy = p.y - my;
+                sxx += p.w * ux * ux;
+                sxy += p.w * ux * uy;
+                syy += p.w * uy * uy;
+            }
+            const tr = sxx + syy;
+            const disc = Math.max(0, tr * tr / 4 - (sxx * syy - sxy * sxy));
+            const lam = tr / 2 + Math.sqrt(disc);   // largest eigenvalue
+            let lx, ly;
+            if (Math.abs(sxy) > 1e-6) { lx = sxy; ly = lam - sxx; }
+            else                      { lx = (sxx >= syy) ? 1 : 0; ly = (sxx >= syy) ? 0 : 1; }
+            const ll = Math.sqrt(lx * lx + ly * ly) || 1;
+            lx /= ll; ly /= ll;
+            // Guard against PCA flipping to the perpendicular axis when the
+            // refined points happen to scatter more across than along.
+            if (Math.abs(lx * tx + ly * ty) < 0.5) return null;
+            sideLines[e] = { px: mx, py: my, dx: lx, dy: ly };
+        }
+
+        // Intersect adjacent refined sides to get new corners.
+        const out = new Array(4);
+        for (let c = 0; c < 4; c++) {
+            const L1 = sideLines[(c - 1 + 4) % 4];
+            const L2 = sideLines[c];
+            const cross = L1.dx * L2.dy - L1.dy * L2.dx;
+            if (Math.abs(cross) < 1e-6) return null;
+            const t = ((L2.px - L1.px) * L2.dy - (L2.py - L1.py) * L2.dx) / cross;
+            const nx = L1.px + t * L1.dx;
+            const ny = L1.py + t * L1.dy;
+            if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
+            out[c] = { x: Math.max(0, Math.min(w - 1, nx)), y: Math.max(0, Math.min(h - 1, ny)) };
+        }
+        // Reject refinements that displace any corner by more than maxOffset*2 —
+        // a runaway fit means a side latched onto something far from the page.
+        const cap = maxOffset * 2;
+        for (let c = 0; c < 4; c++) {
+            if (Math.hypot(out[c].x - quad[c].x, out[c].y - quad[c].y) > cap) return null;
+        }
+        return out;
     }
 
     /** 5x5 Gaussian blur (sigma ≈ 1.0) */
