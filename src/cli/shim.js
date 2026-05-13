@@ -62,8 +62,6 @@
         log('info', `Protocol v${P.VERSION}`);
 
         const config = await httpJson(`${baseUrl}/api/config`);
-        const stats  = await httpJson(`${baseUrl}/api/stats`).catch(() => ({ activeRooms: 0 }));
-        const fpLen  = C.computeFingerprintLength(stats?.activeRooms ?? 0);
 
         const rtcConfig = {
             iceServers: (config?.iceServers || []).filter(s => s && s.urls),
@@ -236,8 +234,8 @@
                     if (msg.type === 'sender-public-key') {
                         const theirPub = await C.importPublicKey(msg.key);
                         sharedKey = await C.deriveSharedKey(keyPair.privateKey, theirPub);
-                        const myFp    = await C.getKeyFingerprint(keyPair.publicKey, fpLen);
-                        const theirFp = await C.getKeyFingerprint(theirPub, fpLen);
+                        const myFp    = await C.getKeyFingerprint(keyPair.publicKey);
+                        const theirFp = await C.getKeyFingerprint(theirPub);
                         const ok = autoAccept ? true : await window.__nodePromptFp(myFp, theirFp);
                         if (ok) {
                             weConfirmed = true;

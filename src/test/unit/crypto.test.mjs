@@ -157,39 +157,34 @@ test('encryptWithMetadata/decryptWithMetadata round-trip', async () => {
     assert.deepEqual(new Uint8Array(data2), new Uint8Array(data));
 });
 
-// ---- computeFingerprintLength ----
-
-test('computeFingerprintLength: four branches', () => {
-    assert.equal(C.computeFingerprintLength(0),     3);
-    assert.equal(C.computeFingerprintLength(10),    3);
-    assert.equal(C.computeFingerprintLength(11),    6);
-    assert.equal(C.computeFingerprintLength(100),   6);
-    assert.equal(C.computeFingerprintLength(101),   9);
-    assert.equal(C.computeFingerprintLength(1000),  9);
-    assert.equal(C.computeFingerprintLength(1001), 12);
-    assert.equal(C.computeFingerprintLength(9999), 12);
-});
-
 // ---- getKeyFingerprint ----
+//
+// Fingerprint length is fixed at 16 hex chars (64 bits), matching the
+// recognised floor for verbal-comparison fingerprints. Any reintroduction
+// of an adaptive / shorter mode would weaken MITM protection, so these
+// tests pin the format.
 
 test('getKeyFingerprint: deterministic for same key', async () => {
     const kp = await C.generateKeyPair();
-    const fp1 = await C.getKeyFingerprint(kp.publicKey, 8);
-    const fp2 = await C.getKeyFingerprint(kp.publicKey, 8);
+    const fp1 = await C.getKeyFingerprint(kp.publicKey);
+    const fp2 = await C.getKeyFingerprint(kp.publicKey);
     assert.equal(fp1, fp2);
 });
 
-test('getKeyFingerprint: clamps to max 12', async () => {
+test('getKeyFingerprint: fixed at 16 hex chars (64 bits, MITM floor)', async () => {
     const kp = await C.generateKeyPair();
-    const fp = await C.getKeyFingerprint(kp.publicKey, 99);
-    // 12 hex chars grouped in chunks of 4 -> "XXXX-XXXX-XXXX"
+    const fp = await C.getKeyFingerprint(kp.publicKey);
     const hexOnly = fp.replace(/-/g, '');
-    assert.equal(hexOnly.length, 12);
+    assert.equal(hexOnly.length, 16);
+    // Grouped as XXXX-XXXX-XXXX-XXXX
+    assert.match(fp, /^[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/);
 });
 
-test('getKeyFingerprint: clamps to min 3', async () => {
+test('getKeyFingerprint: ignores extra args (no adaptive shortening)', async () => {
     const kp = await C.generateKeyPair();
-    const fp = await C.getKeyFingerprint(kp.publicKey, 1);
-    const hexOnly = fp.replace(/-/g, '');
-    assert.equal(hexOnly.length, 3);
+    // Older call sites passed a length; the new API takes only the key. A
+    // stray second arg must NOT shorten the output, otherwise an attacker
+    // (or a regressed caller) could weaken the verification code.
+    const fp = await C.getKeyFingerprint(kp.publicKey, 3);
+    assert.equal(fp.replace(/-/g, '').length, 16);
 });

@@ -64,7 +64,7 @@ WebSend/
     │                       #   (credentials masked) so missing TURNS_PORT is obvious
     ├── server-helpers.js   # Pure server-side helpers (origin parsing, rate-limit
     │                       #   sliding-window logic, TURN HMAC-SHA1 credential
-    │                       #   derivation, fingerprint-length sizing). Unit-tested
+    │                       #   derivation). Unit-tested
     ├── healthcheck.js      # Tiny HTTP health probe used by the Dockerfile HEALTHCHECK
     ├── package.json        # Runtime dep: express ^5. Dev deps: @playwright/test,
     │                       #   canvas, jsdom (used by unit / e2e tests only)
@@ -346,7 +346,6 @@ the matching photo, it surfaces an error toast and gives up.
 |--------|------------------------------|--------------------------------------|-------------|-----------------|
 | GET    | `/send/:roomId`              | Pretty-URL redirect into the sender flow | None    | None            |
 | GET    | `/api/config`                | ICE server list + DEV flag + OCR / file-type config | None | None     |
-| GET    | `/api/stats`                 | Active room count (for fingerprint length) | None  | None            |
 | POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None        | 5/min per IP    |
 | GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 30/min per IP   |
 | POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Room secret | 100/min per IP  |
@@ -378,11 +377,15 @@ relay slot.
 3. **Room secrets**: 16-byte random token required for any room access. Passed in URL hash
    fragment (never sent to server in HTTP requests). Constant-time comparison prevents
    timing attacks. Prevents room enumeration even if the short room ID is guessed.
-4. **Fingerprint verification**: Both parties see short hex fingerprints of each other's
-   public keys and must manually confirm they match, defeating MITM attacks. The fingerprint
-   length adapts to the number of currently active rooms (fetched from `GET /api/stats`):
-   fewer concurrent sessions → shorter codes (as few as 3 hex chars) to reduce verification
-   fatigue; more sessions → longer codes (up to 12 hex chars) to maintain collision resistance.
+4. **Fingerprint verification**: Both parties see a 16-hex-char (64-bit) SHA-256
+   fingerprint of each other's public keys, grouped as `XXXX-XXXX-XXXX-XXXX`, and must
+   manually confirm they match. The length is fixed: 64 bits is the recognised floor
+   for verbal-comparison fingerprints (Signal uses 60 decimal digits, OTR uses 40 hex /
+   160 bits). The relevant attack is a signaling-MITM grinding ECDH keys to a chosen
+   fingerprint, which is a second-preimage search whose cost is independent of how
+   many rooms are live, so the code length must NOT be adapted to active-room count.
+   An earlier "adaptive" version (3-12 hex) was removed for this reason: at 3 hex
+   chars the search is feasible in sub-second time on a laptop.
 5. **Size obfuscation**: Photos are padded to power-of-2 bucket sizes before encryption,
    hiding exact file sizes from network observers. Padding uses random bytes to prevent
    compression-based attacks.

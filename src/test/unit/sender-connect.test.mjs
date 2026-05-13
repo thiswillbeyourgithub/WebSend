@@ -37,8 +37,7 @@ function setup({ deriveSharedKeyCallback } = {}) {
             return { __fake: 'shared' };
         },
         exportPublicKey: async () => 'b64pubkey',
-        getKeyFingerprint: async () => 'AAAA-BBBB',
-        computeFingerprintLength: () => 12,
+        getKeyFingerprint: async () => 'AAAA-BBBB-CCCC-DDDD',
     };
     win.WebSendRTC = class {
         constructor() { this.iceServers = []; }
@@ -64,7 +63,6 @@ function setup({ deriveSharedKeyCallback } = {}) {
     win.PeerUI = { onConnectionTypeDetected: () => {}, showVerifiedInSidebar: () => {}, hasTurn: () => true };
     win.wakeLockMgr = { desired: false, acquire: async () => {}, release: () => {} };
     win.Gallery = { size: () => 0, shredLocal: () => {}, photos: () => [] };
-    win.fetch = async () => ({ ok: false });
 
     const logs = { info: [], warn: [], error: [], success: [] };
     const toasts = [];

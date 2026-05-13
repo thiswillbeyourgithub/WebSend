@@ -200,20 +200,8 @@
             const receiverPublicKey = await window.WebSendCrypto.importPublicKey(msg.key);
             sharedKey = await window.WebSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
 
-            // Adapt fingerprint length to active room load
-            let fpLength = 12;
-            try {
-                const statsRes = await fetch('/api/stats');
-                if (statsRes.ok) {
-                    const stats = await statsRes.json();
-                    fpLength = window.WebSendCrypto.computeFingerprintLength(stats.activeRooms);
-                }
-            } catch (e) {
-                _logger.warn('Could not fetch room stats, using max fingerprint length');
-            }
-
-            const ourFingerprint = await window.WebSendCrypto.getKeyFingerprint(keyPair.publicKey, fpLength);
-            const theirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey, fpLength);
+            const ourFingerprint = await window.WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
+            const theirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey);
 
             _logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
 

@@ -79,8 +79,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - The server-side dependency footprint is intentionally minimal (Express.js only)
 
 ### Man-in-the-Middle Protection
-- **Key fingerprint verification**: after connection, both parties see short fingerprint codes (SHA-256 hash of public keys) that they can compare aloud to confirm no MITM key substitution occurred
-- **Adaptive fingerprint length**: the fingerprint code length scales with the number of active rooms on the server (from 3 hex chars for a handful of rooms up to 12 for thousands), keeping codes short and easy to verify when traffic is low while maintaining collision resistance as concurrency grows
+- **Key fingerprint verification**: after connection, both parties see a 16-hex-char (64-bit) SHA-256 fingerprint of each other's public keys, grouped as `XXXX-XXXX-XXXX-XXXX`, that they compare aloud to confirm no MITM key substitution occurred. The length is fixed at the recognised floor for verbal-comparison fingerprints (Signal uses 60 decimal digits, OTR 40 hex / 160 bits). It is deliberately NOT adapted to server load: a signaling-MITM grinds ECDH keys against any single session, so shortening the code under low load would not reduce attacker effort, just make the attack feasible in seconds on a laptop.
 - Both parties must **explicitly confirm** the fingerprints match before photo transfer begins
 - Either party can **abort** if fingerprints don't match
 

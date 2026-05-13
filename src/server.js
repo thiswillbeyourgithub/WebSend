@@ -1210,15 +1210,6 @@ app.post('/api/rooms/:id/relay/close', rateLimitMiddleware('general'), validateR
     res.status(204).send();
 });
 
-/**
- * Get server stats (active room count) for adaptive fingerprint length.
- * GET /api/stats
- * No authentication required - only exposes aggregate count, not room details.
- */
-app.get('/api/stats', (req, res) => {
-    res.json({ activeRooms: rooms.size });
-});
-
 // Catch-all route for /send/:roomId pattern - serve send.html
 app.get('/send/:roomId', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'send.html'));

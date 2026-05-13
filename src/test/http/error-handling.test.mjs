@@ -74,9 +74,9 @@ test('malformed JSON returns 400 with a scrubbed message', async () => {
 });
 
 test('unknown method on existing path also takes the 404 path', async () => {
-    // No registered handler exists for TRACE on /api/stats; it must
+    // No registered handler exists for DELETE on /api/config; it must
     // not fall through to a noisy default response.
-    const res = await fetch(`${server.baseUrl}/api/stats`, { method: 'DELETE' });
+    const res = await fetch(`${server.baseUrl}/api/config`, { method: 'DELETE' });
     assert.equal(res.status, 404);
     const body = await res.json();
     assert.deepEqual(body, { error: 'Not found' });
