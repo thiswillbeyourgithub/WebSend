@@ -31,6 +31,17 @@
     // not turn into a fetch tight loop.
     const POLL_BACKOFF_MS = 1_000;
 
+    // Same tagged error shape as ws-transport so SenderSend can detect
+    // a recoverable mid-transfer drop and trigger the resume flow.
+    class TransientDisconnectError extends Error {
+        constructor(message, offset) {
+            super(message);
+            this.name = 'TransientDisconnectError';
+            this.transient = true;
+            this.offset = offset | 0;
+        }
+    }
+
     class LPTransport {
         constructor() {
             this.tag = 'LP';
@@ -44,6 +55,7 @@
             // Event callbacks (set by caller)
             this.onConnected = null;
             this.onDisconnected = null;
+            this.onTransientDisconnect = null;
             this.onMessage = null;
             this.onStateChange = null;
             this.onConnectionTypeDetected = null;
@@ -75,35 +87,68 @@
             this._open();
         }
 
+        /**
+         * Re-open the LP slot after a transient drop. The room id /
+         * secret are kept; we just need to re-claim a slot from the
+         * server. PayloadAssembler state is preserved so byte-level
+         * resume can replay the file from the receiver's last byte.
+         */
+        reopen() {
+            if (this._closed) return;
+            if (this._slotToken) return;
+            this._open();
+        }
+
         async _open() {
             if (this._slotToken || this._closed) return;
             if (!this.roomId || !this.roomSecret) {
                 logger.warn('[LP] open called without room/secret');
                 return;
             }
-            try {
-                const res = await fetch(`/api/rooms/${this.roomId}/relay/handshake`, {
-                    method: 'POST',
-                    headers: {
-                        'X-Room-Secret': this.roomSecret,
-                        'Content-Type': 'application/json',
-                    },
-                    body: '{}',
-                });
-                if (!res.ok) {
-                    logger.warn(`[LP] handshake refused: ${res.status}`);
-                    this._handleDisconnect('handshake-refused');
-                    return;
+            // Retry the handshake forever with bounded backoff. The
+            // RacingTransport's reconnect loop also drives reopen()
+            // attempts, but a single _open() call is allowed to outlive
+            // a brief 503 / 409 burst so a successful retry within the
+            // same call avoids re-entering RacingTransport.
+            const backoffSchedule = [0, 500, 1_000, 2_000, 5_000];
+            let attempt = 0;
+            while (!this._closed && !this._slotToken) {
+                const wait = backoffSchedule[Math.min(attempt, backoffSchedule.length - 1)];
+                if (wait > 0) await new Promise(r => setTimeout(r, wait));
+                if (this._closed) return;
+                try {
+                    const res = await fetch(`/api/rooms/${this.roomId}/relay/handshake`, {
+                        method: 'POST',
+                        headers: {
+                            'X-Room-Secret': this.roomSecret,
+                            'Content-Type': 'application/json',
+                        },
+                        body: '{}',
+                    });
+                    if (res.ok) {
+                        const body = await res.json();
+                        this._slot = body.slot;
+                        this._slotToken = body.token;
+                        logger.info(`[LP] handshake ok, slot=${this._slot}` + (attempt > 0 ? ` (after ${attempt} retries)` : ''));
+                        break;
+                    }
+                    // 409 = slots full, 503 = overloaded. Both are transient
+                    // and the RacingTransport's higher-level loop will
+                    // eventually give up if the room is genuinely gone.
+                    // A 401 / 404 is fatal (bad secret / room expired).
+                    if (res.status === 401 || res.status === 403 || res.status === 404) {
+                        logger.warn(`[LP] handshake fatal: ${res.status}`);
+                        this._handleDisconnect('handshake-fatal');
+                        return;
+                    }
+                    logger.warn(`[LP] handshake transient ${res.status}; retrying`);
+                } catch (e) {
+                    if (this._closed) return;
+                    logger.warn('[LP] handshake threw: ' + e.message + '; retrying');
                 }
-                const body = await res.json();
-                this._slot = body.slot;
-                this._slotToken = body.token;
-                logger.info(`[LP] handshake ok, slot=${this._slot}`);
-            } catch (e) {
-                logger.warn('[LP] handshake threw: ' + e.message);
-                this._handleDisconnect('handshake-threw');
-                return;
+                attempt++;
             }
+            if (this._closed || !this._slotToken) return;
             // Send our relay-hello so the peer knows we're live. The peer's
             // hello arrives via the down-poll and triggers _markConnected.
             this._sendControl({ type: 'relay-hello' }).catch((e) => {
@@ -139,8 +184,22 @@
 
                 if (res.status === 204) continue; // long-poll timeout, repoll
                 if (res.status === 410) {
-                    logger.warn('[LP] slot closed by server');
-                    this._handleDisconnect('slot-closed');
+                    // The server told us the slot is closed. Most often
+                    // this means the peer dropped (proxy hiccup, etc) and
+                    // the relay-side grace window expired before they
+                    // re-handshook. From our POV that's still a transient
+                    // condition: the higher layer (RacingTransport) will
+                    // call reopen() to re-claim a slot, and the peer is
+                    // expected to do the same. The receive state in
+                    // PayloadAssembler is preserved across this so byte-
+                    // level resume is possible.
+                    logger.warn('[LP] slot closed by server; will reconnect');
+                    this._slotToken = null;
+                    this._slot = null;
+                    this._helloSent = false;
+                    this._connected = false;
+                    if (this.onTransientDisconnect) this.onTransientDisconnect();
+                    else this._handleDisconnect('slot-closed');
                     return;
                 }
                 if (!res.ok) {
@@ -298,7 +357,7 @@
             return true;
         }
 
-        async sendFile(encryptedData, onProgress) {
+        async sendFile(encryptedData, onProgress, resumeFromOffset) {
             if (!this._connected) {
                 logger.error('[LP] not connected, cannot send file');
                 return false;
@@ -307,27 +366,50 @@
                 throw new Error('sendFile already in progress, wait for the previous transfer to finish');
             }
             this._fileAckInFlight = true;
+            const totalSize = encryptedData.byteLength;
+            const isResume = typeof resumeFromOffset === 'number' && resumeFromOffset > 0;
+            let offset = isResume ? resumeFromOffset : 0;
             try {
-                const totalSize = encryptedData.byteLength;
-                let offset = 0;
-                if (!this.sendMessage(window.Protocol.build.fileStart(totalSize))) {
-                    throw new Error('Failed to send file-start (LP not connected)');
+                if (!isResume) {
+                    if (!this.sendMessage(window.Protocol.build.fileStart(totalSize))) {
+                        throw new TransientDisconnectError('LP not connected for file-start', 0);
+                    }
+                    logger.info(`[LP] sending encrypted file (${totalSize} bytes, padded)`);
+                } else {
+                    logger.info(`[LP] resuming encrypted file from offset ${offset}/${totalSize}`);
                 }
-                logger.info(`[LP] sending encrypted file (${totalSize} bytes, padded)`);
                 while (offset < totalSize) {
-                    if (this._closed) throw new Error('LP closed mid-transfer');
+                    if (this._closed) {
+                        throw new TransientDisconnectError(
+                            `LP closed mid-transfer at offset ${offset}/${totalSize}`,
+                            offset
+                        );
+                    }
                     const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
                     // Sequential awaits provide natural backpressure: the
                     // server only acks our POST when the queue accepts the
                     // frame, and an LP slot has a bounded queue. No need
                     // for an explicit highWater check.
-                    await this._sendBinary(chunk);
+                    try {
+                        await this._sendBinary(chunk);
+                    } catch (e) {
+                        // Any /relay/up failure mid-chunk is treated as a
+                        // transient drop so SenderSend can resume after
+                        // reconnect from this offset.
+                        throw new TransientDisconnectError(
+                            `LP _sendBinary failed at offset ${offset}: ${e.message}`,
+                            offset
+                        );
+                    }
                     offset += chunk.byteLength;
                     const percent = Math.round((offset / totalSize) * 100);
                     if (onProgress) onProgress(percent, offset, totalSize);
                 }
                 if (!this.sendMessage(window.Protocol.build.fileEnd())) {
-                    throw new Error('Failed to send file-end');
+                    throw new TransientDisconnectError(
+                        `LP closed before file-end at offset ${offset}/${totalSize}`,
+                        offset
+                    );
                 }
                 logger.info('[LP] all chunks sent, waiting for receiver acknowledgment...');
                 return await new Promise((resolve, reject) => {
