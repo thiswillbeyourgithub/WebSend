@@ -30,10 +30,14 @@ services:
       - OCR_LANGS=${OCR_LANGS:-eng,fra}
       - OCR_PSM=${OCR_PSM:-12}
       - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES:-ANY}
-    # Uncomment to make websend wait for the bundled coturn service to start.
-    # Only useful if you use the bundled coturn below (not an external TURN server).
+    # Uncomment the relevant lines below to gate websend startup on optional services.
+    #   - coturn: only if you use the bundled coturn (not an external TURN server).
+    #   - oauth2-proxy: STRONGLY RECOMMENDED if you uncomment the oauth2-proxy
+    #     service below. This ensures websend will not start if the auth gate
+    #     fails to come up, so it can never be reached unprotected.
     # depends_on:
     #   - coturn
+    #   - oauth2-proxy
     # Security hardening options
     security_opt:
       # Prevent privilege escalation via setuid/setgid binaries
@@ -102,8 +106,6 @@ services:
   #     - OAUTH2_PROXY_EMAIL_DOMAINS=*
   #     - OAUTH2_PROXY_COOKIE_SECURE=true
   #     - OAUTH2_PROXY_PASS_ACCESS_TOKEN=true
-  #   depends_on:
-  #     - websend
   #   security_opt:
   #     - no-new-privileges:true
   #   read_only: true
