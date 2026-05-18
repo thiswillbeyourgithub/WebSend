@@ -50,6 +50,13 @@
     // just wastes the test's wall clock.
     const RACE_GRACE_FORCED_RELAY_MS = 0;
 
+    // Reconnect backoff schedule (ms). After the winning relay drops we
+    // retry forever, with delays growing to 5 s and then holding flat so
+    // a long network outage doesn't melt the server while we're hopeful.
+    // The cap matches LP's handshake backoff so both reconnect paths
+    // converge at the same retry rate.
+    const RECONNECT_BACKOFF_MS = [500, 1_000, 2_000, 5_000];
+
     class RacingTransport {
         constructor(role) {
             this._role = role; // 'receiver' or 'sender', informational
@@ -89,6 +96,19 @@
             this.onMessage = null;
             this.onStateChange = null;
             this.onConnectionTypeDetected = null;
+            // Fires every time the winning inner transport drops and we
+            // start trying to reconnect. The UI uses this to surface a
+            // "Reconnecting..." banner. attempt is 1-indexed.
+            this.onReconnecting = null;
+            // Fires once per successful reconnect after a transient drop.
+            // The receive page hooks this to emit file-resume-offer (if
+            // an in-flight transfer was pending) and to re-run the
+            // public-key exchange to detect a peer swap.
+            this.onReconnected = null;
+
+            // Reconnect-loop state, used after a winner is locked.
+            this._reconnecting = false;
+            this._reconnectAbort = false;
 
             this._wireInners();
         }
@@ -99,10 +119,13 @@
             this.webrtc.onMessage = (m) => this._handleInnerMessage('webrtc', m);
             this.webrtc.onStateChange = (s) => this._handleInnerStateChange('webrtc', s);
             this.webrtc.onConnectionTypeDetected = (t) => this._handleInnerCT('webrtc', t);
+            // WebRTC doesn't expose a transient-disconnect signal yet, so
+            // its drops are still treated as fatal. Relay-only resume in v1.
 
             if (this.ws) {
                 this.ws.onConnected = () => this._handleInnerConnected('ws');
                 this.ws.onDisconnected = () => this._handleInnerDisconnected('ws');
+                this.ws.onTransientDisconnect = () => this._handleInnerTransient('ws');
                 this.ws.onMessage = (m) => this._handleInnerMessage('ws', m);
                 this.ws.onStateChange = (s) => this._handleInnerStateChange('ws', s);
                 this.ws.onConnectionTypeDetected = (t) => this._handleInnerCT('ws', t);
@@ -113,6 +136,7 @@
             if (!this.lp) return;
             this.lp.onConnected = () => this._handleInnerConnected('lp');
             this.lp.onDisconnected = () => this._handleInnerDisconnected('lp');
+            this.lp.onTransientDisconnect = () => this._handleInnerTransient('lp');
             this.lp.onMessage = (m) => this._handleInnerMessage('lp', m);
             this.lp.onStateChange = (s) => this._handleInnerStateChange('lp', s);
             this.lp.onConnectionTypeDetected = (t) => this._handleInnerCT('lp', t);
@@ -141,7 +165,18 @@
         }
 
         _handleInnerConnected(name) {
-            if (this._closed || this.winner) return;
+            if (this._closed) return;
+            // Post-reconnect callback path: the winner inner came back
+            // up after a transient drop. Fire onReconnected upward so
+            // the application layer can re-key / emit file-resume-offer.
+            if (this.winner === name && this._reconnecting) {
+                this._reconnecting = false;
+                logger.success(`[Race] ${name.toUpperCase()} reconnected after transient drop`);
+                if (this.onStateChange) this.onStateChange('connected');
+                if (this.onReconnected) this.onReconnected();
+                return;
+            }
+            if (this.winner) return;
             if (name === 'webrtc') {
                 if (this._relayForced) {
                     logger.info('[Race] WebRTC connected but relay forced, ignoring');
@@ -171,9 +206,71 @@
             }
         }
 
+        // A relay inner reported a transient disconnect: kick off the
+        // reconnect loop on that inner. We do not fall back to a
+        // different transport here — the original race already decided
+        // which path works on this network. Retrying the same kind is
+        // both faster and avoids re-doing the WebRTC ICE handshake which
+        // we already know doesn't connect.
+        _handleInnerTransient(name) {
+            if (this._closed) return;
+            // Only act when the dropped inner is our winner. A late
+            // transient signal from a loser (already closed by lockWinner)
+            // is ignored.
+            if (this.winner !== name) return;
+            if (this._reconnecting) return; // loop already running
+            this._reconnecting = true;
+            logger.warn(`[Race] ${name.toUpperCase()} dropped (transient); starting reconnect loop`);
+            if (this.onStateChange) this.onStateChange('connecting');
+            this._reconnectLoop(name);
+        }
+
+        async _reconnectLoop(name) {
+            let attempt = 0;
+            while (!this._closed && !this._reconnectAbort && this._reconnecting && this.winner === name) {
+                const wait = RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1)];
+                attempt++;
+                if (this.onReconnecting) {
+                    try { this.onReconnecting(attempt); } catch (_) {}
+                }
+                logger.info(`[Race] reconnect attempt ${attempt} for ${name.toUpperCase()} in ${wait}ms`);
+                await new Promise(r => setTimeout(r, wait));
+                if (this._closed || this._reconnectAbort || this.winner !== name) return;
+                const inner = this._innerByName(name);
+                if (!inner || typeof inner.reopen !== 'function') {
+                    logger.error(`[Race] inner ${name} cannot reopen; giving up`);
+                    this._reconnecting = false;
+                    if (this.onDisconnected) this.onDisconnected();
+                    return;
+                }
+                try {
+                    inner.reopen();
+                } catch (e) {
+                    logger.warn(`[Race] reopen threw: ${e.message}`);
+                    continue;
+                }
+                // Give the inner up to (wait * 4) ms to come back. If
+                // _handleInnerConnected fires in that window, it flips
+                // _reconnecting off and we exit the loop. If not, we
+                // retry with the next backoff step.
+                const grace = wait * 4;
+                const start = Date.now();
+                while (this._reconnecting && !this._closed && !this._reconnectAbort
+                    && this.winner === name && Date.now() - start < grace) {
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            }
+        }
+
         _handleInnerDisconnected(name) {
             if (this._closed) return;
             if (this.winner === name) {
+                // If we're already in a reconnect loop, treat a second
+                // disconnect signal from the same inner as noise: the
+                // loop's reopen attempts naturally surface disconnects
+                // as they fail, and we don't want to fire onDisconnected
+                // upward (that would tear down the pairing).
+                if (this._reconnecting) return;
                 if (this.onDisconnected) this.onDisconnected();
                 return;
             }
@@ -309,13 +406,18 @@
             return this._innerByName(this.winner).sendMessage(message);
         }
 
-        async sendFile(bytes, onProgress) {
+        async sendFile(bytes, onProgress, resumeFromOffset) {
             if (!this.winner) throw new Error('Not connected yet');
-            return this._innerByName(this.winner).sendFile(bytes, onProgress);
+            // Propagate resumeFromOffset so SenderSend can byte-resume an
+            // in-flight transfer after a relay reconnect. WebRTC inner
+            // ignores the arg (v1 only supports relay-resume).
+            return this._innerByName(this.winner).sendFile(bytes, onProgress, resumeFromOffset);
         }
 
         close() {
             this._closed = true;
+            this._reconnectAbort = true;
+            this._reconnecting = false;
             if (this._raceTimer) { clearTimeout(this._raceTimer); this._raceTimer = null; }
             try { this.webrtc.close(); } catch (_) {}
             if (this.ws) { try { this.ws.close(); } catch (_) {} }
