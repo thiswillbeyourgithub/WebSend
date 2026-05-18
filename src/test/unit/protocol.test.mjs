@@ -333,3 +333,86 @@ test('build.batchEnd produces valid message', () => {
 test('build.ready produces valid message', () => {
     assert.equal(validate(build.ready()).ok, true);
 });
+
+// ---- file-resume-offer / file-resume-ack (relay-reconnect resume protocol) ----
+
+test('validate: file-resume-offer with valid size+received is ok', () => {
+    const r = validate({
+        type: 'file-resume-offer',
+        size: MIN_FILE_START_SIZE,
+        received: 0,
+    });
+    assert.equal(r.ok, true);
+});
+
+test('validate: file-resume-offer with received < size is ok', () => {
+    const r = validate({
+        type: 'file-resume-offer',
+        size: MIN_FILE_START_SIZE * 4,
+        received: MIN_FILE_START_SIZE * 2,
+    });
+    assert.equal(r.ok, true);
+});
+
+test('validate: file-resume-offer rejects size below MIN_FILE_START_SIZE', () => {
+    assert.equal(validate({ type: 'file-resume-offer', size: 1024, received: 0 }).ok, false);
+});
+
+test('validate: file-resume-offer rejects size above MAX_FILE_SIZE', () => {
+    assert.equal(validate({ type: 'file-resume-offer', size: MAX_FILE_SIZE + 1, received: 0 }).ok, false);
+});
+
+test('validate: file-resume-offer rejects negative received', () => {
+    assert.equal(validate({ type: 'file-resume-offer', size: MIN_FILE_START_SIZE, received: -1 }).ok, false);
+});
+
+test('validate: file-resume-offer rejects non-integer received', () => {
+    assert.equal(validate({ type: 'file-resume-offer', size: MIN_FILE_START_SIZE, received: 1.5 }).ok, false);
+});
+
+test('validate: file-resume-offer rejects missing fields', () => {
+    assert.equal(validate({ type: 'file-resume-offer', size: MIN_FILE_START_SIZE }).ok, false);
+    assert.equal(validate({ type: 'file-resume-offer', received: 0 }).ok, false);
+});
+
+test('validate: file-resume-ack with offset 0 is ok', () => {
+    assert.equal(validate({ type: 'file-resume-ack', offset: 0 }).ok, true);
+});
+
+test('validate: file-resume-ack with positive offset is ok', () => {
+    assert.equal(validate({ type: 'file-resume-ack', offset: 1024 }).ok, true);
+});
+
+test('validate: file-resume-ack rejects negative offset', () => {
+    assert.equal(validate({ type: 'file-resume-ack', offset: -1 }).ok, false);
+});
+
+test('validate: file-resume-ack rejects non-integer offset', () => {
+    assert.equal(validate({ type: 'file-resume-ack', offset: 1.5 }).ok, false);
+});
+
+test('validate: file-resume-ack rejects offset above MAX_FILE_SIZE', () => {
+    assert.equal(validate({ type: 'file-resume-ack', offset: MAX_FILE_SIZE + 1 }).ok, false);
+});
+
+test('build.fileResumeOffer produces valid stamped message', () => {
+    const m = build.fileResumeOffer(MIN_FILE_START_SIZE * 4, MIN_FILE_START_SIZE);
+    assert.equal(m.type, 'file-resume-offer');
+    assert.equal(m.size, MIN_FILE_START_SIZE * 4);
+    assert.equal(m.received, MIN_FILE_START_SIZE);
+    assert.equal(m.protocolVersion, 1);
+    assert.equal(validate(m).ok, true);
+});
+
+test('build.fileResumeAck produces valid stamped message', () => {
+    const m = build.fileResumeAck(2048);
+    assert.equal(m.type, 'file-resume-ack');
+    assert.equal(m.offset, 2048);
+    assert.equal(m.protocolVersion, 1);
+    assert.equal(validate(m).ok, true);
+});
+
+test('build.fileResumeAck with 0 offset (cannot-resume signal) is valid', () => {
+    const m = build.fileResumeAck(0);
+    assert.equal(validate(m).ok, true);
+});

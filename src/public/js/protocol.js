@@ -56,6 +56,18 @@
             && isCornerObj(corners.tl) && isCornerObj(corners.tr)
             && isCornerObj(corners.br) && isCornerObj(corners.bl);
     }
+    function isNonNegativeInt(v) {
+        return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v >= 0;
+    }
+    function isReceivedInRange(v) {
+        // file-resume-offer.received is bounded by size; the cross-field
+        // (received <= size) check is enforced in the receiver-side
+        // handler since per-field validators don't see siblings.
+        return isNonNegativeInt(v) && v <= MAX_FILE_SIZE;
+    }
+    function isOffsetInRange(v) {
+        return isNonNegativeInt(v) && v <= MAX_FILE_SIZE;
+    }
     function isTransformArray(v) {
         if (!Array.isArray(v) || v.length === 0 || v.length > MAX_TRANSFORMS_PER_MSG) return false;
         const validOps = new Set(['rotateCW', 'flipH', 'bw', 'crop']);
@@ -80,6 +92,16 @@
         'file-end':                {},
         'file-ack':                { required: { sha256: isHex64 } },
         'file-nack':               { required: { error: 'string' } },
+        // file-resume-offer: receiver → sender after a transport reconnect.
+        // Tells the sender "I have an in-flight file-start of {size} bytes,
+        // of which {received} bytes are buffered contiguously; resume from
+        // there if you can". size reuses isBoundedSize so a hostile peer
+        // cannot smuggle a tiny size and grind huge buffer growth.
+        'file-resume-offer':       { required: { size: isBoundedSize, received: isReceivedInRange } },
+        // file-resume-ack: sender → receiver. offset === 0 means "I cannot
+        // resume, expect a fresh file-start"; offset > 0 means "I will
+        // continue from this byte, keep the existing buffer".
+        'file-resume-ack':         { required: { offset: isOffsetInRange } },
         'delete-image':            { required: { hash: isHex64 } },
         'transform-image':         { required: { oldHash: isHex64, transforms: isTransformArray } },
         'transform-nack':          { required: { oldHash: isHex64, reason: 'string' } },
@@ -126,6 +148,8 @@
         fileEnd:               ()                        => stamp({ type: 'file-end' }),
         fileAck:               (sha256)                  => stamp({ type: 'file-ack',                sha256 }),
         fileNack:              (error)                   => stamp({ type: 'file-nack',               error }),
+        fileResumeOffer:       (size, received)          => stamp({ type: 'file-resume-offer',       size, received }),
+        fileResumeAck:         (offset)                  => stamp({ type: 'file-resume-ack',         offset }),
         deleteImage:           (hash)                    => stamp({ type: 'delete-image',            hash }),
         transformImage:        (oldHash, transforms)     => stamp({ type: 'transform-image',         oldHash, transforms }),
         transformNack:         (oldHash, reason)         => stamp({ type: 'transform-nack',          oldHash, reason }),
