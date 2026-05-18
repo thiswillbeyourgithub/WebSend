@@ -21,6 +21,12 @@
     let theyConfirmed = false;
     let lastRoomId = null;
     let lastSecret = null;
+    // True when a 'ready' arrived before local verification state caught
+    // up (e.g. control messages reordered across a transport switch, or
+    // the user clicked Match a fraction of a second later than the
+    // receiver). Re-evaluated after weConfirmed / theyConfirmed flip
+    // so a dropped ready does not wedge the sender permanently.
+    let pendingReady = false;
 
     // -- Wired-in deps --
     let _i18n = null;
@@ -68,6 +74,7 @@
             sharedKey = null;
             weConfirmed = false;
             theyConfirmed = false;
+            pendingReady = false;
             if (rtc) {
                 try { rtc.close(); } catch (_) {}
                 rtc = null;
@@ -170,6 +177,7 @@
         sharedKey = null;
         weConfirmed = false;
         theyConfirmed = false;
+        pendingReady = false;
         window.SenderSend.clear();
 
         rtc = window.Transport.createForSender();
@@ -220,6 +228,7 @@
     function handleFingerprintConfirmed() {
         _logger.info('Receiver confirmed fingerprint match');
         theyConfirmed = true;
+        if (pendingReady) maybeFlushReady();
     }
 
     function handleFingerprintDenied() {
@@ -235,12 +244,26 @@
         // when BOTH sides have explicitly confirmed and a shared key was
         // actually derived.
         if (!sharedKey || !weConfirmed || !theyConfirmed) {
-            _logger.warn(`Ignoring premature 'ready' (sharedKey=${!!sharedKey}, weConfirmed=${weConfirmed}, theyConfirmed=${theyConfirmed})`);
+            _logger.warn(`Deferring 'ready' until verification completes (sharedKey=${!!sharedKey}, weConfirmed=${weConfirmed}, theyConfirmed=${theyConfirmed})`);
+            // Defer rather than drop: confirmFingerprint /
+            // handleFingerprintConfirmed will re-trigger maybeFlushReady
+            // once the local flags catch up. The security check still
+            // gates capture mode (capture only opens when all three
+            // conditions are simultaneously true), so deferring is safe.
+            pendingReady = true;
             return;
         }
+        pendingReady = false;
         _logger.success('Both parties verified, can now send photos');
         window.PeerUI.showVerifiedInSidebar();
         if (_onReadyToCapture) _onReadyToCapture();
+    }
+
+    function maybeFlushReady() {
+        if (!pendingReady) return;
+        if (!sharedKey || !weConfirmed || !theyConfirmed) return;
+        _logger.info('Verification state caught up; honoring previously-deferred ready');
+        handleReady();
     }
 
     // Per-photo cap on transform-nack-driven re-sends. A verified-but-
@@ -298,13 +321,28 @@
 
     // ============ Fingerprint user actions ============
 
-    function confirmFingerprint() {
-        weConfirmed = true;
-        rtc.sendMessage(window.Protocol.build.fingerprintConfirmed());
+    async function sendMessageWithRetry(message, label) {
+        const delaysMs = [0, 50, 150, 300, 600, 1200];
+        for (const d of delaysMs) {
+            if (d > 0) await new Promise(r => setTimeout(r, d));
+            if (rtc.sendMessage(message)) {
+                if (d > 0) _logger.info(`Sent ${label} after ${d}ms retry`);
+                return true;
+            }
+        }
+        _logger.error(`Failed to send ${label} after retries - peer will not advance`);
+        return false;
     }
 
-    function denyFingerprint() {
-        rtc.sendMessage(window.Protocol.build.fingerprintDenied());
+    async function confirmFingerprint() {
+        weConfirmed = true;
+        await sendMessageWithRetry(window.Protocol.build.fingerprintConfirmed(), 'fingerprint-confirmed');
+        // Honour a 'ready' that arrived before the user clicked Match.
+        if (pendingReady) maybeFlushReady();
+    }
+
+    async function denyFingerprint() {
+        await sendMessageWithRetry(window.Protocol.build.fingerprintDenied(), 'fingerprint-denied');
     }
 
     // ============ Cleanup ============
@@ -319,6 +357,7 @@
         sharedKey = null;
         weConfirmed = false;
         theyConfirmed = false;
+        pendingReady = false;
         lastRoomId = null;
         lastSecret = null;
         if (window.Gallery && typeof window.Gallery.shredLocal === 'function') {
