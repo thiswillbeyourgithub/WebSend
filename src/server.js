@@ -312,9 +312,13 @@ function checkRateLimit(ip, limitType) {
 
     // Check if limit exceeded
     if (limiter.timestamps.length >= config.maxRequests) {
-        // Block for the remainder of the window
-        limiter.blockedUntil = now + config.windowMs;
-        const retryAfter = Math.ceil(config.windowMs / 1000);
+        // Block until the oldest in-window timestamp ages out (the actual
+        // remainder of the sliding window). Previously this was `now +
+        // windowMs`, which inflated a momentary overshoot into a full extra
+        // window of 429s even after the oldest timestamps had expired.
+        const oldest = limiter.timestamps[0];
+        limiter.blockedUntil = oldest + config.windowMs;
+        const retryAfter = Math.max(1, Math.ceil((limiter.blockedUntil - now) / 1000));
         return { allowed: false, retryAfter };
     }
 
