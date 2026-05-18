@@ -27,6 +27,17 @@
     // receiver). Re-evaluated after weConfirmed / theyConfirmed flip
     // so a dropped ready does not wedge the sender permanently.
     let pendingReady = false;
+    // Fingerprints cached after the original verification so we can
+    // recognise the SAME peer after a transport reconnect and skip the
+    // verification modal. A mismatch on reconnect = peer swap / MITM
+    // attempt; we force a fresh pairing in that case.
+    let cachedTheirFingerprint = null;
+    let cachedOurFingerprint = null;
+    // True between the transport firing onTransientDisconnect and the
+    // first successful re-handshake after onReconnected. handlePublicKey
+    // accepts a re-key in this window and validates it against the
+    // cached fingerprints.
+    let inReconnect = false;
 
     // -- Wired-in deps --
     let _i18n = null;
@@ -75,6 +86,9 @@
             weConfirmed = false;
             theyConfirmed = false;
             pendingReady = false;
+            cachedTheirFingerprint = null;
+            cachedOurFingerprint = null;
+            inReconnect = false;
             if (rtc) {
                 try { rtc.close(); } catch (_) {}
                 rtc = null;
@@ -110,6 +124,8 @@
         rtc.onMessage = onMessage;
         rtc.onStateChange = onStateChange;
         rtc.onConnectionTypeDetected = window.PeerUI.onConnectionTypeDetected;
+        rtc.onReconnecting = onReconnecting;
+        rtc.onReconnected = onReconnected;
     }
 
     // ============ WebRTC state callbacks ============
@@ -157,6 +173,31 @@
         _showToast(_i18n.t('send.disconnectedHint'), { duration: 0 });
     }
 
+    // RacingTransport callbacks for the auto-reconnect path. The transport
+    // itself owns the retry-forever loop; sender-connect just surfaces the
+    // status to the UI and arms the rekey-on-reconnect branch.
+    function onReconnecting(attempt) {
+        inReconnect = true;
+        _logger.warn(`Relay reconnect attempt ${attempt}`);
+        const statusEl = document.getElementById('connection-status');
+        if (statusEl) {
+            statusEl.textContent = (_i18n.t('send.reconnecting') || 'Reconnecting...') +
+                (attempt > 1 ? ` (${attempt})` : '');
+            statusEl.className = 'status status-info';
+        }
+    }
+
+    function onReconnected() {
+        _logger.success('Relay reconnected; awaiting peer re-handshake');
+        const statusEl = document.getElementById('connection-status');
+        if (statusEl) {
+            statusEl.textContent = _i18n.t('send.connected');
+            statusEl.className = 'status status-connected';
+        }
+        // inReconnect stays true until handlePublicKey verifies the
+        // peer's fingerprint matches the cached one.
+    }
+
     // ============ Reconnect ============
 
     async function reconnect() {
@@ -178,6 +219,9 @@
         weConfirmed = false;
         theyConfirmed = false;
         pendingReady = false;
+        cachedTheirFingerprint = null;
+        cachedOurFingerprint = null;
+        inReconnect = false;
         window.SenderSend.clear();
 
         rtc = window.Transport.createForSender();
@@ -190,17 +234,55 @@
     // ============ Key exchange + fingerprint verification ============
 
     async function handlePublicKey(msg) {
-        // Refuse mid-session re-key. Once a shared key has been derived,
-        // accepting a new `public-key` message would silently rotate the
-        // encryption key to whatever the (possibly hostile) peer chose,
-        // while weConfirmed/theyConfirmed remain true from the previous
-        // handshake. The user would think they had verified the peer,
-        // but every subsequent photo would actually be encrypted to the
-        // attacker's new key. Force a clean reconnect to roll the
-        // verification state if a re-key is legitimately needed.
+        // Reconnect branch: a public-key arriving with sharedKey already
+        // set is allowed only when the RacingTransport announced a
+        // reconnect. We verify the peer's fingerprint hasn't changed
+        // (preserving the original anti-MITM gate), keep the existing
+        // sharedKey + weConfirmed/theyConfirmed state, and just answer
+        // with our public-key so the receiver can do its own check.
         if (sharedKey) {
-            _logger.warn('Ignoring unexpected public-key after key exchange already completed');
-            _showToast(_i18n.t('send.unexpectedRekey') || 'Unexpected re-key attempt blocked', { type: 'error', duration: 5000 });
+            if (!inReconnect) {
+                // Same refusal as before: a mid-session re-key without a
+                // reconnect signal would silently rotate the encryption
+                // key under fingerprint state the user has already
+                // confirmed.
+                _logger.warn('Ignoring unexpected public-key after key exchange already completed');
+                _showToast(_i18n.t('send.unexpectedRekey') || 'Unexpected re-key attempt blocked', { type: 'error', duration: 5000 });
+                return;
+            }
+            try {
+                const receiverPublicKey = await window.WebSendCrypto.importPublicKey(msg.key);
+                const newTheirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey);
+                if (newTheirFingerprint !== cachedTheirFingerprint) {
+                    // The peer changed during the reconnect window. Could
+                    // be a peer-swap MITM. Refuse to silently auto-confirm
+                    // and force the user back to scan so they see a fresh
+                    // verification ceremony.
+                    _logger.error(`Peer fingerprint changed during reconnect: cached ${cachedTheirFingerprint} vs new ${newTheirFingerprint}`);
+                    _showToast(_i18n.t('send.peerChangedOnReconnect') ||
+                        'Peer key changed during reconnect, please rescan', { type: 'error', duration: 0 });
+                    sharedKey = null;
+                    weConfirmed = false;
+                    theyConfirmed = false;
+                    cachedTheirFingerprint = null;
+                    cachedOurFingerprint = null;
+                    inReconnect = false;
+                    if (_onScanRequested) _onScanRequested();
+                    return;
+                }
+                // Same peer. Re-send our public-key so the receiver can
+                // do its own fingerprint comparison. Crypto state is
+                // preserved verbatim so the in-flight encrypted file is
+                // still decryptable.
+                const ourPublicKeyB64 = await window.WebSendCrypto.exportPublicKey(keyPair.publicKey);
+                rtc.sendMessage(window.Protocol.build.senderPublicKey(ourPublicKeyB64));
+                _logger.success(`Reconnect rekey verified, peer fingerprint unchanged (${newTheirFingerprint})`);
+                inReconnect = false;
+                // weConfirmed / theyConfirmed are kept from the original
+                // session so the sender stays past the verification gate.
+            } catch (e) {
+                _logger.error('Failed to verify peer on reconnect: ' + e.message);
+            }
             return;
         }
         _logger.info('Received receiver public key, performing key exchange...');
@@ -210,6 +292,8 @@
 
             const ourFingerprint = await window.WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
             const theirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey);
+            cachedOurFingerprint = ourFingerprint;
+            cachedTheirFingerprint = theirFingerprint;
 
             _logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
 
@@ -358,6 +442,9 @@
         weConfirmed = false;
         theyConfirmed = false;
         pendingReady = false;
+        cachedTheirFingerprint = null;
+        cachedOurFingerprint = null;
+        inReconnect = false;
         lastRoomId = null;
         lastSecret = null;
         if (window.Gallery && typeof window.Gallery.shredLocal === 'function') {
