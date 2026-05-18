@@ -205,6 +205,16 @@
         let roomSecret = ''; // Cryptographic secret for room access
         let weConfirmed = false;  // Track if we confirmed fingerprints
         let theyConfirmed = false; // Track if sender confirmed fingerprints
+        // Cached after the original verification ceremony so a transport
+        // reconnect can recognise the SAME peer (matching sender public
+        // key fingerprint) and skip the modal. A mismatch is treated as
+        // a peer-swap and the modal is reshown with a warning.
+        let cachedSenderFingerprint = null;
+        let cachedOurFingerprint = null;
+        // Set true between RacingTransport's onReconnecting and a
+        // successful re-handshake; lets handleSenderPublicKey take the
+        // fingerprint-match branch.
+        let inReconnect = false;
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string, ocrPageData: object|null}
         const preBWData = {}; // Pre-BW originals for undo, keyed by imageIndex (used by applyBWToImage and TransformReplay)
         let pendingReplaceHash = null; // Hash of image being replaced by an incoming edit
@@ -319,6 +329,8 @@
                 rtc.onMessage = onMessage;
                 rtc.onStateChange = onStateChange;
                 rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
+                rtc.onReconnecting = onReconnecting;
+                rtc.onReconnected = onReconnected;
 
                 // Create room and offer
                 const roomInfo = await rtc.createRoom();
@@ -588,6 +600,60 @@
             });
         }
 
+        function onReconnecting(attempt) {
+            inReconnect = true;
+            logger.warn(`Relay reconnect attempt ${attempt}`);
+            const statusEl = document.querySelector('#step-connected .status') ||
+                             document.getElementById('status-waiting');
+            if (statusEl) {
+                statusEl.textContent = (i18n.t('receive.reconnecting') || 'Reconnecting...') +
+                    (attempt > 1 ? ` (${attempt})` : '');
+                statusEl.className = 'status status-info';
+            }
+        }
+
+        async function onReconnected() {
+            logger.success('Relay reconnected; re-handshake with sender');
+            const statusEl = document.querySelector('#step-connected .status') ||
+                             document.getElementById('status-waiting');
+            if (statusEl) {
+                statusEl.textContent = i18n.t('receive.connected');
+                statusEl.className = 'status status-connected';
+            }
+            // Re-emit our public key so the sender can verify our
+            // fingerprint hasn't changed. The sender's handlePublicKey
+            // takes the rekey-on-reconnect branch (compares to its cached
+            // fingerprint) and replies with sender-public-key, which our
+            // handleSenderPublicKey verifies against cachedSenderFingerprint.
+            try {
+                if (keyPair && rtc) {
+                    const publicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
+                    await sendMessageWithRetry(Protocol.build.publicKey(publicKeyB64), 'public-key (reconnect)');
+                }
+            } catch (e) {
+                logger.error('onReconnected: failed to re-send public key: ' + e.message);
+            }
+            // If we have a partial in-flight transfer (file-start was
+            // received before the drop, file-end never arrived), tell
+            // the sender what byte we got to so it can byte-resume the
+            // same ciphertext rather than re-encrypting from scratch.
+            try {
+                if (rtc && window.PayloadAssembler) {
+                    const innerWinner = rtc.winner ? rtc[rtc.winner === 'webrtc' ? 'webrtc' : rtc.winner] : null;
+                    if (innerWinner && window.PayloadAssembler.hasInflightTransfer(innerWinner)) {
+                        const st = window.PayloadAssembler.getResumeState(innerWinner);
+                        logger.info(`Emitting file-resume-offer size=${st.size} received=${st.received}`);
+                        await sendMessageWithRetry(
+                            Protocol.build.fileResumeOffer(st.size, st.received),
+                            'file-resume-offer'
+                        );
+                    }
+                }
+            } catch (e) {
+                logger.error('onReconnected: failed to emit file-resume-offer: ' + e.message);
+            }
+        }
+
         function onDisconnected() {
             logger.warn('Disconnected from sender');
             wakeLockMgr.release();
@@ -691,6 +757,9 @@
             sharedKey = null;
             weConfirmed = false;
             theyConfirmed = false;
+            cachedSenderFingerprint = null;
+            cachedOurFingerprint = null;
+            inReconnect = false;
             pendingReplaceHash = null;
 
             // If we have images, keep step-connected visible and show QR inline
@@ -709,6 +778,8 @@
                 rtc.onMessage = onMessage;
                 rtc.onStateChange = onStateChange;
                 rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
+                rtc.onReconnecting = onReconnecting;
+                rtc.onReconnected = onReconnected;
 
                 // Reuse the same roomId/secret so the displayed QR stays valid.
                 rtc.roomId = keepRoomId;
@@ -787,6 +858,8 @@
                 rtc.onMessage = onMessage;
                 rtc.onStateChange = onStateChange;
                 rtc.onConnectionTypeDetected = PeerUI.onConnectionTypeDetected;
+                rtc.onReconnecting = onReconnecting;
+                rtc.onReconnected = onReconnected;
 
                 const roomInfo = await rtc.createRoom();
                 roomSecret = roomInfo.secret;
@@ -861,6 +934,9 @@
             sharedKey = null;
             weConfirmed = false;
             theyConfirmed = false;
+            cachedSenderFingerprint = null;
+            cachedOurFingerprint = null;
+            inReconnect = false;
             pendingReplaceHash = null;
             photoCount = 0;
             receiveXferStart = null;
@@ -885,6 +961,34 @@
             // is blocked by VERIFIED_GATED_HANDLERS. Clearing sharedKey here
             // also means decryption would fail even if the gate were bypassed.
             const isRekey = sharedKey !== null;
+
+            // Reconnect branch: a rekey arriving while inReconnect was set
+            // is verified against the cached fingerprints. If the
+            // sender's public-key fingerprint matches the cached one, we
+            // keep the existing sharedKey / weConfirmed / theyConfirmed
+            // so the in-flight partial buffer remains decryptable and
+            // the user is not prompted to verify again.
+            if (isRekey && inReconnect && cachedSenderFingerprint) {
+                try {
+                    const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);
+                    const fp = await WebSendCrypto.getKeyFingerprint(senderPublicKey);
+                    if (fp === cachedSenderFingerprint) {
+                        logger.success(`Reconnect rekey verified, sender fingerprint unchanged (${fp})`);
+                        inReconnect = false;
+                        // sharedKey / weConfirmed / theyConfirmed kept as-is.
+                        return;
+                    }
+                    logger.error(`Sender fingerprint changed during reconnect: cached ${cachedSenderFingerprint} vs new ${fp}; forcing re-verification`);
+                    showToast(i18n.t('receive.peerChangedOnReconnect') ||
+                        'Peer key changed during reconnect, please re-verify', { type: 'error', duration: 0 });
+                    // Fall through into the normal rekey path which
+                    // tears down verification state and reshows the modal.
+                } catch (e) {
+                    logger.error('Reconnect rekey check failed: ' + e.message + '; falling back to fresh verification');
+                }
+                inReconnect = false;
+            }
+
             if (isRekey) {
                 logger.warn('Sender re-keyed mid-session; re-verification required before further files');
             }
@@ -898,6 +1002,9 @@
 
                 const ourFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
                 const theirFingerprint = await WebSendCrypto.getKeyFingerprint(senderPublicKey);
+                // Cache for the rekey-on-reconnect branch above.
+                cachedSenderFingerprint = theirFingerprint;
+                cachedOurFingerprint = ourFingerprint;
 
                 // Display fingerprints in verification modal
                 // Sender key at top, receiver key at bottom (consistent on both devices)
@@ -982,6 +1089,24 @@
             logger.info('Batch end received');
         }
 
+        function handleFileResumeAck(msg) {
+            // Sender's reply to our file-resume-offer. offset > 0 means
+            // the sender will continue from that byte; the partial
+            // buffer on our side is kept and binary chunks resume.
+            // offset === 0 means the sender cannot resume (different
+            // photo at head of queue, lost cache, etc.); discard the
+            // partial buffer so a fresh file-start re-opens cleanly.
+            const innerWinner = rtc.winner ? rtc[rtc.winner === 'webrtc' ? 'webrtc' : rtc.winner] : null;
+            if (!innerWinner) return;
+            if (msg.offset === 0) {
+                logger.warn('file-resume-ack offset=0; discarding partial in-flight buffer');
+                window.PayloadAssembler.discardInflightOnResumeReset(innerWinner);
+                finalizeReceiveStats();
+            } else {
+                logger.info(`file-resume-ack offset=${msg.offset}; resuming partial receive`);
+            }
+        }
+
         function finalizeReceiveStats() {
             const elapsed = receiveXferStart ? (Date.now() - receiveXferStart) / 1000 : 0;
             if (elapsed > 0) {
@@ -1011,6 +1136,10 @@
             'batch-start-if-nonempty': handleBatchStartIfNonempty,
             'batch-end': handleBatchEnd,
             'encrypted-file': (msg) => ReceiveFlow.handleEncryptedFile(msg),
+            // Relay-reconnect resume protocol: sender's reply to our
+            // file-resume-offer. file-resume-offer is emitted by
+            // onReconnected (not by a peer), so it never appears here.
+            'file-resume-ack': handleFileResumeAck,
         };
 
         // Peer-controlled handlers that mutate state or run heavy work on
@@ -1029,6 +1158,10 @@
             'batch-start-if-nonempty',
             'batch-end',
             'encrypted-file',
+            // file-resume-ack can clear our partial receive buffer
+            // (when offset=0). Gating it keeps an unverified peer from
+            // disturbing receive state during the verification window.
+            'file-resume-ack',
         ]);
 
         async function onMessage(msg) {
