@@ -40,6 +40,19 @@
     // catches stuck pipes in the foreground before a real OOM occurs.
     const STUCK_PIPE_BYTES = 16 * 1024 * 1024;
 
+    // Tagged error thrown when the WS drops mid-sendFile but the higher
+    // layers can recover via the relay-reconnect resume protocol. The
+    // RacingTransport / SenderSend distinguish this from a fatal error
+    // by reading .transient === true.
+    class TransientDisconnectError extends Error {
+        constructor(message, offset) {
+            super(message);
+            this.name = 'TransientDisconnectError';
+            this.transient = true;
+            this.offset = offset | 0;
+        }
+    }
+
     class WSTransport {
         constructor() {
             this.tag = 'WS';
@@ -57,6 +70,12 @@
             // Event callbacks (set by caller)
             this.onConnected = null;
             this.onDisconnected = null;
+            // Transient drop: the underlying socket closed unexpectedly
+            // but the higher layer can retry without tearing down the
+            // crypto / pairing state. RacingTransport wires this to the
+            // reconnect loop; onDisconnected stays reserved for the
+            // explicit close() path.
+            this.onTransientDisconnect = null;
             this.onMessage = null;
             this.onStateChange = null;
             this.onConnectionTypeDetected = null;
@@ -92,6 +111,26 @@
         openSlotB(roomId, secret) {
             this.roomId = roomId;
             this.roomSecret = secret;
+            this._openWs();
+        }
+
+        /**
+         * Re-open the same WS slot after a transient drop. The room id /
+         * secret are kept from the previous session so the same slot
+         * (a or b) is claimed again. Receive state in PayloadAssembler is
+         * deliberately NOT reset here — that's what makes the byte-level
+         * resume protocol possible.
+         *
+         * The server-side relay slot was torn down on the previous WS
+         * close, so the rejoin allocates a fresh slot. The per-pairing
+         * session-byte cap restarts at zero on the server, which is
+         * acceptable: the receiver's own _sessionTotalBytes still grows
+         * across reconnects and enforces the same 4 GiB ceiling locally.
+         */
+        reopen() {
+            if (this._closed) return;
+            if (this.ws) return; // already open
+            this._connected = false;
             this._openWs();
         }
 
@@ -132,8 +171,18 @@
                 if (this._abusiveTeardown) return;
                 this._logRelayFailure(event.code, event.reason);
                 this._connected = false;
+                this.ws = null;
                 if (this.onStateChange) this.onStateChange('failed');
-                if (this.onDisconnected) this.onDisconnected();
+                // Prefer the transient-disconnect callback when present so
+                // the RacingTransport can reconnect without tearing down
+                // pairing state. Fall back to onDisconnected for callers
+                // that haven't opted into reconnect (test code, older
+                // wiring). The race transport sets both: one fires.
+                if (this.onTransientDisconnect) {
+                    this.onTransientDisconnect();
+                } else if (this.onDisconnected) {
+                    this.onDisconnected();
+                }
             };
 
             ws.onerror = (event) => {
@@ -239,7 +288,22 @@
             return true;
         }
 
-        async sendFile(encryptedData, onProgress) {
+        /**
+         * Send (or resume sending) an encrypted file.
+         *
+         * - When `resumeFromOffset` is undefined, sends a fresh file-start
+         *   followed by all chunks from offset 0.
+         * - When `resumeFromOffset > 0`, skips file-start (the receiver
+         *   already has it from the pre-drop transfer) and continues
+         *   binary chunks from that offset.
+         *
+         * On a transient WS drop, throws TransientDisconnectError with
+         * the byte offset reached so SenderSend can keep the head of the
+         * queue and re-emit file-resume-ack after reconnect. The cached
+         * encryptedData buffer MUST be the same one used on the original
+         * call so the GCM nonce / ciphertext layout stay byte-identical.
+         */
+        async sendFile(encryptedData, onProgress, resumeFromOffset) {
             if (!this._isOpen()) {
                 logger.error('[WS] not open, cannot send file');
                 return false;
@@ -249,28 +313,40 @@
             }
             this._fileAckInFlight = true;
 
-            try {
-                const totalSize = encryptedData.byteLength;
-                let offset = 0;
+            const totalSize = encryptedData.byteLength;
+            const isResume = typeof resumeFromOffset === 'number' && resumeFromOffset > 0;
+            let offset = isResume ? resumeFromOffset : 0;
 
-                if (!this.sendMessage(window.Protocol.build.fileStart(totalSize))) {
-                    throw new Error('Failed to send file-start (WS not open)');
+            try {
+                if (!isResume) {
+                    if (!this.sendMessage(window.Protocol.build.fileStart(totalSize))) {
+                        throw new Error('Failed to send file-start (WS not open)');
+                    }
+                    logger.info(`[WS] sending encrypted file (${totalSize} bytes, padded)`);
+                } else {
+                    logger.info(`[WS] resuming encrypted file from offset ${offset}/${totalSize}`);
                 }
-                logger.info(`[WS] sending encrypted file (${totalSize} bytes, padded)`);
 
                 while (offset < totalSize) {
                     // Backpressure via WS bufferedAmount. If buffered keeps
                     // climbing past STUCK_PIPE_BYTES, the consumer is dead;
                     // give up rather than hold the file in browser memory
                     // forever.
-                    while (this.ws.bufferedAmount > SEND_BUFFER_HIGH_WATER) {
+                    while (this.ws && this.ws.bufferedAmount > SEND_BUFFER_HIGH_WATER) {
                         if (this.ws.bufferedAmount > STUCK_PIPE_BYTES) {
                             throw new Error(`WS stuck (bufferedAmount=${this.ws.bufferedAmount})`);
                         }
                         await new Promise(r => setTimeout(r, 50));
                     }
                     if (!this._isOpen()) {
-                        throw new Error('WS closed mid-transfer');
+                        // The WS dropped mid-transfer. The TransientDisconnectError
+                        // carries the byte offset reached so the higher
+                        // layer can resume from here once the relay
+                        // reconnects.
+                        throw new TransientDisconnectError(
+                            `WS closed mid-transfer at offset ${offset}/${totalSize}`,
+                            offset
+                        );
                     }
                     const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
                     this.ws.send(chunk);
@@ -280,7 +356,10 @@
                 }
 
                 if (!this.sendMessage(window.Protocol.build.fileEnd())) {
-                    throw new Error('Failed to send file-end');
+                    throw new TransientDisconnectError(
+                        `WS closed before file-end at offset ${offset}/${totalSize}`,
+                        offset
+                    );
                 }
                 logger.info('[WS] all chunks sent, waiting for receiver acknowledgment...');
 
