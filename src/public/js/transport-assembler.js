@@ -48,6 +48,33 @@
         host._abusiveTeardown = false;
     }
 
+    // Resume helpers: a transient transport drop must preserve the
+    // in-flight file-start buffer so we can byte-level-resume after
+    // reconnect. Callers gate on these helpers; resetReceive() above
+    // is reserved for explicit teardown (cleanup / startNewPairing /
+    // a fresh file-start that invalidates the in-flight one).
+
+    function hasInflightTransfer(host) {
+        return host.expectedSize > 0 && host.receivedSize < host.expectedSize;
+    }
+
+    function getResumeState(host) {
+        if (!hasInflightTransfer(host)) return null;
+        return { size: host.expectedSize, received: host.receivedSize };
+    }
+
+    // Sender-side: called when our peer responds to file-resume-offer
+    // with file-resume-ack {offset: 0} (sender cannot or chose not to
+    // resume; expect a fresh file-start). Drops the partial buffer
+    // without touching the session-byte counter, which is independent
+    // of any particular file.
+    function discardInflightOnResumeReset(host) {
+        host.receiveBuffer = [];
+        host.receivedSize = 0;
+        host.expectedSize = 0;
+        host._lastLoggedDecile = -1;
+    }
+
     // Consume a control-frame message (already parsed + Protocol.validate'd).
     // Returns true if the assembler handled it (file-start / file-end /
     // file-ack / file-nack); returns false if the caller should forward it
@@ -172,5 +199,8 @@
         clearFileAckState,
         resolveFileAck,
         rejectFileAck,
+        hasInflightTransfer,
+        getResumeState,
+        discardInflightOnResumeReset,
     });
 })();
