@@ -18,6 +18,12 @@
     const queue = [];
     let isSending = false;
     let pendingBatchEnd = false;
+    // True between a TransientDisconnectError caught in drain() and a
+    // file-resume-offer (or fatal teardown). While paused, the head
+    // of the queue keeps its cachedEncryptedData so resume sends the
+    // exact same ciphertext bytes (same GCM nonce) and the receiver's
+    // partial buffer remains valid.
+    let pausedOnTransient = false;
 
     // -- Wired-in deps (set by attach) --
     let _getRtc = null;
@@ -85,6 +91,7 @@
         queue.length = 0;
         isSending = false;
         pendingBatchEnd = false;
+        pausedOnTransient = false;
         updateBanner();
     }
 
@@ -99,6 +106,10 @@
      */
     async function drain() {
         if (isSending) return;
+        if (pausedOnTransient) {
+            _logger.info('drain() called while paused on transient drop, skipping');
+            return;
+        }
         isSending = true;
         updateBanner();
 
@@ -106,10 +117,11 @@
         while (queue.length > 0) {
             const item = queue[0];
             try {
-                if (item.replaceHash) {
+                if (item.replaceHash && !item._replaceSent) {
                     _getRtc().sendMessage(window.Protocol.build.replaceImage(item.replaceHash));
+                    item._replaceSent = true;
                 }
-                const localHash = await sendOnePhoto(item.blob);
+                const localHash = await sendOnePhoto(item);
                 queue.shift();
                 successCount++;
                 if (item.photoId != null) {
@@ -121,6 +133,17 @@
                 }
                 _logger.success('Queued photo sent and verified by receiver');
             } catch (e) {
+                // Transient transport drop mid-send: keep the head of the
+                // queue (with its cached encryptedData) and pause until a
+                // file-resume-offer arrives via handleResumeOffer.
+                if (e && e.transient) {
+                    _logger.warn(`Send paused on transient drop at offset ${e.offset}`);
+                    item._lastOffset = e.offset | 0;
+                    pausedOnTransient = true;
+                    isSending = false;
+                    updateBanner();
+                    return;
+                }
                 queue.shift();
                 if (item.photoId != null) {
                     const gPhoto = _getGalleryPhotos().find(p => p.id === item.photoId);
@@ -155,11 +178,23 @@
     }
 
     /**
-     * Encrypt and transmit a single photo blob over the WebRTC data channel.
-     * Resolves with the plaintext SHA-256 hex when the receiver acks; throws
-     * on nack or timeout.
+     * Encrypt and transmit a single photo blob.
+     *
+     * Encrypts on first call and caches the ciphertext on the queue
+     * `item` so a transient transport drop can resume sending the same
+     * ciphertext (same GCM nonce) instead of re-encrypting (which
+     * would invalidate the receiver's partial buffer).
+     *
+     * `resumeFromOffset` is propagated to the transport so a relay
+     * reconnect after a mid-transfer drop continues from that byte
+     * instead of re-sending file-start.
+     *
+     * Resolves with the plaintext SHA-256 hex when the receiver acks;
+     * throws on nack, timeout, or transient drop. A transient drop
+     * throws a tagged TransientDisconnectError so drain() can pause
+     * the queue head instead of dropping the photo.
      */
-    async function sendOnePhoto(blob) {
+    async function sendOnePhoto(item, resumeFromOffset) {
         // Hard gate: refuse to encrypt/transmit unless both sides have
         // confirmed the fingerprint and a shared key was derived. This
         // is independent of the UI gate in handleReady so a future bug
@@ -168,21 +203,26 @@
         if (!_isVerified()) {
             throw new Error('Refusing to send: peer not verified');
         }
-        const photoData = await blob.arrayBuffer();
-        _logger.info(`Sending queued photo: ${photoData.byteLength} bytes`);
+        const blob = item.blob;
 
-        const localHash = await window.WebSendCrypto.sha256Hex(photoData);
-        _logger.info(`Plaintext SHA-256: ${localHash}`);
-
-        const filename = blob.name || `websend_${Date.now()}.png`;
-        const mimeType = blob.type || 'image/png';
-
-        const encryptedData = await window.WebSendCrypto.encryptWithMetadata(
-            photoData,
-            { name: filename, mimeType: mimeType, originalSize: photoData.byteLength },
-            _getSharedKey()
-        );
-        _logger.info(`Encrypted size: ${encryptedData.byteLength} bytes (padded)`);
+        // Lazy-encrypt: only on first attempt. On resume, the cached
+        // ciphertext is reused so the receiver's partial buffer stays
+        // valid byte-for-byte.
+        if (!item._cachedEncryptedData) {
+            const photoData = await blob.arrayBuffer();
+            _logger.info(`Sending queued photo: ${photoData.byteLength} bytes`);
+            item._localHash = await window.WebSendCrypto.sha256Hex(photoData);
+            _logger.info(`Plaintext SHA-256: ${item._localHash}`);
+            const filename = blob.name || `websend_${Date.now()}.png`;
+            const mimeType = blob.type || 'image/png';
+            item._cachedEncryptedData = await window.WebSendCrypto.encryptWithMetadata(
+                photoData,
+                { name: filename, mimeType: mimeType, originalSize: photoData.byteLength },
+                _getSharedKey()
+            );
+            _logger.info(`Encrypted size: ${item._cachedEncryptedData.byteLength} bytes (padded)`);
+        }
+        const encryptedData = item._cachedEncryptedData;
 
         const xferStart = Date.now();
         let lastStatsUpdate = 0;
@@ -198,13 +238,92 @@
                 const statsEl = document.getElementById('queue-transfer-stats');
                 if (statsEl) statsEl.textContent = window.formatTransferStats(percent, rate, remaining);
             }
-        });
+        }, resumeFromOffset);
         const elapsed = (Date.now() - xferStart) / 1000;
         const actualRate = elapsed > 0 ? encryptedData.byteLength / elapsed : 0;
         _logger.info(`Transfer complete: ${window.formatRate(actualRate)} avg (${elapsed.toFixed(1)}s, ${encryptedData.byteLength} bytes)`);
         const statsEl = document.getElementById('queue-transfer-stats');
         if (statsEl) statsEl.textContent = '';
+        // Drop the cached ciphertext now that it's done so the GC can
+        // free a potentially large buffer. _localHash stays for the
+        // drain() result.
+        const localHash = item._localHash;
+        item._cachedEncryptedData = null;
         return localHash;
+    }
+
+    /**
+     * Handle a file-resume-offer from the receiver after a relay
+     * reconnect. The receiver tells us how many bytes of an in-flight
+     * file-start it already has. We:
+     *
+     * - If the head of our queue still holds the matching encryptedData
+     *   (same byteLength as the offer's size), reply with
+     *   file-resume-ack {offset: received} and resume sending from
+     *   that offset.
+     * - Otherwise reply with file-resume-ack {offset: 0} so the
+     *   receiver discards its partial buffer and expects a fresh
+     *   file-start. The queue is then drained normally.
+     */
+    function handleResumeOffer(msg) {
+        const head = queue[0];
+        const matches = head
+            && head._cachedEncryptedData
+            && head._cachedEncryptedData.byteLength === msg.size
+            && msg.received > 0
+            && msg.received <= msg.size;
+        if (!matches) {
+            _logger.warn(`file-resume-offer cannot match head of queue (have ${queue.length} item(s), head has cache=${!!(head && head._cachedEncryptedData)}); replying offset=0`);
+            try { _getRtc().sendMessage(window.Protocol.build.fileResumeAck(0)); } catch (_) {}
+            pausedOnTransient = false;
+            // Drain normally if anything is queued.
+            if (queue.length > 0) drain();
+            return;
+        }
+        _logger.info(`file-resume-offer matches head, resuming from offset ${msg.received}/${msg.size}`);
+        try { _getRtc().sendMessage(window.Protocol.build.fileResumeAck(msg.received)); } catch (_) {}
+        pausedOnTransient = false;
+        // Resume via a one-shot drain that passes the offset for the head.
+        resumeDrain(msg.received);
+    }
+
+    async function resumeDrain(resumeFromOffset) {
+        if (isSending) return;
+        isSending = true;
+        updateBanner();
+        const item = queue[0];
+        try {
+            const localHash = await sendOnePhoto(item, resumeFromOffset);
+            queue.shift();
+            if (item.photoId != null) {
+                const gPhoto = _getGalleryPhotos().find(p => p.id === item.photoId);
+                if (gPhoto) {
+                    gPhoto.sentHash = localHash;
+                    gPhoto.sendStatus = 'sent';
+                }
+            }
+            _logger.success('Resumed photo sent and verified by receiver');
+        } catch (e) {
+            if (e && e.transient) {
+                _logger.warn(`Resumed send paused again on transient drop at offset ${e.offset}`);
+                item._lastOffset = e.offset | 0;
+                pausedOnTransient = true;
+                isSending = false;
+                updateBanner();
+                return;
+            }
+            queue.shift();
+            if (item.photoId != null) {
+                const gPhoto = _getGalleryPhotos().find(p => p.id === item.photoId);
+                if (gPhoto) gPhoto.sendStatus = 'failed';
+            }
+            _logger.error('Resumed photo failed: ' + e.message);
+            _showToast(_i18n.t('send.sendFailed'));
+        }
+        isSending = false;
+        updateBanner();
+        // Continue draining anything else still queued.
+        if (queue.length > 0) drain();
     }
 
     // Frozen so a hostile script cannot swap `push` / `drain` with a
@@ -220,5 +339,6 @@
         isActive,
         drain,
         updateBanner,
+        handleResumeOffer,
     });
 })();

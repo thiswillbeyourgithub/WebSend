@@ -392,6 +392,11 @@
         'fingerprint-denied': handleFingerprintDenied,
         'ready': handleReady,
         'transform-nack': handleTransformNack,
+        // Relay-reconnect resume: receiver tells us what bytes of an
+        // in-flight file-start it still holds. SenderSend looks up the
+        // matching cached encryptedData and either resumes from the
+        // offset or restarts the transfer.
+        'file-resume-offer': (msg) => window.SenderSend.handleResumeOffer(msg),
     };
 
     async function onMessage(msg) {
