@@ -466,37 +466,67 @@
         // Timestamp recorded when the connection is established, used for filenames
         let connectionTimestamp = '';
 
-        async function onConnected() {
-            logger.success('Connected to sender!');
-            // Keep screen awake while connected
-            wakeLockMgr.desired = true;
-            await wakeLockMgr.acquire();
-            // Record connection time for image naming
-            const now = new Date();
-            const pad = n => String(n).padStart(2, '0');
-            connectionTimestamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-
-            // Hide QR step, show connected step, hide reconnect banner if any
-            document.getElementById('step-qr').classList.add('hidden');
-            document.getElementById('step-connected').classList.remove('hidden');
-            hideReconnectBanner();
-            const statusEl = document.querySelector('#step-connected .status');
-            if (statusEl) {
-                statusEl.textContent = i18n.t('receive.connectedWaiting');
-                statusEl.className = 'status status-connected';
+        // Retry a sendMessage on backoff if the underlying channel reports
+        // not-yet-open. The legitimate "data channel just became open" gap
+        // is sub-second on a healthy connection; longer means a real
+        // failure that the caller should surface.
+        async function sendMessageWithRetry(message, label) {
+            const delaysMs = [0, 50, 150, 300, 600, 1200];
+            for (const d of delaysMs) {
+                if (d > 0) await new Promise(r => setTimeout(r, d));
+                if (rtc.sendMessage(message)) {
+                    if (d > 0) logger.info(`Sent ${label} after ${d}ms retry`);
+                    return true;
+                }
             }
+            logger.error(`Failed to send ${label} after retries - peer will not advance`);
+            return false;
+        }
 
-            // Wait for data channel to be open before sending public key
-            // The data channel might not be ready immediately after peer connection is established
-            await waitForDataChannel();
+        async function onConnected() {
+            try {
+                logger.success('Connected to sender!');
+                // Keep screen awake while connected
+                wakeLockMgr.desired = true;
+                await wakeLockMgr.acquire();
+                // Record connection time for image naming
+                const now = new Date();
+                const pad = n => String(n).padStart(2, '0');
+                connectionTimestamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 
-            // Send our public key to the sender
-            const publicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
-            const sent = rtc.sendMessage(Protocol.build.publicKey(publicKeyB64));
-            if (sent) {
-                logger.info('Sent public key to sender');
-            } else {
-                logger.error('Failed to send public key - data channel not ready');
+                // Hide QR step, show connected step, hide reconnect banner if any
+                document.getElementById('step-qr').classList.add('hidden');
+                document.getElementById('step-connected').classList.remove('hidden');
+                hideReconnectBanner();
+                const statusEl = document.querySelector('#step-connected .status');
+                if (statusEl) {
+                    statusEl.textContent = i18n.t('receive.connectedWaiting');
+                    statusEl.className = 'status status-connected';
+                }
+
+                // Wait for data channel to be open before sending public key
+                // The data channel might not be ready immediately after peer connection is established
+                await waitForDataChannel();
+
+                // Send our public key to the sender
+                const publicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
+                const sent = await sendMessageWithRetry(Protocol.build.publicKey(publicKeyB64), 'public-key');
+                if (sent) {
+                    logger.info('Sent public key to sender');
+                } else {
+                    const errEl = document.querySelector('#step-connected .status');
+                    if (errEl) {
+                        errEl.textContent = i18n.t('receive.initFailed');
+                        errEl.className = 'status status-error';
+                    }
+                }
+            } catch (e) {
+                logger.error('onConnected failed: ' + e.message);
+                const errEl = document.querySelector('#step-connected .status');
+                if (errEl) {
+                    errEl.textContent = i18n.t('receive.initFailed');
+                    errEl.className = 'status status-error';
+                }
             }
         }
 
@@ -1186,7 +1216,7 @@
         }
 
         /** User confirmed fingerprints match - notify the sender and wait for mutual confirmation */
-        function onConfirmMatch() {
+        async function onConfirmMatch() {
             logger.info('User confirmed fingerprints match');
             weConfirmed = true;
 
@@ -1195,7 +1225,7 @@
             document.getElementById('waiting-confirmation').classList.remove('hidden');
 
             // Tell sender we confirmed
-            rtc.sendMessage(Protocol.build.fingerprintConfirmed());
+            await sendMessageWithRetry(Protocol.build.fingerprintConfirmed(), 'fingerprint-confirmed');
 
             checkBothConfirmed();
         }
@@ -1224,7 +1254,7 @@
                 PeerUI.showVerifiedInSidebar();
 
                 // Tell sender both parties verified, so they can show the photo send UI
-                rtc.sendMessage(Protocol.build.ready());
+                sendMessageWithRetry(Protocol.build.ready(), 'ready');
             }
         }
 
