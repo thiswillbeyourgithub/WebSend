@@ -657,7 +657,26 @@ relay slot.
     handler returns `{"error":"Not found"}` and crucially does not echo
     the requested path, denying an attacker the ability to smuggle
     HTML or ANSI into log scrapers via the URL.
-35. **HTTP-relay fallback transport**: Corporate networks that block UDP
+35. **Relay reconnect with byte-level resume**: When the WS or LP relay
+    drops mid-transfer (proxy hiccup, network blip), the
+    `RacingTransport` reconnect loop in `js/transport.js` re-claims a
+    fresh slot forever with a cap-5 s backoff. `js/ws-transport.js` and
+    `js/lp-transport.js` distinguish a transient close (new
+    `onTransientDisconnect` callback) from an explicit teardown, and
+    `js/transport-assembler.js` keeps the in-flight `receiveBuffer` /
+    `expectedSize` / `receivedSize` intact across the drop. On
+    reconnect, the receiver re-sends its public key (so the sender can
+    verify the cached fingerprint hasn't changed) and, if a partial
+    transfer exists, emits `file-resume-offer {size, received}`. The
+    sender's `js/sender-send.js` caches the encrypted ciphertext on the
+    queue head so the resume reuses the same GCM nonce (the receiver's
+    partial buffer remains decryptable); it replies with
+    `file-resume-ack {offset}` and continues binary chunks from that
+    offset. A peer-fingerprint mismatch on reconnect is treated as a
+    peer-swap and forces a fresh verification ceremony. WebRTC drops
+    are still fatal in v1 (no ICE-restart resume yet); only the relay
+    transports support resume.
+36. **HTTP-relay fallback transport**: Corporate networks that block UDP
     and strip TURNS-over-TCP at the proxy used to leave WebSend with no
     working path. v3.7.0 adds an HTTPS-only fallback that runs over the
     same Caddy port 443 as the rest of the app. The client opens a

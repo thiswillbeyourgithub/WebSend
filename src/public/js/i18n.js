@@ -240,6 +240,8 @@ const i18n = (function() {
             'send.reconnecting': 'Reconnecting...',
             'send.reconnectFailed': 'Reconnection failed. Reload the page or click Back to restart.',
             'send.confirmShredOnNewPairing': 'You have unsent or recently sent photos in this gallery. Connecting to a new receiver will delete them. Continue?',
+            'send.peerChangedOnReconnect': 'Receiver key changed during reconnect, please rescan the QR code',
+            'receive.peerChangedOnReconnect': 'Sender key changed during reconnect, please re-verify the fingerprint',
 
             // Errors
             'error.noPhotoOrKey': 'No photo or key exchange not complete',
@@ -471,6 +473,8 @@ const i18n = (function() {
             'send.reconnecting': 'Reconnexion en cours...',
             'send.reconnectFailed': 'Reconnexion échouée. Rechargez la page ou cliquez sur Retour pour recommencer.',
             'send.confirmShredOnNewPairing': 'Des photos non envoyées ou récemment envoyées sont dans la galerie. Se connecter à un nouveau récepteur les supprimera. Continuer ?',
+            'send.peerChangedOnReconnect': 'La clé du récepteur a changé pendant la reconnexion, veuillez rescanner le QR code',
+            'receive.peerChangedOnReconnect': 'La clé de l\'expéditeur a changé pendant la reconnexion, veuillez re-vérifier l\'empreinte',
 
             // Errors
             'error.noPhotoOrKey': 'Pas de photo ou échange de clés incomplet',

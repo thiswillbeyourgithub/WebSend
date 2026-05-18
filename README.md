@@ -183,6 +183,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 - Anti-DoS caps are mirrored server-side: 4 GiB `MAX_TOTAL_SESSION_BYTES`, 16 KiB `MAX_CONTROL_MSG_BYTES`, plus a 32-frame bounded queue and 60 s idle timeout on the long-poll slots. Long-poll slot tokens (128-bit random) are validated in constant time alongside the room secret.
 - The sidebar shows the active path: **Direct**, **Relay (TURN)**, **Relay (TURNS)**, **Relay (HTTP)**, or **Relay (HTTPS)**.
 - Disable by setting `RELAY_ENABLE=false` on the server (default is `true`).
+- **Relay reconnect with byte-level resume** (added with [Claude Code](https://claude.ai/claude-code)): a transient drop on the relay path no longer kills the session. The `RacingTransport` retries forever with a cap-5 s backoff, the receiver preserves the partial in-flight buffer across the drop, and the resume protocol (`file-resume-offer` + `file-resume-ack`) lets the sender continue from the receiver's last contiguous byte with the same ciphertext (same GCM nonce). If the peer's public-key fingerprint matches the one verified at pairing time, the verification modal is not re-shown; a mismatch is treated as a possible peer-swap and forces re-verification.
 
 ## Non-Security Features
 
