@@ -49,6 +49,9 @@ class WebSendRTC {
         this._icePollTimer = null;
         this._icePollRemoteSide = null; // 'offer' or 'answer' — the side we fetch from
         this._knownRemoteCandidateCount = 0;
+        // Backoff gate so a 429 / 5xx from the ICE poll endpoint doesn't keep
+        // the 1 Hz setInterval hammering the server while we're already blocked.
+        this._icePollBackoffUntil = 0;
 
         // Connection timeout — if WebRTC doesn't reach 'connected' or 'failed' within
         // this duration (e.g. TURN server unreachable), we force-fail instead of polling
@@ -776,6 +779,16 @@ class WebSendRTC {
                         logger.debug('ICE', 'Queued remote candidate (remote desc not set yet)');
                     }
                 }
+            } else {
+                // Without this branch the 1 Hz setInterval re-fires regardless
+                // of status, so a server-side rate-limit block produces a wall
+                // of identical 429s in the user's log. Honor Retry-After when
+                // present, otherwise default to 2s (consistent with the
+                // waitForAnswer backoff).
+                const retryAfterHeader = response.headers.get('Retry-After');
+                const retryAfterSec = Math.max(2, Number(retryAfterHeader) || 0);
+                this._icePollBackoffUntil = Date.now() + retryAfterSec * 1000;
+                logger.warn(`ICE poll got ${response.status}, backing off ${retryAfterSec}s`);
             }
         } catch (e) {
             logger.warn('Failed to fetch ICE candidates: ' + e.message);
@@ -802,6 +815,7 @@ class WebSendRTC {
                 this.stopIceCandidatePolling();
                 return;
             }
+            if (Date.now() < this._icePollBackoffUntil) return;
             await this.fetchRemoteIceCandidates(side);
         }, 1000);
     }
@@ -816,6 +830,7 @@ class WebSendRTC {
             this._icePollTimer = null;
             logger.debug('ICE', 'Stopped ICE candidate polling');
         }
+        this._icePollBackoffUntil = 0;
         if (this._connectionTimeout) {
             clearTimeout(this._connectionTimeout);
             this._connectionTimeout = null;
