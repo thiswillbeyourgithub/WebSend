@@ -30,6 +30,10 @@ services:
       - OCR_LANGS=${OCR_LANGS:-eng,fra}
       - OCR_PSM=${OCR_PSM:-12}
       - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES:-ANY}
+    # Uncomment to make websend wait for the bundled coturn service to start.
+    # Only useful if you use the bundled coturn below (not an external TURN server).
+    # depends_on:
+    #   - coturn
     # Security hardening options
     security_opt:
       # Prevent privilege escalation via setuid/setgid binaries
@@ -128,6 +132,7 @@ services:
   # ─────────────────────────────────────────────────────────────────────
   coturn:
     image: coturn/coturn:latest
+    pull_policy: always
     container_name: coturn
     ports:
       # Use a different port if 3478 is already in use (e.g., by another coturn)
