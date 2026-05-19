@@ -34,7 +34,6 @@
   - [TURN Relay Security](#turn-relay-security)
 - [Non-Security Features](#non-security-features)
 - [Keycloak SSO (Experimental)](#keycloak-sso-experimental)
-- [Future Ideas](#future-ideas)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -260,10 +259,6 @@ A commented-out oauth2-proxy service is included in `docker-compose.yml` along w
 - Comment out the websend `ports:` block so the app is only reachable through oauth2-proxy on `127.0.0.1:4180`.
 
 **Status**: Experimental. WebSocket signaling passes through oauth2-proxy and an established WS tunnel survives cookie expiry; what fails is the next upgrade attempt after a transient blip, because the new HTTP upgrade needs a valid session cookie. The compose block sets `OAUTH2_PROXY_COOKIE_REFRESH=4m` (slightly below Keycloak's default 5-minute access-token lifetime) so the cookie is rotated silently and reconnects keep working. coturn (TURN/TURNS/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because TURN credentials are minted by `/api/config`, which sits behind oauth2-proxy, so unauthenticated clients never receive them.
-
-## Future Ideas
-
-Ideally, the WebRTC signaling server would be replaced by [iroh](https://iroh.computer/) in the future, which would eliminate the need for a signaling server entirely. However, iroh is not yet easy to embed in phone browsers.
 
 ## Requirements
 
