@@ -71,6 +71,19 @@ const TURNS_PORT = process.env.TURNS_PORT || '';
 // blocked. Set RELAY_ENABLE=false to disable (back to WebRTC-only behavior).
 // TODO: revisit default before production rollout once soak-tested.
 const RELAY_ENABLE = (process.env.RELAY_ENABLE || 'true').toLowerCase() !== 'false';
+// RELAY_LP_ONLY: operational knob that forces the long-poll relay to be
+// the ONLY transport offered to clients. When true, WebRTC ICE servers are
+// suppressed and the WebSocket relay endpoint returns 404, so the client
+// is left with only the /relay/{handshake,up,down,close} long-poll path.
+// Useful behind proxies that strip WS upgrades or for deployments that
+// want a single, well-understood transport. Requires RELAY_ENABLE=true:
+// an LP-only deployment with the relay disabled is unreachable, so we
+// abort startup in that case rather than serve a broken config.
+const RELAY_LP_ONLY = (process.env.RELAY_LP_ONLY || 'false').toLowerCase() === 'true';
+if (RELAY_LP_ONLY && !RELAY_ENABLE) {
+    console.error('FATAL: RELAY_LP_ONLY=true requires RELAY_ENABLE=true (LP-only mode with relay disabled is unreachable). Aborting startup.');
+    process.exit(1);
+}
 // DEV_FORCE_CONNECTION: force a specific ICE transport for debugging.
 // Valid values: DIRECT, STUN, GOOGLE_STUN, TURN, TURNS, ALL (default).
 // DIRECT = no ICE servers (LAN host candidates only)
@@ -78,8 +91,12 @@ const RELAY_ENABLE = (process.env.RELAY_ENABLE || 'true').toLowerCase() !== 'fal
 // GOOGLE_STUN = Google's public STUN only
 // TURN = TURN UDP+TCP relay only (forces iceTransportPolicy: relay)
 // TURNS = TURN-over-TLS only (forces iceTransportPolicy: relay)
+// RELAY_LP = long-poll-only (equivalent to RELAY_LP_ONLY=true)
 // ALL or unset = normal behavior (all configured servers)
 const DEV_FORCE_CONNECTION = (process.env.DEV_FORCE_CONNECTION || 'DEFAULT').toUpperCase();
+// Collapsed LP-only flag: either the prod env var or the debug-mode
+// DEV_FORCE_CONNECTION value gets you the same behaviour.
+const LP_ONLY = RELAY_LP_ONLY || DEV_FORCE_CONNECTION === 'RELAY_LP';
 
 // DEV_FORCE_CONNECTION filter table: each mode picks a subset of the configured
 // iceServers for transport-isolation debugging. `forceRelay: true` triggers
@@ -104,6 +121,10 @@ const FORCE_FILTERS = {
     // no path to connect. The client side reads forceConnection in
     // /api/config and short-circuits the race-grace window.
     RELAY_HTTPS: { filter: () => [],                                                                forceRelay: false },
+    // RELAY_LP: same ICE suppression as RELAY_HTTPS, but additionally
+    // disables the WS relay endpoint server-side (via LP_ONLY), so the
+    // client is left with only the long-poll relay path.
+    RELAY_LP:    { filter: () => [],                                                                forceRelay: false },
 };
 FORCE_FILTERS.TURN_TLS = FORCE_FILTERS.TURNS;
 
@@ -681,7 +702,11 @@ app.get('/api/config', (req, res) => {
         // fails to connect within the 10s race window. The relay
         // forwards encrypted bytes verbatim; payload is still ECDH+
         // AES-GCM end-to-end encrypted.
-        relayEnabled: RELAY_ENABLE
+        relayEnabled: RELAY_ENABLE,
+        // LP-only mode: when true, the WS relay endpoint is disabled and
+        // the client skips WebRTC + WS entirely, leaving only the long-poll
+        // relay path. Set via RELAY_LP_ONLY or DEV_FORCE_CONNECTION=RELAY_LP.
+        lpOnly: LP_ONLY
     });
 });
 
@@ -1431,7 +1456,11 @@ setInterval(() => {
 const httpServer = http.createServer(app);
 
 httpServer.on('upgrade', (req, socket, head) => {
-    if (!RELAY_ENABLE) {
+    // LP-only mode refuses WS upgrades for the same reason RELAY_ENABLE=false
+    // does: the client must not be able to use the WebSocket relay. The LP
+    // routes (/relay/handshake, /relay/up, /relay/down, /relay/close) remain
+    // gated only by RELAY_ENABLE so they stay reachable here.
+    if (!RELAY_ENABLE || LP_ONLY) {
         socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
         socket.destroy();
         return;
@@ -1527,6 +1556,7 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
         { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
         { name: 'RELAY_ENABLE',          value: process.env.RELAY_ENABLE,         used: String(RELAY_ENABLE) },
+        { name: 'RELAY_LP_ONLY',         value: process.env.RELAY_LP_ONLY,        used: String(RELAY_LP_ONLY) },
         { name: 'DEV_FORCE_CONNECTION',  value: process.env.DEV_FORCE_CONNECTION, used: DEV_FORCE_CONNECTION },
         { name: 'UMAMI_URL',             value: process.env.UMAMI_URL,            used: UMAMI_URL || '(none)' },
         { name: 'UMAMI_WEBSITE_ID',      value: process.env.UMAMI_WEBSITE_ID,     used: UMAMI_WEBSITE_ID || '(none)' },
@@ -1586,9 +1616,15 @@ httpServer.listen(PORT, '0.0.0.0', () => {
     if (RELAY_ENABLE) {
         const wsScheme = DOMAIN === 'localhost' ? 'ws' : 'wss';
         const httpScheme = DOMAIN === 'localhost' ? 'http' : 'https';
-        console.log('  HTTP-relay fallback: ENABLED');
-        console.log(`    WS:  ${wsScheme}://${DOMAIN}/api/rooms/:id/relay`);
-        console.log(`    LP:  ${httpScheme}://${DOMAIN}/api/rooms/:id/relay/{handshake,up,down,close}`);
+        if (LP_ONLY) {
+            console.log('  HTTP-relay fallback: LP-ONLY MODE (WebRTC + WS disabled)');
+            console.log(`    LP:  ${httpScheme}://${DOMAIN}/api/rooms/:id/relay/{handshake,up,down,close}`);
+            console.log(`    WS:  ${wsScheme}://${DOMAIN}/api/rooms/:id/relay (returns 404)`);
+        } else {
+            console.log('  HTTP-relay fallback: ENABLED');
+            console.log(`    WS:  ${wsScheme}://${DOMAIN}/api/rooms/:id/relay`);
+            console.log(`    LP:  ${httpScheme}://${DOMAIN}/api/rooms/:id/relay/{handshake,up,down,close}`);
+        }
     } else {
         console.log('  HTTP-relay fallback: DISABLED (RELAY_ENABLE=false)');
     }
