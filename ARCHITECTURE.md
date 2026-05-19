@@ -23,10 +23,11 @@ keys. The `ALLOWED_FILE_TYPES` env var controls which file types are accepted
 (`ONLY_IMAGES`, `IMAGE_OR_PDF`, or `ANY` — default: `ANY`). PDFs can be exported as
 a ZIP of page images or as a searchable OCR PDF using the bundled scribe.js/MuPDF engine.
 Other server-tunable knobs surfaced via `/api/config` and the startup env-var dump:
-`OCR_LANGS` (Tesseract languages, default `eng,fra`), `OCR_PSM` (page-segmentation
-mode, default `12`), `TURN_TIMEOUT` (TURN ICE-gather timeout, seconds, default `15`),
-`DEV_FORCE_CONNECTION` (force `DIRECT` / `RELAY` for testing, default `DEFAULT`),
-and `TEST_DISABLE_RATE_LIMIT` (test escape hatch).
+`PORT` (HTTP listen port, default `8080`), `OCR_LANGS` (Tesseract languages, default
+`eng,fra`), `OCR_PSM` (page-segmentation mode, default `12`), `TURN_TIMEOUT` (TURN
+ICE-gather timeout, seconds, default `15`), `DEV_FORCE_CONNECTION` (force `DIRECT` /
+`RELAY` for testing, default `DEFAULT`), and `TEST_DISABLE_RATE_LIMIT` (test escape
+hatch).
 
 ## Directory Structure
 
@@ -129,6 +130,39 @@ WebSend/
         │   │               #   every candidate-pair with reqSent/respRcvd/RTT.
         │   │               #   diagnoseIceServers({force:true}) runs per-server
         │   │               #   reachability probes even outside DEV mode on failure.
+        │   ├── transport.js # RacingTransport: races WebRTC against the HTTP-relay
+        │   │               #   transports under one duck-typed Transport surface
+        │   │               #   (init/createRoom/joinRoom/sendMessage/sendFile +
+        │   │               #   onConnected/onDisconnected/onMessage callbacks) so
+        │   │               #   receive.html and sender-connect.js never branch on
+        │   │               #   transport type. WebRTC is preferred via a
+        │   │               #   RACE_GRACE_MS (10 s) window; the loser is closed when
+        │   │               #   a winner locks in. Reconnect loop with cap-5 s backoff
+        │   │               #   re-claims a fresh slot forever on a transient drop
+        │   ├── transport-assembler.js # PayloadAssembler: shared receive-state
+        │   │               #   machine (file-start / binary chunks / file-end /
+        │   │               #   file-ack / file-nack) plus anti-DoS bounds
+        │   │               #   (MAX_TOTAL_SESSION_BYTES, MAX_CONTROL_MSG_BYTES,
+        │   │               #   MIN_FILE_START_SIZE). Operates on a host instance
+        │   │               #   (the transport itself) so WebRTC, WS, and LP share
+        │   │               #   one implementation instead of three copies that can
+        │   │               #   drift. Exposes window.PayloadAssembler
+        │   ├── ws-transport.js # HTTP-relay fallback transport over WebSocket
+        │   │               #   (/api/rooms/:id/relay). Distinguishes transient close
+        │   │               #   (onTransientDisconnect) from explicit teardown so the
+        │   │               #   RacingTransport can reconnect mid-transfer without
+        │   │               #   re-doing the ECDH handshake. relay-hello handshake
+        │   │               #   on top of the wire gates onConnected on both peers
+        │   │               #   actually joining the slot. Receive state via
+        │   │               #   PayloadAssembler. Payloads remain end-to-end
+        │   │               #   encrypted; the relay forwards opaque bytes only
+        │   ├── lp-transport.js # HTTP-relay fallback transport over pure HTTPS
+        │   │               #   POST/GET (/relay/handshake, /relay/up, /relay/down,
+        │   │               #   /relay/close) for corporate proxies that strip WS.
+        │   │               #   Wire format identical to ws-transport.js. The
+        │   │               #   per-slot token returned by /handshake authenticates
+        │   │               #   subsequent up/down calls in addition to the room
+        │   │               #   secret. Same DoS bounds and PayloadAssembler reuse
         │   ├── logger.js   # In-memory log buffer with UI panel (slide-up overlay).
         │   │               #   Supports info/success/warn/error/debug levels.
         │   │               #   DEV mode (toggled via server config) enables verbose output
@@ -220,6 +254,16 @@ WebSend/
         │   │               #   camera, flash/torch + ImageCapture fallback, live
         │   │               #   document-corner detection overlay, pinch-to-zoom,
         │   │               #   per-frame capture. Exposes window.SenderCamera
+        │   ├── qr-parse.js # Pure parsing helper for QR / pasted URLs on the
+        │   │               #   sender's scan step (kept out of send.html so it can
+        │   │               #   be unit-tested without WebRTC / camera deps).
+        │   │               #   QrParse.parseSendInvite(data, currentOrigin) returns
+        │   │               #   {ok,roomId,secret} or {ok:false,reason:...}.
+        │   │               #   Foreign-origin URLs (a phishing QR pointing at
+        │   │               #   attacker.example) are rejected; bare relative paths
+        │   │               #   for manual entry still work; secret length is
+        │   │               #   bounded so a crafted QR cannot smuggle CR/LF or
+        │   │               #   oversized junk into the X-Room-Secret header
         │   ├── sender-send.js # Sender outgoing photo queue: enqueue, serial drain,
         │   │               #   encryption + transmit (sendOnePhoto), per-photo
         │   │               #   gallery status updates, sticky progress banner, and
