@@ -14,6 +14,7 @@
 
 - [Disclaimer](#disclaimer)
 - [How It Works](#how-it-works)
+- [Threat Model](#threat-model)
 - [Security Features](#security-features)
   - [End-to-End Encryption](#end-to-end-encryption)
   - [Zero Server Trust](#zero-server-trust)
@@ -58,6 +59,45 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 4. Both parties **verify key fingerprints** by reading short codes aloud to each other
 5. **Sender** takes or selects photos, which are encrypted and sent directly
 6. **Receiver** decrypts, previews, optionally crops/rotates/binarizes, and downloads the photos — individually, as a ZIP, or as a single PDF (plain or searchable via OCR). Photos are auto-grouped into "collections" (one per sender batch). The sender side also exposes a Genius-Scan-like gallery (rotate, flip, B&W, perspective crop, drag-and-drop reorder) before the photos are sent
+
+## Threat Model
+
+The protections listed in [Security Features](#security-features) below address a specific set of adversaries and attacks. This section states that set explicitly so a reader can quickly tell what WebSend protects against and what it does not.
+
+**Adversaries considered**:
+- Passive network eavesdroppers on any link (local Wi-Fi, ISP, signaling traffic, TURN/TURNS relay traffic).
+- Active man-in-the-middle on the signaling channel, including a fully malicious WebSend server operator, a compromised reverse proxy, or anyone between the two peers and the server.
+- A compromised or curious TURN / TURNS relay operator.
+- A hostile peer **before** fingerprint verification (a stranger who manages to join the room and floods malformed messages before the user confirms).
+- A hostile peer **after** fingerprint verification (a phone whose user was socially engineered into pairing, then sends oversized files, malformed transforms, or peer-controlled filenames / MIME types).
+- Compromised content delivery: a tampered WebSend server, a hostile CDN, or any attempt to swap in modified JS/CSS at runtime.
+- Phishing QR codes that encode an attacker-controlled origin instead of the legitimate WebSend host.
+
+**In scope (defended)**:
+- Confidentiality and integrity of every file payload, end-to-end, even when the signaling server and the TURN relay are both hostile.
+- Detection of a signaling-channel MITM through the spoken 16-hex-char fingerprint ceremony.
+- Resource-exhaustion DoS attempts from a peer (both before and after the fingerprint ceremony) against the receiver tab, the sender tab, and the server process.
+- Cross-origin and CSRF-style abuse of the signaling API.
+- XSS via peer-controlled filenames or peer-declared MIME types.
+- Silent tampering of static assets at the server or proxy (vendoring plus Subresource Integrity).
+- Cross-session data leakage on either device when the user re-pairs (in-memory shred).
+- Room enumeration or unauthorized room access by guessing the short room ID (room secret in URL fragment, never sent to server).
+
+**Out of scope (explicitly NOT defended)**:
+- A fully compromised endpoint device (rooted phone, malware on the receiver computer, hostile browser, hostile browser extension). Any application-layer protection is bypassable by code running inside the same browser context.
+- A user who **skips** the spoken fingerprint comparison, or who confirms a mismatch by mistake. The verification ceremony is the security; bypassing it removes the guarantee against MITM.
+- Targeted denial-of-service at the network / IP layer (we mitigate application-layer DoS, not packet floods).
+- Forensic recovery of decrypted bytes from device RAM after a transfer (references are dropped on shred, but unreferenced pages are not zeroed).
+- Compromise of the user's HTTPS certificate authority.
+- Side-channel attacks against the browser's Web Crypto implementation.
+- Vulnerabilities inside coturn or oauth2-proxy themselves.
+- Traffic-analysis attacks beyond the fixed power-of-2 size-bucket padding (an observer can still see that *some* transfer happened and roughly when).
+
+**Trust assumptions**:
+- Both endpoint devices, their operating systems, and their browsers behave honestly.
+- The user actually compares the 16-hex fingerprint aloud and aborts on any mismatch.
+- HTTPS is correctly terminated in front of the server (typically Caddy + Let's Encrypt) and the TLS stack is sound.
+- The vendored third-party libraries were honest at the time they were vendored. Subresource Integrity re-verifies the bytes at runtime, so a later swap is detected, but a backdoor present at vendoring time is not.
 
 ## Security Features
 

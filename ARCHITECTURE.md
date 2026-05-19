@@ -8,6 +8,7 @@
 - [Directory Structure](#directory-structure)
 - [Data Flow](#data-flow)
 - [Server API Endpoints](#server-api-endpoints)
+- [Threat Model](#threat-model)
 - [Security Layers](#security-layers)
 - [SSO (Experimental)](#sso-experimental)
 - [Testing](#testing)
@@ -411,6 +412,59 @@ Room endpoints require an `X-Room-Secret` header (constant-time comparison).
 The HTTP-relay endpoints additionally require a per-slot token issued by
 `/relay/handshake` so the room secret alone cannot be used to hijack a live
 relay slot.
+
+## Threat Model
+
+The 36 numbered entries in [Security Layers](#security-layers) below are individual mitigations. This section names the adversaries those mitigations exist to defeat, the attacks that are explicitly in scope, the attacks that are explicitly out of scope (with rationale), and the trust assumptions the design rests on. Each in-scope item cross-references the numbered Security Layers entry (or entries) that addresses it, so a reviewer can trace any claim in this section to the code that backs it.
+
+### Adversaries considered
+
+1. **Passive network eavesdropper** on any link the traffic crosses: local Wi-Fi, ISP, signaling, TURN/TURNS relay.
+2. **Active signaling-channel MITM**, including a fully malicious WebSend server operator, a compromised reverse proxy in front of the server, or any on-path attacker between the two peers and the signaling endpoint. The same model covers a malicious WebSocket / long-poll relay on the HTTP-fallback transport.
+3. **Compromised or curious TURN / TURNS relay operator**, including a relay that logs all bytes.
+4. **Hostile peer before fingerprint verification**: a stranger who learns the room ID and secret (e.g. shoulder-surfing the QR), joins the room, and pushes malformed wire messages, oversized chunks, or invalid transforms before the user has confirmed the fingerprint.
+5. **Hostile peer after fingerprint verification**: a phone whose user was socially engineered into pairing, or a peer whose verification was accepted by mistake. Once verified, this peer can send real files, but it can still try to deliver oversized payloads, malicious filenames / MIME types, malformed transforms, or pathological PDFs.
+6. **Compromised content delivery**: a tampered WebSend server, a hostile CDN, or any other path that could swap in modified JavaScript or CSS at load time.
+7. **Phishing QR codes**: an attacker prints or shares a QR that encodes a URL on an attacker-controlled origin, hoping the user scans it from the legitimate WebSend page.
+8. **Hostile script reaching the page** (e.g. an XSS escape, a malicious browser extension, or a future tampered third-party load) that tries to monkey-patch security-critical globals.
+
+### In scope (defended)
+
+- **Confidentiality and integrity of every file payload, end-to-end, even with hostile server and hostile relay.** ECDH P-256 + HKDF + AES-256-GCM, fresh ephemeral keys per session (forward secrecy). The server only ever sees ciphertext. (Layers §1, §2)
+- **Detection of signaling-channel MITM.** A 64-bit SHA-256 fingerprint of each public key is read aloud by both users. A signaling MITM would need to grind ECDH keys to a chosen fingerprint, which is a second-preimage search whose cost is independent of how many rooms are live. (Layers §4, §23, §24)
+- **Room enumeration and unauthorized room access.** A 128-bit room secret in the URL hash fragment is required for every room API call and compared in constant time. (Layers §3)
+- **Resource-exhaustion DoS from a peer before verification** (the verification modal is up, but message handlers are already running). Caps on receive buffer, per-file size, per-session bytes, control-message size, and log-panel growth all fire before mutual confirmation. (Layers §16, §19, §27)
+- **Resource-exhaustion DoS from a peer after verification.** Transform-replay caps, octet-stream blob URLs, PDF page-render cap, image-transform pixel cap, sender transform-nack retry cap, and background-OCR pixel cap all bound a verified-but-hostile peer. (Layers §17, §20, §28, §29, §30, §31)
+- **Resource exhaustion against the server.** Per-IP rate limits, long-poll waiter caps (per-room and process-wide), and bounded relay-slot queues. (Layers §11, §18, §36)
+- **Cross-origin and CSRF-style abuse.** Origin header validation on all `/api/*` endpoints; `X-Forwarded-For` only trusted from loopback. (Layers §12, §13)
+- **XSS via peer-controlled filenames or MIME types.** All receiver-facing `blob:` URLs are forced to `application/octet-stream`, the per-file card uses `createElement` + `textContent` only, and a defensive Content-Security-Policy plus other hardening headers constrain even an inline-script escape. (Layers §20, §21)
+- **Silent tampering of static assets.** Vanilla HTML/CSS/JS with no bundler or CDN, all third-party libraries vendored, Subresource Integrity on every script and link tag, plus a service worker that only caches same-origin `basic`-type responses. (Layers §9, §10, §25)
+- **Cross-session data leakage on re-pair.** Both devices shred all in-memory user data (decrypted images, OCR text, preBW buffers, blob URLs, scribe WASM state, crypto keys) before establishing a new session. (Layers §32)
+- **Re-key attack on an already-verified session.** The sender refuses any further `public-key` messages once a shared key exists; the receiver allows re-key but forces re-verification synchronously before any await. (Layers §24, §23)
+- **Phishing QR pointing at an attacker origin.** The sender's scan / paste path rejects any URL whose origin is not the current origin, with a user-facing toast. (Layers §26)
+- **Long-poll abuse of the signaling API.** Three layered caps (per-IP rate limit, per-room waiters, process-wide waiters) and per-slot tokens on the HTTP-relay fallback. (Layers §18, §36)
+- **Information leakage via error responses.** A custom 4-arg error middleware scrubs Express's default stack-trace body; a custom 404 handler refuses to echo the requested path. (Layers §34)
+- **Monkey-patching of security-critical globals from a hostile script.** `Object.freeze` is applied at export time to `WebSendCrypto`, `Protocol` (and `Protocol.build`), `QrParse`, `SenderConnect`, `SenderSend`, `ReceiveCard`, and `VerificationModal`. (Layers §33)
+
+### Out of scope (explicitly NOT defended)
+
+- **A fully compromised endpoint device** (rooted phone, malware on the receiver computer, hostile browser, hostile browser extension). Rationale: any application-layer protection is bypassable by code running inside the same browser context as the page. WebSend assumes both endpoints are honest.
+- **A user who skips the spoken fingerprint comparison**, or who confirms a mismatch by mistake. Rationale: the fingerprint ceremony *is* the MITM defense. There is no other check that can detect a chosen-key MITM if the user does not actually compare the codes.
+- **Targeted denial-of-service at the network / IP layer.** Rationale: WebSend mitigates application-layer DoS (giant chunks, pipelined long-polls, malformed messages) at the Node and browser layers; mitigating packet floods is the job of the upstream reverse proxy / CDN / firewall.
+- **Forensic recovery of decrypted bytes from device RAM after a transfer.** Rationale: we drop references on shred so the garbage collector can reclaim the pages, but JavaScript cannot zero memory deterministically and we do not run in a TEE.
+- **Compromise of the user's HTTPS certificate authority.** Rationale: a forged certificate breaks the TLS layer underneath everything; the fingerprint ceremony still catches an active ECDH MITM on top of that, but confidentiality of the room ID and timing metadata is gone.
+- **Side-channel attacks against the browser's Web Crypto implementation.** Rationale: Web Crypto is the trusted cryptographic primitive; reimplementing it in user-space would expose worse side channels, not better ones.
+- **Vulnerabilities inside coturn or oauth2-proxy themselves.** Rationale: these are external components; WebSend's threat model assumes they are correct. `misc/check_turn.py` is provided as a manual probe.
+- **Traffic analysis beyond fixed-bucket size padding.** Rationale: padding to power-of-2 buckets hides the *exact* file size, but an observer can still see that some transfer happened, roughly when, and within which bucket. Hiding the timing pattern would require constant-rate padding traffic, which is not implemented.
+- **Targeted ECDH key-grinding for a chosen 64-bit fingerprint.** Rationale: the fingerprint length (64 bits) is at the recognized floor for verbal-comparison ceremonies and is fixed regardless of server load; a determined attacker willing to spend significant compute can in principle grind a colliding fingerprint, but the cost is significant and the fingerprint length is held constant for that reason. (See the explanatory paragraph at Layer §4.)
+
+### Trust assumptions
+
+- Both endpoint devices, their operating systems, and their browsers behave honestly. A compromised browser can defeat any in-page protection by definition.
+- The user actually compares the 16-hex fingerprint aloud and aborts on any mismatch. The four-list structure of this threat model exists precisely to make that requirement visible.
+- HTTPS is correctly terminated in front of the server (typically Caddy + Let's Encrypt) and the TLS stack is sound.
+- The vendored third-party libraries were honest at the time they were vendored. Subresource Integrity (§10) re-verifies the bytes at runtime, so a later swap is detected; a backdoor present at vendoring time is not.
+- `NODE_ENV` is not relied on for security posture: the custom error / 404 handlers (§34) make the server safe to deploy even when `NODE_ENV` is unset, which it is in the shipped Docker image.
 
 ## Security Layers
 
