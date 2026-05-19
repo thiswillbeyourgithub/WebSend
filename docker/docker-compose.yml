@@ -152,6 +152,14 @@ services:
   #     # upstream a few ms before websend would have replied with a clean
   #     # 204, so the client sees a 504. 60s leaves comfortable headroom.
   #     - OAUTH2_PROXY_UPSTREAM_TIMEOUT=60s
+  #     # Silently refresh the session cookie shortly before the access
+  #     # token expires. Keycloak's default access-token lifetime is 5
+  #     # minutes; without this, every 5 minutes oauth2-proxy redirects
+  #     # the next request to Keycloak instead of using the refresh
+  #     # token. Multi-minute file transfers over the long-poll relay
+  #     # would otherwise abort mid-flight. Pick a value slightly LOWER
+  #     # than the realm's access-token lifetime in Keycloak.
+  #     - OAUTH2_PROXY_COOKIE_REFRESH=4m
   #   security_opt:
   #     - no-new-privileges:true
   #   read_only: true
