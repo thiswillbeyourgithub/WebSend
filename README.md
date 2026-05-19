@@ -223,6 +223,7 @@ The protections listed in [Security Features](#security-features) below address 
 - Anti-DoS caps are mirrored server-side: 4 GiB `MAX_TOTAL_SESSION_BYTES`, 16 KiB `MAX_CONTROL_MSG_BYTES`, plus a 32-frame bounded queue and 60 s idle timeout on the long-poll slots. Long-poll slot tokens (128-bit random) are validated in constant time alongside the room secret.
 - The sidebar shows the active path: **Direct**, **Relay (TURN)**, **Relay (TURNS)**, **Relay (HTTP)**, or **Relay (HTTPS)**.
 - Disable by setting `RELAY_ENABLE=false` on the server (default is `true`).
+- **Long-poll-only mode**: set `RELAY_LP_ONLY=true` (or the debug equivalent `DEV_FORCE_CONNECTION=RELAY_LP`) to force the long-poll relay path only. WebRTC ICE servers are suppressed and the WebSocket relay endpoint returns 404, so the client uses only `/api/rooms/:id/relay/{handshake,up,down,close}`. Useful behind proxies that strip WS upgrades or for deployments standardising on a single, well-understood transport. Requires `RELAY_ENABLE=true`; the server aborts startup otherwise.
 - **Relay reconnect with byte-level resume** (added with [Claude Code](https://claude.ai/claude-code)): a transient drop on the relay path no longer kills the session. The `RacingTransport` retries forever with a cap-5 s backoff, the receiver preserves the partial in-flight buffer across the drop, and the resume protocol (`file-resume-offer` + `file-resume-ack`) lets the sender continue from the receiver's last contiguous byte with the same ciphertext (same GCM nonce). If the peer's public-key fingerprint matches the one verified at pairing time, the verification modal is not re-shown; a mismatch is treated as a possible peer-swap and forces re-verification.
 
 ## Non-Security Features
@@ -308,7 +309,9 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `OCR_LANGS` | Tesseract languages used by the receiver's OCR (comma-separated) | `eng,fra` |
 | `OCR_PSM` | Tesseract page-segmentation mode | `12` |
 | `TURN_TIMEOUT` | Seconds the client waits for TURN ICE candidates before giving up | `15` |
-| `DEV_FORCE_CONNECTION` | Force `DIRECT` or `RELAY` ICE policy for testing (otherwise `DEFAULT`) | `DEFAULT` |
+| `DEV_FORCE_CONNECTION` | Force `DIRECT`, `RELAY_HTTPS`, `RELAY_LP`, or other ICE policy for testing (otherwise `DEFAULT`) | `DEFAULT` |
+| `RELAY_ENABLE` | Expose the HTTP-relay fallback transport (WebSocket + long-poll). Set to `false` to disable | `true` |
+| `RELAY_LP_ONLY` | Force long-poll-only transport: suppresses WebRTC ICE servers and 404s the WS relay endpoint so clients only use the long-poll path. Requires `RELAY_ENABLE=true` | `false` |
 | `PORT` | HTTP port the Node server listens on inside the container | `8080` |
 | `TEST_DISABLE_RATE_LIMIT` | Disable per-IP rate limiting (test escape hatch only) | _(unset)_ |
 

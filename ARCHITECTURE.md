@@ -27,8 +27,11 @@ Other server-tunable knobs surfaced via `/api/config` and the startup env-var du
 `PORT` (HTTP listen port, default `8080`), `OCR_LANGS` (Tesseract languages, default
 `eng,fra`), `OCR_PSM` (page-segmentation mode, default `12`), `TURN_TIMEOUT` (TURN
 ICE-gather timeout, seconds, default `15`), `DEV_FORCE_CONNECTION` (force `DIRECT` /
-`RELAY` for testing, default `DEFAULT`), and `TEST_DISABLE_RATE_LIMIT` (test escape
-hatch).
+`RELAY_HTTPS` / `RELAY_LP` for testing, default `DEFAULT`), `RELAY_ENABLE` (expose the
+HTTP-relay fallback transport, default `true`), `RELAY_LP_ONLY` (long-poll-only
+transport: suppresses WebRTC ICE servers and disables the WS relay endpoint so only
+the long-poll path is exposed, default `false`), and `TEST_DISABLE_RATE_LIMIT` (test
+escape hatch).
 
 ## Directory Structure
 
@@ -401,7 +404,7 @@ the matching photo, it surfaces an error toast and gives up.
 | GET    | `/api/rooms/:id/ice/offer`   | Get receiver ICE candidates          | Room secret | None            |
 | POST   | `/api/rooms/:id/ice/answer`  | Add sender ICE candidate             | Room secret | 100/min per IP  |
 | GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | None            |
-| WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket)      | `?secret=...` query | 100/min per IP |
+| WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query | 100/min per IP |
 | POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 100/min per IP |
 | POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay  | Room secret + `X-Slot-Token` | 100/min per IP |
 | GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | 100/min per IP |
@@ -798,7 +801,12 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     HTTPS)) and a one-time toast reminds the user that the relay is
     slower than P2P. Disabled by setting `RELAY_ENABLE=false` on the
     server, in which case the WS upgrade returns 404 and the long-poll
-    endpoints return 404 too.
+    endpoints return 404 too. Set `RELAY_LP_ONLY=true` (or the debug
+    equivalent `DEV_FORCE_CONNECTION=RELAY_LP`) to disable WebRTC and
+    WebSocket entirely so only the long-poll path is exercised; useful
+    behind proxies that strip WS or for deployments standardising on a
+    single transport. `/api/config` exposes an `lpOnly` flag so the
+    client honours the same mode and skips both racers locally.
 
 ## SSO (Experimental)
 
@@ -905,6 +913,16 @@ a malicious client cannot ignore the receiver-side bounds.
 Disabled by setting `RELAY_ENABLE=false` on the server (the WS upgrade
 and all `/relay/*` endpoints return 404, and `/api/config` reports
 `relayEnabled:false` so the client never even tries).
+
+Set `RELAY_LP_ONLY=true` (or `DEV_FORCE_CONNECTION=RELAY_LP`) to keep
+the long-poll path enabled but turn off WebRTC and the WS relay. In
+this mode `/api/config` returns an empty `iceServers` list and
+`lpOnly:true`, the WS upgrade returns 404, and the client's
+`RacingTransport` skips both the WebRTC and WS racers and spawns the
+long-poll transport immediately at room setup. Useful behind proxies
+that strip WS upgrades or for deployments standardising on one
+transport. Requires `RELAY_ENABLE=true`; the server refuses to start
+otherwise.
 
 This feature was added with assistance from
 [Claude Code](https://claude.ai/claude-code).
