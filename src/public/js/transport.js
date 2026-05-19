@@ -88,6 +88,13 @@
             // instead of waiting for WS to disconnect first.
             this._lpOnly = false;
             this._raceGraceMs = RACE_GRACE_MS;
+            // Latest connection-type info reported by each inner, keyed by
+            // inner name. We cache it because the inner fires it from
+            // _markConnected immediately after onConnected, while our
+            // _lockWinner runs one event loop turn later (setTimeout 0 in
+            // the relay grace path) — without the cache the upward call is
+            // dropped because this.winner is still null when CT arrives.
+            this._pendingCT = { webrtc: null, ws: null, lp: null };
             // Cached so we can openSlotA / openSlotB on the LP inner when
             // we spawn it after WS already had its turn at room setup.
             this._roomId = null;
@@ -321,6 +328,9 @@
 
         _handleInnerCT(name, t) {
             if (this._closed) return;
+            // Always cache, so _lockWinner can replay it once the race
+            // resolves even if CT arrived before we picked a winner.
+            this._pendingCT[name] = t;
             if (this.winner === name && this.onConnectionTypeDetected) {
                 this.onConnectionTypeDetected(t);
             }
@@ -347,6 +357,13 @@
             }
             logger.success(`[Race] Winner: ${name}`);
             if (this.onConnected) this.onConnected();
+            // Replay any CT that arrived before we locked the winner (relay
+            // transports fire CT synchronously right after onConnected, but
+            // _lockWinner runs a tick later via setTimeout 0).
+            const cachedCT = this._pendingCT[name];
+            if (cachedCT && this.onConnectionTypeDetected) {
+                this.onConnectionTypeDetected(cachedCT);
+            }
         }
 
         async init() {
