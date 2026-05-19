@@ -826,9 +826,15 @@ Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend
   long-lived connections may drop when the OAuth token expires. This can be mitigated
   by increasing token lifetimes in Keycloak or by adding reconnection logic.
 - **coturn (TURN/STUN)** uses UDP/TCP protocols that oauth2-proxy cannot intercept.
-  However, TURN credentials are only issued via the HTTP signaling API, so
-  unauthenticated users cannot obtain them.
-- No user, group, or permission mapping is performed — it is a simple authentication gate.
+  However, TURN credentials are minted by the `/api/config` endpoint, which sits
+  behind oauth2-proxy, so unauthenticated clients never receive them.
+- **Trust model**. The websend rate limiter keys on `req.ip`, which Express derives
+  from `X-Forwarded-For` only when the immediate peer is in the `trust proxy` list.
+  Default is `loopback` (Caddy on the same host). With SSO enabled, oauth2-proxy
+  becomes the immediate peer at a Docker bridge IP, so `TRUST_PROXY=loopback,linklocal,uniquelocal`
+  must be set on the websend service, otherwise every request appears to come from
+  the auth proxy and the per-IP buckets degrade into one shared bucket.
+- No user, group, or permission mapping is performed; it is a simple authentication gate.
 
 This feature is experimental and was added with assistance from
 [Claude Code](https://claude.ai/claude-code).
@@ -848,7 +854,7 @@ A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and abort
 - Receiver UI logic: the perspective-crop tool and the **transform-replay protocol** (`transform-image` messages for `rotateCW` / `flipH` / `bw` / `crop`); the receiver-side replay handler lives in `js/transform-replay.js` (`window.TransformReplay`) and dispatches into `js/image-transforms.js`. The export modal (PDF / ZIP / B&W Otsu / scribe.js OCR / per-PDF actions) lives in `js/receive-export.js`; the hand-crafted minimal PDF generator lives in `js/pdf-builder.js` and has unit tests covering xref offsets, trailer size, and multi-image structure.
 - Protocol edge paths: fingerprint **mismatch / abort**, `file-ack` integrity **mismatch or timeout → retry**, room TTL expiry (10 min), SRI-mismatch failure mode. E2E only drives the happy path.
 - PWA service-worker caching + `controllerchange` auto-reload.
-- `src/healthcheck.js` and SSO / oauth2-proxy endpoints.
+- `src/healthcheck.js` and SSO / oauth2-proxy endpoints. The `TRUST_PROXY` env-var parsing in `server.js` is also uncovered (default `loopback` is exercised by the HTTP tier, but non-default values are not).
 - TURN time-based HMAC-SHA1 credential derivation (coturn itself is out of scope; `misc/check_turn.py` is the manual probe).
 
 ## Deployment

@@ -112,7 +112,7 @@ services:
   # Note on coturn: oauth2-proxy only protects HTTP/WS traffic. coturn
   # (STUN/TURN over UDP/TCP) is outside its scope, but is indirectly
   # protected because TURN credentials are minted by /api/config, which
-  # sits behind oauth2-proxy — unauthenticated clients never receive them.
+  # sits behind oauth2-proxy, so unauthenticated clients never receive them.
   # ─────────────────────────────────────────────────────────────────────
   # oauth2-proxy:
   #   # :latest keeps the gate patched against newly disclosed CVEs without

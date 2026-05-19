@@ -249,11 +249,17 @@ The protections listed in [Security Features](#security-features) below address 
 
 ## Keycloak SSO (Experimental)
 
-WebSend can be placed behind [Keycloak](https://www.keycloak.org/) authentication using [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/). This provides a simple "authenticated or not" gate — only users who log in via Keycloak can access the app. No user, group, or permission mapping is performed.
+WebSend can be placed behind [Keycloak](https://www.keycloak.org/) authentication using [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/). This provides a simple "authenticated or not" gate: only users who log in via Keycloak can access the app. No user, group, or permission mapping is performed.
 
 A commented-out oauth2-proxy service is included in `docker-compose.yml` along with corresponding environment variables in `env.example`. This feature was added with assistance from [Claude Code](https://claude.ai/claude-code).
 
-**Status**: Experimental. WebSocket signaling should work through oauth2-proxy, but long-lived connections may break when OAuth tokens expire. Token lifetime tuning in Keycloak may be required. coturn (TURN/TURNS/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because unauthenticated users cannot obtain TURN/TURNS credentials.
+**Required configuration when enabling SSO**:
+
+- Set `TRUST_PROXY=loopback,linklocal,uniquelocal` in your `.env`. Without it, the websend rate limiter treats the oauth2-proxy bridge IP as the client and collapses every caller into one shared bucket, letting a single user lock out the rest. The default `loopback` value is only correct when Caddy on the same host is the *only* proxy in front.
+- Register `https://${DOMAIN}/oauth2/callback` as a Valid Redirect URI in the Keycloak client, and `https://${DOMAIN}` as a Web Origin. The compose file already wires `OAUTH2_PROXY_REDIRECT_URL` to that exact URL.
+- Comment out the websend `ports:` block so the app is only reachable through oauth2-proxy on `127.0.0.1:4180`.
+
+**Status**: Experimental. WebSocket signaling should work through oauth2-proxy, but long-lived connections may break when OAuth tokens expire; token lifetime tuning in Keycloak may be required. coturn (TURN/TURNS/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because TURN credentials are minted by `/api/config`, which sits behind oauth2-proxy, so unauthenticated clients never receive them.
 
 ## Future Ideas
 
@@ -313,6 +319,7 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `RELAY_ENABLE` | Expose the HTTP-relay fallback transport (WebSocket + long-poll). Set to `false` to disable | `true` |
 | `RELAY_LP_ONLY` | Force long-poll-only transport: suppresses WebRTC ICE servers and 404s the WS relay endpoint so clients only use the long-poll path. Requires `RELAY_ENABLE=true` | `false` |
 | `PORT` | HTTP port the Node server listens on inside the container | `8080` |
+| `TRUST_PROXY` | Comma-separated [Express trust-proxy](https://expressjs.com/en/guide/behind-proxies.html) specifiers. Set to `loopback,linklocal,uniquelocal` when oauth2-proxy fronts websend, otherwise the per-IP rate limiter degrades into one shared bucket | `loopback` |
 | `TEST_DISABLE_RATE_LIMIT` | Disable per-IP rate limiting (test escape hatch only) | _(unset)_ |
 
 ## Firewall (UFW)
