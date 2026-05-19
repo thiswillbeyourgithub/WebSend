@@ -648,7 +648,13 @@ app.get('/api/config', (req, res) => {
     let filteredServers = iceServers;
     let forceRelay = false;
 
-    if (DEV_FORCE_CONNECTION !== 'DEFAULT') {
+    // LP-only mode suppresses every ICE server regardless of DEV_FORCE_CONNECTION,
+    // so the client cannot even attempt WebRTC. This is the prod-grade flag;
+    // the DEV_FORCE_CONNECTION=RELAY_LP branch below collapses to the same
+    // effect via the RELAY_LP filter entry.
+    if (LP_ONLY) {
+        filteredServers = [];
+    } else if (DEV_FORCE_CONNECTION !== 'DEFAULT') {
         debugLog('CONFIG', `DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION}: filtering ICE servers`);
 
         const entry = FORCE_FILTERS[DEV_FORCE_CONNECTION];
@@ -679,8 +685,12 @@ app.get('/api/config', (req, res) => {
         }
     }
 
-    // Warn if no ICE servers at all and we're not intentionally in DIRECT mode
-    if (filteredServers.length === 0 && DEV_FORCE_CONNECTION !== 'DIRECT') {
+    // Warn if no ICE servers at all and we're not intentionally in a
+    // WebRTC-disabling mode (DIRECT, RELAY_HTTPS, or LP-only).
+    if (filteredServers.length === 0
+        && DEV_FORCE_CONNECTION !== 'DIRECT'
+        && DEV_FORCE_CONNECTION !== 'RELAY_HTTPS'
+        && !LP_ONLY) {
         console.warn('No ICE servers configured! WebRTC connections will likely fail.');
     }
 
