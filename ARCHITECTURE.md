@@ -822,9 +822,14 @@ Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend
 
 - oauth2-proxy intercepts all HTTP/WS requests and redirects unauthenticated users
   to Keycloak's login page. After login, requests are proxied to the websend container.
-- **WebSocket signaling** passes through oauth2-proxy (it supports WS upgrade), but
-  long-lived connections may drop when the OAuth token expires. This can be mitigated
-  by increasing token lifetimes in Keycloak or by adding reconnection logic.
+- **WebSocket signaling** passes through oauth2-proxy (it supports WS upgrade).
+  Once the WS tunnel is established it survives cookie expiry, because oauth2-proxy
+  blindly forwards frames without re-checking the session. What does fail is the
+  *next* upgrade attempt after a transient network blip: the new HTTP upgrade
+  request needs a valid session cookie and will be redirected to Keycloak instead.
+  The compose recipe sets `OAUTH2_PROXY_COOKIE_REFRESH=4m` to keep the cookie
+  fresh below Keycloak's default 5-minute access-token lifetime so reconnects
+  succeed silently.
 - **coturn (TURN/STUN)** uses UDP/TCP protocols that oauth2-proxy cannot intercept.
   However, TURN credentials are minted by the `/api/config` endpoint, which sits
   behind oauth2-proxy, so unauthenticated clients never receive them.
