@@ -263,8 +263,10 @@
                 const isSecure = location.protocol === 'https:';
                 const type = isSecure ? 'relay-https' : 'relay-http';
                 const detailsKey = isSecure ? 'connection.relayHttpSecureDetails' : 'connection.relayHttpDetails';
-                const details = (window.i18n && typeof window.i18n.t === 'function')
-                    ? window.i18n.t(detailsKey) : detailsKey;
+                // i18n is a script-scope global (not a window property), so we
+                // reference it by name. typeof guards against load-order quirks.
+                const details = (typeof i18n !== 'undefined' && typeof i18n.t === 'function')
+                    ? i18n.t(detailsKey) : detailsKey;
                 this.onConnectionTypeDetected({
                     type,
                     details,

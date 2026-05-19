@@ -50,7 +50,7 @@
             const key = info.type === 'relay-https'
                 ? 'connection.relayHttpSecureHint'
                 : 'connection.relayHttpHint';
-            const text = (window.i18n && typeof window.i18n.t === 'function') ? window.i18n.t(key) : null;
+            const text = (typeof i18n !== 'undefined' && typeof i18n.t === 'function') ? i18n.t(key) : null;
             if (text && typeof window.showToast === 'function') {
                 window.showToast(text, { type: 'warn', duration: 8000 });
             }
