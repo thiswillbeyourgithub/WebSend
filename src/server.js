@@ -148,9 +148,20 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
     : [`https://${DOMAIN}`, `http://${DOMAIN}`];
 
-// Trust proxy headers only from loopback (Caddy runs on same host).
+// Trust proxy headers only from loopback by default (Caddy runs on same host).
 // This ensures X-Forwarded-For cannot be spoofed by external clients.
-app.set('trust proxy', 'loopback');
+//
+// TRUST_PROXY: comma-separated list of Express trust-proxy specifiers
+// (https://expressjs.com/en/guide/behind-proxies.html). Defaults to 'loopback'.
+// When oauth2-proxy runs as a sibling Docker container, websend's peer is the
+// Docker bridge IP (RFC1918), not loopback. In that case set
+// TRUST_PROXY=loopback,linklocal,uniquelocal so X-Forwarded-For from the auth
+// proxy is honoured; otherwise the per-IP rate limiter collapses every caller
+// into one shared bucket. See docker/env.example for the SSO recipe.
+const TRUST_PROXY = process.env.TRUST_PROXY
+    ? process.env.TRUST_PROXY.split(',').map(s => s.trim()).filter(Boolean)
+    : 'loopback';
+app.set('trust proxy', TRUST_PROXY);
 
 // ============ Defensive HTTP Headers ============
 // Defense-in-depth headers applied to every response. These do not replace
