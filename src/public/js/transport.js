@@ -81,6 +81,12 @@
             // the WebRTC racer's onConnected so the relay wins immediately
             // even if WebRTC briefly connects over loopback.
             this._relayForced = false;
+            // True when the server is in LP-only mode (RELAY_LP_ONLY=true
+            // or DEV_FORCE_CONNECTION=RELAY_LP). The WS racer is skipped
+            // entirely (server returns 404 on the upgrade) and the LP
+            // racer is spawned the moment we have a room id + secret
+            // instead of waiting for WS to disconnect first.
+            this._lpOnly = false;
             this._raceGraceMs = RACE_GRACE_MS;
             // Cached so we can openSlotA / openSlotB on the LP inner when
             // we spawn it after WS already had its turn at room setup.
@@ -142,15 +148,17 @@
             this.lp.onConnectionTypeDetected = (t) => this._handleInnerCT('lp', t);
         }
 
-        // Spawn the LP fallback transport. Called when WS disconnects
-        // before either side wins (proxies stripping the upgrade, etc).
-        _spawnLp() {
+        // Spawn the LP fallback transport. Called either when WS
+        // disconnects before either side wins (proxies stripping the
+        // upgrade, etc), or immediately from createRoom/joinRoom when
+        // LP-only mode is active and there is no WS to wait on.
+        _spawnLp(reason = 'WS disconnected pre-winner') {
             if (this._lpSpawned || this._closed || this.winner) return;
             if (!this._lpEnabled) return;
             if (typeof window.LPTransport !== 'function') return;
             if (!this._roomId || !this._roomSecret) return;
             this._lpSpawned = true;
-            logger.info('[Race] WS disconnected pre-winner; spawning LP fallback');
+            logger.info(`[Race] ${reason}; spawning LP transport`);
             this.lp = new window.LPTransport();
             this._wireLp();
             this.lp.init().then(() => {
@@ -352,15 +360,28 @@
                 if (res.ok) {
                     const cfg = await res.json();
                     this._relayEnabled = !!cfg.relayEnabled;
-                    if (cfg.forceConnection === 'RELAY_HTTPS') {
+                    this._lpOnly = !!cfg.lpOnly;
+                    if (cfg.forceConnection === 'RELAY_HTTPS' || this._lpOnly) {
                         this._relayForced = true;
                         this._raceGraceMs = RACE_GRACE_FORCED_RELAY_MS;
-                        logger.warn('[Race] DEV_FORCE_CONNECTION=RELAY_HTTPS, WebRTC suppressed, relay wins on hello');
+                        if (this._lpOnly) {
+                            logger.warn('[Race] LP-only mode active: WebRTC + WS suppressed, only long-poll relay will run');
+                        } else {
+                            logger.warn('[Race] DEV_FORCE_CONNECTION=RELAY_HTTPS, WebRTC suppressed, relay wins on hello');
+                        }
                     }
                 }
             } catch (_) { this._relayEnabled = false; }
             this._lpEnabled = this._relayEnabled && (typeof window.LPTransport === 'function');
-            if (this._relayEnabled && this.ws) {
+            if (this._lpOnly) {
+                // Skip WS entirely: the server returns 404 on the upgrade
+                // in LP-only mode so any attempt would just waste a
+                // roundtrip and emit a misleading "connection closed"
+                // disconnect signal into the racer state machine.
+                if (this.ws) { try { this.ws.close(); } catch (_) {} }
+                this.ws = null;
+                logger.info('[Race] LP-only: WS racer skipped, LP will be spawned at room setup');
+            } else if (this._relayEnabled && this.ws) {
                 await this.ws.init();
                 logger.info('[Race] HTTP-relay fallback transport enabled (WS primary, LP on-demand)');
             } else {
@@ -373,6 +394,10 @@
             this._roomId = r.roomId;
             this._roomSecret = r.secret;
             if (this._relayEnabled && this.ws) this.ws.setRoom(r.roomId, r.secret);
+            // LP-only: spawn the long-poll racer right away. The normal
+            // flow waits for WS to disconnect first; here there is no WS,
+            // so LP must start itself to ever reach the relay-hello state.
+            if (this._lpOnly) this._spawnLp('LP-only mode');
             return r;
         }
 
@@ -395,6 +420,9 @@
             if (this._relayEnabled && this.ws) {
                 try { this.ws.openSlotB(roomId, secret); } catch (e) { logger.warn('[Race] openSlotB failed: ' + e.message); }
             }
+            // LP-only: spawn the long-poll racer right away (mirror of
+            // the createRoom path on the receiver side).
+            if (this._lpOnly) this._spawnLp('LP-only mode');
             return this.webrtc.joinRoom(roomId, secret);
         }
 
