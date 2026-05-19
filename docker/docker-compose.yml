@@ -145,6 +145,13 @@ services:
   #     # realm membership, not from this var.
   #     - OAUTH2_PROXY_EMAIL_DOMAINS=*
   #     - OAUTH2_PROXY_COOKIE_SECURE=true
+  #     # Upstream timeout default is 30s, which is exactly the answer
+  #     # long-poll ceiling in server.js (TIMEOUT_MS in /api/rooms/:id/answer)
+  #     # and only 5s of headroom over LP_DOWN_TIMEOUT_MS (25s) for the
+  #     # /relay/down long-poll. On the edge, oauth2-proxy cancels the
+  #     # upstream a few ms before websend would have replied with a clean
+  #     # 204, so the client sees a 504. 60s leaves comfortable headroom.
+  #     - OAUTH2_PROXY_UPSTREAM_TIMEOUT=60s
   #   security_opt:
   #     - no-new-privileges:true
   #   read_only: true
