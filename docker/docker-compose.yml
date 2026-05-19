@@ -7,8 +7,12 @@ services:
       args:
         - RUN_NPM_AUDIT=${RUN_NPM_AUDIT:-false}
     ports:
-      # If using oauth2-proxy, do NOT expose this port directly.
-      # Instead, access the app through oauth2-proxy's port (4180).
+      # ⚠ WARNING: when the oauth2-proxy block below is enabled, COMMENT OUT
+      # this entire "ports:" section. Otherwise the websend container stays
+      # reachable on 127.0.0.1:7395 and any process on the host (or anything
+      # bridged onto the host via VPN / SSH tunnel / a sibling container with
+      # host networking) bypasses Keycloak authentication entirely. The
+      # reverse proxy should target oauth2-proxy on 127.0.0.1:4180 instead.
       - "127.0.0.1:7395:8080"
     restart: unless-stopped
     environment:
@@ -30,6 +34,14 @@ services:
       - OCR_LANGS=${OCR_LANGS:-eng,fra}
       - OCR_PSM=${OCR_PSM:-12}
       - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES:-ANY}
+      # TRUST_PROXY: which proxy IPs Express should trust for X-Forwarded-For.
+      # Default 'loopback' is correct when only Caddy on the host fronts websend.
+      # If you enable the oauth2-proxy block below, set
+      #   TRUST_PROXY=loopback,linklocal,uniquelocal
+      # in your .env, otherwise the bridge IP of oauth2-proxy is treated as
+      # untrusted and the per-IP rate limiter collapses every caller into a
+      # single shared bucket (one user can lock out the rest).
+      - TRUST_PROXY=${TRUST_PROXY:-loopback}
     # Uncomment the relevant lines below to gate websend startup on optional services.
     #   - coturn: only if you use the bundled coturn (not an external TURN server).
     #   - oauth2-proxy: STRONGLY RECOMMENDED if you uncomment the oauth2-proxy
@@ -75,10 +87,17 @@ services:
   # "authenticated or not" gate.
   #
   # Prerequisites:
-  #   1. A running Keycloak instance with a client configured for WebSend
-  #   2. Set OAUTH2_* variables in your .env file (see env.example)
-  #   3. Point your reverse proxy (Caddy) at 127.0.0.1:4180 instead of 7395
-  #   4. Remove or comment out the websend "ports" section above
+  #   1. A running Keycloak instance with a client configured for WebSend:
+  #        - Access Type: confidential
+  #        - Valid Redirect URIs: https://${DOMAIN}/oauth2/callback
+  #        - Web Origins: https://${DOMAIN}
+  #   2. Set OAUTH2_* variables in your .env file (see env.example).
+  #   3. Set TRUST_PROXY=loopback,linklocal,uniquelocal in your .env so
+  #      websend trusts the X-Forwarded-For header set by oauth2-proxy.
+  #      Without this the per-IP rate limiter is effectively disabled
+  #      (every request appears to come from the auth proxy's bridge IP).
+  #   4. Point your reverse proxy (Caddy) at 127.0.0.1:4180 instead of 7395.
+  #   5. Remove or comment out the websend "ports" section above.
   #
   # Note on WebSocket: oauth2-proxy supports WebSocket proxying, but
   # long-lived WS connections (used for signaling) may break when the
@@ -87,10 +106,14 @@ services:
   #
   # Note on coturn: oauth2-proxy only protects HTTP/WS traffic. coturn
   # (STUN/TURN over UDP/TCP) is outside its scope, but is indirectly
-  # protected because unauthenticated users cannot reach the signaling
-  # server to obtain TURN credentials.
+  # protected because TURN credentials are minted by /api/config, which
+  # sits behind oauth2-proxy — unauthenticated clients never receive them.
   # ─────────────────────────────────────────────────────────────────────
   # oauth2-proxy:
+  #   # :latest keeps the gate patched against newly disclosed CVEs without
+  #   # manual intervention, but auth behaviour can change on rebuild. Pin a
+  #   # tag (e.g. v7.6.0) if you need reproducibility, at the cost of having
+  #   # to bump it yourself when security fixes land upstream.
   #   image: quay.io/oauth2-proxy/oauth2-proxy:latest
   #   container_name: oauth2-proxy
   #   ports:
@@ -103,9 +126,20 @@ services:
   #     - OAUTH2_PROXY_COOKIE_SECRET=${OAUTH2_COOKIE_SECRET}
   #     - OAUTH2_PROXY_UPSTREAM=http://websend:8080
   #     - OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:4180
+  #     # Required when Caddy terminates TLS upstream: tells oauth2-proxy to
+  #     # honour X-Forwarded-Proto / X-Forwarded-Host so it builds an https://
+  #     # redirect_uri and sets Secure cookies correctly.
+  #     - OAUTH2_PROXY_REVERSE_PROXY=true
+  #     # Exact-match redirect URI; must also be registered in the Keycloak
+  #     # client's "Valid redirect URIs" list, or login will fail.
+  #     - OAUTH2_PROXY_REDIRECT_URL=https://${DOMAIN}/oauth2/callback
+  #     # Skip the oauth2-proxy interstitial "Sign in with Keycloak" button
+  #     # and go straight to the IdP (only one provider is configured here).
+  #     - OAUTH2_PROXY_SKIP_PROVIDER_BUTTON=true
+  #     # '*' = any email domain. Real access control comes from Keycloak
+  #     # realm membership, not from this var.
   #     - OAUTH2_PROXY_EMAIL_DOMAINS=*
   #     - OAUTH2_PROXY_COOKIE_SECURE=true
-  #     - OAUTH2_PROXY_PASS_ACCESS_TOKEN=true
   #   security_opt:
   #     - no-new-privileges:true
   #   read_only: true
