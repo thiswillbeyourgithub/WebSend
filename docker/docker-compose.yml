@@ -160,6 +160,11 @@ services:
   #     # would otherwise abort mid-flight. Pick a value slightly LOWER
   #     # than the realm's access-token lifetime in Keycloak.
   #     - OAUTH2_PROXY_COOKIE_REFRESH=4m
+  #     # PKCE for the auth-code flow. The confidential client does not
+  #     # strictly require it, but enabling S256 is cheap defence in
+  #     # depth against authorisation-code interception and is the
+  #     # default recommendation in current OAuth 2.1 guidance.
+  #     - OAUTH2_PROXY_CODE_CHALLENGE_METHOD=S256
   #   security_opt:
   #     - no-new-privileges:true
   #   read_only: true
