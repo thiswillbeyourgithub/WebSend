@@ -325,10 +325,55 @@ const WebSendCrypto = {
      * @param {CryptoKey} sharedKey - AES key derived from ECDH
      * @returns {Promise<ArrayBuffer>} Encrypted padded payload
      */
+    /**
+     * Compress an ArrayBuffer with gzip via CompressionStream. Returns null
+     * if the runtime does not provide CompressionStream (very old browsers)
+     * or if compression did not shrink the input. Compression happens
+     * before encryption because ciphertext is incompressible; the
+     * encoding flag travels inside the encrypted metadata block so it
+     * remains end-to-end confidential.
+     */
+    async _maybeGzip(data) {
+        if (typeof CompressionStream !== 'function') return null;
+        try {
+            const cs = new CompressionStream('gzip');
+            const stream = new Blob([data]).stream().pipeThrough(cs);
+            const buf = await new Response(stream).arrayBuffer();
+            if (buf.byteLength < data.byteLength) {
+                logger.info(`gzip: ${data.byteLength}B -> ${buf.byteLength}B (${Math.round(100 * buf.byteLength / data.byteLength)}%)`);
+                return buf;
+            }
+            logger.info(`gzip: ${data.byteLength}B -> ${buf.byteLength}B (no win, sending raw)`);
+            return null;
+        } catch (e) {
+            logger.warn('gzip failed, sending raw: ' + e.message);
+            return null;
+        }
+    },
+
+    async _gunzip(data) {
+        const ds = new DecompressionStream('gzip');
+        const stream = new Blob([data]).stream().pipeThrough(ds);
+        return await new Response(stream).arrayBuffer();
+    },
+
     async encryptWithMetadata(data, metadata, sharedKey) {
-        const metadataJson = JSON.stringify(metadata);
+        // Try gzip before encryption. Encrypted bytes are random-looking
+        // and thus incompressible, so compressing on the wire after
+        // encryption would be wasted work; doing it here also keeps the
+        // size-hiding padding pass downstream and the encoding flag
+        // inside the encrypted metadata.
+        const compressed = await this._maybeGzip(data);
+        let dataArray;
+        let metaForJson = metadata;
+        if (compressed) {
+            dataArray = new Uint8Array(compressed);
+            metaForJson = Object.assign({}, metadata, { encoding: 'gzip' });
+        } else {
+            dataArray = new Uint8Array(data);
+        }
+        const metadataJson = JSON.stringify(metaForJson);
         const metadataBytes = new TextEncoder().encode(metadataJson);
-        const dataArray = new Uint8Array(data);
 
         // Calculate sizes:
         // content = [4B metadata_len] + [metadata] + [data]
@@ -416,9 +461,20 @@ const WebSendCrypto = {
 
         logger.success(`Decrypted with metadata: ${data.length}B data, metadata: ${metadataJson.substring(0, 50)}...`);
 
+        // If the sender gzip'd before encryption, undo it now. The flag
+        // lives inside the encrypted metadata so an on-path observer
+        // cannot tell whether a given payload was compressed. data is a
+        // freshly-allocated slice (Uint8Array.prototype.slice copies)
+        // so data.buffer is the exact dataLength bytes already.
+        let outBuffer = data.buffer;
+        if (metadata && metadata.encoding === 'gzip') {
+            outBuffer = await this._gunzip(outBuffer);
+            logger.success(`Decompressed gzip: ${data.length}B -> ${outBuffer.byteLength}B`);
+        }
+
         return {
             metadata: metadata,
-            data: data.buffer
+            data: outBuffer
         };
     }
 };
