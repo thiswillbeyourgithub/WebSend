@@ -243,11 +243,13 @@ const MAX_CONTROL_MSG_BYTES = 16 * 1024; // 16 KiB
 const LP_DOWN_TIMEOUT_MS = 25_000;          // long-poll hold time
 const LP_QUEUE_MAX_FRAMES = 32;             // bounded per-slot incoming queue
 const LP_SLOT_TOKEN_BYTES = 16;             // 128-bit slot token
-// Per-frame body cap on /relay/up. 256 KiB gives ~16x headroom over
-// CHUNK_SIZE (16 KiB) for future protocol additions while keeping a
-// hostile peer's max-body footprint bounded. MAX_TOTAL_SESSION_BYTES
-// (4 GiB) is the session-level ceiling on top of this.
-const LP_FRAME_BODY_LIMIT = '256kb';
+// Per-frame body cap on /relay/up. 320 KiB sits just above the LP
+// CHUNK_SIZE (256 KiB, see lp-transport.js) with framing headroom. The
+// WS/WebRTC paths still use 16 KiB chunks; the LP path is larger so a
+// big file does not need thousands of round-trips on the long-poll
+// transport. MAX_TOTAL_SESSION_BYTES (4 GiB) is the session-level
+// ceiling on top of this.
+const LP_FRAME_BODY_LIMIT = '320kb';
 const LP_SLOT_IDLE_TIMEOUT_MS = 60_000;     // close LP slot after this idle
 
 // ============ Rate Limiting ============
@@ -1112,9 +1114,15 @@ app.post('/api/rooms/:id/relay/handshake', rateLimitMiddleware('general'), valid
  *   anything else            -> text/control frame
  * Body: the frame bytes (raw). Capped at LP_FRAME_BODY_LIMIT by express.raw.
  */
+// No rateLimitMiddleware on /relay/up: the data path is already bounded by
+// the per-frame body cap (LP_FRAME_BODY_LIMIT), the per-pairing byte cap
+// (MAX_TOTAL_SESSION_BYTES = 4 GiB), the bounded peer queue (LP_QUEUE_MAX_FRAMES),
+// and the slot idle timeout (LP_SLOT_IDLE_TIMEOUT_MS). The slot token is
+// constant-time-compared so an attacker without the token cannot drive
+// this endpoint at all. The per-IP general bucket made multi-MB transfers
+// impossible on corp networks where many users share one egress IP.
 app.post(
     '/api/rooms/:id/relay/up',
-    rateLimitMiddleware('general'),
     validateRoomSecret,
     express.raw({ type: '*/*', limit: LP_FRAME_BODY_LIMIT }),
     (req, res) => {
@@ -1165,7 +1173,11 @@ app.post(
  *   204                           -> no frame within LP_DOWN_TIMEOUT_MS
  *   410                           -> slot closed by server (peer gone, etc)
  */
-app.get('/api/rooms/:id/relay/down', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+// No rateLimitMiddleware on /relay/down: same reasoning as /relay/up.
+// The per-room MAX_WAITERS_PER_ROOM cap and the global MAX_TOTAL_WAITERS
+// ceiling already bound concurrent long-pollers; without them the
+// per-IP bucket would also kill multi-corp-user transfers.
+app.get('/api/rooms/:id/relay/down', validateRoomSecret, (req, res) => {
     if (!RELAY_ENABLE) return res.status(404).json({ error: 'Relay disabled' });
     const room = req.room;
     const r = room.relay;
