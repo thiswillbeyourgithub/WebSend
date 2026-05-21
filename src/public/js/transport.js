@@ -294,6 +294,18 @@
             if (!this.winner && name === 'ws' && !this._lpSpawned) {
                 this._spawnLp();
             }
+            // LP failed before winning: LP is the last-resort transport
+            // (no further fallback exists), so propagate upward so the
+            // UI can surface a real error instead of spinning. If WebRTC
+            // is still in flight we let it finish; only when both relays
+            // are out do we give up here.
+            if (!this.winner && name === 'lp') {
+                const wsDead = !this.ws || !(this.ws.isConnected && this.ws.isConnected());
+                if (wsDead) {
+                    logger.warn('[Race] LP failed pre-winner with no other relay live; giving up');
+                    if (this.onDisconnected) this.onDisconnected();
+                }
+            }
             // If WebRTC fails before connecting and a relay is already
             // hello-ready, lock that relay in now instead of waiting out
             // the grace window: the race is already decided.

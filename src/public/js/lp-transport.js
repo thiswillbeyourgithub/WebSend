@@ -187,18 +187,18 @@
                     // The server told us the slot is closed. Most often
                     // this means the peer dropped (proxy hiccup, etc) and
                     // the relay-side grace window expired before they
-                    // re-handshook. From our POV that's still a transient
-                    // condition: the higher layer (RacingTransport) will
-                    // call reopen() to re-claim a slot, and the peer is
-                    // expected to do the same. The receive state in
-                    // PayloadAssembler is preserved across this so byte-
-                    // level resume is possible.
+                    // re-handshook. Post-connect this is transient and
+                    // the racer reconnects via reopen(); pre-connect (no
+                    // relay-hello yet) it has to surface as a hard
+                    // disconnect so the racer can stop spinning, since
+                    // LP is already the last-resort transport.
                     logger.warn('[LP] slot closed by server; will reconnect');
+                    const hadConnected = this._connected;
                     this._slotToken = null;
                     this._slot = null;
                     this._helloSent = false;
                     this._connected = false;
-                    if (this.onTransientDisconnect) this.onTransientDisconnect();
+                    if (hadConnected && this.onTransientDisconnect) this.onTransientDisconnect();
                     else this._handleDisconnect('slot-closed');
                     return;
                 }

@@ -170,18 +170,22 @@
                 if (this._closed) return; // close() initiated by us
                 if (this._abusiveTeardown) return;
                 this._logRelayFailure(event.code, event.reason);
+                const hadConnected = this._connected;
                 this._connected = false;
                 this.ws = null;
                 if (this.onStateChange) this.onStateChange('failed');
-                // Prefer the transient-disconnect callback when present so
-                // the RacingTransport can reconnect without tearing down
-                // pairing state. Fall back to onDisconnected for callers
-                // that haven't opted into reconnect (test code, older
-                // wiring). The race transport sets both: one fires.
-                if (this.onTransientDisconnect) {
+                // Only treat the close as transient if we had actually
+                // reached _markConnected. A close before relay-hello (the
+                // common corp-proxy "accept the upgrade then drop it"
+                // pattern) must surface as onDisconnected so the
+                // RacingTransport falls back to the LP transport instead
+                // of silently dropping the signal in _handleInnerTransient.
+                if (hadConnected && this.onTransientDisconnect) {
                     this.onTransientDisconnect();
                 } else if (this.onDisconnected) {
                     this.onDisconnected();
+                } else if (this.onTransientDisconnect) {
+                    this.onTransientDisconnect();
                 }
             };
 
