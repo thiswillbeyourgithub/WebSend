@@ -166,7 +166,12 @@ WebSend/
         │   │               #   Wire format identical to ws-transport.js. The
         │   │               #   per-slot token returned by /handshake authenticates
         │   │               #   subsequent up/down calls in addition to the room
-        │   │               #   secret. Same DoS bounds and PayloadAssembler reuse
+        │   │               #   secret. 256 KiB CHUNK_SIZE (vs. 16 KiB on WS/WebRTC)
+        │   │               #   because every chunk is a full HTTPS round-trip, plus
+        │   │               #   self-throttling at ~10 req/sec so a corp proxy in
+        │   │               #   front of us cannot trip us with its own bucket;
+        │   │               #   honours Retry-After on 429. Same DoS bounds and
+        │   │               #   PayloadAssembler reuse as ws-transport.js
         │   ├── logger.js   # In-memory log buffer with UI panel (slide-up overlay).
         │   │               #   Supports info/success/warn/error/debug levels.
         │   │               #   DEV mode (toggled via server config) enables verbose output
@@ -406,8 +411,8 @@ the matching photo, it surfaces an error toast and gives up.
 | GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | None            |
 | WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query | 100/min per IP |
 | POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 100/min per IP |
-| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay  | Room secret + `X-Slot-Token` | 100/min per IP |
-| GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | 100/min per IP |
+| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay  | Room secret + `X-Slot-Token` | None (byte caps only) |
+| GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | None (waiter caps only) |
 | POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Room secret + `X-Slot-Token` | 100/min per IP |
 
 All `/api/*` endpoints validate the `Origin` header against `ALLOWED_ORIGINS`.
@@ -490,34 +495,46 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 5. **Size obfuscation**: Photos are padded to power-of-2 bucket sizes before encryption,
    hiding exact file sizes from network observers. Padding uses random bytes to prevent
    compression-based attacks.
-6. **Metadata encryption**: Filename, MIME type, and original size are encrypted inside the
+6. **Pre-encryption compression**: `encryptWithMetadata` attempts `gzip` via
+   `CompressionStream` before encrypting and uses the compressed bytes only if they
+   shrink the payload (so JPEG/PNG/MP4 fall through unchanged). The `encoding=gzip`
+   flag travels inside the encrypted metadata block so an on-path observer cannot
+   tell whether a given payload was compressed. Compression happens before padding
+   so the bucket boundary still hides the underlying size.
+7. **Metadata encryption**: Filename, MIME type, and original size are encrypted inside the
    payload, not sent in plaintext over the data channel.
-7. **Transfer integrity verification**: After decryption, the receiver computes SHA-256 of the
+8. **Transfer integrity verification**: After decryption, the receiver computes SHA-256 of the
    plaintext data and sends it back via `file-ack`. The sender compares it against its own
    pre-encryption hash to confirm end-to-end integrity. On mismatch or timeout, the sender
    can retry without losing the photo.
-8. **No phone storage**: Photos are captured directly in the browser and stay in memory only —
+9. **No phone storage**: Photos are captured directly in the browser and stay in memory only —
    never written to the phone's gallery, filesystem, or local storage. Photos are kept in
    memory until the receiver confirms successful receipt.
-9. **Supply chain attack resistance**: No frameworks, bundlers, or build tools — the frontend
+10. **Supply chain attack resistance**: No frameworks, bundlers, or build tools — the frontend
    is vanilla HTML/CSS/JS with zero `node_modules` in the browser. All third-party
    client-side libraries (jsQR, qrcode.js, client-zip, scribe.js-ocr, Tesseract WASM +
    language models, eruda) are vendored directly in the repository — no CDN fetches at runtime.
    The server-side dependency footprint is minimal (Express.js plus `ws`
    for the HTTP-relay fallback transport added in v3.7.0; `ws` is the
    canonical Node WebSocket library, zero transitive deps, ~200 KB).
-10. **SRI**: All `<script>` and `<link>` tags use `integrity` attributes (Subresource
+11. **SRI**: All `<script>` and `<link>` tags use `integrity` attributes (Subresource
    Integrity), ensuring even a compromised server cannot silently swap in tampered files.
-11. **Rate limiting**: Per-IP sliding window limits on room creation (5/min), room lookup
-    (30/min), and general API (100/min).
-12. **Origin validation**: API rejects requests from unauthorized origins (CSRF protection).
-13. **Proxy trust**: Express trusts `X-Forwarded-For` only from loopback (Caddy).
-14. **Docker hardening**: Read-only filesystem, no-new-privileges, all capabilities dropped,
+12. **Rate limiting**: Per-IP sliding window limits on room creation (5/min), room lookup
+    (30/min), and general API (100/min). The HTTP-relay data path (`/relay/up`,
+    `/relay/down`) is intentionally exempt: a single LP transfer is many POSTs,
+    and corp NATs share one egress IP across many users, so a per-IP cap on the
+    data path made multi-MB transfers impossible. The relay endpoints are still
+    bounded by the per-frame body cap, the per-pairing 4 GiB session cap, the
+    bounded peer queue, the slot idle timeout, and the constant-time slot-token
+    check that gates every up/down call.
+13. **Origin validation**: API rejects requests from unauthorized origins (CSRF protection).
+14. **Proxy trust**: Express trusts `X-Forwarded-For` only from loopback (Caddy).
+15. **Docker hardening**: Read-only filesystem, no-new-privileges, all capabilities dropped,
     non-root user, memory/CPU limits.
-15. **TURN relay security**: Time-based HMAC-SHA1 credentials with configurable TTL. Even
+16. **TURN relay security**: Time-based HMAC-SHA1 credentials with configurable TTL. Even
     when relayed through TURN, photos remain end-to-end encrypted — the TURN server only
     sees encrypted blobs.
-16. **Receiver-side payload bounding (anti-DoS)**: The data-channel binary branch refuses
+17. **Receiver-side payload bounding (anti-DoS)**: The data-channel binary branch refuses
     chunks that arrive before a valid `file-start`, refuses any chunk that would push the
     in-flight file past its declared `expectedSize`, and refuses any chunk that would
     push the cumulative session bytes past `Protocol.MAX_TOTAL_SESSION_BYTES` (4 GiB).
@@ -530,7 +547,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     The CLI shim (`src/cli/shim.js`) mirrors the same three bound checks plus a
     verified-fingerprint gate on `file-start`/`file-end`/`batch-end` and binary chunks,
     so the optional Node CLI receiver path enjoys the same protection as the browser path.
-17. **Transform-replay hardening (anti-DoS)**: `Protocol.isTransformArray` caps
+18. **Transform-replay hardening (anti-DoS)**: `Protocol.isTransformArray` caps
     `transforms[]` length at `MAX_TRANSFORMS_PER_MSG` (32) and, for `op:'crop'`,
     requires `corners` to be `{tl,tr,br,bl}` with each `{x,y}` being a finite number
     in `[0, 1]`. `cropPerspective` defensively clamps its output dimensions to
@@ -540,7 +557,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind
     `weConfirmed && theyConfirmed` so an unverified peer cannot push files, replay
     transforms, or rearrange the gallery while the verification modal is still up.
-18. **Long-poll waiter caps (anti-DoS)**: `GET /api/rooms/:id/answer?wait=true`
+19. **Long-poll waiter caps (anti-DoS)**: `GET /api/rooms/:id/answer?wait=true`
     is layered behind three independent caps so a peer holding a valid room
     secret cannot exhaust server memory or file descriptors by pipelining
     `?wait=true` requests over HTTP/2: (a) `rateLimitMiddleware('general')`
@@ -551,7 +568,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     counter caps total in-flight waiters across all rooms with 503. Each
     settle path (timeout, send, roomGone, client-abort) decrements the
     counter so it stays consistent across normal and TTL-expiry paths.
-19. **Receiver UI DoS hardening (anti-DoS)**: Two independent caps prevent a
+20. **Receiver UI DoS hardening (anti-DoS)**: Two independent caps prevent a
     verified-but-hostile peer (or any pre-verification flooder) from growing
     receiver-side DOM/state without bound. (a) `Collections.createNew()`
     refuses past `MAX_COLLECTIONS_PER_SESSION = 64`, so flooding `batch-start`
@@ -562,7 +579,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     `renderLogs()` rebuilds from the bounded in-memory buffer. This blocks
     the pre-verification log-flood OOM where each invalid wire message
     triggered `logger.warn`/`error` and grew the panel forever.
-20. **Octet-stream blob URLs (anti-XSS)**: Every `blob:` URL the receiver
+21. **Octet-stream blob URLs (anti-XSS)**: Every `blob:` URL the receiver
     hands to an `<img>`, the download `<a>`, the lightbox, or the crop
     modal is allocated with `application/octet-stream`, regardless of the
     peer-supplied `metadata.mimeType`. Without this, a verified peer could
@@ -577,7 +594,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     truth is `ReceiveCard.makeSafeBlobUrl()` (`js/receive-card.js`); all
     receiver paths (decrypted files, transform replay, in-place rotate /
     B&W / crop) flow through it.
-21. **Defensive HTTP headers**: Every response carries a baseline header
+22. **Defensive HTTP headers**: Every response carries a baseline header
     set so a future code mistake (or compromised third-party asset) is
     constrained by the browser even if it slips past application-level
     checks: a Content-Security-Policy with `default-src 'self'`,
