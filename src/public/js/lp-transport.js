@@ -24,12 +24,33 @@
     'use strict';
 
     const FILE_ACK_TIMEOUT_MS = 30_000;
-    const CHUNK_SIZE = 16_384; // 16 KiB, matches webrtc.js and ws-transport.js
+    // LP uses larger chunks than WS/WebRTC because every chunk is a full
+    // HTTP round-trip; 256 KiB keeps a 10 MB transfer at ~40 POSTs instead
+    // of 640. Must stay under the server's LP_FRAME_BODY_LIMIT (320 KiB)
+    // with headroom for framing.
+    const CHUNK_SIZE = 262_144; // 256 KiB
     // The /relay/down endpoint blocks up to LP_SERVER_HOLD_MS server-side;
     // the client immediately re-polls on timeout. POLL_BACKOFF_MS is the
     // minimum gap between failed polls so a server-side error storm does
     // not turn into a fetch tight loop.
     const POLL_BACKOFF_MS = 1_000;
+    // Voluntary client-side pacing on /relay/up. The server no longer
+    // rate-limits the data path (see server.js commit), but a corporate
+    // proxy in front of the server might. 100 ms = ~10 req/sec which
+    // sits well below any sane proxy threshold while still pushing
+    // ~2.5 MB/sec at CHUNK_SIZE=256 KiB.
+    const LP_UP_MIN_GAP_MS = 100;
+
+    function sleep(ms) {
+        return ms > 0 ? new Promise(r => setTimeout(r, ms)) : Promise.resolve();
+    }
+
+    function parseRetryAfter(res) {
+        const h = res.headers.get('Retry-After');
+        if (!h) return 0;
+        const n = parseInt(h, 10);
+        return Number.isFinite(n) && n > 0 ? n * 1000 : 0;
+    }
 
     // Same tagged error shape as ws-transport so SenderSend can detect
     // a recoverable mid-transfer drop and trigger the resume flow.
@@ -70,6 +91,14 @@
             this._slotToken = null;
             this._pollAbort = null;  // AbortController for the in-flight poll
             this._helloSent = false;
+            // Last /relay/up POST timestamp for client-side pacing.
+            this._lastUpAt = 0;
+        }
+
+        async _paceUp() {
+            const now = Date.now();
+            const gap = LP_UP_MIN_GAP_MS - (now - this._lastUpAt);
+            if (gap > 0) await sleep(gap);
         }
 
         async init() { /* no-op; /api/config is fetched by RacingTransport */ }
@@ -114,7 +143,7 @@
             let attempt = 0;
             while (!this._closed && !this._slotToken) {
                 const wait = backoffSchedule[Math.min(attempt, backoffSchedule.length - 1)];
-                if (wait > 0) await new Promise(r => setTimeout(r, wait));
+                if (wait > 0) await sleep(wait);
                 if (this._closed) return;
                 try {
                     const res = await fetch(`/api/rooms/${this.roomId}/relay/handshake`, {
@@ -140,6 +169,17 @@
                         logger.warn(`[LP] handshake fatal: ${res.status}`);
                         this._handleDisconnect('handshake-fatal');
                         return;
+                    }
+                    // 429 carries a Retry-After hint from an upstream proxy
+                    // (the relay endpoints are no longer per-IP rate-limited
+                    // by us). Honour it before the next attempt so we don't
+                    // re-hammer a saturated bucket.
+                    if (res.status === 429) {
+                        const ra = parseRetryAfter(res);
+                        if (ra > 0) {
+                            logger.warn(`[LP] handshake 429, waiting ${ra}ms (Retry-After)`);
+                            await sleep(ra);
+                        }
                     }
                     logger.warn(`[LP] handshake transient ${res.status}; retrying`);
                 } catch (e) {
@@ -303,6 +343,7 @@
             // express.json() body parser leaves it for our route-level
             // express.raw() to read as bytes. The peer parses it as JSON
             // on the receive side identically to a WS text frame.
+            await this._paceUp();
             const res = await fetch(`/api/rooms/${this.roomId}/relay/up`, {
                 method: 'POST',
                 headers: {
@@ -312,10 +353,16 @@
                 },
                 body,
             });
+            this._lastUpAt = Date.now();
+            if (res.status === 429) {
+                const ra = parseRetryAfter(res);
+                if (ra > 0) await sleep(ra);
+            }
             if (!res.ok) throw new Error(`up status ${res.status}`);
         }
 
         async _sendBinary(chunk) {
+            await this._paceUp();
             const res = await fetch(`/api/rooms/${this.roomId}/relay/up`, {
                 method: 'POST',
                 headers: {
@@ -325,6 +372,11 @@
                 },
                 body: chunk,
             });
+            this._lastUpAt = Date.now();
+            if (res.status === 429) {
+                const ra = parseRetryAfter(res);
+                if (ra > 0) await sleep(ra);
+            }
             if (!res.ok) throw new Error(`up status ${res.status}`);
         }
 
