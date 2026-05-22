@@ -1,20 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────
+# Compose Profiles
+# ─────────────────────────────────────────────────────────────────────
+# This file uses Docker Compose PROFILES so every service is opt-in.
+# Select what to run by setting COMPOSE_PROFILES in your .env file:
+#
+#   direct  websend bound to 127.0.0.1:7395 (trusted-network deploys
+#           where Caddy fronts websend directly)
+#   auth    websend with NO host port + oauth2-proxy on 127.0.0.1:4180
+#           (public deploys gated behind Keycloak SSO)
+#   turn    bundled coturn TURN relay (skip if you use an external one)
+#
+# Typical combinations:
+#   COMPOSE_PROFILES=direct          local / LAN only, external TURN
+#   COMPOSE_PROFILES=direct,turn     local / LAN with bundled TURN
+#   COMPOSE_PROFILES=auth            public with SSO, external TURN
+#   COMPOSE_PROFILES=auth,turn       public with SSO and bundled TURN
+#
+# `direct` and `auth` are mutually exclusive: both define the same
+# container_name ("websend"), so Compose refuses to start both at once.
+# That mutual exclusion is the safety property that makes it impossible
+# to expose websend on 127.0.0.1:7395 while oauth2-proxy is also up.
+# ─────────────────────────────────────────────────────────────────────
+
+# YAML anchor: shared config for every websend variant.
+# The `x-` prefix tells Compose to ignore this as a top-level key.
+# Services below merge it in with `<<: *websend-base`.
+# CAVEAT: YAML merge-keys REPLACE lists, they do not deep-merge. So if
+# a variant needs to tweak a single env var (see websend-gated below)
+# it must re-list the whole `environment:` block.
+x-websend-base: &websend-base
+  build:
+    context: ../src
+    dockerfile: ../docker/Dockerfile
+    args:
+      - RUN_NPM_AUDIT=${RUN_NPM_AUDIT:-false}
+  restart: unless-stopped
+  environment:
+    - DOMAIN=${DOMAIN:-localhost}
+    - DEV=${DEV:-0}
+    - STUN_SERVER=${STUN_SERVER:-}
+    - STUN_GOOGLE_FALLBACK=${STUN_GOOGLE_FALLBACK:-true}
+    - TURN_SERVER=${TURN_SERVER:-}
+    - TURN_SECRET=${TURN_SECRET:-}
+    - TURN_CREDENTIAL_TTL=${TURN_CREDENTIAL_TTL:-3600}
+    - TURN_TIMEOUT=${TURN_TIMEOUT:-15}
+    - TURNS_PORT=${TURNS_PORT:-}
+    - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+    - DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION:-DEFAULT}
+    - UMAMI_URL=${UMAMI_URL:-}
+    - UMAMI_WEBSITE_ID=${UMAMI_WEBSITE_ID:-}
+    - UMAMI_DNT=${UMAMI_DNT:-true}
+    - RELAY_ENABLE=${RELAY_ENABLE:-true}
+    - OCR_LANGS=${OCR_LANGS:-eng,fra}
+    - OCR_PSM=${OCR_PSM:-12}
+    - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES:-ANY}
+    # TRUST_PROXY: which proxy IPs Express should trust for X-Forwarded-For.
+    # Default 'loopback' is correct when only Caddy on the host fronts websend
+    # (the `direct` profile). The `auth` profile overrides this to
+    # 'loopback,linklocal,uniquelocal' on websend-gated, since oauth2-proxy is
+    # the immediate peer at a Docker bridge IP. Without that override the
+    # per-IP rate limiter collapses every caller into one shared bucket and
+    # one user can lock out the rest.
+    - TRUST_PROXY=${TRUST_PROXY:-loopback}
+  security_opt:
+    # Prevent privilege escalation via setuid/setgid binaries.
+    - no-new-privileges:true
+  # Read-only root filesystem to prevent runtime modifications.
+  read_only: true
+  # Drop all capabilities since we don't need any privileged operations.
+  cap_drop:
+    - ALL
+  # Run as non-root user (matches Dockerfile USER directive).
+  user: "1001:1001"
+  deploy:
+    resources:
+      limits:
+        memory: 128M
+        cpus: '0.5'
+  privileged: false
+  # Health check probes the internal port directly: when oauth2-proxy is in
+  # front, https://$DOMAIN/ redirects to Keycloak and the spider follows it
+  # out of the container's reachability scope, flapping the healthcheck.
+  # /api/config is cheap, always 200, and doesn't depend on DOMAIN DNS
+  # resolution from inside the container.
+  healthcheck:
+    test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/api/config"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+
 services:
-  websend:
+  # ── websend (direct mode) ───────────────────────────────────────────
+  # Activated by: COMPOSE_PROFILES=direct
+  # Binds 127.0.0.1:7395 so Caddy (or curl from the host) can reach the
+  # app. Use this when you do NOT want oauth2-proxy in front.
+  websend-direct:
+    <<: *websend-base
     container_name: websend
-    build:
-      context: ../src
-      dockerfile: ../docker/Dockerfile
-      args:
-        - RUN_NPM_AUDIT=${RUN_NPM_AUDIT:-false}
+    profiles: ["direct"]
     ports:
-      # ⚠ WARNING: when the oauth2-proxy block below is enabled, COMMENT OUT
-      # this entire "ports:" section. Otherwise the websend container stays
-      # reachable on 127.0.0.1:7395 and any process on the host (or anything
-      # bridged onto the host via VPN / SSH tunnel / a sibling container with
-      # host networking) bypasses Keycloak authentication entirely. The
-      # reverse proxy should target oauth2-proxy on 127.0.0.1:4180 instead.
       - "127.0.0.1:7395:8080"
-    restart: unless-stopped
+
+  # ── websend (gated mode) ────────────────────────────────────────────
+  # Activated by: COMPOSE_PROFILES=auth
+  # No host port published. Only reachable from oauth2-proxy on the
+  # internal compose network (DNS name "websend-gated"), so the auth
+  # gate cannot be bypassed by anything on the host. Same container_name
+  # as websend-direct ("websend") for log/monitoring continuity.
+  websend-gated:
+    <<: *websend-base
+    container_name: websend
+    profiles: ["auth"]
+    # Override TRUST_PROXY because oauth2-proxy sits in front and adds
+    # X-Forwarded-For from its bridge IP. See base block for the full
+    # rationale. The whole env list must be re-stated because YAML
+    # merge-keys replace lists rather than deep-merging them.
     environment:
       - DOMAIN=${DOMAIN:-localhost}
       - DEV=${DEV:-0}
@@ -34,152 +135,105 @@ services:
       - OCR_LANGS=${OCR_LANGS:-eng,fra}
       - OCR_PSM=${OCR_PSM:-12}
       - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES:-ANY}
-      # TRUST_PROXY: which proxy IPs Express should trust for X-Forwarded-For.
-      # Default 'loopback' is correct when only Caddy on the host fronts websend.
-      # If you enable the oauth2-proxy block below, set
-      #   TRUST_PROXY=loopback,linklocal,uniquelocal
-      # in your .env, otherwise the bridge IP of oauth2-proxy is treated as
-      # untrusted and the per-IP rate limiter collapses every caller into a
-      # single shared bucket (one user can lock out the rest).
-      - TRUST_PROXY=${TRUST_PROXY:-loopback}
-    # Uncomment the relevant lines below to gate websend startup on optional services.
-    #   - coturn: only if you use the bundled coturn (not an external TURN server).
-    #   - oauth2-proxy: STRONGLY RECOMMENDED if you uncomment the oauth2-proxy
-    #     service below. This ensures websend will not start if the auth gate
-    #     fails to come up, so it can never be reached unprotected.
-    # depends_on:
-    #   - coturn
-    #   - oauth2-proxy
-    # Security hardening options
-    security_opt:
-      # Prevent privilege escalation via setuid/setgid binaries
-      - no-new-privileges:true
-    # Read-only root filesystem to prevent runtime modifications
-    read_only: true
-    # Temporary writable directories if needed (none required for this app)
-    # tmpfs:
-    #   - /tmp:size=10M,mode=1777
-    # Drop all capabilities since we don't need any privileged operations
-    cap_drop:
-      - ALL
-    # Run as non-root user (matches Dockerfile USER directive)
-    user: "1001:1001"
-    # Limit resources to prevent DoS
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-          cpus: '0.5'
-    # Disable container from gaining additional privileges
-    privileged: false
-    # Health check to ensure the service is responsive.
-    # Probes the internal port directly: when oauth2-proxy is in front,
-    # https://$DOMAIN/ redirects to Keycloak and the spider follows it
-    # out of the container's reachability scope, flapping the healthcheck.
-    # /api/config is cheap, always 200, and doesn't depend on DOMAIN DNS
-    # resolution from inside the container.
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/api/config"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      - TRUST_PROXY=${TRUST_PROXY:-loopback,linklocal,uniquelocal}
 
-  # ── oauth2-proxy (Keycloak SSO) — Experimental ─────────────────────
-  # Uncomment to put WebSend behind Keycloak authentication via oauth2-proxy.
-  # This provides SSO gating: only authenticated Keycloak users can access
-  # the app. No user/group/permission mapping is performed — it is a simple
-  # "authenticated or not" gate.
+  # ── oauth2-proxy (Keycloak SSO gate) ────────────────────────────────
+  # Activated by: COMPOSE_PROFILES=auth
+  # Caddy should target 127.0.0.1:4180 instead of 7395 when this is on.
   #
-  # Prerequisites:
+  # Prerequisites (see env.example for the matching env vars):
   #   1. A running Keycloak instance with a client configured for WebSend:
   #        - Access Type: confidential
   #        - Valid Redirect URIs: https://${DOMAIN}/oauth2/callback
   #        - Web Origins: https://${DOMAIN}
   #   2. Set OAUTH2_* variables in your .env file (see env.example).
-  #   3. Set TRUST_PROXY=loopback,linklocal,uniquelocal in your .env so
-  #      websend trusts the X-Forwarded-For header set by oauth2-proxy.
-  #      Without this the per-IP rate limiter is effectively disabled
-  #      (every request appears to come from the auth proxy's bridge IP).
-  #   4. Point your reverse proxy (Caddy) at 127.0.0.1:4180 instead of 7395.
-  #   5. Remove or comment out the websend "ports" section above.
   #
-  # Note on WebSocket: oauth2-proxy supports WebSocket proxying, but
-  # long-lived WS connections (used for signaling) may break when the
-  # OAuth token expires mid-session. Monitor and adjust token lifetimes
-  # in Keycloak if you experience disconnections.
+  # WebSocket: oauth2-proxy supports WebSocket proxying. Long-lived WS
+  # connections (used for signaling) survive cookie expiry, but the
+  # *next* upgrade attempt after a transient blip needs a valid session
+  # cookie. OAUTH2_PROXY_COOKIE_REFRESH=4m below keeps the cookie fresh
+  # below Keycloak's default 5-minute access-token lifetime.
   #
-  # Note on coturn: oauth2-proxy only protects HTTP/WS traffic. coturn
-  # (STUN/TURN over UDP/TCP) is outside its scope, but is indirectly
-  # protected because TURN credentials are minted by /api/config, which
-  # sits behind oauth2-proxy, so unauthenticated clients never receive them.
-  # ─────────────────────────────────────────────────────────────────────
-  # oauth2-proxy:
-  #   # :latest keeps the gate patched against newly disclosed CVEs without
-  #   # manual intervention, but auth behaviour can change on rebuild. Pin a
-  #   # tag (e.g. v7.6.0) if you need reproducibility, at the cost of having
-  #   # to bump it yourself when security fixes land upstream.
-  #   image: quay.io/oauth2-proxy/oauth2-proxy:latest
-  #   container_name: oauth2-proxy
-  #   ports:
-  #     - "127.0.0.1:4180:4180"
-  #   environment:
-  #     - OAUTH2_PROXY_PROVIDER=keycloak-oidc
-  #     - OAUTH2_PROXY_OIDC_ISSUER_URL=${OAUTH2_OIDC_ISSUER_URL}
-  #     - OAUTH2_PROXY_CLIENT_ID=${OAUTH2_CLIENT_ID}
-  #     - OAUTH2_PROXY_CLIENT_SECRET=${OAUTH2_CLIENT_SECRET}
-  #     - OAUTH2_PROXY_COOKIE_SECRET=${OAUTH2_COOKIE_SECRET}
-  #     - OAUTH2_PROXY_UPSTREAM=http://websend:8080
-  #     - OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:4180
-  #     # Required when Caddy terminates TLS upstream: tells oauth2-proxy to
-  #     # honour X-Forwarded-Proto / X-Forwarded-Host so it builds an https://
-  #     # redirect_uri and sets Secure cookies correctly.
-  #     - OAUTH2_PROXY_REVERSE_PROXY=true
-  #     # Exact-match redirect URI; must also be registered in the Keycloak
-  #     # client's "Valid redirect URIs" list, or login will fail.
-  #     - OAUTH2_PROXY_REDIRECT_URL=https://${DOMAIN}/oauth2/callback
-  #     # Skip the oauth2-proxy interstitial "Sign in with Keycloak" button
-  #     # and go straight to the IdP (only one provider is configured here).
-  #     - OAUTH2_PROXY_SKIP_PROVIDER_BUTTON=true
-  #     # '*' = any email domain. Real access control comes from Keycloak
-  #     # realm membership, not from this var.
-  #     - OAUTH2_PROXY_EMAIL_DOMAINS=*
-  #     - OAUTH2_PROXY_COOKIE_SECURE=true
-  #     # Upstream timeout default is 30s, which is exactly the answer
-  #     # long-poll ceiling in server.js (TIMEOUT_MS in /api/rooms/:id/answer)
-  #     # and only 5s of headroom over LP_DOWN_TIMEOUT_MS (25s) for the
-  #     # /relay/down long-poll. On the edge, oauth2-proxy cancels the
-  #     # upstream a few ms before websend would have replied with a clean
-  #     # 204, so the client sees a 504. 60s leaves comfortable headroom.
-  #     - OAUTH2_PROXY_UPSTREAM_TIMEOUT=60s
-  #     # Silently refresh the session cookie shortly before the access
-  #     # token expires. Keycloak's default access-token lifetime is 5
-  #     # minutes; without this, every 5 minutes oauth2-proxy redirects
-  #     # the next request to Keycloak instead of using the refresh
-  #     # token. Multi-minute file transfers over the long-poll relay
-  #     # would otherwise abort mid-flight. Pick a value slightly LOWER
-  #     # than the realm's access-token lifetime in Keycloak.
-  #     - OAUTH2_PROXY_COOKIE_REFRESH=4m
-  #     # PKCE for the auth-code flow. The confidential client does not
-  #     # strictly require it, but enabling S256 is cheap defence in
-  #     # depth against authorisation-code interception and is the
-  #     # default recommendation in current OAuth 2.1 guidance.
-  #     - OAUTH2_PROXY_CODE_CHALLENGE_METHOD=S256
-  #   security_opt:
-  #     - no-new-privileges:true
-  #   read_only: true
-  #   cap_drop:
-  #     - ALL
-  #   restart: unless-stopped
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         memory: 128M
-  #         cpus: '0.5'
+  # coturn: oauth2-proxy only protects HTTP/WS traffic. coturn (STUN/TURN
+  # over UDP/TCP) is outside its scope, but is indirectly protected
+  # because TURN credentials are minted by /api/config, which sits behind
+  # oauth2-proxy, so unauthenticated clients never receive them.
+  oauth2-proxy:
+    # :latest keeps the gate patched against newly disclosed CVEs without
+    # manual intervention, but auth behaviour can change on rebuild. Pin a
+    # tag (e.g. v7.6.0) if you need reproducibility, at the cost of having
+    # to bump it yourself when security fixes land upstream.
+    image: quay.io/oauth2-proxy/oauth2-proxy:latest
+    container_name: oauth2-proxy
+    profiles: ["auth"]
+    # Gating startup on websend-gated ensures the gate never serves a 502
+    # window where unauthenticated clients could see "service unavailable"
+    # pages from the auth proxy itself before the upstream is ready.
+    depends_on:
+      - websend-gated
+    ports:
+      - "127.0.0.1:4180:4180"
+    environment:
+      - OAUTH2_PROXY_PROVIDER=keycloak-oidc
+      - OAUTH2_PROXY_OIDC_ISSUER_URL=${OAUTH2_OIDC_ISSUER_URL}
+      - OAUTH2_PROXY_CLIENT_ID=${OAUTH2_CLIENT_ID}
+      - OAUTH2_PROXY_CLIENT_SECRET=${OAUTH2_CLIENT_SECRET}
+      - OAUTH2_PROXY_COOKIE_SECRET=${OAUTH2_COOKIE_SECRET}
+      # DNS name is the compose service name, NOT container_name. The
+      # gated websend service is named "websend-gated" on the bridge
+      # network even though its container is named "websend".
+      - OAUTH2_PROXY_UPSTREAM=http://websend-gated:8080
+      - OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:4180
+      # Required when Caddy terminates TLS upstream: tells oauth2-proxy to
+      # honour X-Forwarded-Proto / X-Forwarded-Host so it builds an https://
+      # redirect_uri and sets Secure cookies correctly.
+      - OAUTH2_PROXY_REVERSE_PROXY=true
+      # Exact-match redirect URI; must also be registered in the Keycloak
+      # client's "Valid redirect URIs" list, or login will fail.
+      - OAUTH2_PROXY_REDIRECT_URL=https://${DOMAIN}/oauth2/callback
+      # Skip the oauth2-proxy interstitial "Sign in with Keycloak" button
+      # and go straight to the IdP (only one provider is configured here).
+      - OAUTH2_PROXY_SKIP_PROVIDER_BUTTON=true
+      # '*' = any email domain. Real access control comes from Keycloak
+      # realm membership, not from this var.
+      - OAUTH2_PROXY_EMAIL_DOMAINS=*
+      - OAUTH2_PROXY_COOKIE_SECURE=true
+      # Upstream timeout default is 30s, which is exactly the answer
+      # long-poll ceiling in server.js (TIMEOUT_MS in /api/rooms/:id/answer)
+      # and only 5s of headroom over LP_DOWN_TIMEOUT_MS (25s) for the
+      # /relay/down long-poll. On the edge, oauth2-proxy cancels the
+      # upstream a few ms before websend would have replied with a clean
+      # 204, so the client sees a 504. 60s leaves comfortable headroom.
+      - OAUTH2_PROXY_UPSTREAM_TIMEOUT=60s
+      # Silently refresh the session cookie shortly before the access
+      # token expires. Keycloak's default access-token lifetime is 5
+      # minutes; without this, every 5 minutes oauth2-proxy redirects
+      # the next request to Keycloak instead of using the refresh
+      # token. Multi-minute file transfers over the long-poll relay
+      # would otherwise abort mid-flight. Pick a value slightly LOWER
+      # than the realm's access-token lifetime in Keycloak.
+      - OAUTH2_PROXY_COOKIE_REFRESH=4m
+      # PKCE for the auth-code flow. The confidential client does not
+      # strictly require it, but enabling S256 is cheap defence in
+      # depth against authorisation-code interception and is the
+      # default recommendation in current OAuth 2.1 guidance.
+      - OAUTH2_PROXY_CODE_CHALLENGE_METHOD=S256
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
 
-  # ── coturn TURN relay server ──────────────────────────────────────────
-  # This project ships with a bundled coturn (https://github.com/coturn/coturn)
-  # service, pre-configured to work out of the box with WebSend.
+  # ── coturn TURN relay server ────────────────────────────────────────
+  # Activated by: COMPOSE_PROFILES=turn
+  # This project ships a bundled coturn (https://github.com/coturn/coturn)
+  # pre-configured to work out of the box with WebSend.
   # coturn acts as a TURN relay for when direct peer-to-peer WebRTC fails
   # (e.g. symmetric NAT, restrictive firewalls, carrier-grade NAT).
   #
@@ -187,14 +241,14 @@ services:
   # (see env.example). Without these, the app will still work but only
   # when direct P2P connections succeed.
   #
-  # If you already have a coturn instance (e.g., for Nextcloud Talk), you can
-  # skip this service entirely and point TURN_SERVER / TURN_SECRET to your
+  # If you already have a coturn instance (e.g., for Nextcloud Talk), skip
+  # the `turn` profile entirely and point TURN_SERVER / TURN_SECRET at your
   # existing server instead.
-  # ─────────────────────────────────────────────────────────────────────
   coturn:
     image: coturn/coturn:latest
     pull_policy: always
     container_name: coturn
+    profiles: ["turn"]
     ports:
       # Use a different port if 3478 is already in use (e.g., by another coturn)
       - "3478:3478/udp"
@@ -216,7 +270,7 @@ services:
     #
     # Docker NAT: --external-ip format is PUBLIC_IP/INTERNAL_IP.
     # 0.0.0.0 as internal means "all container interfaces" (correct for Docker).
-    # NOTE: DOMAIN must be an IP address here, NOT a hostname — coturn does not
+    # NOTE: DOMAIN must be an IP address here, NOT a hostname, coturn does not
     # resolve DNS for --external-ip. Set a separate TURN_EXTERNAL_IP env var if
     # your DOMAIN is a hostname.
     command:
@@ -236,7 +290,7 @@ services:
       - --external-ip=${TURN_EXTERNAL_IP:-${DOMAIN:-127.0.0.1}}
       - --check-origin-consistency
       - --cpus=1
-    # Security hardening options
+    # Security hardening options.
     # Note: no-new-privileges is NOT set because the turnserver binary
     # has file capabilities that require privilege transition at exec.
     cap_drop:
