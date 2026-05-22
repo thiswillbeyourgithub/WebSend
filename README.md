@@ -252,13 +252,15 @@ The protections listed in [Security Features](#security-features) below address 
 
 WebSend can be placed behind [Keycloak](https://www.keycloak.org/) authentication using [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/). This provides a simple "authenticated or not" gate: only users who log in via Keycloak can access the app. No user, group, or permission mapping is performed.
 
-A commented-out oauth2-proxy service is included in `docker-compose.yml` along with corresponding environment variables in `env.example`. This feature was added with assistance from [Claude Code](https://claude.ai/claude-code).
+The oauth2-proxy service is wired up in `docker-compose.yml` under the `auth` [compose profile](#compose-profiles). Setting `COMPOSE_PROFILES=auth` (or `auth,turn`) in your `.env` swaps in a websend variant that has **no published host port** and brings up oauth2-proxy in front of it on `127.0.0.1:4180`, all without editing the YAML. This feature was added with assistance from [Claude Code](https://claude.ai/claude-code).
 
 **Required configuration when enabling SSO**:
 
-- Set `TRUST_PROXY=loopback,linklocal,uniquelocal` in your `.env`. Without it, the websend rate limiter treats the oauth2-proxy bridge IP as the client and collapses every caller into one shared bucket, letting a single user lock out the rest. The default `loopback` value is only correct when Caddy on the same host is the *only* proxy in front.
 - Register `https://${DOMAIN}/oauth2/callback` as a Valid Redirect URI in the Keycloak client, and `https://${DOMAIN}` as a Web Origin. The compose file already wires `OAUTH2_PROXY_REDIRECT_URL` to that exact URL.
-- Comment out the websend `ports:` block so the app is only reachable through oauth2-proxy on `127.0.0.1:4180`.
+- Set the `OAUTH2_*` variables in your `.env` (see `docker/env.example`).
+- Point your reverse proxy at `127.0.0.1:4180` instead of `127.0.0.1:7395`. The `auth` profile's websend variant has no host port to expose, so there is no way to bypass the gate from the host.
+
+`TRUST_PROXY` is set automatically to `loopback,linklocal,uniquelocal` by the `auth` profile; the override is needed because oauth2-proxy runs as a sibling container at a Docker bridge IP, and without it the per-IP rate limiter collapses every caller into one shared bucket and a single user can lock the rest out. Only override `TRUST_PROXY` yourself if you have extra proxy hops upstream of Caddy.
 
 **Status**: Experimental. WebSocket signaling passes through oauth2-proxy and an established WS tunnel survives cookie expiry; what fails is the next upgrade attempt after a transient blip, because the new HTTP upgrade needs a valid session cookie. The compose block sets `OAUTH2_PROXY_COOKIE_REFRESH=4m` (slightly below Keycloak's default 5-minute access-token lifetime) so the cookie is rotated silently and reconnects keep working. coturn (TURN/TURNS/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because TURN credentials are minted by `/api/config`, which sits behind oauth2-proxy, so unauthenticated clients never receive them.
 
@@ -278,20 +280,45 @@ A commented-out oauth2-proxy service is included in `docker-compose.yml` along w
    # Edit .env and set DOMAIN to your server's IP or hostname
    ```
 
-2. Start the services:
+2. Pick which services to run by setting `COMPOSE_PROFILES` in `.env`. The provided template defaults to `direct,turn` (websend bound to `127.0.0.1:7395` plus the bundled coturn). See [Compose Profiles](#compose-profiles) for the full table and other combinations (e.g. `auth,turn` for SSO).
+
+   > **Upgrading from v4.2 or earlier?** Service activation moved from "comment / uncomment YAML" to `COMPOSE_PROFILES`. If you `docker compose up -d` and nothing starts, add a line like `COMPOSE_PROFILES=direct,turn` to your `.env`.
+
+3. Start the services:
    ```bash
    docker compose up -d
    ```
 
-3. Set up [Caddy](https://caddyserver.com/) (or another reverse proxy) to terminate HTTPS and proxy to port 7395
+4. Set up [Caddy](https://caddyserver.com/) (or another reverse proxy) to terminate HTTPS and proxy to port 7395 (or 4180 if you use the `auth` profile).
 
-4. Access the app at `https://your-domain`
+5. Access the app at `https://your-domain`
 
 ## Configuration
 
 All configuration is done via environment variables in `docker/.env` (see `docker/env.example` for documentation). Docker Compose automatically loads `.env` and substitutes variables into `docker-compose.yml`.
 
 **Important**: after changing `.env`, you must run `docker compose up -d` (not `docker compose restart`) for changes to take effect, because `restart` reuses the existing container with old environment values.
+
+### Compose Profiles
+
+Every service in `docker-compose.yml` is opt-in via a [Docker Compose profile](https://docs.docker.com/compose/profiles/) selected by the `COMPOSE_PROFILES` env var. With no profile set, `docker compose up -d` starts nothing.
+
+| Profile | Brings up | Use case |
+|---------|-----------|----------|
+| `direct` | `websend` bound to `127.0.0.1:7395` | Local / LAN / trusted-network deploys, Caddy fronts websend directly |
+| `auth`   | `websend` (no host port) + `oauth2-proxy` on `127.0.0.1:4180` | Public deploys gated behind Keycloak SSO |
+| `turn`   | bundled `coturn` TURN relay | Anyone using the in-repo TURN server (skip if you have an external one) |
+
+Typical combinations to put in `.env`:
+
+```
+COMPOSE_PROFILES=direct           # local / LAN, external TURN
+COMPOSE_PROFILES=direct,turn      # local / LAN with bundled TURN
+COMPOSE_PROFILES=auth             # public with SSO, external TURN
+COMPOSE_PROFILES=auth,turn        # public with SSO and bundled TURN
+```
+
+`direct` and `auth` are mutually exclusive: both define `container_name: websend`, so Compose refuses to start both at once. That refusal is the safety property that makes it impossible to leave websend exposed on `127.0.0.1:7395` while the oauth2-proxy gate is also running (the failure mode the old "comment out the ports block" instructions tried to prevent by hand).
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -316,7 +343,7 @@ All configuration is done via environment variables in `docker/.env` (see `docke
 | `RELAY_ENABLE` | Expose the HTTP-relay fallback transport (WebSocket + long-poll). Set to `false` to disable | `true` |
 | `RELAY_LP_ONLY` | Force long-poll-only transport: suppresses WebRTC ICE servers and 404s the WS relay endpoint so clients only use the long-poll path. Requires `RELAY_ENABLE=true` | `false` |
 | `PORT` | HTTP port the Node server listens on inside the container | `8080` |
-| `TRUST_PROXY` | Comma-separated [Express trust-proxy](https://expressjs.com/en/guide/behind-proxies.html) specifiers. Set to `loopback,linklocal,uniquelocal` when oauth2-proxy fronts websend, otherwise the per-IP rate limiter degrades into one shared bucket | `loopback` |
+| `TRUST_PROXY` | Comma-separated [Express trust-proxy](https://expressjs.com/en/guide/behind-proxies.html) specifiers. Automatically set to `loopback,linklocal,uniquelocal` by the `auth` compose profile; only override if you have extra proxy hops upstream of Caddy | `loopback` (`direct`) / `loopback,linklocal,uniquelocal` (`auth`) |
 | `TEST_DISABLE_RATE_LIMIT` | Disable per-IP rate limiting (test escape hatch only) | _(unset)_ |
 
 ## Firewall (UFW)
