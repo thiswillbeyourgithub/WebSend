@@ -45,9 +45,16 @@ WebSend/
 ├── docker/
 │   ├── Dockerfile          # Node 20 Alpine image, non-root user, production build
 │   ├── docker-compose.yml  # Service definition with security hardening (read-only FS,
-│   │                       #   dropped capabilities, resource limits, health check)
-│   │                       #   Also contains commented-out coturn TURN relay service
-│   └── env.example         # Documented env vars: DOMAIN, ICE servers, TURN credentials, ALLOWED_FILE_TYPES
+│   │                       #   dropped capabilities, resource limits, health check).
+│   │                       #   Defines three opt-in profiles selected via
+│   │                       #   COMPOSE_PROFILES: `direct` (websend on 127.0.0.1:7395),
+│   │                       #   `auth` (websend with no host port + oauth2-proxy on
+│   │                       #   127.0.0.1:4180), `turn` (bundled coturn relay).
+│   │                       #   Shared websend config lives in an x-websend-base YAML
+│   │                       #   anchor; the `direct` and `auth` websend variants both
+│   │                       #   set container_name=websend so Compose enforces their
+│   │                       #   mutual exclusion automatically.
+│   └── env.example         # Documented env vars: COMPOSE_PROFILES, DOMAIN, ICE servers, TURN credentials, ALLOWED_FILE_TYPES
 │
 └── src/
     ├── cli/                # Optional Node CLI receiver (advanced; not for end users).
@@ -828,7 +835,9 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 ## SSO (Experimental)
 
 WebSend can optionally be gated behind **Keycloak** SSO using **oauth2-proxy** as a
-reverse authentication proxy. The architecture with SSO enabled:
+reverse authentication proxy. SSO is enabled by selecting the `auth` compose profile
+in `COMPOSE_PROFILES` (see the [Compose Profiles](README.md#compose-profiles) section
+of the README). The architecture with SSO enabled:
 
 ```
 Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend (:8080)
@@ -837,8 +846,15 @@ Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend
                                Keycloak (OIDC)
 ```
 
+- The `auth` profile brings up a websend variant (compose service name `websend-gated`,
+  container name `websend`) that publishes no host port, plus the `oauth2-proxy` service.
+  The mutually-exclusive `direct` profile (compose service name `websend-direct`,
+  same container name) is the only path that binds `127.0.0.1:7395`. Because both
+  variants share `container_name: websend`, Compose refuses to run them together,
+  so the "host can bypass the gate" failure mode is structurally impossible.
 - oauth2-proxy intercepts all HTTP/WS requests and redirects unauthenticated users
-  to Keycloak's login page. After login, requests are proxied to the websend container.
+  to Keycloak's login page. After login, requests are proxied to the websend container
+  via the compose-network DNS name `websend-gated:8080`.
 - **WebSocket signaling** passes through oauth2-proxy (it supports WS upgrade).
   Once the WS tunnel is established it survives cookie expiry, because oauth2-proxy
   blindly forwards frames without re-checking the session. What does fail is the
@@ -852,10 +868,11 @@ Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend
   behind oauth2-proxy, so unauthenticated clients never receive them.
 - **Trust model**. The websend rate limiter keys on `req.ip`, which Express derives
   from `X-Forwarded-For` only when the immediate peer is in the `trust proxy` list.
-  Default is `loopback` (Caddy on the same host). With SSO enabled, oauth2-proxy
-  becomes the immediate peer at a Docker bridge IP, so `TRUST_PROXY=loopback,linklocal,uniquelocal`
-  must be set on the websend service, otherwise every request appears to come from
-  the auth proxy and the per-IP buckets degrade into one shared bucket.
+  Default is `loopback` (Caddy on the same host). With the `auth` profile active,
+  oauth2-proxy is the immediate peer at a Docker bridge IP, so the compose file
+  pre-sets `TRUST_PROXY=loopback,linklocal,uniquelocal` on `websend-gated` by
+  default. Without that, every request appears to come from the auth proxy and
+  the per-IP buckets degrade into one shared bucket.
 - No user, group, or permission mapping is performed; it is a simple authentication gate.
 
 This feature is experimental and was added with assistance from
