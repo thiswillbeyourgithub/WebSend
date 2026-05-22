@@ -22,12 +22,44 @@
 # to expose websend on 127.0.0.1:7395 while oauth2-proxy is also up.
 # ─────────────────────────────────────────────────────────────────────
 
-# YAML anchor: shared config for every websend variant.
-# The `x-` prefix tells Compose to ignore this as a top-level key.
-# Services below merge it in with `<<: *websend-base`.
-# CAVEAT: YAML merge-keys REPLACE lists, they do not deep-merge. So if
-# a variant needs to tweak a single env var (see websend-gated below)
-# it must re-list the whole `environment:` block.
+# YAML anchors: shared config for every websend variant.
+# The `x-` prefix tells Compose to ignore these as top-level keys.
+# Services below merge them in with `<<: *websend-env` / `<<: *websend-base`.
+#
+# Why TWO anchors and a map-form environment block? YAML merge-keys
+# REPLACE lists rather than deep-merging them, so the list form
+# `environment: [- FOO=bar, ...]` forces every variant that wants to
+# tweak a single env var to re-state every other var. Using the MAP
+# form (`environment: { FOO: bar, ... }`) lets us put the shared map
+# in its own anchor and merge it with `<<: *websend-env` inside each
+# variant's `environment:` block, then override only the keys that
+# differ. The cost is that quoting matters (values look like YAML
+# scalars and could coerce to int/bool if unquoted), so values are
+# quoted defensively below.
+x-websend-env: &websend-env
+  DOMAIN: "${DOMAIN:-localhost}"
+  DEV: "${DEV:-0}"
+  STUN_SERVER: "${STUN_SERVER:-}"
+  STUN_GOOGLE_FALLBACK: "${STUN_GOOGLE_FALLBACK:-true}"
+  TURN_SERVER: "${TURN_SERVER:-}"
+  TURN_SECRET: "${TURN_SECRET:-}"
+  TURN_CREDENTIAL_TTL: "${TURN_CREDENTIAL_TTL:-3600}"
+  TURN_TIMEOUT: "${TURN_TIMEOUT:-15}"
+  TURNS_PORT: "${TURNS_PORT:-}"
+  ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-}"
+  DEV_FORCE_CONNECTION: "${DEV_FORCE_CONNECTION:-DEFAULT}"
+  UMAMI_URL: "${UMAMI_URL:-}"
+  UMAMI_WEBSITE_ID: "${UMAMI_WEBSITE_ID:-}"
+  UMAMI_DNT: "${UMAMI_DNT:-true}"
+  RELAY_ENABLE: "${RELAY_ENABLE:-true}"
+  OCR_LANGS: "${OCR_LANGS:-eng,fra}"
+  OCR_PSM: "${OCR_PSM:-12}"
+  ALLOWED_FILE_TYPES: "${ALLOWED_FILE_TYPES:-ANY}"
+  # TRUST_PROXY is NOT in this shared map: each variant sets its own
+  # default (loopback for direct, loopback+linklocal+uniquelocal for
+  # auth) so the right value ships without users having to override it.
+  # The full rationale lives on each variant's TRUST_PROXY line below.
+
 x-websend-base: &websend-base
   build:
     context: ../src
@@ -35,33 +67,6 @@ x-websend-base: &websend-base
     args:
       - RUN_NPM_AUDIT=${RUN_NPM_AUDIT:-false}
   restart: unless-stopped
-  environment:
-    - DOMAIN=${DOMAIN:-localhost}
-    - DEV=${DEV:-0}
-    - STUN_SERVER=${STUN_SERVER:-}
-    - STUN_GOOGLE_FALLBACK=${STUN_GOOGLE_FALLBACK:-true}
-    - TURN_SERVER=${TURN_SERVER:-}
-    - TURN_SECRET=${TURN_SECRET:-}
-    - TURN_CREDENTIAL_TTL=${TURN_CREDENTIAL_TTL:-3600}
-    - TURN_TIMEOUT=${TURN_TIMEOUT:-15}
-    - TURNS_PORT=${TURNS_PORT:-}
-    - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
-    - DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION:-DEFAULT}
-    - UMAMI_URL=${UMAMI_URL:-}
-    - UMAMI_WEBSITE_ID=${UMAMI_WEBSITE_ID:-}
-    - UMAMI_DNT=${UMAMI_DNT:-true}
-    - RELAY_ENABLE=${RELAY_ENABLE:-true}
-    - OCR_LANGS=${OCR_LANGS:-eng,fra}
-    - OCR_PSM=${OCR_PSM:-12}
-    - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES:-ANY}
-    # TRUST_PROXY: which proxy IPs Express should trust for X-Forwarded-For.
-    # Default 'loopback' is correct when only Caddy on the host fronts websend
-    # (the `direct` profile). The `auth` profile overrides this to
-    # 'loopback,linklocal,uniquelocal' on websend-gated, since oauth2-proxy is
-    # the immediate peer at a Docker bridge IP. Without that override the
-    # per-IP rate limiter collapses every caller into one shared bucket and
-    # one user can lock out the rest.
-    - TRUST_PROXY=${TRUST_PROXY:-loopback}
   security_opt:
     # Prevent privilege escalation via setuid/setgid binaries.
     - no-new-privileges:true
@@ -101,6 +106,12 @@ services:
     profiles: ["direct"]
     ports:
       - "127.0.0.1:7395:8080"
+    environment:
+      <<: *websend-env
+      # TRUST_PROXY: which proxy IPs Express should trust for
+      # X-Forwarded-For. 'loopback' is correct here because Caddy on the
+      # same host is the only proxy in front of websend.
+      TRUST_PROXY: "${TRUST_PROXY:-loopback}"
 
   # ── websend (gated mode) ────────────────────────────────────────────
   # Activated by: COMPOSE_PROFILES=auth
@@ -112,30 +123,15 @@ services:
     <<: *websend-base
     container_name: websend
     profiles: ["auth"]
-    # Override TRUST_PROXY because oauth2-proxy sits in front and adds
-    # X-Forwarded-For from its bridge IP. See base block for the full
-    # rationale. The whole env list must be re-stated because YAML
-    # merge-keys replace lists rather than deep-merging them.
     environment:
-      - DOMAIN=${DOMAIN:-localhost}
-      - DEV=${DEV:-0}
-      - STUN_SERVER=${STUN_SERVER:-}
-      - STUN_GOOGLE_FALLBACK=${STUN_GOOGLE_FALLBACK:-true}
-      - TURN_SERVER=${TURN_SERVER:-}
-      - TURN_SECRET=${TURN_SECRET:-}
-      - TURN_CREDENTIAL_TTL=${TURN_CREDENTIAL_TTL:-3600}
-      - TURN_TIMEOUT=${TURN_TIMEOUT:-15}
-      - TURNS_PORT=${TURNS_PORT:-}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
-      - DEV_FORCE_CONNECTION=${DEV_FORCE_CONNECTION:-DEFAULT}
-      - UMAMI_URL=${UMAMI_URL:-}
-      - UMAMI_WEBSITE_ID=${UMAMI_WEBSITE_ID:-}
-      - UMAMI_DNT=${UMAMI_DNT:-true}
-      - RELAY_ENABLE=${RELAY_ENABLE:-true}
-      - OCR_LANGS=${OCR_LANGS:-eng,fra}
-      - OCR_PSM=${OCR_PSM:-12}
-      - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES:-ANY}
-      - TRUST_PROXY=${TRUST_PROXY:-loopback,linklocal,uniquelocal}
+      <<: *websend-env
+      # TRUST_PROXY must include linklocal+uniquelocal here: oauth2-proxy
+      # sits in front and the immediate peer is its Docker bridge IP, not
+      # loopback. Without trusting RFC1918 ranges, the per-IP rate limiter
+      # cannot see real client IPs from X-Forwarded-For and collapses every
+      # caller into one shared bucket, letting a single user lock the rest
+      # out.
+      TRUST_PROXY: "${TRUST_PROXY:-loopback,linklocal,uniquelocal}"
 
   # ── oauth2-proxy (Keycloak SSO gate) ────────────────────────────────
   # Activated by: COMPOSE_PROFILES=auth
