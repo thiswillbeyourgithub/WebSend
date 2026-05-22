@@ -153,11 +153,12 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 //
 // TRUST_PROXY: comma-separated list of Express trust-proxy specifiers
 // (https://expressjs.com/en/guide/behind-proxies.html). Defaults to 'loopback'.
-// When oauth2-proxy runs as a sibling Docker container, websend's peer is the
-// Docker bridge IP (RFC1918), not loopback. In that case set
-// TRUST_PROXY=loopback,linklocal,uniquelocal so X-Forwarded-For from the auth
-// proxy is honoured; otherwise the per-IP rate limiter collapses every caller
-// into one shared bucket. See docker/env.example for the SSO recipe.
+// When running under the `auth` compose profile (oauth2-proxy in front of
+// websend as a sibling Docker container), websend's peer is the Docker bridge
+// IP (RFC1918), not loopback. The `auth` profile's websend-gated service in
+// docker-compose.yml pre-sets TRUST_PROXY=loopback,linklocal,uniquelocal for
+// that reason; otherwise the per-IP rate limiter collapses every caller into
+// one shared bucket. See docker/env.example for the full profile reference.
 const TRUST_PROXY = process.env.TRUST_PROXY
     ? process.env.TRUST_PROXY.split(',').map(s => s.trim()).filter(Boolean)
     : 'loopback';
