@@ -149,13 +149,12 @@ async function main() {
         console.log('');
     });
 
-    await page.exposeFunction('__nodePromptFp', async (myFp, theirFp) => {
+    await page.exposeFunction('__nodePromptFp', async (code) => {
         console.log('');
-        console.log(`  Your fingerprint:   ${myFp}`);
-        console.log(`  Sender fingerprint: ${theirFp}`);
+        console.log(`  Verification code: ${code}`);
         console.log('');
         if (opts.autoAccept) return true;
-        return await promptYesNo('Do both fingerprints match on your phone? [y/N] ');
+        return await promptYesNo('Does this code match the one shown on the other device? [y/N] ');
     });
 
     const stats = { savedCount: 0, savedBytes: 0 };

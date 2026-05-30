@@ -234,9 +234,8 @@
                     if (msg.type === 'sender-public-key') {
                         const theirPub = await C.importPublicKey(msg.key);
                         sharedKey = await C.deriveSharedKey(keyPair.privateKey, theirPub);
-                        const myFp    = await C.getKeyFingerprint(keyPair.publicKey);
-                        const theirFp = await C.getKeyFingerprint(theirPub);
-                        const ok = autoAccept ? true : await window.__nodePromptFp(myFp, theirFp);
+                        const code = await C.getCombinedFingerprint(keyPair.publicKey, theirPub);
+                        const ok = autoAccept ? true : await window.__nodePromptFp(code);
                         if (ok) {
                             weConfirmed = true;
                             send(P.build.fingerprintConfirmed());
