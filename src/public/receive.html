@@ -53,20 +53,13 @@
             <div id="verification-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
                 <div style="background: white; border-radius: 15px; padding: 25px; max-width: 350px; margin: 20px; text-align: center;">
                     <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="verify.title">🔒 Verify Connection</h2>
-                    <p style="margin: 0 0 20px 0; color: #555; font-size: 0.95rem;" data-i18n="verify.instruction.receiver">
-                        Read these codes aloud to the sender. Do they match what they see?
+                    <p style="margin: 0 0 20px 0; color: #555; font-size: 0.95rem;" data-i18n="verify.instruction">
+                        Check that the code below is identical on both devices. Only confirm if they match.
                     </p>
 
                     <div style="background: #f5f5f5; border-radius: 10px; padding: 15px; margin-bottom: 20px;">
-                        <!-- Sender key always at top for consistent display on both devices -->
-                        <div style="margin-bottom: 15px;">
-                            <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.senderKey.theirs">Sender's key (theirs)</span>
-                            <p id="sender-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1b5e20; margin: 5px 0; letter-spacing: 2px;">----</p>
-                        </div>
-                        <div style="border-top: 1px solid #ddd; padding-top: 15px;">
-                            <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.receiverKey.yours">Receiver's key (yours)</span>
-                            <p id="receiver-fingerprint" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1565c0; margin: 5px 0; letter-spacing: 2px;">----</p>
-                        </div>
+                        <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.codeLabel">Verification code</span>
+                        <p id="verification-code" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1565c0; margin: 5px 0; letter-spacing: 2px;">----</p>
                     </div>
 
                     <p style="margin: 0 0 20px 0; color: #d32f2f; font-size: 0.85rem;" data-i18n="verify.warning">
@@ -147,12 +140,12 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-qco2/N4kSFCU33xFDralq88DIQRpamtrV0R38O0kmC2hbo1KXZ26NdAahOjtLpWG"></script>
+    <script src="/js/i18n.js" integrity="sha384-pGCP0jUG7CBgCuCvq71Oszmox0aD3fh18iwwwF+pcNTf+fGJi4EK+a+qbbnOqCKH"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-aYkZ1w9YE74ls+xjYvpD+F8uPd255ZIbLqxn1DD0pjh+5EeACudM0OTtjT/Dz6Sk"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-/gzZ7L0lKHe10PNpEnyyj/UyaNEl2woHG4WQz11dIRiPcWpbspO25nS1aCJl0FYd"></script>
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
-    <script src="/js/crypto.js" integrity="sha384-0+voTjZli9/wY/BEUrp5CtvXcw0hKdSGcIP9BznW+97tWVkuCb8NpnmlmYWADacF"></script>
+    <script src="/js/crypto.js" integrity="sha384-e7WvV/6bT3OcTOMX7KHK1BhRRf30dTZAEolkwNmXm2NeGzhDfcNDk1nMiuJBjEh7"></script>
     <script src="/js/protocol.js" integrity="sha384-8ljBTasCc9Vhe2KnPIyGPeRbD0vVXEx+/DQzYkZ4WaX/pCHSSr+9vUI5LraRIsi/"></script>
     <script src="/js/webrtc.js" integrity="sha384-ooZReOnUOwlgCPyDWusmk+UmxEG38Cy79wTwuD5cbZd5e9b6QDiUIEl2b/a/v58b"></script>
     <script src="/js/transport-assembler.js" integrity="sha384-Bfk+ad/+nGjfQ/LOECACnUHHm+eYXdvC66xt/RzvJMW+dqs/caqQwnXFt7awFQHA"></script>
@@ -1000,18 +993,16 @@
                 const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);
                 sharedKey = await WebSendCrypto.deriveSharedKey(keyPair.privateKey, senderPublicKey);
 
-                const ourFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
-                const theirFingerprint = await WebSendCrypto.getKeyFingerprint(senderPublicKey);
-                // Cache for the rekey-on-reconnect branch above.
-                cachedSenderFingerprint = theirFingerprint;
-                cachedOurFingerprint = ourFingerprint;
+                // Per-key fingerprints are cached only for the
+                // rekey-on-reconnect peer-identity check above.
+                cachedSenderFingerprint = await WebSendCrypto.getKeyFingerprint(senderPublicKey);
+                cachedOurFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
 
-                // Display fingerprints in verification modal
-                // Sender key at top, receiver key at bottom (consistent on both devices)
-                document.getElementById('sender-fingerprint').textContent = theirFingerprint;
-                document.getElementById('receiver-fingerprint').textContent = ourFingerprint;
-
-                logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
+                // Single combined code, identical on both devices, shown in
+                // the verification modal so users just check the two screens match.
+                const combinedFingerprint = await WebSendCrypto.getCombinedFingerprint(keyPair.publicKey, senderPublicKey);
+                document.getElementById('verification-code').textContent = combinedFingerprint;
+                logger.success(`Key exchange complete. Verification code: ${combinedFingerprint}`);
 
                 // Show blocking verification modal
                 showVerificationModal();

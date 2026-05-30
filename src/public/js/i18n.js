@@ -184,13 +184,9 @@ const i18n = (function() {
 
             // Verification modal
             'verify.title': '🔒 Verify Connection',
-            'verify.instruction.sender': 'Read these codes aloud to the receiver. Do they match what they see?',
-            'verify.instruction.receiver': 'Read these codes aloud to the sender. Do they match what they see?',
-            'verify.senderKey.yours': 'Sender\'s key (yours)',
-            'verify.senderKey.theirs': 'Sender\'s key (theirs)',
-            'verify.receiverKey.yours': 'Receiver\'s key (yours)',
-            'verify.receiverKey.theirs': 'Receiver\'s key (theirs)',
-            'verify.warning': '⚠️ If codes don\'t match, someone may be intercepting the connection!',
+            'verify.instruction': 'Check that the code below is identical on both devices. Only confirm if they match.',
+            'verify.codeLabel': 'Verification code',
+            'verify.warning': '⚠️ If the codes are different, someone may be intercepting the connection!',
             'verify.confirm': '✓ Yes, codes match',
             'verify.deny': '✗ No, cancel connection',
             'verify.deniedBySender': 'Connection cancelled by sender - fingerprints did not match.\n\nThis could indicate a security issue. Please try again.',
@@ -419,13 +415,9 @@ const i18n = (function() {
 
             // Verification modal
             'verify.title': '🔒 Vérifier la connexion',
-            'verify.instruction.sender': 'Lisez ces codes à voix haute au destinataire. Correspondent-ils à ce qu\'il voit ?',
-            'verify.instruction.receiver': 'Lisez ces codes à voix haute à l\'expéditeur. Correspondent-ils à ce qu\'il voit ?',
-            'verify.senderKey.yours': 'Clé de l\'expéditeur (la vôtre)',
-            'verify.senderKey.theirs': 'Clé de l\'expéditeur (la leur)',
-            'verify.receiverKey.yours': 'Clé du destinataire (la vôtre)',
-            'verify.receiverKey.theirs': 'Clé du destinataire (la leur)',
-            'verify.warning': '⚠️ Si les codes ne correspondent pas, quelqu\'un peut intercepter la connexion !',
+            'verify.instruction': 'Vérifiez que le code ci-dessous est identique sur les deux appareils. Ne confirmez que s\'ils correspondent.',
+            'verify.codeLabel': 'Code de vérification',
+            'verify.warning': '⚠️ Si les codes sont différents, quelqu\'un peut intercepter la connexion !',
             'verify.confirm': '✓ Oui, les codes correspondent',
             'verify.deny': '✗ Non, annuler la connexion',
             'verify.deniedBySender': 'Connexion annulée par l\'expéditeur - les empreintes ne correspondaient pas.\n\nCela pourrait indiquer un problème de sécurité. Veuillez réessayer.',

@@ -71,19 +71,14 @@
         <div id="verification-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
             <div class="verify-card">
                 <h2 class="verify-title" data-i18n="verify.title">🔒 Verify Connection</h2>
-                <p class="verify-instruction" data-i18n="verify.instruction.sender">
-                    Read these codes aloud to the receiver. Do they match what they see?
+                <p class="verify-instruction" data-i18n="verify.instruction">
+                    Check that the code below is identical on both devices. Only confirm if they match.
                 </p>
 
                 <div class="verify-codes">
-                    <!-- Sender key always at top for consistent display on both devices -->
                     <div class="verify-code-block">
-                        <span class="verify-code-label" data-i18n="verify.senderKey.yours">Sender's key (yours)</span>
-                        <p id="sender-fingerprint" class="verify-fingerprint verify-fingerprint-sender">----</p>
-                    </div>
-                    <div class="verify-code-block-divided">
-                        <span class="verify-code-label" data-i18n="verify.receiverKey.theirs">Receiver's key (theirs)</span>
-                        <p id="receiver-fingerprint" class="verify-fingerprint verify-fingerprint-receiver">----</p>
+                        <span class="verify-code-label" data-i18n="verify.codeLabel">Verification code</span>
+                        <p id="verification-code" class="verify-fingerprint verify-fingerprint-sender">----</p>
                     </div>
                 </div>
 
@@ -289,12 +284,12 @@
 
     <script src="/js/doc-detect.js" integrity="sha384-sCV68p9zA2bjYAqSZ891AnX8ESCyvrigBHgbU1Nh6KFB/62Jb8gZlDgIuDonm6xh" crossorigin="anonymous"></script>
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-qco2/N4kSFCU33xFDralq88DIQRpamtrV0R38O0kmC2hbo1KXZ26NdAahOjtLpWG"></script>
+    <script src="/js/i18n.js" integrity="sha384-pGCP0jUG7CBgCuCvq71Oszmox0aD3fh18iwwwF+pcNTf+fGJi4EK+a+qbbnOqCKH"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-aYkZ1w9YE74ls+xjYvpD+F8uPd255ZIbLqxn1DD0pjh+5EeACudM0OTtjT/Dz6Sk"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-/gzZ7L0lKHe10PNpEnyyj/UyaNEl2woHG4WQz11dIRiPcWpbspO25nS1aCJl0FYd"></script>
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
-    <script src="/js/crypto.js" integrity="sha384-0+voTjZli9/wY/BEUrp5CtvXcw0hKdSGcIP9BznW+97tWVkuCb8NpnmlmYWADacF"></script>
+    <script src="/js/crypto.js" integrity="sha384-e7WvV/6bT3OcTOMX7KHK1BhRRf30dTZAEolkwNmXm2NeGzhDfcNDk1nMiuJBjEh7"></script>
     <script src="/js/protocol.js" integrity="sha384-8ljBTasCc9Vhe2KnPIyGPeRbD0vVXEx+/DQzYkZ4WaX/pCHSSr+9vUI5LraRIsi/"></script>
     <script src="/js/webrtc.js" integrity="sha384-ooZReOnUOwlgCPyDWusmk+UmxEG38Cy79wTwuD5cbZd5e9b6QDiUIEl2b/a/v58b"></script>
     <script src="/js/transport-assembler.js" integrity="sha384-Bfk+ad/+nGjfQ/LOECACnUHHm+eYXdvC66xt/RzvJMW+dqs/caqQwnXFt7awFQHA"></script>
@@ -306,7 +301,7 @@
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-LTPGF18+5jFBGR0I9E2w/S8qCTnPg31f9dtJwBFDrgGI1HalzQMpKf/9ZrcT9zM6"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
     <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-BDeuGBT7jJxrALEn68SFjh/A6sH/2xDEZelDXzbDYd0KzwoRB9DH6x1dYQoZNoX/"></script>
-    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-mups4pW1oesS8ybPeKIyj5JnS4iO/SYsVGTA7Vlrpe5swVJUR1Q56Qrl+/ZFYQY2"></script>
+    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-q0WlRASjlXB38n+HWJMHndk90pkCNhQba7JaaBDfTT7kzesjDOn5QDr8Fn5lU7nc"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-fcGrrLyX4p4ezy27wAN+wf7dd2a42zAkTHbILlB6rjauzOh70XuQJIrzWSHKlee2"></script>
     <script src="/js/qr-parse.js" crossorigin="anonymous" integrity="sha384-WAVjGaW7/8LbUYIxmiRgeQNvbiuRqzJmqEz4TwPFQQc5yyHWHgnCg8BqCO+9A+mM"></script>
     <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-FswQQCZnOdEDc4CTFf3AG/vBJEW6Hc+I5V6RjG/jRovXFiWTuMKtKFRpab/VEBMF"></script>
@@ -472,9 +467,8 @@
                 logger,
                 showToast,
                 onReadyToCapture: () => showStep(stepChoose),
-                onFingerprintReady: (theirFp, ourFp) => {
-                    document.getElementById('sender-fingerprint').textContent = ourFp;
-                    document.getElementById('receiver-fingerprint').textContent = theirFp;
+                onFingerprintReady: (code) => {
+                    document.getElementById('verification-code').textContent = code;
                     showVerificationModal();
                 },
                 onShowConnecting: () => showStep(stepConnecting),

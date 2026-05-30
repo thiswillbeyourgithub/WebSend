@@ -132,7 +132,13 @@ const WebSendCrypto = {
     },
 
     /**
-     * Compute SHA-256 fingerprint of a public key for visual verification.
+     * Compute SHA-256 fingerprint of a single public key.
+     *
+     * This is NOT the user-facing verification code any more (see
+     * getCombinedFingerprint for that). It is kept for the reconnect
+     * peer-identity check: caching one fingerprint per peer key lets the
+     * reconnect path detect a peer swap without re-running the full
+     * verification ceremony.
      *
      * Fixed at 16 hex chars (64 bits). This is the recognised floor for
      * verbal-comparison fingerprints (Signal uses 60 decimal digits, OTR
@@ -160,6 +166,70 @@ const WebSendCrypto = {
             .join('')
             .toUpperCase();
         // Group in chunks of 4 with dashes for readability (XXXX-XXXX-XXXX-XXXX)
+        const groups = [];
+        for (let i = 0; i < hexChars.length; i += 4) {
+            groups.push(hexChars.slice(i, i + 4));
+        }
+        return groups.join('-');
+    },
+
+    /**
+     * Lexicographic comparison of two byte arrays. Returns <0, 0, or >0.
+     * Used to put the two public keys in a canonical order so both peers
+     * hash the same byte sequence regardless of who is sender or receiver.
+     */
+    _compareBytes(a, b) {
+        const len = Math.min(a.length, b.length);
+        for (let i = 0; i < len; i++) {
+            if (a[i] !== b[i]) return a[i] - b[i];
+        }
+        return a.length - b.length;
+    },
+
+    /**
+     * Compute a single combined verification code from BOTH public keys.
+     *
+     * Unlike getKeyFingerprint (one fingerprint per key), this derives ONE
+     * code that is identical on both devices. The user only has to check
+     * that the two screens show the same code, instead of cross-referencing
+     * two separate fingerprints in swapped roles (which testers found
+     * confusing). The two raw public keys are sorted into a canonical order
+     * before hashing so both peers compute the same value regardless of
+     * argument order.
+     *
+     * 24 hex chars (96 bits). This is a single comparison rather than the
+     * two 64-bit comparisons of the previous per-key scheme, so the length
+     * is raised to 96 bits to keep the work factor (a 2^96 second-preimage
+     * grind to make the two screens agree) comfortably above the old design.
+     * The relevant attack is a signaling-MITM grinding ECDH keys until the
+     * combined code on both sides matches; that cost is independent of how
+     * many rooms are live, so do NOT shorten this or make it adaptive.
+     *
+     * @param {CryptoKey} pubKeyA - One party's ECDH public key
+     * @param {CryptoKey} pubKeyB - The other party's ECDH public key
+     * @returns {Promise<string>} 24-hex-char code grouped as XXXX-XXXX-XXXX-XXXX-XXXX-XXXX
+     */
+    async getCombinedFingerprint(pubKeyA, pubKeyB) {
+        const HEX_LEN = 24; // 96 bits, see doc above. Do not lower.
+
+        const rawA = new Uint8Array(await crypto.subtle.exportKey('raw', pubKeyA));
+        const rawB = new Uint8Array(await crypto.subtle.exportKey('raw', pubKeyB));
+
+        // Canonical order so the code is identical on both peers.
+        const [first, second] = this._compareBytes(rawA, rawB) <= 0
+            ? [rawA, rawB]
+            : [rawB, rawA];
+        const combined = new Uint8Array(first.length + second.length);
+        combined.set(first, 0);
+        combined.set(second, first.length);
+
+        const hash = await crypto.subtle.digest('SHA-256', combined);
+        const hashArray = new Uint8Array(hash);
+        const hexChars = Array.from(hashArray.slice(0, HEX_LEN / 2))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('')
+            .toUpperCase();
+        // Group in chunks of 4 with dashes (XXXX-XXXX-XXXX-XXXX-XXXX-XXXX)
         const groups = [];
         for (let i = 0; i < hexChars.length; i += 4) {
             groups.push(hexChars.slice(i, i + 4));
@@ -481,6 +551,6 @@ const WebSendCrypto = {
 
 // Export for use in other modules. Frozen so a hostile script (XSS, malicious
 // browser extension, or compromised dependency loaded after this file) cannot
-// monkey-patch deriveSharedKey / encryptWithMetadata / getKeyFingerprint to
-// subvert the E2EE handshake at runtime.
+// monkey-patch deriveSharedKey / encryptWithMetadata / getCombinedFingerprint
+// to subvert the E2EE handshake at runtime.
 window.WebSendCrypto = Object.freeze(WebSendCrypto);

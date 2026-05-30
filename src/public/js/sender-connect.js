@@ -290,19 +290,21 @@
             const receiverPublicKey = await window.WebSendCrypto.importPublicKey(msg.key);
             sharedKey = await window.WebSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
 
-            const ourFingerprint = await window.WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
-            const theirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey);
-            cachedOurFingerprint = ourFingerprint;
-            cachedTheirFingerprint = theirFingerprint;
+            // Per-key fingerprints are cached only for the reconnect
+            // peer-identity check below; the user-facing code is the
+            // single combined fingerprint computed next.
+            cachedOurFingerprint = await window.WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
+            cachedTheirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey);
 
-            _logger.success(`Key exchange complete. Our key: ${ourFingerprint}, Their key: ${theirFingerprint}`);
+            const combinedFingerprint = await window.WebSendCrypto.getCombinedFingerprint(keyPair.publicKey, receiverPublicKey);
+            _logger.success(`Key exchange complete. Verification code: ${combinedFingerprint}`);
 
             const ourPublicKeyB64 = await window.WebSendCrypto.exportPublicKey(keyPair.publicKey);
             rtc.sendMessage(window.Protocol.build.senderPublicKey(ourPublicKeyB64));
             _logger.info('Sent our public key to receiver');
 
             if (_onFingerprintReady) {
-                _onFingerprintReady(theirFingerprint, ourFingerprint);
+                _onFingerprintReady(combinedFingerprint);
             }
         } catch (e) {
             _logger.error('Failed to complete key exchange: ' + e.message);
