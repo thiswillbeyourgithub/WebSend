@@ -1870,10 +1870,6 @@ footer {
 .verify-code-block {
     margin-bottom: 15px;
 }
-.verify-code-block-divided {
-    border-top: 1px solid #ddd;
-    padding-top: 15px;
-}
 .verify-code-label {
     font-size: 0.85rem;
     color: #666;
@@ -1884,9 +1880,8 @@ footer {
     font-weight: bold;
     margin: 5px 0;
     letter-spacing: 2px;
+    color: #1565c0;
 }
-.verify-fingerprint-sender { color: #1b5e20; }
-.verify-fingerprint-receiver { color: #1565c0; }
 .verify-warning {
     margin: 0 0 20px 0;
     color: #d32f2f;
