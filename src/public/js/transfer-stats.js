@@ -17,14 +17,19 @@ function formatRate(bytesPerSec) {
 
 /**
  * Build the one-line transfer-stats label shown below the progress bar.
- * @param {number} percent   0–100
+ * @param {number} percent   0-100
  * @param {number} rate      bytes per second
  * @param {number} remaining seconds until completion (may be Infinity)
  * @returns {string} e.g. "42%  1.2 MB/s  14s"
  */
 function formatTransferStats(percent, rate, remaining) {
     let s = percent + '%  ' + formatRate(rate);
-    if (isFinite(remaining) && remaining > 10) {
+    // Show the ETA whenever it is known (finite). The only case without a
+    // time component is the first ~200ms before any rate is measured, when
+    // remaining is Infinity. Previously this was gated on remaining > 10,
+    // so the ETA vanished both at the start (rate still 0) and near the end
+    // (under 10s), which read as "it appears then goes away".
+    if (isFinite(remaining) && remaining >= 0) {
         const m = Math.floor(remaining / 60);
         const sec = Math.round(remaining % 60);
         s += '  ' + (m > 0 ? m + 'm ' : '') + sec + 's';

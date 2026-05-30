@@ -37,13 +37,21 @@ test('formatTransferStats: appends remaining time when finite and > 10s', () => 
     assert.ok(s.includes('1m'), `Expected minutes in: ${s}`);
 });
 
+test('formatTransferStats: still shows short remaining time (<= 10s)', () => {
+    // The ETA must stay visible all the way down instead of vanishing near
+    // the end of a transfer.
+    const s = formatTransferStats(99, 1024, 8);
+    assert.ok(/\b8s$/.test(s), `Expected "8s" suffix, got: ${s}`);
+});
+
+test('formatTransferStats: shows 0s at completion', () => {
+    const s = formatTransferStats(100, 1024 * 1024, 0);
+    assert.ok(/\b0s$/.test(s), `Expected "0s" suffix, got: ${s}`);
+});
+
 test('formatTransferStats: omits remaining time when Infinity', () => {
     const s = formatTransferStats(10, 1024, Infinity);
     // Should not end with a time token like "5s" or "1m 10s"
     assert.ok(!/\d+s$/.test(s), `Should not end with time suffix, got: ${s}`);
 });
 
-test('formatTransferStats: omits remaining time when <= 10s', () => {
-    const s = formatTransferStats(99, 1024, 8);
-    assert.ok(!s.includes('8s'), `Should not append short remaining, got: ${s}`);
-});
