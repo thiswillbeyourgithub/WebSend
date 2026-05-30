@@ -531,6 +531,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
    canonical Node WebSocket library, zero transitive deps, ~200 KB).
 11. **SRI**: All `<script>` and `<link>` tags use `integrity` attributes (Subresource
    Integrity), ensuring even a compromised server cannot silently swap in tampered files.
+   *Planned*: adopt [WEBCAT](https://github.com/freedomofpress/webcat/) (Web-based Code
+   Assurance and Transparency, from the Freedom of the Press Foundation) once it matures —
+   it layers enforced code signing plus a public transparency log on top of SRI, so a
+   compatible browser refuses any WebSend frontend whose signed manifest is absent from the
+   log, closing the "backdoor present at vendoring/build time" gap SRI alone cannot catch.
 12. **Rate limiting**: Per-IP sliding window limits on room creation (5/min), room lookup
     (30/min), and general API (100/min). The HTTP-relay data path (`/relay/up`,
     `/relay/down`) is intentionally exempt: a single LP transfer is many POSTs,
