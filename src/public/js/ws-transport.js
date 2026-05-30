@@ -357,8 +357,14 @@
                     const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
                     this.ws.send(chunk);
                     offset += chunk.byteLength;
-                    const percent = Math.round((offset / totalSize) * 100);
-                    if (onProgress) onProgress(percent, offset, totalSize);
+                    // Report bytes actually handed off to the network rather
+                    // than bytes buffered locally, so the sender's % and rate
+                    // match the receiver's instead of running ahead by up to
+                    // the bufferedAmount high-water mark.
+                    const buffered = this.ws ? this.ws.bufferedAmount : 0;
+                    const delivered = Math.max(0, offset - buffered);
+                    const percent = Math.round((delivered / totalSize) * 100);
+                    if (onProgress) onProgress(percent, delivered, totalSize);
                 }
 
                 if (!this.sendMessage(window.Protocol.build.fileEnd())) {

@@ -479,8 +479,15 @@ class WebSendRTC {
                 this.dataChannel.send(chunk);
                 offset += chunk.byteLength;
 
-                const percent = Math.round((offset / totalSize) * 100);
-                if (onProgress) onProgress(percent, offset, totalSize);
+                // Report bytes actually handed off to the network, not bytes
+                // written into the local send buffer. `offset` runs up to
+                // ~1 MiB ahead (the bufferedAmount high-water mark above), so
+                // reporting it made the sender's % and rate read well above
+                // the receiver's (which counts bytes that have arrived). Use
+                // the delivered estimate so both ends track each other.
+                const delivered = Math.max(0, offset - this.dataChannel.bufferedAmount);
+                const percent = Math.round((delivered / totalSize) * 100);
+                if (onProgress) onProgress(percent, delivered, totalSize);
             }
 
             if (!this.sendMessage(Protocol.build.fileEnd())) {
