@@ -626,6 +626,19 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     `<script>`/`<style>` in the HTML are still allowed via
     `'unsafe-inline'` because the page logic is currently inline; moving
     that out is a follow-up that lets us drop the exception.
+    On connections the server already sees as secure (`req.secure`, which
+    honours `X-Forwarded-Proto` only from the trusted proxy, i.e. Caddy on
+    loopback) two further headers fire: a `Strict-Transport-Security`
+    header (`HSTS_MAX_AGE` seconds, default one year; `0` disables it) so a
+    browser refuses plain HTTP for this origin after the first secure visit
+    and an SSL-strip downgrade on later visits fails, and an
+    `upgrade-insecure-requests` CSP directive so a stray `http:` / `ws:`
+    subresource or fetch is upgraded before it leaves the browser. Both are
+    skipped on a non-secure connection so plain-HTTP local dev still works.
+    WebSend does not terminate TLS itself; these are the belt-and-braces
+    layer on top of the reverse proxy that owns HTTPS. The default
+    `ALLOWED_ORIGINS` likewise drops the cleartext `http://{DOMAIN}` origin
+    unless `DOMAIN` is the local-dev sentinel `localhost`.
 22. **Signaling-API hardening**: every `/api/*` response carries
     `Cache-Control: no-store` so a misbehaving CDN or browser cache
     cannot replay another session's offer / TURN credentials / room

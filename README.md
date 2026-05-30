@@ -136,6 +136,11 @@ The protections listed in [Security Features](#security-features) below address 
 - Express **trusts proxy headers only from loopback**, so `X-Forwarded-For` cannot be spoofed by external clients (designed to run behind [Caddy](https://caddyserver.com/))
 - **Long-poll waiter caps**: layered defense for `?wait=true`. A per-room cap (4 concurrent waiters) refuses extras with 429, and a process-wide ceiling (10000 in-flight waiters) refuses extras with 503, before any socket / closure / timer is allocated.
 
+### Transport Security Headers
+- Every response carries a defensive header set (Content-Security-Policy, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, COOP/CORP, Permissions-Policy).
+- WebSend trusts the reverse proxy (Caddy) to terminate TLS, but adds belt-and-braces enforcement on top: on any connection the server sees as HTTPS (`req.secure`, derived from `X-Forwarded-Proto` and trusted only from the loopback proxy) it sends a **`Strict-Transport-Security`** header (`HSTS_MAX_AGE`, default 1 year; set `0` to disable) so a browser refuses plain HTTP for the origin after the first secure visit, and appends **`upgrade-insecure-requests`** to the CSP so a stray `http:` / `ws:` subresource is upgraded before it leaves the browser. Both are skipped on a plain-HTTP connection so local dev still works. This is the failsafe that keeps the sender/relay and relay/receiver hops encrypted at the transport layer (WebRTC is always DTLS, and the WS / long-poll relay paths use `wss:` / `https:`) underneath the end-to-end AES-GCM layer.
+- The default `ALLOWED_ORIGINS` no longer accepts the cleartext `http://{DOMAIN}` origin unless `DOMAIN` is the local-dev sentinel `localhost`.
+
 ### Receiver Payload Bounding (Anti-DoS)
 - The data-channel binary branch refuses chunks that arrive before a valid `file-start`, refuses any chunk that would push the in-flight file past its declared size, and refuses any chunk that would push the cumulative session bytes past 4 GiB. On any of those, the data channel and peer connection are torn down immediately.
 - The `file-start` size validator enforces a 16 KiB floor (the smallest legitimate padded ciphertext) so a hostile peer cannot smuggle a tiny declared size to keep the receive buffer growing under the radar.
@@ -324,7 +329,8 @@ COMPOSE_PROFILES=auth,turn        # public with SSO and bundled TURN
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DOMAIN` | Server IP or hostname | `localhost` |
-| `ALLOWED_ORIGINS` | Comma-separated allowed origins for API requests | `https://{DOMAIN}, http://{DOMAIN}` |
+| `ALLOWED_ORIGINS` | Comma-separated allowed origins for API requests | `https://{DOMAIN}` (the cleartext `http://{DOMAIN}` is added only when `DOMAIN=localhost`) |
+| `HSTS_MAX_AGE` | `Strict-Transport-Security` max-age in seconds, sent only on connections the server sees as HTTPS. `0` disables the header | `31536000` (1 year) |
 | `DEV` | Enable verbose debug logging (`1` or `0`) | `0` |
 | `STUN_SERVER` | Self-hosted STUN server (`host:port`) | _(empty -- uses Google STUN)_ |
 | `STUN_GOOGLE_FALLBACK` | Use Google's public STUN as fallback | `true` |

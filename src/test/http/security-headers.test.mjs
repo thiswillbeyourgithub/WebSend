@@ -68,6 +68,48 @@ test('CSP includes the Umami origin in script-src/connect-src when configured', 
     }
 });
 
+test('plain-HTTP request gets no HSTS and no upgrade-insecure-requests', async () => {
+    // Over a cleartext hop (req.secure === false) we must NOT advertise HSTS
+    // (a MITM could forge/strip it) and must NOT force upgrade-insecure-
+    // requests (it would break a genuine plain-HTTP local-dev deployment).
+    const res = await fetch(`${srv.baseUrl}/send.html`);
+    assert.equal(res.headers.get('strict-transport-security'), null,
+        'HSTS must not be sent over a non-secure connection');
+    const csp = res.headers.get('content-security-policy') || '';
+    assert.doesNotMatch(csp, /upgrade-insecure-requests/,
+        'upgrade-insecure-requests must not be sent over a non-secure connection');
+});
+
+test('secure request (X-Forwarded-Proto: https) gets HSTS + upgrade-insecure-requests', async () => {
+    // The test server connects from loopback and trust proxy defaults to
+    // loopback, so X-Forwarded-Proto is honoured and req.secure becomes true,
+    // exactly as it does behind Caddy in production.
+    const res = await fetch(`${srv.baseUrl}/send.html`, {
+        headers: { 'X-Forwarded-Proto': 'https' },
+    });
+    assert.match(res.headers.get('strict-transport-security') || '', /^max-age=\d+$/,
+        'HSTS with a max-age must be sent on a secure connection');
+    const csp = res.headers.get('content-security-policy') || '';
+    assert.match(csp, /upgrade-insecure-requests/,
+        'upgrade-insecure-requests must be appended on a secure connection');
+});
+
+test('HSTS_MAX_AGE=0 disables the header even on a secure connection', async () => {
+    const srv2 = await startServer({ HSTS_MAX_AGE: '0' });
+    try {
+        const res = await fetch(`${srv2.baseUrl}/send.html`, {
+            headers: { 'X-Forwarded-Proto': 'https' },
+        });
+        assert.equal(res.headers.get('strict-transport-security'), null,
+            'HSTS must be absent when HSTS_MAX_AGE=0');
+        // upgrade-insecure-requests is independent of HSTS and should still fire
+        const csp = res.headers.get('content-security-policy') || '';
+        assert.match(csp, /upgrade-insecure-requests/);
+    } finally {
+        await stopServer(srv2.proc);
+    }
+});
+
 test('404 response carries a CSP at least as restrictive as ours', async () => {
     // serve-static's built-in 404 page sets its own (stricter) CSP
     // (default-src 'none') so the body is rendered with no powers at

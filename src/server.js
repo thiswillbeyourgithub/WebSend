@@ -142,11 +142,15 @@ function debugLog(context, message, data = null) {
 }
 
 // ALLOWED_ORIGINS: comma-separated list of allowed origins for Origin header validation.
-// If not set, defaults to https://{DOMAIN} and http://{DOMAIN} (for local dev).
+// If not set, defaults to https://{DOMAIN}. The cleartext http://{DOMAIN} origin is
+// added ONLY for the local-dev sentinel DOMAIN=localhost; a real deployment never
+// accepts a plaintext origin by default (WebSend is meant to run behind HTTPS).
 // Example: ALLOWED_ORIGINS=https://share.example.com,https://backup.example.com
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-    : [`https://${DOMAIN}`, `http://${DOMAIN}`];
+    : DOMAIN === 'localhost'
+        ? [`https://${DOMAIN}`, `http://${DOMAIN}`]
+        : [`https://${DOMAIN}`];
 
 // Trust proxy headers only from loopback by default (Caddy runs on same host).
 // This ensures X-Forwarded-For cannot be spoofed by external clients.
@@ -211,8 +215,31 @@ const CSP_DIRECTIVES = [
     "form-action 'none'",
 ].join('; ');
 
+// Secure-context variant: tells the browser to upgrade any stray http:// /
+// ws:// subresource or fetch to its https:// / wss:// form before it hits the
+// network, so a single mistyped scheme cannot open a cleartext hop. Only sent
+// on connections we already see as secure (see req.secure note below), so it
+// never breaks plain-HTTP local dev.
+const CSP_DIRECTIVES_SECURE = `${CSP_DIRECTIVES}; upgrade-insecure-requests`;
+
+// HSTS_MAX_AGE: Strict-Transport-Security max-age in seconds (default 1 year).
+// Set to 0 to disable the header entirely. WebSend does not enforce TLS itself
+// (it trusts the reverse proxy to terminate HTTPS); HSTS is the belt-and-braces
+// layer that makes a browser refuse plain-HTTP for this origin after the first
+// secure visit, defeating an SSL-strip downgrade on later visits.
+const _hstsRaw = process.env.HSTS_MAX_AGE;
+const HSTS_MAX_AGE = (_hstsRaw !== undefined && Number.isFinite(parseInt(_hstsRaw, 10)))
+    ? parseInt(_hstsRaw, 10)
+    : 31536000;
+
 app.use((req, res, next) => {
-    res.setHeader('Content-Security-Policy', CSP_DIRECTIVES);
+    // req.secure honours X-Forwarded-Proto, but ONLY from a peer in the
+    // trust-proxy list (loopback by default = Caddy on the same host), so a
+    // remote client cannot forge it. True for the normal HTTPS-behind-Caddy
+    // deploy; false for direct plain-HTTP local dev, which is exactly when we
+    // want to skip HSTS / upgrade-insecure-requests to avoid breaking it.
+    const secure = req.secure;
+    res.setHeader('Content-Security-Policy', secure ? CSP_DIRECTIVES_SECURE : CSP_DIRECTIVES);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     // Hash fragment carries the room secret; suppress full-URL leaks
@@ -221,6 +248,9 @@ app.use((req, res, next) => {
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('Permissions-Policy', 'interest-cohort=(), browsing-topics=()');
+    if (secure && HSTS_MAX_AGE > 0) {
+        res.setHeader('Strict-Transport-Security', `max-age=${HSTS_MAX_AGE}`);
+    }
     next();
 });
 
@@ -1588,6 +1618,7 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'TURN_CREDENTIAL_TTL',   value: process.env.TURN_CREDENTIAL_TTL,  used: String(TURN_CREDENTIAL_TTL) },
         { name: 'TURN_TIMEOUT',          value: process.env.TURN_TIMEOUT,         used: String(TURN_TIMEOUT) },
         { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
+        { name: 'HSTS_MAX_AGE',          value: process.env.HSTS_MAX_AGE,         used: HSTS_MAX_AGE > 0 ? `${HSTS_MAX_AGE}s` : '(disabled)' },
         { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
         { name: 'RELAY_ENABLE',          value: process.env.RELAY_ENABLE,         used: String(RELAY_ENABLE) },
         { name: 'RELAY_LP_ONLY',         value: process.env.RELAY_LP_ONLY,        used: String(RELAY_LP_ONLY) },
