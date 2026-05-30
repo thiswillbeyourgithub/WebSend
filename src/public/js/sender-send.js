@@ -214,7 +214,15 @@
             item._localHash = await window.WebSendCrypto.sha256Hex(photoData);
             _logger.info(`Plaintext SHA-256: ${item._localHash}`);
             const filename = blob.name || `websend_${Date.now()}.png`;
-            const mimeType = blob.type || 'image/png';
+            // Camera/gallery blobs always carry an explicit image/* type (set
+            // by canvas.toBlob). An empty blob.type only happens for a
+            // file-picker pass-through of a type the browser does not
+            // recognize (e.g. a .img disk image). Defaulting those to
+            // image/png mislabels arbitrary binary as a picture, so the
+            // receiver tries to render/OCR it and the file can end up
+            // discarded as a failed photo. Fall back to a generic type so
+            // such files travel as plain downloadable files instead.
+            const mimeType = blob.type || 'application/octet-stream';
             item._cachedEncryptedData = await window.WebSendCrypto.encryptWithMetadata(
                 photoData,
                 { name: filename, mimeType: mimeType, originalSize: photoData.byteLength },

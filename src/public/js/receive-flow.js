@@ -214,35 +214,51 @@
             return;
         }
 
+        // Step 1 - decryption. A failure here is content-agnostic (AES-GCM
+        // tag mismatch, malformed metadata length, missing key) and must
+        // nack so the sender can retry. Local logger gets the full message;
+        // the peer only ever sees the constant 'decrypt-failed'. A
+        // peer-facing string would otherwise turn the receiver into an
+        // oracle for distinguishing AES-GCM tag failures from JSON parse
+        // errors / metadata-length overflows / missing keys, which lets a
+        // hostile sender narrow down probing attacks against the crypto layer.
+        let decoded;
         try {
-            const decoded = await decryptIncomingFile(msg.blob);
-
-            let replaceIdx = -1;
-            const pendingHash = _getPendingReplaceHash();
-            if (pendingHash) {
-                replaceIdx = receivedImages.findIndex(img => img && img.hash === pendingHash);
-                _setPendingReplaceHash(null);
-                if (replaceIdx === -1) {
-                    _logger.warn(`replace-image: old hash not found, adding as new image`);
-                }
+            decoded = await decryptIncomingFile(msg.blob);
+        } catch (e) {
+            _logger.error('Failed to decrypt photo: ' + e.message);
+            if (!_getRtc().sendMessage(window.Protocol.build.fileNack('decrypt-failed'))) {
+                _logger.warn('Nack could not be sent (channel closed) — sender will time out');
             }
+            return;
+        }
 
+        let replaceIdx = -1;
+        const pendingHash = _getPendingReplaceHash();
+        if (pendingHash) {
+            replaceIdx = receivedImages.findIndex(img => img && img.hash === pendingHash);
+            _setPendingReplaceHash(null);
+            if (replaceIdx === -1) {
+                _logger.warn(`replace-image: old hash not found, adding as new image`);
+            }
+        }
+
+        // Step 2 - display. The bytes already decrypted correctly, so a
+        // failure presenting them must NOT be reported as a decryption
+        // failure: doing so would nack and discard a file that arrived
+        // intact. Worst case the file is shown as a (broken) thumbnail or a
+        // generic download, but it is never thrown away once it decrypted.
+        // The sender no longer mislabels unknown file types as image/png
+        // (sender-send.js), so a disk image and friends arrive as a plain
+        // downloadable file rather than a picture in the first place.
+        try {
             if (replaceIdx !== -1) {
                 await applyImageReplacement(replaceIdx, decoded);
             } else {
                 await addNewReceivedImage(decoded);
             }
         } catch (e) {
-            // Local logger gets the full message; the peer only sees a
-            // constant. A peer-facing string would otherwise turn the
-            // receiver into an oracle for distinguishing AES-GCM tag
-            // failures from JSON parse errors / metadata-length
-            // overflows / missing keys, which lets a hostile sender
-            // narrow down probing attacks against the crypto layer.
-            _logger.error('Failed to decrypt photo: ' + e.message);
-            if (!_getRtc().sendMessage(window.Protocol.build.fileNack('decrypt-failed'))) {
-                _logger.warn('Nack could not be sent (channel closed) — sender will time out');
-            }
+            _logger.error('Failed to display received file: ' + e.message);
         }
     }
 
