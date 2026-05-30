@@ -38,6 +38,7 @@ function setup({ deriveSharedKeyCallback } = {}) {
         },
         exportPublicKey: async () => 'b64pubkey',
         getKeyFingerprint: async () => 'AAAA-BBBB-CCCC-DDDD',
+        getCombinedFingerprint: async () => 'AAAA-BBBB-CCCC-DDDD',
     };
     win.WebSendRTC = class {
         constructor() { this.iceServers = []; }
