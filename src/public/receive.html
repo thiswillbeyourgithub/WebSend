@@ -940,6 +940,14 @@
         }
 
         window.addEventListener('beforeunload', cleanupAllData);
+        // pagehide is the reliable terminal-teardown signal on mobile
+        // (especially iOS Safari), where beforeunload frequently does not
+        // fire. Skip the persisted case: the page is entering the bfcache and
+        // may be restored, so shredding the session here would break a
+        // legitimate resume. An OS that later discards the bfcached page fires
+        // no event at all, but nothing is persisted to disk so there is
+        // nothing to recover regardless.
+        window.addEventListener('pagehide', (e) => { if (!e.persisted) cleanupAllData(); });
 
 
         async function handleSenderPublicKey(msg) {
