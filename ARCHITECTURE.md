@@ -113,8 +113,8 @@ WebSend/
         │   │               #   and-drop wiring. Cross-page state injected via
         │   │               #   Collections.attach({...}). Exposes window.Collections
         │   ├── crypto.js   # ECDH key exchange (P-256) + AES-GCM-256 encryption via
-        │   │               #   Web Crypto API. Includes HKDF key derivation, key
-        │   │               #   fingerprinting for MITM detection, size-bucket padding
+        │   │               #   Web Crypto API. Includes HKDF key derivation, a combined
+        │   │               #   two-key verification code for MITM detection, size-bucket padding
         │   │               #   to hide exact file sizes, and metadata bundling (filename,
         │   │               #   MIME type encrypted inside the payload)
         │   ├── protocol.js # Data-channel message schemas, validation, and builders.
@@ -361,8 +361,8 @@ WebSend/
   11. Send ECDH public key ─────────────────────────────────────▶ 12. Derive shared AES key
   ◀────────────────────────────────────────────── Send ECDH public key back
   13. Derive same shared AES key
-  14. Show fingerprint verification modal ◀─────────────────────▶ Show fingerprint modal
-  15. Both confirm match
+  14. Show same combined verification code ◀────────────────────▶ Show same combined code
+  15. Both check the two screens match, confirm
 
   ◀──────────────────────────────────── Encrypt photo (AES-GCM, padded)
                                         Send via data channel chunks
@@ -446,7 +446,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 ### In scope (defended)
 
 - **Confidentiality and integrity of every file payload, end-to-end, even with hostile server and hostile relay.** ECDH P-256 + HKDF + AES-256-GCM, fresh ephemeral keys per session (forward secrecy). The server only ever sees ciphertext. (Layers §1, §2)
-- **Detection of signaling-channel MITM.** A 64-bit SHA-256 fingerprint of each public key is read aloud by both users. A signaling MITM would need to grind ECDH keys to a chosen fingerprint, which is a second-preimage search whose cost is independent of how many rooms are live. (Layers §4, §23, §24)
+- **Detection of signaling-channel MITM.** A single 96-bit SHA-256 code derived from both public keys is shown identically on both screens; the users confirm the two screens match. A signaling MITM would need to grind ECDH keys until the combined code matches on both sides, a second-preimage search whose cost is independent of how many rooms are live. (Layers §4, §23, §24)
 - **Room enumeration and unauthorized room access.** A 128-bit room secret in the URL hash fragment is required for every room API call and compared in constant time. (Layers §3)
 - **Resource-exhaustion DoS from a peer before verification** (the verification modal is up, but message handlers are already running). Caps on receive buffer, per-file size, per-session bytes, control-message size, and log-panel growth all fire before mutual confirmation. (Layers §16, §19, §27)
 - **Resource-exhaustion DoS from a peer after verification.** Transform-replay caps, octet-stream blob URLs, PDF page-render cap, image-transform pixel cap, sender transform-nack retry cap, and background-OCR pixel cap all bound a verified-but-hostile peer. (Layers §17, §20, §28, §29, §30, §31)
@@ -464,19 +464,19 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 ### Out of scope (explicitly NOT defended)
 
 - **A fully compromised endpoint device** (rooted phone, malware on the receiver computer, hostile browser, hostile browser extension). Rationale: any application-layer protection is bypassable by code running inside the same browser context as the page. WebSend assumes both endpoints are honest.
-- **A user who skips the spoken fingerprint comparison**, or who confirms a mismatch by mistake. Rationale: the fingerprint ceremony *is* the MITM defense. There is no other check that can detect a chosen-key MITM if the user does not actually compare the codes.
+- **A user who skips the verification-code comparison**, or who confirms a non-matching code by mistake. Rationale: the verification ceremony *is* the MITM defense. There is no other check that can detect a chosen-key MITM if the user does not actually compare the codes on the two screens.
 - **Targeted denial-of-service at the network / IP layer.** Rationale: WebSend mitigates application-layer DoS (giant chunks, pipelined long-polls, malformed messages) at the Node and browser layers; mitigating packet floods is the job of the upstream reverse proxy / CDN / firewall.
 - **Forensic recovery of decrypted bytes from device RAM after a transfer.** Rationale: we drop references on shred so the garbage collector can reclaim the pages, but JavaScript cannot zero memory deterministically and we do not run in a TEE.
 - **Compromise of the user's HTTPS certificate authority.** Rationale: a forged certificate breaks the TLS layer underneath everything; the fingerprint ceremony still catches an active ECDH MITM on top of that, but confidentiality of the room ID and timing metadata is gone.
 - **Side-channel attacks against the browser's Web Crypto implementation.** Rationale: Web Crypto is the trusted cryptographic primitive; reimplementing it in user-space would expose worse side channels, not better ones.
 - **Vulnerabilities inside coturn or oauth2-proxy themselves.** Rationale: these are external components; WebSend's threat model assumes they are correct. `misc/check_turn.py` is provided as a manual probe.
 - **Traffic analysis beyond fixed-bucket size padding.** Rationale: padding to power-of-2 buckets hides the *exact* file size, but an observer can still see that some transfer happened, roughly when, and within which bucket. Hiding the timing pattern would require constant-rate padding traffic, which is not implemented.
-- **Targeted ECDH key-grinding for a chosen 64-bit fingerprint.** Rationale: the fingerprint length (64 bits) is at the recognized floor for verbal-comparison ceremonies and is fixed regardless of server load; a determined attacker willing to spend significant compute can in principle grind a colliding fingerprint, but the cost is significant and the fingerprint length is held constant for that reason. (See the explanatory paragraph at Layer §4.)
+- **Targeted ECDH key-grinding to make the 96-bit combined code match.** Rationale: the code length (96 bits) is fixed regardless of server load; a determined attacker willing to spend significant compute can in principle grind a colliding combined code, but the cost is significant and the length is held constant for that reason. (See the explanatory paragraph at Layer §4.)
 
 ### Trust assumptions
 
 - Both endpoint devices, their operating systems, and their browsers behave honestly. A compromised browser can defeat any in-page protection by definition.
-- The user actually compares the 16-hex fingerprint aloud and aborts on any mismatch. The four-list structure of this threat model exists precisely to make that requirement visible.
+- The user actually compares the 24-hex verification code shown on the two screens and aborts on any mismatch. The four-list structure of this threat model exists precisely to make that requirement visible.
 - HTTPS is correctly terminated in front of the server (typically Caddy + Let's Encrypt) and the TLS stack is sound.
 - The vendored third-party libraries were honest at the time they were vendored. Subresource Integrity (§10) re-verifies the bytes at runtime, so a later swap is detected; a backdoor present at vendoring time is not.
 - `NODE_ENV` is not relied on for security posture: the custom error / 404 handlers (§34) make the server safe to deploy even when `NODE_ENV` is unset, which it is in the shipped Docker image.
@@ -490,15 +490,20 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 3. **Room secrets**: 16-byte random token required for any room access. Passed in URL hash
    fragment (never sent to server in HTTP requests). Constant-time comparison prevents
    timing attacks. Prevents room enumeration even if the short room ID is guessed.
-4. **Fingerprint verification**: Both parties see a 16-hex-char (64-bit) SHA-256
-   fingerprint of each other's public keys, grouped as `XXXX-XXXX-XXXX-XXXX`, and must
-   manually confirm they match. The length is fixed: 64 bits is the recognised floor
-   for verbal-comparison fingerprints (Signal uses 60 decimal digits, OTR uses 40 hex /
-   160 bits). The relevant attack is a signaling-MITM grinding ECDH keys to a chosen
-   fingerprint, which is a second-preimage search whose cost is independent of how
-   many rooms are live, so the code length must NOT be adapted to active-room count.
-   An earlier "adaptive" version (3-12 hex) was removed for this reason: at 3 hex
-   chars the search is feasible in sub-second time on a laptop.
+4. **Verification code**: Both parties see a single 24-hex-char (96-bit) SHA-256
+   code derived from BOTH public keys (the two raw keys are sorted into a canonical
+   order before hashing), grouped as `XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`. The same code is
+   shown on both devices, so users only confirm the two screens match instead of
+   cross-referencing two separate per-key fingerprints in swapped roles (which testers
+   found confusing). The length is fixed and must NOT be adapted to active-room count.
+   The relevant attack is a signaling-MITM grinding ECDH keys until the combined code
+   matches on both sides, a second-preimage search whose cost is independent of how
+   many rooms are live. 96 bits is used because this is a single comparison (the earlier
+   design compared two independent 64-bit per-key fingerprints), keeping the
+   single-comparison grind comfortably above the old scheme. An earlier "adaptive"
+   version (3-12 hex) was removed because at 3 hex chars the search is feasible in
+   sub-second time on a laptop. `getKeyFingerprint` (64-bit, per key) is retained only
+   for the reconnect peer-identity check and is not shown to the user.
 5. **Size obfuscation**: Photos are padded to power-of-2 bucket sizes before encryption,
    hiding exact file sizes from network observers. Padding uses random bytes to prevent
    compression-based attacks.
