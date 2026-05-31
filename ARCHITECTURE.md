@@ -390,7 +390,10 @@ Send {type:'transform-image',                ───────────�
 
 Transform ops: `rotateCW`, `flipH`, `bw` (Otsu binarization), `crop` (with normalized
 corner coordinates for perspective transform). The receiver stores `originalData` (the
-as-first-received image) so transforms always replay from the pristine source.
+as-first-received image) so transforms always replay from the pristine source. This is
+an alias of the live `data` buffer, not a copy: since `data` is only ever reassigned to
+a fresh buffer (never mutated in place), the two can share one allocation, avoiding a
+doubling of receiver resident memory per file.
 
 The happy path is fire-and-forget (no positive ack). On failure (unknown `oldHash`,
 missing `originalData`, or replay exception) the receiver sends `{type:'transform-nack',

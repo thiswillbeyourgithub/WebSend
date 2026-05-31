@@ -136,7 +136,11 @@
         oldImg.name = fileName;
         oldImg.fileType = fileType;
         oldImg.hash = null;
-        oldImg.originalData = new Uint8Array(fileData);
+        // Alias, not a copy: `data` is only ever reassigned to a fresh buffer
+        // (here and in transform-replay), never mutated in place, so sharing
+        // one buffer with originalData is safe and halves resident memory.
+        // If you ever start writing into `data` byte-by-byte, copy here again.
+        oldImg.originalData = fileData;
         oldImg.originalMimeType = fileMimeType;
 
         window.ReceiveCard.setCardImage(replaceIdx, fileBlob, { filename: fileName });
@@ -170,7 +174,10 @@
             name: fileName,
             hash: null,
             fileType: fileType,
-            originalData: new Uint8Array(fileData),
+            // Alias, not a copy: see applyImageReplacement above. `data` is
+            // only ever reassigned, never mutated in place, so originalData can
+            // share the same buffer and avoid doubling resident memory.
+            originalData: fileData,
             originalMimeType: fileMimeType
         };
         receivedImages.push(imgObj);
