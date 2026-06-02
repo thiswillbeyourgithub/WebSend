@@ -32,7 +32,10 @@ function buildSidebar({ showLogs = true } = {}) {
     const logsHidden = showLogs ? '' : ' hidden';
 
     const html = `
-    <div id="maintenance-banner" class="maintenance-banner" data-i18n="maintenance.banner"></div>
+    <!-- Banner text (including the "restarted X ago" age) is injected by
+         updateDevBadge() with i18n interpolation; no data-i18n here so a later
+         language switch cannot replace it with the raw "{age}" template. -->
+    <div id="maintenance-banner" class="maintenance-banner"></div>
     <!-- Settings button: opens sidebar with settings, logs, about -->
     <button class="kebab-btn" id="kebab-btn" aria-label="Settings"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
 
@@ -175,6 +178,28 @@ function initSidebar() {
 }
 
 /**
+ * Turn a server start timestamp (epoch ms, from /api/config.serverStartedAt)
+ * into a localized "restarted X ago" phrase for the DEV maintenance banner.
+ * Picks the coarsest sensible unit (days > hours > minutes) so users can tell
+ * at a glance how recently the instance was restarted, and thus how likely it
+ * is to have just been modified and broken.
+ *
+ * @param {number|null} startedAt - Epoch ms the server process started.
+ * @returns {string} A translated relative-time string (e.g. "2 hours ago").
+ */
+function formatStartAge(startedAt) {
+    if (!startedAt || typeof startedAt !== 'number') return i18n.t('maintenance.ageJustNow');
+    const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const hours   = Math.floor(minutes / 60);
+    const days    = Math.floor(hours / 24);
+    if (days >= 1)    return i18n.t(days    === 1 ? 'maintenance.ageDay'    : 'maintenance.ageDays',    { n: days });
+    if (hours >= 1)   return i18n.t(hours   === 1 ? 'maintenance.ageHour'   : 'maintenance.ageHours',   { n: hours });
+    if (minutes >= 1) return i18n.t(minutes === 1 ? 'maintenance.ageMinute' : 'maintenance.ageMinutes', { n: minutes });
+    return i18n.t('maintenance.ageJustNow');
+}
+
+/**
  * Update the DEV-mode badge and version line in the sidebar after fetching /api/config.
  * Also shows the maintenance banner when in DEV mode (the banner text is set by i18n).
  *
@@ -186,6 +211,7 @@ function initSidebar() {
 function updateDevBadge(config) {
     const isDev   = typeof config === 'object' && config !== null ? !!config.dev : !!config;
     const version = typeof config === 'object' && config !== null ? config.version : null;
+    const startedAt = typeof config === 'object' && config !== null ? config.serverStartedAt : null;
 
     const badge = document.getElementById('sidebar-dev-badge');
     if (badge) {
@@ -195,7 +221,7 @@ function updateDevBadge(config) {
             badge.classList.add('dev-active');
             const banner = document.getElementById('maintenance-banner');
             if (banner) {
-                banner.textContent = i18n.t('maintenance.banner');
+                banner.textContent = i18n.t('maintenance.banner', { age: formatStartAge(startedAt) });
                 banner.classList.add('visible');
                 banner.addEventListener('click', () => {
                     banner.style.opacity = '0';

@@ -222,7 +222,14 @@ const i18n = (function() {
             'menu.connection': 'Connection',
             'menu.devMode': 'DEV mode enabled',
             'menu.prodMode': 'Production mode',
-            'maintenance.banner': '\u26a0\ufe0f Developer instance — expect occasional restarts. Things should work, but if something seems off, it\'s likely being actively worked on.',
+            'maintenance.banner': '\u26a0\ufe0f Developer instance, restarted {age}. It is being actively modified and may be temporarily broken. If something seems off, please come back in a few hours. If the problem persists, open an issue at github.com/thiswillbeyourgithub/ImageSecureSend/issues',
+            'maintenance.ageJustNow': 'just now',
+            'maintenance.ageMinute': '1 minute ago',
+            'maintenance.ageMinutes': '{n} minutes ago',
+            'maintenance.ageHour': '1 hour ago',
+            'maintenance.ageHours': '{n} hours ago',
+            'maintenance.ageDay': '1 day ago',
+            'maintenance.ageDays': '{n} days ago',
 
             // Disconnection hints
             'receive.disconnectedHint': 'Disconnected. Reload the page or click Back to restart.',
@@ -451,7 +458,14 @@ const i18n = (function() {
             'menu.connection': 'Connexion',
             'menu.devMode': 'Mode DEV activé',
             'menu.prodMode': 'Mode production',
-            'maintenance.banner': '\u26a0\ufe0f Instance de développement — des redémarrages sont possibles. Tout devrait fonctionner, mais en cas de souci, c\'est probablement en cours de modification.',
+            'maintenance.banner': '\u26a0\ufe0f Instance de développement, redémarrée {age}. Elle est en cours de modification et peut être temporairement cassée. Si quelque chose ne va pas, revenez dans quelques heures. Si le problème persiste, ouvrez un ticket sur github.com/thiswillbeyourgithub/ImageSecureSend/issues',
+            'maintenance.ageJustNow': 'à l\'instant',
+            'maintenance.ageMinute': 'il y a 1 minute',
+            'maintenance.ageMinutes': 'il y a {n} minutes',
+            'maintenance.ageHour': 'il y a 1 heure',
+            'maintenance.ageHours': 'il y a {n} heures',
+            'maintenance.ageDay': 'il y a 1 jour',
+            'maintenance.ageDays': 'il y a {n} jours',
 
             // Disconnection hints
             'receive.disconnectedHint': 'Déconnecté. Rechargez la page ou cliquez sur Retour pour redémarrer.',

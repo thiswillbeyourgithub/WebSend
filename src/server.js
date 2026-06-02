@@ -17,6 +17,11 @@ const PORT = parseInt(process.env.PORT, 10) || 8080;
 const DOMAIN = process.env.DOMAIN || 'localhost';
 // DEV mode: when 1, enables verbose debug logging for handshake/connection troubleshooting
 const DEV = process.env.DEV === '1';
+// Wall-clock time this process (container) started, in epoch ms. Exposed via
+// /api/config so the DEV maintenance banner can tell users how long ago the
+// instance was last restarted ("restarted 2 hours ago"), hinting that it may
+// have just been modified and could be temporarily broken.
+const SERVER_START = Date.now();
 
 // ============ Analytics (Umami) ============
 // Privacy-preserving analytics via Umami. Only enabled when both URL and website ID are set.
@@ -746,6 +751,9 @@ app.get('/api/config', (req, res) => {
         ...(forceRelay ? { iceTransportPolicy: 'relay' } : {}),
         forceConnection: DEV_FORCE_CONNECTION !== 'DEFAULT' ? DEV_FORCE_CONNECTION : undefined,
         dev: DEV,
+        // Epoch ms this server process started; the DEV banner turns this into a
+        // human "restarted X hours/days ago" string client-side.
+        serverStartedAt: SERVER_START,
         turnTimeout: TURN_TIMEOUT,
         version: APP_VERSION,
         ocrLangs: OCR_LANGS.split(',').map(l => l.trim()),

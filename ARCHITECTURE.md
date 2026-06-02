@@ -289,7 +289,11 @@ WebSend/
         │   │               #   used by index/receive/send. Exposes buildSidebar(),
         │   │               #   initSidebar(), updateDevBadge() (also on window) so each
         │   │               #   page only wires once. updateDevBadge() accepts the full
-        │   │               #   /api/config object and also fills the sidebar version line
+        │   │               #   /api/config object and also fills the sidebar version line.
+        │   │               #   In DEV mode it shows the maintenance banner, turning
+        │   │               #   config.serverStartedAt into a "restarted X hours/days ago"
+        │   │               #   notice (via formatStartAge) so users know the instance was
+        │   │               #   recently restarted and may be temporarily broken
         │   ├── transfer-stats.js # Pure helpers to format transfer progress (rate,
         │   │               #   percent, ETA) into "42%  1.2 MB/s  14s" labels. Used by
         │   │               #   both send.html and receive.html
