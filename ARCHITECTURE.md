@@ -189,14 +189,21 @@ WebSend/
         │   │               #   detectCorners, onApply, onCancel }); used by both send.html
         │   │               #   and receive.html so the ~450 LOC crop logic is not duplicated
         │   ├── doc-detect.js # Pure-JS document edge detection: downscale → grayscale
-        │   │               #   → blur → Sobel → Otsu → contour trace, then per contour
-        │   │               #   generates 3 candidate quads in parallel (Douglas-Peucker
-        │   │               #   on the raw contour, DP on the convex hull, min-area
-        │   │               #   rotated rectangle via rotating calipers) and scores
-        │   │               #   each quad by **perimeter edge alignment** against the
-        │   │               #   Sobel edge map (not brightness/area), so curved sides
-        │   │               #   and folded corners still produce a usable crop. Corners
-        │   │               #   are emitted in a consistent CW order (TL→TR→BR→BL) and
+        │   │               #   → blur → Sobel → Otsu → two foreground masks (border
+        │   │               #   flood-fill + brightness Otsu). Each mask is CLEANED with a
+        │   │               #   morphological opening (erode→dilate, severing the thin
+        │   │               #   tendrils that fuse the page to background texture) and
+        │   │               #   reduced to its largest connected component, so the page is
+        │   │               #   the sole blob and its hull no longer blows out to the image
+        │   │               #   corners. Per contour it generates 3 candidate quads in
+        │   │               #   parallel (Douglas-Peucker on the raw contour, DP on the
+        │   │               #   convex hull, min-area rotated rectangle via rotating
+        │   │               #   calipers) and scores each by **perimeter edge alignment**
+        │   │               #   against the Sobel edge map AND **coverage** of the union
+        │   │               #   page mask (so a brightness blob truncated by an on-page
+        │   │               #   shadow can't win by collapsing a corner inward). Sides are
+        │   │               #   then snapped to the strongest local edge. Corners are
+        │   │               #   emitted in a consistent CW order (TL→TR→BR→BL) and
         │   │               #   segmentation is hardened against degenerate contours.
         │   │               #   Used by sender camera live overlay and the crop modal's
         │   │               #   auto-corner-detection. Exposes DocDetect
@@ -912,7 +919,7 @@ This feature is experimental and was added with assistance from
 
 Three tiers, layered from fast/cheap to slow/realistic:
 
-- **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed. `doc-detect-samples.test.mjs` runs the document-edge detector against real camera shots in `test/fixtures/doc-samples/`, warps the detected quad to the ground-truth dimensions in `test/fixtures/doc-target-result/` via `ImageTransforms.perspectiveTransform`, and asserts both mean luminance and mean Sobel edge density of the crop match the target within 1% of 0..255 (BW + math, no colour classifier); skips automatically when the optional `canvas` devDep is not installed.
+- **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed. `doc-detect-samples.test.mjs` runs the document-edge detector against real camera shots in `test/fixtures/doc-samples/`, warps the detected quad to the ground-truth dimensions in `test/fixtures/doc-target-result/` via `ImageTransforms.perspectiveTransform`, and asserts both mean luminance and mean Sobel edge density of the crop match the target within 1% of 0..255 (BW + math, no colour classifier). It also applies a per-corner **geometry guard** (`EXPECTED_CORNERS`, tolerance 0.06 normalized) because the content metrics stay green even when a corner collapses inward over a uniform page; the guard catches that class of failure. Skips automatically when the optional `canvas` devDep is not installed.
 - **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, and the `/vendor` `/scribe` `/tessdata` static mounts. A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
 - **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer.
 

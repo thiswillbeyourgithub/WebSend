@@ -49,6 +49,23 @@ const EDGE_TOLERANCE_OVERRIDES = {
     '4.jpg': 255 * 0.015,
 };
 
+// Expected normalized corner positions (hand-verified against the overlay
+// renders). This is a GEOMETRY guard: the edge-density metric above is content-
+// based and stays green even when a corner collapses inward over a uniform page
+// (e.g. 2.jpg's top-right caving in along a diagonal shadow), so we additionally
+// assert each detected corner lands within CORNER_TOLERANCE of where the page
+// corner actually is. Catches collapses the luminance/edge metrics miss.
+const EXPECTED_CORNERS = {
+    '1.jpg': { tl: { x: 0.294, y: 0.330 }, tr: { x: 0.708, y: 0.246 }, br: { x: 0.719, y: 0.726 }, bl: { x: 0.252, y: 0.714 } },
+    '2.jpg': { tl: { x: 0.176, y: 0.204 }, tr: { x: 0.863, y: 0.174 }, br: { x: 0.882, y: 0.832 }, bl: { x: 0.190, y: 0.844 } },
+    '3.jpg': { tl: { x: 0.353, y: 0.326 }, tr: { x: 0.730, y: 0.240 }, br: { x: 0.739, y: 0.736 }, bl: { x: 0.353, y: 0.682 } },
+    '4.jpg': { tl: { x: 0.296, y: 0.250 }, tr: { x: 0.933, y: 0.122 }, br: { x: 0.942, y: 0.914 }, bl: { x: 0.292, y: 0.780 } },
+    '5.jpg': { tl: { x: 0.333, y: 0.142 }, tr: { x: 0.875, y: 0.234 }, br: { x: 0.796, y: 0.815 }, bl: { x: 0.196, y: 0.586 } },
+};
+// Euclidean tolerance in normalized image units. Comfortably tighter than the
+// ~0.12 by which a collapsed corner misses, but loose enough not to be brittle.
+const CORNER_TOLERANCE = 0.06;
+
 let canvasMod = null;
 try { canvasMod = await import('canvas'); } catch { /* optional */ }
 
@@ -96,6 +113,18 @@ if (!canvasMod) {
 
             const norm = DocDetect.detectFromImage(srcImg);
             assert.ok(norm, `no quad detected in ${file}`);
+
+            // Geometry guard: every corner must land near the true page corner.
+            const expected = EXPECTED_CORNERS[file];
+            if (expected) {
+                for (const k of ['tl', 'tr', 'br', 'bl']) {
+                    const d = Math.hypot(norm[k].x - expected[k].x, norm[k].y - expected[k].y);
+                    assert.ok(d <= CORNER_TOLERANCE,
+                        `${file}: ${k} corner off by ${d.toFixed(3)} (>${CORNER_TOLERANCE}) — ` +
+                        `got (${norm[k].x.toFixed(3)},${norm[k].y.toFixed(3)}), ` +
+                        `expected (${expected[k].x},${expected[k].y})`);
+                }
+            }
 
             // De-normalize corners to source pixel space and warp to target dims.
             const W = srcImg.width, H = srcImg.height;

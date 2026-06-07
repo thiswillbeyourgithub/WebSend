@@ -142,14 +142,28 @@ const DocDetect = (function () {
         for (let x = 0; x < w; x++) { fgBright[x] = 0; fgBright[(h - 1) * w + x] = 0; }
         for (let y = 0; y < h; y++) { fgBright[y * w] = 0; fgBright[y * w + w - 1] = 0; }
 
-        // 8. Find contours from BOTH foreground masks; the scorer picks the winner.
-        const contours = _findContours(fgEdges, w, h).concat(_findContours(fgBright, w, h));
+        // 7c. Clean both masks: opening severs thin tendrils that fuse the page to
+        //     background texture, then keep only the largest component (the page).
+        //     Without this the flood-fill page blob fits no quad (its hull blows out
+        //     to the image corners) and a shadow-truncated brightness blob wins.
+        const fgEdgesClean = _largestComponent(_morphOpen(fgEdges, w, h, 2), w, h);
+        const fgBrightClean = _largestComponent(_morphOpen(fgBright, w, h, 2), w, h);
+
+        // Union of the two cleaned page masks: captures the page even when one
+        // mask truncates it (e.g. a shadow drops part of the page below the
+        // brightness threshold). Used by the scorer to reject candidate sides
+        // that cut through the page interior instead of tracing its boundary.
+        const fgUnion = new Uint8Array(w * h);
+        for (let i = 0; i < fgUnion.length; i++) fgUnion[i] = (fgEdgesClean[i] || fgBrightClean[i]) ? 1 : 0;
+
+        // 8. Find contours from BOTH cleaned foreground masks; the scorer picks the winner.
+        const contours = _findContours(fgEdgesClean, w, h).concat(_findContours(fgBrightClean, w, h));
 
         // 9. Find best quad. Scorer rewards quads whose 4 sides trace real
         //    image edges (directional Sobel alignment), which is colour- and
         //    luminance-agnostic — works equally for dark-page-on-light-bg and
         //    light-page-on-dark-bg.
-        const quad = _findLargestQuad(contours, w, h, gx, gy, magScale);
+        const quad = _findLargestQuad(contours, w, h, gx, gy, magScale, fgUnion);
         if (!quad) return null;
 
         // 10. Snap each side to its strongest local Sobel edge. The contour-derived
@@ -411,6 +425,68 @@ const DocDetect = (function () {
         return out;
     }
 
+    /** 3x3 erosion on binary image (foreground survives only with 8 full neighbours) */
+    function _erode(binary, w, h) {
+        const out = new Uint8Array(w * h);
+        for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+                const i = y * w + x;
+                if (binary[i] && binary[i - 1] && binary[i + 1] &&
+                    binary[i - w] && binary[i + w] &&
+                    binary[i - w - 1] && binary[i - w + 1] &&
+                    binary[i + w - 1] && binary[i + w + 1]) {
+                    out[i] = 1;
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Morphological opening: `iters` erosions followed by `iters` dilations.
+     * Severs the thin tendrils that connect a page blob to surrounding texture
+     * noise and removes isolated specks, while restoring the page to ~its
+     * original size. Essential before contouring a flood-fill foreground mask,
+     * whose page region is otherwise fused to background noise and fits no quad.
+     */
+    function _morphOpen(mask, w, h, iters) {
+        let m = mask;
+        for (let i = 0; i < iters; i++) m = _erode(m, w, h);
+        for (let i = 0; i < iters; i++) m = _dilate(m, w, h);
+        return m;
+    }
+
+    /**
+     * Keep only the largest 4-connected foreground component of a binary mask.
+     * Drops every speck and detached noise blob so the page is the sole survivor,
+     * which keeps its convex hull from blowing out to the image corners.
+     */
+    function _largestComponent(mask, w, h) {
+        const label = new Int32Array(w * h);
+        const stack = [];
+        let best = 0, bestSize = 0, cur = 0;
+        for (let s = 0; s < w * h; s++) {
+            if (!mask[s] || label[s]) continue;
+            cur++;
+            let size = 0;
+            stack.length = 0; stack.push(s); label[s] = cur;
+            while (stack.length) {
+                const idx = stack.pop();
+                size++;
+                const x = idx % w;
+                if (x > 0     && mask[idx - 1] && !label[idx - 1]) { label[idx - 1] = cur; stack.push(idx - 1); }
+                if (x < w - 1 && mask[idx + 1] && !label[idx + 1]) { label[idx + 1] = cur; stack.push(idx + 1); }
+                if (idx >= w        && mask[idx - w] && !label[idx - w]) { label[idx - w] = cur; stack.push(idx - w); }
+                if (idx < w * (h - 1) && mask[idx + w] && !label[idx + w]) { label[idx + w] = cur; stack.push(idx + w); }
+            }
+            if (size > bestSize) { bestSize = size; best = cur; }
+        }
+        const out = new Uint8Array(w * h);
+        if (!best) return out;
+        for (let i = 0; i < w * h; i++) if (label[i] === best) out[i] = 1;
+        return out;
+    }
+
     /**
      * Flood-fill from image borders through non-edge pixels to identify background.
      * Everything not reachable from the border is foreground (the document).
@@ -523,10 +599,53 @@ const DocDetect = (function () {
     }
 
     /**
+     * Fraction of the foreground (page) mask that falls INSIDE the quad.
+     * Scored against the union of both page masks, this is the cross-mask-fair
+     * signal that a per-contour fit score lacks: a quad that collapses part of
+     * the page (e.g. a brightness mask truncated by a shadow) leaves much of the
+     * union foreground outside itself and scores low, while the quad that hugs
+     * the whole page scores high. `total` is the precomputed foreground count.
+     */
+    function _quadForegroundCoverage(quad, fgMask, w, h, total) {
+        if (!total) return 1;
+        // Bounding box to skip the bulk of background pixels.
+        let minX = w, minY = h, maxX = 0, maxY = 0;
+        for (const p of quad) {
+            if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        }
+        const x0 = Math.max(0, minX | 0), x1 = Math.min(w - 1, Math.ceil(maxX));
+        const y0 = Math.max(0, minY | 0), y1 = Math.min(h - 1, Math.ceil(maxY));
+        let inside = 0;
+        for (let y = y0; y <= y1; y++) {
+            for (let x = x0; x <= x1; x++) {
+                if (!fgMask[y * w + x]) continue;
+                if (_pointInQuad(x, y, quad)) inside++;
+            }
+        }
+        return inside / total;
+    }
+
+    /** Point-in-convex-quad test via consistent cross-product sign. */
+    function _pointInQuad(x, y, quad) {
+        let sign = 0;
+        for (let e = 0; e < 4; e++) {
+            const a = quad[e], b = quad[(e + 1) % 4];
+            const cr = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+            if (cr !== 0) {
+                const s = cr > 0 ? 1 : -1;
+                if (sign === 0) sign = s;
+                else if (s !== sign) return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Find the largest convex quadrilateral among detected contours.
      * Uses Douglas-Peucker simplification to reduce contours to polygons.
      */
-    function _findLargestQuad(contours, w, h, gx, gy, magMean) {
+    function _findLargestQuad(contours, w, h, gx, gy, magMean, fgMask) {
         const minArea = w * h * 0.03; // Quad must be >3% of frame
         const maxArea = w * h * 0.75; // ...and not the entire frame (real pages have margin)
         const frameArea = w * h;
@@ -546,6 +665,8 @@ const DocDetect = (function () {
         // image border, which kills the failure mode where the scorer prefers
         // a quad that traces the image's own edge.
         const margin = Math.min(w, h) * 0.01;
+        let fgTotal = 0;
+        if (fgMask) for (let i = 0; i < fgMask.length; i++) fgTotal += fgMask[i];
         const tryQuad = (quad, contour) => {
             if (!_isConvex(quad)) return;
             const area = _polygonArea(quad);
@@ -559,7 +680,11 @@ const DocDetect = (function () {
             const fit = Math.exp(-meanDist / (diag * 0.02));
             const rawAlign = _perimeterEdgeAlignment(quad, gx, gy, w, h, magMean);
             const align = Math.min(1.5, Math.max(0.5, rawAlign));
-            const score = (area / frameArea) * fit * align * align;
+            // Coverage of the union page mask. Squared so it meaningfully
+            // penalises quads that drop a chunk of the page (shadow-truncated
+            // brightness blobs) without overwhelming the geometry terms.
+            const coverage = fgMask ? _quadForegroundCoverage(quad, fgMask, w, h, fgTotal) : 1;
+            const score = (area / frameArea) * fit * align * align * coverage * coverage;
             if (score > bestScore) {
                 bestScore = score;
                 bestQuad = quad;
