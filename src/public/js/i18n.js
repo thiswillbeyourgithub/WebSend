@@ -173,6 +173,7 @@ const i18n = (function() {
             'receive.discardNo': '✗ Cancel',
             'receive.expired': 'Connection expired. Please refresh.',
             'receive.initFailed': 'Failed to initialize. Please refresh.',
+            'receive.orCopyLink': 'Or copy this link:',
             'receive.disconnected': 'Disconnected',
             'receive.qrFailed': 'QR code failed. Share this URL:',
 
@@ -411,6 +412,7 @@ const i18n = (function() {
             'receive.discardNo': '✗ Annuler',
             'receive.expired': 'Connexion expirée. Veuillez actualiser.',
             'receive.initFailed': 'Échec de l\'initialisation. Veuillez actualiser.',
+            'receive.orCopyLink': 'Ou copiez ce lien :',
             'receive.disconnected': 'Déconnecté',
             'receive.qrFailed': 'Échec du QR code. Partagez cette URL :',
 
