@@ -57,7 +57,14 @@
             return;
         }
         banner.classList.remove('hidden');
-        text.textContent = _i18n.t('send.queueSending').replace('{n}', queue.length);
+        // Word the banner for what is actually queued: "photo(s)" when every
+        // item is an image, "file(s)" otherwise (e.g. a PDF or document
+        // picked from the file picker), so sending a file no longer says
+        // "photo".
+        const allImages = queue.length > 0 && queue.every(
+            it => it && it.blob && typeof it.blob.type === 'string' && it.blob.type.startsWith('image/'));
+        const key = allImages ? 'send.queueSending' : 'send.queueSendingFiles';
+        text.textContent = _i18n.t(key).replace('{n}', queue.length);
     }
 
     // -- Queue mutation --
