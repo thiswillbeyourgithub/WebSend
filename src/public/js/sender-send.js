@@ -98,6 +98,30 @@
     function size() { return queue.length; }
     function isActive() { return isSending; }
 
+    /**
+     * Map a send failure to the most informative user-facing toast so the
+     * user understands the cause without opening the logs. Shared by the
+     * drain() and resumeDrain() failure paths so the classification lives
+     * in one place. Falls back to the generic "please retry" message for
+     * unclassified errors.
+     */
+    function showSendFailureToast(e) {
+        const msg = (e && e.message) || '';
+        if (msg.includes('timeout')) {
+            _showToast(_i18n.t('send.transferTimeout'));
+        } else if (msg.includes('Receiver decryption failed')) {
+            _showToast(_i18n.t('send.checksumMismatch'));
+        } else if ((e && e.name === 'NotReadableError') || /could not be read/i.test(msg)) {
+            // The blob/File handle went stale: classically the OS reclaimed
+            // the picked file after the app was backgrounded during the
+            // picker. Tell the user to re-select it (sticky toast so the
+            // longer explanation is readable), not just "please retry".
+            _showToast(_i18n.t('send.fileUnreadable'), { type: 'error', duration: 0 });
+        } else {
+            _showToast(_i18n.t('send.sendFailed'));
+        }
+    }
+
     // -- Drain loop --
 
     /**
@@ -150,15 +174,7 @@
                     if (gPhoto) gPhoto.sendStatus = 'failed';
                 }
                 _logger.error('Queued photo failed: ' + e.message);
-                const isTimeout = e.message.includes('timeout');
-                const isNack = e.message.includes('Receiver decryption failed');
-                if (isTimeout) {
-                    _showToast(_i18n.t('send.transferTimeout'));
-                } else if (isNack) {
-                    _showToast(_i18n.t('send.checksumMismatch'));
-                } else {
-                    _showToast(_i18n.t('send.sendFailed'));
-                }
+                showSendFailureToast(e);
             }
             updateBanner();
         }
@@ -326,7 +342,7 @@
                 if (gPhoto) gPhoto.sendStatus = 'failed';
             }
             _logger.error('Resumed photo failed: ' + e.message);
-            _showToast(_i18n.t('send.sendFailed'));
+            showSendFailureToast(e);
         }
         isSending = false;
         updateBanner();
