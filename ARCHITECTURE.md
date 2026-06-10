@@ -872,9 +872,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     partial buffer remains decryptable); it replies with
     `file-resume-ack {offset}` and continues binary chunks from that
     offset. A peer-fingerprint mismatch on reconnect is treated as a
-    peer-swap and forces a fresh verification ceremony. WebRTC drops
-    are still fatal in v1 (no ICE-restart resume yet); only the relay
-    transports support resume.
+    peer-swap and forces a fresh verification ceremony. All three
+    transports honour the resume offset in `sendFile` (a resumed send
+    skips `file-start` so the receiver's partial buffer is preserved);
+    WebRTC drops are still fatal in v1 (no ICE-restart reconnect yet),
+    so in practice resume engages on the relay paths.
 36. **HTTP-relay fallback transport**: Corporate networks that block UDP
     and strip TURNS-over-TCP at the proxy used to leave WebSend with no
     working path. v3.7.0 adds an HTTPS-only fallback that runs over the

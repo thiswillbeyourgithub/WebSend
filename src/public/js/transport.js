@@ -512,8 +512,8 @@
         async sendFile(bytes, onProgress, resumeFromOffset) {
             if (!this.winner) throw new Error('Not connected yet');
             // Propagate resumeFromOffset so SenderSend can byte-resume an
-            // in-flight transfer after a relay reconnect. WebRTC inner
-            // ignores the arg (v1 only supports relay-resume).
+            // in-flight transfer after a reconnect; all three inners
+            // (WebRTC / WS / LP) honour it.
             return this._innerByName(this.winner).sendFile(bytes, onProgress, resumeFromOffset);
         }
 

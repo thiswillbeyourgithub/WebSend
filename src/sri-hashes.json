@@ -28,10 +28,10 @@
   "/js/transfer-stats.js": "sha384-C9g9PypkkEoJ52ceSAwRjcc90zW8ndip0HK3IhCpQ8x233C1AIM+qpVUu41oa8hQ",
   "/js/transform-replay.js": "sha384-+EEuhwDyVsHFYHHBmQGfcVn909daLZh+b/Gv6g8jfFqLUDuhkJZB3i9c2gXCkubt",
   "/js/transport-assembler.js": "sha384-EaqsYuUMBzjFE7NtGlIQ+n3yn6IpniY8DNIlmLRpcsdX2oMFfkwZ3yMr/Wz7Jvch",
-  "/js/transport.js": "sha384-oGJ3hjbml/48JY+d+zAAyjuXmONglVCadCSnabVbcLJcMdYh8a1YaD7tVPa0FtuN",
+  "/js/transport.js": "sha384-aAaDq3PdhQtmQDQKTmR2Saa7xjNt28TkDFhQdPUCsdD9ukX2IRsT/I+F3CM19o7s",
   "/js/verification-modal.js": "sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh",
   "/js/wake-lock.js": "sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7",
-  "/js/webrtc.js": "sha384-1Nii8C96PgEULnNvAv0gMAgn8ue5T82K3cjwLfIuUx12EAT0VVlkE0sBDDnZrNk1",
+  "/js/webrtc.js": "sha384-KO3xc4LH2Y1a4G2BZoAZ0dEp/+kMFk/XOXG5Vodx+mzHar7UYkU0rITk9YdoOVPp",
   "/js/ws-transport.js": "sha384-Vu9BVIScT1GNfpENnIRNtET+llG8cFHVkrC7gjkoTcfAKJ979VYJS1I3Zkv6uldT",
   "/css/style.css": "sha384-SEjYcLR396hXQJn5GupOcdF4Qz/NGeaFrFmtEVe1b3JdcalU9V4KD9G3HkdDAyM0"
 }

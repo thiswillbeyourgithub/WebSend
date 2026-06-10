@@ -516,8 +516,12 @@ class WebSendRTC {
      *
      * @param {ArrayBuffer} encryptedData - Already-encrypted data with metadata bundled
      * @param {Function} onProgress - Progress callback (percent)
+     * @param {number} [resumeFromOffset] - Continue an interrupted transfer
+     *     from this byte. Set by SenderSend after the receiver answered our
+     *     file-resume-offer; no file-start is sent (the receiver keeps its
+     *     partial buffer, a fresh file-start would reset it).
      */
-    async sendFile(encryptedData, onProgress) {
+    async sendFile(encryptedData, onProgress, resumeFromOffset) {
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
             logger.error('Data channel not open');
             return false;
@@ -531,16 +535,20 @@ class WebSendRTC {
         try {
             const CHUNK_SIZE = 16384; // 16KB chunks
             const totalSize = encryptedData.byteLength;
-            let offset = 0;
+            const isResume = typeof resumeFromOffset === 'number' && resumeFromOffset > 0;
+            let offset = isResume ? resumeFromOffset : 0;
 
-            // File-start message contains only the encrypted size (which is padded).
-            // No plaintext metadata is revealed - name, type, and original size
-            // are encrypted inside the payload.
-            if (!this.sendMessage(Protocol.build.fileStart(totalSize))) {
-                throw new Error('Failed to send file-start (channel not open)');
+            if (!isResume) {
+                // File-start message contains only the encrypted size (which is padded).
+                // No plaintext metadata is revealed - name, type, and original size
+                // are encrypted inside the payload.
+                if (!this.sendMessage(Protocol.build.fileStart(totalSize))) {
+                    throw new Error('Failed to send file-start (channel not open)');
+                }
+                logger.info(`Sending encrypted file (${totalSize} bytes, padded)`);
+            } else {
+                logger.info(`Resuming encrypted file from offset ${offset}/${totalSize}`);
             }
-
-            logger.info(`Sending encrypted file (${totalSize} bytes, padded)`);
 
             while (offset < totalSize) {
                 while (this.dataChannel.bufferedAmount > 1024 * 1024) {
