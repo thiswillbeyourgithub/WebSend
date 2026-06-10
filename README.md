@@ -131,7 +131,7 @@ The protections listed in [Security Features](#security-features) below address 
 - This prevents room enumeration and unauthorized room access even if an attacker guesses or brute-forces the short room ID
 
 ### Rate Limiting and Origin Validation
-- **Per-IP rate limiting** on room creation (5/min), room lookups (30/min), and general API calls (100/min) to prevent DoS and enumeration. The general 100/min cap also covers `GET /api/rooms/:id/answer?wait=true` so a peer holding a valid secret cannot pipeline long-polls to exhaust memory. The HTTP-relay data path (`/relay/up`, `/relay/down`) is exempt: a single LP transfer is many POSTs and corporate NATs share one egress IP across many users, so a per-IP cap on the data path made multi-MB transfers impossible. The relay endpoints are still bounded by the per-frame body cap, the 4 GiB per-pairing session cap, the bounded peer queue, the slot idle timeout, and the per-slot token gating every call.
+- **Per-IP rate limiting** on room creation (5/min), room lookups (30/min), and general API calls (100/min) to prevent DoS and enumeration. The general 100/min cap also covers `GET /api/rooms/:id/answer?wait=true` so a peer holding a valid secret cannot pipeline long-polls to exhaust memory. The HTTP-relay data path (`/relay/up`, `/relay/down`) is exempt: a single LP transfer is many POSTs and corporate NATs share one egress IP across many users, so a per-IP cap on the data path made multi-MB transfers impossible. The relay endpoints are still bounded by the per-frame body cap, the 4 GiB per-pairing session cap, the bounded peer queue (enforced as backpressure: `/relay/up` answers 429 when the peer's queue is full and a WS sender's socket is paused, so a slow receiver throttles the sender instead of losing frames), the slot idle timeout, and the per-slot token gating every call.
 - **Origin header validation** blocks cross-origin API requests from unauthorized websites (CSRF-like protection)
 - Express **trusts proxy headers only from loopback**, so `X-Forwarded-For` cannot be spoofed by external clients (designed to run behind [Caddy](https://caddyserver.com/))
 - **Long-poll waiter caps**: layered defense for `?wait=true`. A per-room cap (4 concurrent waiters) refuses extras with 429, and a process-wide ceiling (10000 in-flight waiters) refuses extras with 503, before any socket / closure / timer is allocated.
@@ -168,6 +168,7 @@ The protections listed in [Security Features](#security-features) below address 
 - After decryption, the receiver computes a **SHA-256 checksum** of the plaintext data and sends it back to the sender via a `file-ack` message
 - The sender compares this against its own pre-encryption hash to **verify end-to-end integrity** (encryption, transfer, and decryption all succeeded)
 - If verification fails or times out, the sender is notified and can **retry** without losing the photo
+- Before decryption is attempted, the receiver checks that the byte count at `file-end` matches the announced size; a short transfer is rejected with a distinct "incomplete" error so both sides see "data lost in transit, retry" instead of an opaque checksum failure
 
 ### No Phone Storage
 - Photos are captured directly in the browser (no camera app) and **stay in browser memory only**
