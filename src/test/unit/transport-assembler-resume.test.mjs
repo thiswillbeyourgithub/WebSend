@@ -21,7 +21,8 @@ const assemblerPath = path.resolve(__dirname, '../../public/js/transport-assembl
 // the same window object as Protocol.
 const win = {};
 const logger = { info: () => {}, success: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
-const ctx = createContext({ window: win, logger, console });
+// Blob is passed in for the file-end assembly path (node's global Blob).
+const ctx = createContext({ window: win, logger, console, Blob });
 runInContext(readFileSync(protocolPath, 'utf8'), ctx);
 runInContext(readFileSync(assemblerPath, 'utf8'), ctx);
 
@@ -117,6 +118,41 @@ test('fresh file-start clears the existing buffer (invalidating any in-flight)',
     assert.equal(h.receiveBuffer.length, 0);
     assert.equal(h.receivedSize, 0);
     assert.equal(h.expectedSize, MIN * 2);
+});
+
+test('file-end with missing bytes emits file-incomplete, not encrypted-file', () => {
+    const h = makeHost();
+    const events = [];
+    h.onMessage = (m) => events.push(m);
+    PA.handleControl(h, { type: 'file-start', size: MIN * 4 });
+    PA.handleBinary(h, new ArrayBuffer(MIN)); // only a quarter arrives
+    PA.handleControl(h, { type: 'file-end' });
+    const incomplete = events.find(m => m.type === 'file-incomplete');
+    assert.ok(incomplete, 'expected a file-incomplete event');
+    assert.equal(incomplete.received, MIN);
+    assert.equal(incomplete.expected, MIN * 4);
+    assert.equal(events.find(m => m.type === 'encrypted-file'), undefined,
+        'a short blob must never reach the decrypt path');
+    // State is cleared so the next file-start opens cleanly.
+    assert.equal(h.receivedSize, 0);
+    assert.equal(h.expectedSize, 0);
+    assert.equal(h.receiveBuffer.length, 0);
+});
+
+test('complete file-end emits encrypted-file and leaves no inflight state', () => {
+    const h = makeHost();
+    const events = [];
+    h.onMessage = (m) => events.push(m);
+    PA.handleControl(h, { type: 'file-start', size: MIN });
+    PA.handleBinary(h, new ArrayBuffer(MIN));
+    PA.handleControl(h, { type: 'file-end' });
+    assert.ok(events.find(m => m.type === 'encrypted-file'));
+    assert.equal(events.find(m => m.type === 'file-incomplete'), undefined);
+    // expectedSize must be cleared at file-end: leaving it set made
+    // hasInflightTransfer() true again (receivedSize is back to 0), so a
+    // reconnect after a *completed* transfer sent a bogus resume offer.
+    assert.equal(PA.hasInflightTransfer(h), false);
+    assert.equal(PA.getResumeState(h), null);
 });
 
 test('PayloadAssembler is frozen', () => {

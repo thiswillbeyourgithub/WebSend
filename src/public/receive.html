@@ -140,7 +140,7 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-Jj0PrPdLkR0LH603Xs54rbEYt41vcuye3M7j4a0Td97EgeCyMkql8cMRYQM9i1xe"></script>
+    <script src="/js/i18n.js" integrity="sha384-0dSvlv3SiYAl7CSpPZuYlRMNgUe1tOUMDi9eU5ibRUHY0XaAoUNXmMUn3dv7Kh1A"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-fst2l+qnD3PVySYzIxn0U+k9Ro9avFWmm7PiCJ3vW8k724XkJ6ooz084uzoApo0k"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-C9g9PypkkEoJ52ceSAwRjcc90zW8ndip0HK3IhCpQ8x233C1AIM+qpVUu41oa8hQ"></script>
@@ -148,7 +148,7 @@
     <script src="/js/crypto.js" integrity="sha384-e7WvV/6bT3OcTOMX7KHK1BhRRf30dTZAEolkwNmXm2NeGzhDfcNDk1nMiuJBjEh7"></script>
     <script src="/js/protocol.js" integrity="sha384-8ljBTasCc9Vhe2KnPIyGPeRbD0vVXEx+/DQzYkZ4WaX/pCHSSr+9vUI5LraRIsi/"></script>
     <script src="/js/webrtc.js" integrity="sha384-1Nii8C96PgEULnNvAv0gMAgn8ue5T82K3cjwLfIuUx12EAT0VVlkE0sBDDnZrNk1"></script>
-    <script src="/js/transport-assembler.js" integrity="sha384-Bfk+ad/+nGjfQ/LOECACnUHHm+eYXdvC66xt/RzvJMW+dqs/caqQwnXFt7awFQHA"></script>
+    <script src="/js/transport-assembler.js" integrity="sha384-EaqsYuUMBzjFE7NtGlIQ+n3yn6IpniY8DNIlmLRpcsdX2oMFfkwZ3yMr/Wz7Jvch"></script>
     <script src="/js/ws-transport.js" integrity="sha384-Vu9BVIScT1GNfpENnIRNtET+llG8cFHVkrC7gjkoTcfAKJ979VYJS1I3Zkv6uldT"></script>
     <script src="/js/lp-transport.js" integrity="sha384-FgcY9WBahaTbVPS8UWfX9Lux247UWxXTKbY+WcwnwCRjSj8CHM+Rm607ATjpf0PF"></script>
     <script src="/js/transport.js" integrity="sha384-oGJ3hjbml/48JY+d+zAAyjuXmONglVCadCSnabVbcLJcMdYh8a1YaD7tVPa0FtuN"></script>
@@ -1190,6 +1190,20 @@
             }
         }
 
+        function handleFileIncomplete(msg) {
+            // Local synthetic event from PayloadAssembler: file-end arrived
+            // but bytes are missing. Nack with the distinct 'incomplete'
+            // error (the byte count is public, this is not a crypto oracle)
+            // so the sender shows "data lost, retry" instead of the opaque
+            // checksum-mismatch it would get from a doomed decrypt attempt.
+            logger.error(`Transfer incomplete: received ${msg.received}/${msg.expected} bytes`);
+            if (!rtc.sendMessage(Protocol.build.fileNack('incomplete'))) {
+                logger.warn('Incomplete-nack could not be sent (channel closed) — sender will time out');
+            }
+            finalizeReceiveStats();
+            showToast(i18n.t('receive.transferIncomplete'), { type: 'error' });
+        }
+
         function finalizeReceiveStats() {
             const elapsed = receiveXferStart ? (Date.now() - receiveXferStart) / 1000 : 0;
             if (elapsed > 0) {
@@ -1219,6 +1233,9 @@
             'batch-start-if-nonempty': handleBatchStartIfNonempty,
             'batch-end': handleBatchEnd,
             'encrypted-file': (msg) => ReceiveFlow.handleEncryptedFile(msg),
+            // Local synthetic event (like 'progress'): file-end arrived
+            // with bytes missing; nacks 'incomplete' back to the sender.
+            'file-incomplete': handleFileIncomplete,
             // Relay-reconnect resume protocol: sender's reply to our
             // file-resume-offer. file-resume-offer is emitted by
             // onReconnected (not by a peer), so it never appears here.
@@ -1241,6 +1258,10 @@
             'batch-start-if-nonempty',
             'batch-end',
             'encrypted-file',
+            // An unverified peer can reach the assembler (it sits below the
+            // verification layer), so gate the incomplete-nack path like
+            // encrypted-file: the unverified sender just times out.
+            'file-incomplete',
             // file-resume-ack can clear our partial receive buffer
             // (when offset=0). Gating it keeps an unverified peer from
             // disturbing receive state during the verification window.

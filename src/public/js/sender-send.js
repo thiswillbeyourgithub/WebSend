@@ -116,6 +116,11 @@
         const msg = (e && e.message) || '';
         if (msg.includes('timeout')) {
             _showToast(_i18n.t('send.transferTimeout'));
+        } else if (msg.includes('Receiver decryption failed: incomplete')) {
+            // The receiver got file-end with bytes missing (transport-level
+            // loss). Distinct from a checksum mismatch: nothing is wrong
+            // with the data we sent, a retry will usually succeed.
+            _showToast(_i18n.t('send.transferIncomplete'));
         } else if (msg.includes('Receiver decryption failed')) {
             _showToast(_i18n.t('send.checksumMismatch'));
         } else if ((e && e.name === 'NotReadableError') || /could not be read/i.test(msg)) {

@@ -565,7 +565,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 8. **Transfer integrity verification**: After decryption, the receiver computes SHA-256 of the
    plaintext data and sends it back via `file-ack`. The sender compares it against its own
    pre-encryption hash to confirm end-to-end integrity. On mismatch or timeout, the sender
-   can retry without losing the photo.
+   can retry without losing the photo. Before decryption is even attempted, the assembler
+   checks that the byte count at `file-end` matches the `file-start` size; a short transfer
+   is nacked with the distinct `incomplete` error (byte counts are public, so this is not a
+   decryption oracle) and the sender shows a "data lost in transit, retry" message instead
+   of an opaque checksum failure.
 9. **No phone storage**: Photos are captured directly in the browser and stay in memory only —
    never written to the phone's gallery, filesystem, or local storage. Photos are kept in
    memory until the receiver confirms successful receipt.

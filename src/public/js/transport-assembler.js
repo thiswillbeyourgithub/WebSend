@@ -89,11 +89,35 @@
             return true;
         }
         if (msg.type === 'file-end') {
+            // Bytes went missing in transit (chunks carry no sequence
+            // numbers, so this is the first place a loss is detectable).
+            // Don't hand the short blob to the decrypt path: AES-GCM would
+            // fail anyway and the sender would see an opaque "decryption
+            // failed" instead of the actionable "data was lost, retry".
+            if (host.receivedSize !== host.expectedSize) {
+                logger.error(`[${host.tag}] file-end after ${host.receivedSize}/${host.expectedSize} bytes; transfer incomplete`);
+                if (host.onMessage) {
+                    host.onMessage({
+                        type: 'file-incomplete',
+                        received: host.receivedSize,
+                        expected: host.expectedSize,
+                    });
+                }
+                host.receiveBuffer = [];
+                host.receivedSize = 0;
+                host.expectedSize = 0;
+                return true;
+            }
             logger.info(`[${host.tag}] file transfer complete, assembling...`);
             const blob = new Blob(host.receiveBuffer, { type: 'application/octet-stream' });
             if (host.onMessage) host.onMessage({ type: 'encrypted-file', blob });
             host.receiveBuffer = [];
             host.receivedSize = 0;
+            // Also clear expectedSize: the transfer is over. Leaving it set
+            // made hasInflightTransfer() true again (receivedSize dropped
+            // back to 0), so a reconnect after a *completed* transfer sent
+            // the sender a bogus file-resume-offer {received: 0}.
+            host.expectedSize = 0;
             return true;
         }
         if (msg.type === 'file-ack') {
