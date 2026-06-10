@@ -40,18 +40,8 @@
     // catches stuck pipes in the foreground before a real OOM occurs.
     const STUCK_PIPE_BYTES = 16 * 1024 * 1024;
 
-    // Tagged error thrown when the WS drops mid-sendFile but the higher
-    // layers can recover via the relay-reconnect resume protocol. The
-    // RacingTransport / SenderSend distinguish this from a fatal error
-    // by reading .transient === true.
-    class TransientDisconnectError extends Error {
-        constructor(message, offset) {
-            super(message);
-            this.name = 'TransientDisconnectError';
-            this.transient = true;
-            this.offset = offset | 0;
-        }
-    }
+    // A WS drop mid-sendFile throws the shared window.TransientDisconnectError
+    // (defined in segment-stream.js) so SenderSend can pause for resume.
 
     class WSTransport {
         constructor() {
@@ -295,21 +285,20 @@
         }
 
         /**
-         * Send (or resume sending) an encrypted file.
+         * Send (or resume sending) a file as sealed v2 records.
          *
-         * - When `resumeFromOffset` is undefined, sends a fresh file-start
-         *   followed by all chunks from offset 0.
-         * - When `resumeFromOffset > 0`, skips file-start (the receiver
-         *   already has it from the pre-drop transfer) and continues
-         *   binary chunks from that offset.
+         * SegmentStream.pump owns the record/control flow; this transport
+         * supplies WS chunking, bufferedAmount backpressure, and drop
+         * detection. When `resumeFromSeq > 0`, no file-start is sent (the
+         * receiver kept its verified segments and was re-keyed via
+         * file-resume-ack before this call).
          *
-         * On a transient WS drop, throws TransientDisconnectError with
-         * the byte offset reached so SenderSend can keep the head of the
-         * queue and re-emit file-resume-ack after reconnect. The cached
-         * encryptedData buffer MUST be the same one used on the original
-         * call so the GCM nonce / ciphertext layout stay byte-identical.
+         * On a transient WS drop, throws TransientDisconnectError tagged
+         * with the record seq to resume from so SenderSend can keep the
+         * head of the queue and answer the receiver's file-resume-offer
+         * after reconnect.
          */
-        async sendFile(encryptedData, onProgress, resumeFromOffset) {
+        async sendFile(segmentSender, onProgress, resumeFromSeq) {
             if (!this._isOpen()) {
                 logger.error('[WS] not open, cannot send file');
                 return false;
@@ -319,61 +308,33 @@
             }
             this._fileAckInFlight = true;
 
-            const totalSize = encryptedData.byteLength;
-            const isResume = typeof resumeFromOffset === 'number' && resumeFromOffset > 0;
-            let offset = isResume ? resumeFromOffset : 0;
-
             try {
-                if (!isResume) {
-                    if (!this.sendMessage(window.Protocol.build.fileStart(totalSize))) {
-                        throw new Error('Failed to send file-start (WS not open)');
-                    }
-                    logger.info(`[WS] sending encrypted file (${totalSize} bytes, padded)`);
-                } else {
-                    logger.info(`[WS] resuming encrypted file from offset ${offset}/${totalSize}`);
-                }
-
-                while (offset < totalSize) {
-                    // Backpressure via WS bufferedAmount. If buffered keeps
-                    // climbing past STUCK_PIPE_BYTES, the consumer is dead;
-                    // give up rather than hold the file in browser memory
-                    // forever.
-                    while (this.ws && this.ws.bufferedAmount > SEND_BUFFER_HIGH_WATER) {
-                        if (this.ws.bufferedAmount > STUCK_PIPE_BYTES) {
-                            throw new Error(`WS stuck (bufferedAmount=${this.ws.bufferedAmount})`);
-                        }
-                        await new Promise(r => setTimeout(r, 50));
-                    }
-                    if (!this._isOpen()) {
-                        // The WS dropped mid-transfer. The TransientDisconnectError
-                        // carries the byte offset reached so the higher
-                        // layer can resume from here once the relay
-                        // reconnects.
-                        throw new TransientDisconnectError(
-                            `WS closed mid-transfer at offset ${offset}/${totalSize}`,
-                            offset
-                        );
-                    }
-                    const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
-                    this.ws.send(chunk);
-                    offset += chunk.byteLength;
+                const io = {
+                    chunkSize: CHUNK_SIZE,
+                    sendControl: (message) => this.sendMessage(message),
                     // Report bytes actually handed off to the network rather
                     // than bytes buffered locally, so the sender's % and rate
                     // match the receiver's instead of running ahead by up to
                     // the bufferedAmount high-water mark.
-                    const buffered = this.ws ? this.ws.bufferedAmount : 0;
-                    const delivered = Math.max(0, offset - buffered);
-                    const percent = Math.round((delivered / totalSize) * 100);
-                    if (onProgress) onProgress(percent, delivered, totalSize);
-                }
-
-                if (!this.sendMessage(window.Protocol.build.fileEnd())) {
-                    throw new TransientDisconnectError(
-                        `WS closed before file-end at offset ${offset}/${totalSize}`,
-                        offset
-                    );
-                }
-                logger.info('[WS] all chunks sent, waiting for receiver acknowledgment...');
+                    backlogBytes: () => (this.ws ? this.ws.bufferedAmount : 0),
+                    sendChunk: async (chunk) => {
+                        // Backpressure via WS bufferedAmount. If buffered keeps
+                        // climbing past STUCK_PIPE_BYTES, the consumer is dead;
+                        // give up rather than hold the stream open forever.
+                        while (this.ws && this.ws.bufferedAmount > SEND_BUFFER_HIGH_WATER) {
+                            if (this.ws.bufferedAmount > STUCK_PIPE_BYTES) {
+                                throw new Error(`WS stuck (bufferedAmount=${this.ws.bufferedAmount})`);
+                            }
+                            await new Promise(r => setTimeout(r, 50));
+                        }
+                        if (!this._isOpen()) {
+                            throw new window.TransientDisconnectError('WS closed mid-transfer');
+                        }
+                        this.ws.send(chunk);
+                    },
+                };
+                await window.SegmentStream.pump(segmentSender, io, onProgress, resumeFromSeq);
+                logger.info('[WS] all records sent, waiting for receiver acknowledgment...');
 
                 return await new Promise((resolve, reject) => {
                     window.PayloadAssembler.setupFileAck(this, resolve, reject, FILE_ACK_TIMEOUT_MS);

@@ -313,3 +313,18 @@ test('v2 session byte cap still aborts the stream', () => {
     assert.equal(aborts.length, 1);
     assert.match(aborts[0], /session byte cap/);
 });
+
+test('armV2Parser readies a fresh host for resumed records without a file-start', () => {
+    // After a reconnect the winner can be a fresh transport object whose
+    // parser never saw the original v2 file-start; receive.html re-arms
+    // it from the file-resume-ack. Without that, the first resumed
+    // record would abort as "binary chunk before file-start".
+    const { host, events, aborts } = makeV2Host();
+    PA.armV2Parser(host, 3, 2);
+    PA.handleBinary(host, wireRecord(2).buffer);
+    assert.equal(aborts.length, 0, 'resumed records must not be treated as abusive');
+    const segs = events.filter(e => e.type === 'file-segment');
+    assert.deepEqual(segs.map(s => s.seq), [2]);
+    const progress = events.filter(e => e.type === 'progress');
+    assert.equal(progress.at(-1).segCount, 3, 'progress keeps the exact segment count');
+});

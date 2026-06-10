@@ -351,6 +351,45 @@
         });
     }
 
+    /**
+     * Resume state for the reconnect flow: the next record seq this
+     * receiver is missing, or null when no transfer is in flight.
+     * Awaits the segment chain first so in-flight accepts settle and
+     * nextSeq is final (the chain never rejects; _enqueueSegmentWork
+     * swallows errors).
+     */
+    async function getResumeState() {
+        await _segmentChain;
+        if (!_segmentReceiver) return null;
+        return { nextSeq: _segmentReceiver.nextSeq, segCount: _segmentReceiver.segCount };
+    }
+
+    /**
+     * Apply the sender's file-resume-ack: re-key the in-flight receiver
+     * with the fresh salt so records resent from {nextSeq} verify.
+     * Resolves with {segCount} (for re-arming the transport's record
+     * parser) or null when there is nothing to resume.
+     */
+    function applyResumeAck(nextSeq, saltB64) {
+        return _enqueueSegmentWork(() => {
+            if (!_segmentReceiver) {
+                _logger.warn('file-resume-ack with no transfer in flight; ignoring');
+                return null;
+            }
+            _segmentReceiver.rekey(saltB64, nextSeq);
+            return { segCount: _segmentReceiver.segCount };
+        });
+    }
+
+    /**
+     * Drop the in-flight transfer without nacking (the sender told us
+     * via file-resume-ack {nextSeq: 0} that it will start over with a
+     * fresh file-start).
+     */
+    function abandonTransfer() {
+        return _enqueueSegmentWork(() => { _segmentReceiver = null; });
+    }
+
     function handleFileEnd() {
         return _enqueueSegmentWork(async () => {
             if (!_segmentReceiver) return;
@@ -383,6 +422,9 @@
         handleFileStart,
         handleFileSegment,
         handleFileEnd,
+        getResumeState,
+        applyResumeAck,
+        abandonTransfer,
         // Exposed for testing the pure pipeline:
         decryptIncomingFile,
         applyImageReplacement,

@@ -30,16 +30,44 @@ function loadIntoJsdom({ verified }) {
     );
     const win = dom.window;
 
-    const sentFiles = [];
+    const sentFiles = [];   // [{sender, resumeFromSeq}] per rtc.sendFile call
     const sentMessages = [];
-    win.WebSendCrypto = {
-        sha256Hex: async () => 'deadbeef',
-        encryptWithMetadata: async (data) => new ArrayBuffer(data.byteLength),
+    const created = [];     // createSender args, to assert metadata/keys wiring
+    const rewinds = [];     // seqs passed to fakeSender.rewind
+
+    // Fake SegmentStream: sender-send only drives the SegmentSender
+    // lifecycle (create once, rewind on resume, finishHash after ack);
+    // the real record crypto is covered by segment-stream.test.mjs.
+    function makeFakeSegmentSender() {
+        let nextSeq = 0;
+        return {
+            segCount: 3,
+            get nextSeq() { return nextSeq; },
+            saltB64: 'A'.repeat(22) + '==',
+            estimatedWireSize: 4096,
+            estimateWireOffset: (seq) => seq * 1024,
+            _advance(seq) { nextSeq = seq; },
+            rewind: async (seq) => {
+                rewinds.push(seq);
+                nextSeq = seq;
+                return { saltB64: 'B'.repeat(22) + '==' };
+            },
+            finishHash: async () => 'deadbeef',
+        };
+    }
+    win.SegmentStream = {
+        createSender: async (opts) => {
+            created.push(opts);
+            return makeFakeSegmentSender();
+        },
     };
     win.Protocol = {
         build: {
             replaceImage: (h) => ({ type: 'replace-image', hash: h }),
             batchEnd: () => ({ type: 'batch-end' }),
+            fileResumeAckV2: (nextSeq, salt) => (salt === undefined
+                ? { type: 'file-resume-ack', nextSeq }
+                : { type: 'file-resume-ack', nextSeq, salt }),
         },
     };
     win.formatRate = () => '0 kB/s';
@@ -47,14 +75,16 @@ function loadIntoJsdom({ verified }) {
 
     const fakeRtc = {
         sendMessage: (m) => sentMessages.push(m),
-        sendFile: async (buf) => { sentFiles.push(buf); },
+        sendFile: async (sender, onProgress, resumeFromSeq) => {
+            sentFiles.push({ sender, resumeFromSeq });
+        },
     };
 
     const logs = { info: [], warn: [], error: [], success: [] };
     const toasts = [];
     const deps = {
         getRtc: () => fakeRtc,
-        getSharedKey: () => ({ __fake: 'key' }),
+        getSessionKeys: () => ({ __fake: 'sessionKeys' }),
         isVerified: () => verified,
         i18n: { t: (k) => k },
         logger: {
@@ -72,7 +102,7 @@ function loadIntoJsdom({ verified }) {
     script.call(win);
 
     win.SenderSend.attach(deps);
-    return { win, sentFiles, sentMessages, logs, toasts };
+    return { win, fakeRtc, sentFiles, sentMessages, created, rewinds, logs, toasts };
 }
 
 function makeBlob(win) {
@@ -91,8 +121,80 @@ test('sendOnePhoto refuses to transmit when peer is not verified', async () => {
 });
 
 test('sendOnePhoto transmits when peer is verified', async () => {
-    const { win, sentFiles } = loadIntoJsdom({ verified: true });
+    const { win, sentFiles, created } = loadIntoJsdom({ verified: true });
     win.SenderSend.push({ blob: makeBlob(win) });
     await win.SenderSend.drain();
-    assert.equal(sentFiles.length, 1, 'exactly one encrypted blob should be sent');
+    assert.equal(sentFiles.length, 1, 'exactly one segment stream should be sent');
+    assert.equal(created.length, 1, 'one SegmentSender per file');
+    assert.equal(created[0].metadata.mimeType, 'image/png');
+    assert.equal(created[0].metadata.originalSize, 4);
+    assert.deepEqual(created[0].sessionKeys, { __fake: 'sessionKeys' },
+        'the session key handles must reach SegmentStream.createSender');
+});
+
+test('transient drop pauses the queue; resume-offer rewinds before acking and resumes from seq', async () => {
+    const { win, fakeRtc, sentFiles, sentMessages, rewinds } = loadIntoJsdom({ verified: true });
+
+    // First attempt drops mid-transfer with a tagged transient error.
+    let calls = 0;
+    fakeRtc.sendFile = async (sender, onProgress, resumeFromSeq) => {
+        sentFiles.push({ sender, resumeFromSeq });
+        if (++calls === 1) {
+            sender._advance(2);
+            const e = new Error('drop');
+            e.transient = true;
+            e.nextSeq = 2;
+            throw e;
+        }
+    };
+
+    const item = { blob: makeBlob(win) };
+    win.SenderSend.push(item);
+    await win.SenderSend.drain();
+    assert.equal(sentFiles.length, 1, 'first attempt went out');
+    assert.equal(win.SenderSend.size(), 1, 'queue head must survive a transient drop');
+
+    // Receiver offers to resume from record 2 after reconnect.
+    await win.SenderSend.handleResumeOffer({ type: 'file-resume-offer', nextSeq: 2 });
+    // Wait for the one-shot resume drain to finish.
+    await new Promise(r => setTimeout(r, 0));
+
+    assert.deepEqual(rewinds, [2], 'the SegmentSender must be rewound to the offered seq');
+    const ack = sentMessages.find(m => m.type === 'file-resume-ack');
+    assert.deepEqual(ack, { type: 'file-resume-ack', nextSeq: 2, salt: 'B'.repeat(22) + '==' },
+        'the ack must carry the fresh salt from the rewind');
+    assert.equal(sentFiles.length, 2, 'the transfer resumes');
+    assert.equal(sentFiles[1].resumeFromSeq, 2);
+    assert.equal(sentFiles[1].sender, sentFiles[0].sender,
+        'the same SegmentSender (same digests) must be reused on resume');
+    assert.equal(win.SenderSend.size(), 0, 'item leaves the queue after the resumed send acks');
+});
+
+test('resume-offer the head cannot match is answered with nextSeq=0 and a fresh drain', async () => {
+    const { win, fakeRtc, sentFiles, sentMessages, rewinds } = loadIntoJsdom({ verified: true });
+
+    let calls = 0;
+    fakeRtc.sendFile = async (sender, onProgress, resumeFromSeq) => {
+        sentFiles.push({ sender, resumeFromSeq });
+        if (++calls === 1) {
+            sender._advance(2);
+            const e = new Error('drop');
+            e.transient = true;
+            throw e;
+        }
+    };
+
+    win.SenderSend.push({ blob: makeBlob(win) });
+    await win.SenderSend.drain();
+
+    // Offered seq is out of range for the head (segCount 3 allows <= 4).
+    await win.SenderSend.handleResumeOffer({ type: 'file-resume-offer', nextSeq: 9 });
+    await new Promise(r => setTimeout(r, 0));
+
+    const ack = sentMessages.find(m => m.type === 'file-resume-ack');
+    assert.deepEqual(ack, { type: 'file-resume-ack', nextSeq: 0 });
+    assert.equal(sentFiles.length, 2, 'a fresh full send must follow');
+    assert.equal(sentFiles[1].resumeFromSeq, undefined, 'fresh send, not a resume');
+    assert.deepEqual(rewinds, [0],
+        'the advanced sender must be rewound to 0 so the fresh file-start re-keys');
 });

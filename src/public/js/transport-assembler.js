@@ -101,17 +101,7 @@
                 // the byte stream. Decrypt/verify happens above the
                 // verification gate (ReceiveFlow + SegmentReceiver), so
                 // file-start must be forwarded upward for gating.
-                host.expectedSize = 0;
-                host._v2Mode = true;
-                host._v2Pending = null;
-                host._v2NextSeq = 0;
-                host._v2ExpectedRecords = msg.segCount + 1;
-                host._v2WireBytes = 0;
-                // Wire-size estimate for byte-based rate/ETA display
-                // (upper bound: gzip only shrinks records; percent should
-                // use the exact seq/segCount fields on progress events).
-                host._v2WireEstimate = host._v2ExpectedRecords
-                    * (window.Protocol.SEG_SIZE + V2_RECORD_OVERHEAD);
+                armV2Parser(host, msg.segCount, 0);
                 logger.info(`[${host.tag}] receiving v2 chunked file (${msg.segCount} segments)`);
                 return false;
             }
@@ -254,6 +244,27 @@
         host._v2NextSeq = nextSeq;
     }
 
+    // (Re-)arm the v2 record parser on {host}. Two callers: a v2
+    // file-start (nextSeq 0), and the reconnect resume path, where the
+    // post-reconnect winner is a fresh transport object whose parser
+    // never saw the file-start, so records would otherwise be rejected
+    // as "binary chunk before file-start". Wire-byte progress restarts
+    // at 0; the receiver's percent display uses the exact seq/segCount
+    // fields on progress events, the byte fields only feed rate/ETA.
+    function armV2Parser(host, segCount, nextSeq) {
+        host.expectedSize = 0;
+        host._v2Mode = true;
+        host._v2Pending = null;
+        host._v2NextSeq = nextSeq;
+        host._v2ExpectedRecords = segCount + 1;
+        host._v2WireBytes = 0;
+        // Wire-size estimate for byte-based rate/ETA display (upper
+        // bound: gzip only shrinks records).
+        host._v2WireEstimate = host._v2ExpectedRecords
+            * (window.Protocol.SEG_SIZE + V2_RECORD_OVERHEAD);
+        host._lastLoggedDecile = -1;
+    }
+
     function handleBinary(host, buf) {
         if (host._abusiveTeardown) return;
         if (host._v2Mode) {
@@ -344,6 +355,7 @@
         handleControl,
         handleBinary,
         resetParser,
+        armV2Parser,
         abortAbusiveStream,
         setupFileAck,
         clearFileAckState,

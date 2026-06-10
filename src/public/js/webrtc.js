@@ -509,19 +509,23 @@ class WebSendRTC {
     }
 
     /**
-     * Send a file (binary) over the data channel.
-     * The data should already be encrypted with metadata bundled via
-     * WebSendCrypto.encryptWithMetadata() - this function only handles
-     * chunked transfer and does not see any plaintext metadata.
+     * Send (or resume sending) a file over the data channel as sealed v2
+     * records. This transport never sees plaintext: SegmentStream.pump
+     * pulls already-encrypted records from {segmentSender} and slices
+     * them into 16 KiB data-channel chunks via the io primitives below.
      *
-     * @param {ArrayBuffer} encryptedData - Already-encrypted data with metadata bundled
-     * @param {Function} onProgress - Progress callback (percent)
-     * @param {number} [resumeFromOffset] - Continue an interrupted transfer
-     *     from this byte. Set by SenderSend after the receiver answered our
-     *     file-resume-offer; no file-start is sent (the receiver keeps its
-     *     partial buffer, a fresh file-start would reset it).
+     * @param {Object} segmentSender - From SegmentStream.createSender
+     * @param {Function} onProgress - (percent, deliveredBytes, totalBytes)
+     * @param {number} [resumeFromSeq] - Continue an interrupted transfer
+     *     from this record. Set by SenderSend after the receiver answered
+     *     our file-resume-offer; no file-start is sent (the receiver kept
+     *     its verified segments and was re-keyed via file-resume-ack).
+     *
+     * A drop mid-transfer throws TransientDisconnectError (tagged
+     * .transient, .nextSeq) so SenderSend pauses the queue head for a
+     * resume instead of failing the file: same contract as WS/LP.
      */
-    async sendFile(encryptedData, onProgress, resumeFromOffset) {
+    async sendFile(segmentSender, onProgress, resumeFromSeq) {
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
             logger.error('Data channel not open');
             return false;
@@ -533,50 +537,27 @@ class WebSendRTC {
         this._fileAckInFlight = true;
 
         try {
-            const CHUNK_SIZE = 16384; // 16KB chunks
-            const totalSize = encryptedData.byteLength;
-            const isResume = typeof resumeFromOffset === 'number' && resumeFromOffset > 0;
-            let offset = isResume ? resumeFromOffset : 0;
-
-            if (!isResume) {
-                // File-start message contains only the encrypted size (which is padded).
-                // No plaintext metadata is revealed - name, type, and original size
-                // are encrypted inside the payload.
-                if (!this.sendMessage(Protocol.build.fileStart(totalSize))) {
-                    throw new Error('Failed to send file-start (channel not open)');
-                }
-                logger.info(`Sending encrypted file (${totalSize} bytes, padded)`);
-            } else {
-                logger.info(`Resuming encrypted file from offset ${offset}/${totalSize}`);
-            }
-
-            while (offset < totalSize) {
-                while (this.dataChannel.bufferedAmount > 1024 * 1024) {
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                }
-                if (this.dataChannel.readyState !== 'open') {
-                    throw new Error('Data channel closed mid-transfer');
-                }
-
-                const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
-                this.dataChannel.send(chunk);
-                offset += chunk.byteLength;
-
+            const io = {
+                chunkSize: 16384, // 16KB chunks
+                sendControl: (message) => this.sendMessage(message),
                 // Report bytes actually handed off to the network, not bytes
-                // written into the local send buffer. `offset` runs up to
-                // ~1 MiB ahead (the bufferedAmount high-water mark above), so
-                // reporting it made the sender's % and rate read well above
-                // the receiver's (which counts bytes that have arrived). Use
-                // the delivered estimate so both ends track each other.
-                const delivered = Math.max(0, offset - this.dataChannel.bufferedAmount);
-                const percent = Math.round((delivered / totalSize) * 100);
-                if (onProgress) onProgress(percent, delivered, totalSize);
-            }
-
-            if (!this.sendMessage(Protocol.build.fileEnd())) {
-                throw new Error('Failed to send file-end (channel not open)');
-            }
-            logger.info('All chunks sent, waiting for receiver acknowledgment...');
+                // written into the local send buffer, so the sender's % and
+                // rate track the receiver's instead of running ahead by up
+                // to the bufferedAmount high-water mark.
+                backlogBytes: () => (this.dataChannel ? this.dataChannel.bufferedAmount : 0),
+                sendChunk: async (chunk) => {
+                    while (this.dataChannel && this.dataChannel.readyState === 'open'
+                            && this.dataChannel.bufferedAmount > 1024 * 1024) {
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                    }
+                    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+                        throw new window.TransientDisconnectError('Data channel closed mid-transfer');
+                    }
+                    this.dataChannel.send(chunk);
+                },
+            };
+            await window.SegmentStream.pump(segmentSender, io, onProgress, resumeFromSeq);
+            logger.info('All records sent, waiting for receiver acknowledgment...');
 
             // Wait for file-ack / file-nack from receiver, or timeout.
             // PayloadAssembler.handleControl routes the ack messages into

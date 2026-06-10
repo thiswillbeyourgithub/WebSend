@@ -20,14 +20,14 @@
     let pendingBatchEnd = false;
     // True between a TransientDisconnectError caught in drain() and a
     // file-resume-offer (or fatal teardown). While paused, the head
-    // of the queue keeps its cachedEncryptedData so resume sends the
-    // exact same ciphertext bytes (same GCM nonce) and the receiver's
-    // partial buffer remains valid.
+    // of the queue keeps its SegmentSender so the resume can rewind it
+    // (fresh salt, re-key) and continue from the record the receiver
+    // reports in its file-resume-offer.
     let pausedOnTransient = false;
 
     // -- Wired-in deps (set by attach) --
     let _getRtc = null;
-    let _getSharedKey = null;
+    let _getSessionKeys = null;
     let _isVerified = null;
     let _i18n = null;
     let _logger = null;
@@ -36,7 +36,7 @@
 
     function attach(deps) {
         _getRtc = deps.getRtc;
-        _getSharedKey = deps.getSharedKey;
+        _getSessionKeys = deps.getSessionKeys;
         _isVerified = deps.isVerified || (() => true);
         _i18n = deps.i18n;
         _logger = deps.logger;
@@ -170,11 +170,10 @@
                 _logger.success('Queued photo sent and verified by receiver');
             } catch (e) {
                 // Transient transport drop mid-send: keep the head of the
-                // queue (with its cached encryptedData) and pause until a
+                // queue (with its SegmentSender) and pause until a
                 // file-resume-offer arrives via handleResumeOffer.
                 if (e && e.transient) {
-                    _logger.warn(`Send paused on transient drop at offset ${e.offset}`);
-                    item._lastOffset = e.offset | 0;
+                    _logger.warn(`Send paused on transient drop at record ${e.nextSeq}`);
                     pausedOnTransient = true;
                     isSending = false;
                     updateBanner();
@@ -206,23 +205,27 @@
     }
 
     /**
-     * Encrypt and transmit a single photo blob.
+     * Transmit a single queued blob as v2 sealed segment records.
      *
-     * Encrypts on first call and caches the ciphertext on the queue
-     * `item` so a transient transport drop can resume sending the same
-     * ciphertext (same GCM nonce) instead of re-encrypting (which
-     * would invalidate the receiver's partial buffer).
+     * A SegmentSender is created on first attempt and kept on the queue
+     * `item` so a transient transport drop can resume the transfer:
+     * plaintext is re-read from the blob one segment at a time
+     * (constant memory, no whole-file ciphertext cache), and any rewind
+     * re-keys with a fresh salt before resending.
      *
-     * `resumeFromOffset` is propagated to the transport so a relay
-     * reconnect after a mid-transfer drop continues from that byte
-     * instead of re-sending file-start.
+     * `resumeFromSeq` is propagated to the transport so a relay
+     * reconnect after a mid-transfer drop continues from that record
+     * instead of re-sending file-start. The caller (handleResumeOffer)
+     * must have rewound the SegmentSender and sent the file-resume-ack
+     * carrying the new salt first.
      *
-     * Resolves with the plaintext SHA-256 hex when the receiver acks;
+     * Resolves with the composite file hash hex (the v2 file identity,
+     * matching the receiver's file-ack hash) when the receiver acks;
      * throws on nack, timeout, or transient drop. A transient drop
      * throws a tagged TransientDisconnectError so drain() can pause
      * the queue head instead of dropping the photo.
      */
-    async function sendOnePhoto(item, resumeFromOffset) {
+    async function sendOnePhoto(item, resumeFromSeq) {
         // Hard gate: refuse to encrypt/transmit unless both sides have
         // confirmed the fingerprint and a shared key was derived. This
         // is independent of the UI gate in handleReady so a future bug
@@ -233,14 +236,7 @@
         }
         const blob = item.blob;
 
-        // Lazy-encrypt: only on first attempt. On resume, the cached
-        // ciphertext is reused so the receiver's partial buffer stays
-        // valid byte-for-byte.
-        if (!item._cachedEncryptedData) {
-            const photoData = await blob.arrayBuffer();
-            _logger.info(`Sending queued photo: ${photoData.byteLength} bytes`);
-            item._localHash = await window.WebSendCrypto.sha256Hex(photoData);
-            _logger.info(`Plaintext SHA-256: ${item._localHash}`);
+        if (!item._segmentSender) {
             const filename = blob.name || `websend_${Date.now()}.png`;
             // Camera/gallery blobs always carry an explicit image/* type (set
             // by canvas.toBlob). An empty blob.type only happens for a
@@ -251,18 +247,25 @@
             // discarded as a failed photo. Fall back to a generic type so
             // such files travel as plain downloadable files instead.
             const mimeType = blob.type || 'application/octet-stream';
-            item._cachedEncryptedData = await window.WebSendCrypto.encryptWithMetadata(
-                photoData,
-                { name: filename, mimeType: mimeType, originalSize: photoData.byteLength },
-                _getSharedKey()
-            );
-            _logger.info(`Encrypted size: ${item._cachedEncryptedData.byteLength} bytes (padded)`);
+            item._segmentSender = await window.SegmentStream.createSender({
+                blob,
+                metadata: { name: filename, mimeType: mimeType, originalSize: blob.size },
+                sessionKeys: _getSessionKeys(),
+            });
+            _logger.info(`Sending queued file: ${blob.size} bytes in ${item._segmentSender.segCount} segments`);
         }
-        const encryptedData = item._cachedEncryptedData;
+        const segmentSender = item._segmentSender;
+
+        // Fresh (non-resume) attempt on a sender that already advanced:
+        // a restart after the receiver declined to resume. Rewind to the
+        // start so the new file-start carries a fresh salt.
+        if (!resumeFromSeq && segmentSender.nextSeq > 0) {
+            await segmentSender.rewind(0);
+        }
 
         const xferStart = Date.now();
         let lastStatsUpdate = 0;
-        await _getRtc().sendFile(encryptedData, (percent, offset, totalSize) => {
+        await _getRtc().sendFile(segmentSender, (percent, offset, totalSize) => {
             const fill = document.getElementById('queue-progress-fill');
             if (fill) fill.style.width = percent + '%';
             const now = Date.now();
@@ -274,62 +277,66 @@
                 const statsEl = document.getElementById('queue-transfer-stats');
                 if (statsEl) statsEl.textContent = window.formatTransferStats(percent, rate, remaining);
             }
-        }, resumeFromOffset);
+        }, resumeFromSeq);
         const elapsed = (Date.now() - xferStart) / 1000;
-        const actualRate = elapsed > 0 ? encryptedData.byteLength / elapsed : 0;
-        _logger.info(`Transfer complete: ${window.formatRate(actualRate)} avg (${elapsed.toFixed(1)}s, ${encryptedData.byteLength} bytes)`);
+        const wireSize = segmentSender.estimatedWireSize;
+        const actualRate = elapsed > 0 ? wireSize / elapsed : 0;
+        _logger.info(`Transfer complete: ${window.formatRate(actualRate)} avg (${elapsed.toFixed(1)}s, ~${wireSize} bytes)`);
         const statsEl = document.getElementById('queue-transfer-stats');
         if (statsEl) statsEl.textContent = '';
-        // Drop the cached ciphertext now that it's done so the GC can
-        // free a potentially large buffer. _localHash stays for the
-        // drain() result.
-        const localHash = item._localHash;
-        item._cachedEncryptedData = null;
+        // The composite hash is the file's identity token on both sides
+        // (gallery sentHash, replace/delete flows). Computed from the
+        // per-segment digests, so no whole-file buffer is ever needed.
+        const localHash = await segmentSender.finishHash();
+        item._segmentSender = null;
         return localHash;
     }
 
     /**
      * Handle a file-resume-offer from the receiver after a relay
-     * reconnect. The receiver tells us how many bytes of an in-flight
-     * file-start it already has. We:
+     * reconnect. The receiver tells us the next record seq it is
+     * missing of an in-flight v2 transfer. We:
      *
-     * - If the head of our queue still holds the matching encryptedData
-     *   (same byteLength as the offer's size), reply with
-     *   file-resume-ack {offset: received} and resume sending from
-     *   that offset.
-     * - Otherwise reply with file-resume-ack {offset: 0} so the
-     *   receiver discards its partial buffer and expects a fresh
+     * - If the head of our queue still holds a SegmentSender the offer
+     *   can apply to, rewind it to that seq (re-keying with a fresh
+     *   salt), reply with file-resume-ack {nextSeq, salt}, and resume
+     *   sending from that record.
+     * - Otherwise reply with file-resume-ack {nextSeq: 0} so the
+     *   receiver discards its partial transfer and expects a fresh
      *   file-start. The queue is then drained normally.
      */
-    function handleResumeOffer(msg) {
+    async function handleResumeOffer(msg) {
         const head = queue[0];
-        const matches = head
-            && head._cachedEncryptedData
-            && head._cachedEncryptedData.byteLength === msg.size
-            && msg.received > 0
-            && msg.received <= msg.size;
-        if (!matches) {
-            _logger.warn(`file-resume-offer cannot match head of queue (have ${queue.length} item(s), head has cache=${!!(head && head._cachedEncryptedData)}); replying offset=0`);
-            try { _getRtc().sendMessage(window.Protocol.build.fileResumeAck(0)); } catch (_) {}
+        const segmentSender = head && head._segmentSender;
+        const canResume = segmentSender
+            && Number.isInteger(msg.nextSeq)
+            && msg.nextSeq > 0
+            && msg.nextSeq <= segmentSender.segCount + 1;
+        if (!canResume) {
+            _logger.warn(`file-resume-offer cannot match head of queue (have ${queue.length} item(s), head has sender=${!!segmentSender}, offered nextSeq=${msg.nextSeq}); replying nextSeq=0`);
+            try { _getRtc().sendMessage(window.Protocol.build.fileResumeAckV2(0)); } catch (_) {}
             pausedOnTransient = false;
             // Drain normally if anything is queued.
             if (queue.length > 0) drain();
             return;
         }
-        _logger.info(`file-resume-offer matches head, resuming from offset ${msg.received}/${msg.size}`);
-        try { _getRtc().sendMessage(window.Protocol.build.fileResumeAck(msg.received)); } catch (_) {}
+        // Rewind BEFORE acking: the ack carries the fresh salt the
+        // receiver must re-key with before any resent record arrives.
+        const { saltB64 } = await segmentSender.rewind(msg.nextSeq);
+        _logger.info(`file-resume-offer matches head, resuming from record ${msg.nextSeq}/${segmentSender.segCount + 1}`);
+        try { _getRtc().sendMessage(window.Protocol.build.fileResumeAckV2(msg.nextSeq, saltB64)); } catch (_) {}
         pausedOnTransient = false;
-        // Resume via a one-shot drain that passes the offset for the head.
-        resumeDrain(msg.received);
+        // Resume via a one-shot drain that passes the seq for the head.
+        resumeDrain(msg.nextSeq);
     }
 
-    async function resumeDrain(resumeFromOffset) {
+    async function resumeDrain(resumeFromSeq) {
         if (isSending) return;
         isSending = true;
         updateBanner();
         const item = queue[0];
         try {
-            const localHash = await sendOnePhoto(item, resumeFromOffset);
+            const localHash = await sendOnePhoto(item, resumeFromSeq);
             queue.shift();
             if (item.photoId != null) {
                 const gPhoto = _getGalleryPhotos().find(p => p.id === item.photoId);
@@ -341,8 +348,7 @@
             _logger.success('Resumed photo sent and verified by receiver');
         } catch (e) {
             if (e && e.transient) {
-                _logger.warn(`Resumed send paused again on transient drop at offset ${e.offset}`);
-                item._lastOffset = e.offset | 0;
+                _logger.warn(`Resumed send paused again on transient drop at record ${e.nextSeq}`);
                 pausedOnTransient = true;
                 isSending = false;
                 updateBanner();

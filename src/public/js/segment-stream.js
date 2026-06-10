@@ -38,6 +38,22 @@
     /** [4B BE seq][4B BE ctLen] before each record's ciphertext */
     const RECORD_HEADER_BYTES = 8;
 
+    /**
+     * Tagged error thrown when a transport drops mid-sendFile but the
+     * higher layers can recover via the resume protocol (SenderSend
+     * pauses the queue head and waits for a file-resume-offer instead of
+     * failing the file). Shared by all three transports; pump() stamps
+     * .nextSeq with the first record the receiver may be missing.
+     */
+    class TransientDisconnectError extends Error {
+        constructor(message, nextSeq) {
+            super(message);
+            this.name = 'TransientDisconnectError';
+            this.transient = true;
+            if (Number.isInteger(nextSeq)) this.nextSeq = nextSeq;
+        }
+    }
+
     /** AES-GCM auth tag length, for wire-size estimates */
     const GCM_TAG_BYTES = 16;
 
@@ -110,6 +126,20 @@
             get nextSeq() { return nextSeq; },
 
             /**
+             * Estimated wire bytes of all records before {seq}: the
+             * progress baseline when a transfer resumes mid-file.
+             * Upper-bound like estimatedWireSize (gzip only shrinks).
+             */
+            estimateWireOffset(seq) {
+                if (!Number.isInteger(seq) || seq < 0 || seq > segCount + 1) {
+                    throw new Error(`Invalid wire-offset seq ${seq}`);
+                }
+                if (seq === 0) return 0;
+                if (seq === segCount + 1) return estimatedWireSize;
+                return metaRecord + (seq - 1) * fullRecord;
+            },
+
+            /**
              * Seal and return the next wire record, or null after the final
              * segment. {seq, bytes: ArrayBuffer, isFinal}.
              */
@@ -150,10 +180,12 @@
              * Reposition to resend from record {seq}, re-keying the tail
              * with a fresh salt. Returns the new salt (base64) which MUST
              * reach the receiver (segment-rewind / file-resume-ack) before
-             * any resent record.
+             * any resent record. seq segCount+1 is legal: the receiver
+             * verified every record but missed file-end, so the resume
+             * resends nothing and only file-end goes out.
              */
             async rewind(seq) {
-                if (!Number.isInteger(seq) || seq < 0 || seq > segCount) {
+                if (!Number.isInteger(seq) || seq < 0 || seq > segCount + 1) {
                     throw new Error(`Invalid rewind seq ${seq}`);
                 }
                 salt = WebSendCrypto.getRandomBytes(16);
@@ -277,11 +309,76 @@
         });
     }
 
+    /**
+     * Drive a SegmentSender over one transport. The record/chunk loop,
+     * file-start/file-end control flow, resume bookkeeping, and progress
+     * arithmetic live here once instead of once per transport; the
+     * transport supplies only its primitives via {io}:
+     *
+     *   chunkSize       wire frame size for this transport
+     *   sendControl(m)  send one JSON control frame, returns boolean
+     *   sendChunk(buf)  async; apply the transport's own backpressure,
+     *                   then send one binary chunk. Throws
+     *                   TransientDisconnectError (without nextSeq; pump
+     *                   stamps it) on a recoverable drop, a plain Error
+     *                   on a fatal condition.
+     *   backlogBytes()  bytes accepted locally but not yet handed to the
+     *                   network, so progress reports delivered bytes and
+     *                   the sender's % / rate track the receiver's.
+     *
+     * When {resumeFromSeq} > 0 no file-start is sent: the receiver kept
+     * its partial state and was re-keyed via file-resume-ack before this
+     * call. The caller still owns the file-ack wait that follows.
+     */
+    async function pump(sender, io, onProgress, resumeFromSeq) {
+        const isResume = Number.isInteger(resumeFromSeq) && resumeFromSeq > 0;
+        if (!isResume) {
+            if (!io.sendControl(Protocol.build.fileStartV2(sender.segCount, sender.saltB64))) {
+                throw new TransientDisconnectError('transport closed before file-start', 0);
+            }
+        }
+        const total = sender.estimatedWireSize;
+        let wireSent = sender.estimateWireOffset(isResume ? resumeFromSeq : 0);
+        let record = null;
+        try {
+            while ((record = await sender.next()) !== null) {
+                const bytes = record.bytes;
+                for (let off = 0; off < bytes.byteLength; off += io.chunkSize) {
+                    await io.sendChunk(bytes.slice(off, off + io.chunkSize));
+                }
+                wireSent += bytes.byteLength;
+                if (onProgress) {
+                    // Percent counts records (exact; byte totals are only
+                    // an upper-bound estimate since gzip shrinks records),
+                    // while the byte fields feed rate/ETA display. Same
+                    // split as the receiver's progress events.
+                    const delivered = Math.max(0, Math.min(wireSent, total) - io.backlogBytes());
+                    const percent = Math.min(100,
+                        Math.round(((record.seq + 1) / sender.totalRecords) * 100));
+                    onProgress(percent, delivered, total);
+                }
+            }
+        } catch (e) {
+            if (e && e.transient && !Number.isInteger(e.nextSeq)) {
+                // The record in flight may be partially delivered, so the
+                // resume must include it again; between records the next
+                // unsent one is the boundary.
+                e.nextSeq = record ? record.seq : sender.nextSeq;
+            }
+            throw e;
+        }
+        if (!io.sendControl(Protocol.build.fileEnd())) {
+            throw new TransientDisconnectError('transport closed before file-end', sender.nextSeq);
+        }
+    }
+
+    window.TransientDisconnectError = TransientDisconnectError;
     window.SegmentStream = Object.freeze({
         META_RECORD_PLAINTEXT,
         FINAL_PAD_BUCKETS,
         RECORD_HEADER_BYTES,
         createSender,
         createReceiver,
+        pump,
     });
 })();

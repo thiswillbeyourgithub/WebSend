@@ -62,16 +62,8 @@
         return Number.isFinite(n) && n > 0 ? n * 1000 : 0;
     }
 
-    // Same tagged error shape as ws-transport so SenderSend can detect
-    // a recoverable mid-transfer drop and trigger the resume flow.
-    class TransientDisconnectError extends Error {
-        constructor(message, offset) {
-            super(message);
-            this.name = 'TransientDisconnectError';
-            this.transient = true;
-            this.offset = offset | 0;
-        }
-    }
+    // A drop mid-sendFile throws the shared window.TransientDisconnectError
+    // (defined in segment-stream.js) so SenderSend can pause for resume.
 
     class LPTransport {
         constructor() {
@@ -436,7 +428,7 @@
             return true;
         }
 
-        async sendFile(encryptedData, onProgress, resumeFromOffset) {
+        async sendFile(segmentSender, onProgress, resumeFromSeq) {
             if (!this._connected) {
                 logger.error('[LP] not connected, cannot send file');
                 return false;
@@ -445,61 +437,40 @@
                 throw new Error('sendFile already in progress, wait for the previous transfer to finish');
             }
             this._fileAckInFlight = true;
-            const totalSize = encryptedData.byteLength;
-            const isResume = typeof resumeFromOffset === 'number' && resumeFromOffset > 0;
-            let offset = isResume ? resumeFromOffset : 0;
             try {
-                if (!isResume) {
-                    if (!this.sendMessage(window.Protocol.build.fileStart(totalSize))) {
-                        throw new TransientDisconnectError('LP not connected for file-start', 0);
-                    }
-                    logger.info(`[LP] sending encrypted file (${totalSize} bytes, padded)`);
-                } else {
-                    logger.info(`[LP] resuming encrypted file from offset ${offset}/${totalSize}`);
-                }
-                while (offset < totalSize) {
-                    if (this._closed) {
-                        throw new TransientDisconnectError(
-                            `LP closed mid-transfer at offset ${offset}/${totalSize}`,
-                            offset
-                        );
-                    }
-                    const chunk = encryptedData.slice(offset, offset + CHUNK_SIZE);
-                    // Sequential awaits provide natural backpressure: the
-                    // server only acks our POST when the queue accepts the
-                    // frame, and an LP slot has a bounded queue. No need
-                    // for an explicit highWater check.
-                    try {
-                        await this._sendBinary(chunk);
-                    } catch (e) {
-                        // Any /relay/up failure mid-chunk is treated as a
-                        // transient drop so SenderSend can resume after
-                        // reconnect from this offset.
-                        throw new TransientDisconnectError(
-                            `LP _sendBinary failed at offset ${offset}: ${e.message}`,
-                            offset
-                        );
-                    }
-                    offset += chunk.byteLength;
+                const io = {
+                    chunkSize: CHUNK_SIZE,
+                    sendControl: (message) => this.sendMessage(message),
                     // Report delivered bytes (server-acked minus the peer's
-                    // undrained backlog), not uploaded bytes. Raw `offset`
+                    // undrained backlog), not uploaded bytes. Raw upload
                     // counts frames the server accepted instantly, which on
                     // a slow receiver read up to a whole queue (8 MiB) and
                     // roughly 2x in rate ahead of the receiver's display.
                     // Mirrors the bufferedAmount correction in webrtc.js /
                     // ws-transport.js. The backlog includes control frames
-                    // and is sampled per-POST, so clamp to [0, offset].
-                    const delivered = Math.max(0, offset - this._peerBacklogBytes);
-                    const percent = Math.round((delivered / totalSize) * 100);
-                    if (onProgress) onProgress(percent, delivered, totalSize);
-                }
-                if (!this.sendMessage(window.Protocol.build.fileEnd())) {
-                    throw new TransientDisconnectError(
-                        `LP closed before file-end at offset ${offset}/${totalSize}`,
-                        offset
-                    );
-                }
-                logger.info('[LP] all chunks sent, waiting for receiver acknowledgment...');
+                    // and is sampled per-POST; pump clamps to >= 0.
+                    backlogBytes: () => this._peerBacklogBytes,
+                    sendChunk: async (chunk) => {
+                        if (this._closed) {
+                            throw new window.TransientDisconnectError('LP closed mid-transfer');
+                        }
+                        // Sequential awaits provide natural backpressure: the
+                        // server only acks our POST when the queue accepts the
+                        // frame, and an LP slot has a bounded queue. No need
+                        // for an explicit highWater check.
+                        try {
+                            await this._sendBinary(chunk);
+                        } catch (e) {
+                            // Any /relay/up failure mid-chunk is treated as a
+                            // transient drop so SenderSend can resume after
+                            // reconnect from this record.
+                            throw new window.TransientDisconnectError(
+                                `LP _sendBinary failed: ${e.message}`);
+                        }
+                    },
+                };
+                await window.SegmentStream.pump(segmentSender, io, onProgress, resumeFromSeq);
+                logger.info('[LP] all records sent, waiting for receiver acknowledgment...');
                 return await new Promise((resolve, reject) => {
                     window.PayloadAssembler.setupFileAck(this, resolve, reject, FILE_ACK_TIMEOUT_MS);
                 });

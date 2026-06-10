@@ -17,6 +17,10 @@
     let rtc = null;
     let keyPair = null;
     let sharedKey = null;
+    // Session key handles from deriveSessionKeys: sharedKey plus the
+    // deriveFileKey(salt) used by SegmentStream to derive per-file
+    // subkeys for v2 chunked transfers. Lifecycle mirrors sharedKey.
+    let sessionKeys = null;
     let weConfirmed = false;
     let theyConfirmed = false;
     let lastRoomId = null;
@@ -83,6 +87,7 @@
             }
             keyPair = null;
             sharedKey = null;
+            sessionKeys = null;
             weConfirmed = false;
             theyConfirmed = false;
             pendingReady = false;
@@ -216,6 +221,7 @@
         // Reset crypto and queue state
         keyPair = await window.WebSendCrypto.generateKeyPair();
         sharedKey = null;
+        sessionKeys = null;
         weConfirmed = false;
         theyConfirmed = false;
         pendingReady = false;
@@ -280,6 +286,7 @@
                     _showToast(_i18n.t('send.peerChangedOnReconnect') ||
                         'Peer key changed during reconnect, please rescan', { type: 'error', duration: 0 });
                     sharedKey = null;
+                    sessionKeys = null;
                     weConfirmed = false;
                     theyConfirmed = false;
                     cachedTheirFingerprint = null;
@@ -306,7 +313,8 @@
         _logger.info('Received receiver public key, performing key exchange...');
         try {
             const receiverPublicKey = await window.WebSendCrypto.importPublicKey(msg.key);
-            sharedKey = await window.WebSendCrypto.deriveSharedKey(keyPair.privateKey, receiverPublicKey);
+            sessionKeys = await window.WebSendCrypto.deriveSessionKeys(keyPair.privateKey, receiverPublicKey);
+            sharedKey = sessionKeys.sharedKey;
 
             // Per-key fingerprints are cached only for the reconnect
             // peer-identity check below; the user-facing code is the
@@ -464,6 +472,7 @@
         rtc = null;
         keyPair = null;
         sharedKey = null;
+        sessionKeys = null;
         weConfirmed = false;
         theyConfirmed = false;
         pendingReady = false;
@@ -500,6 +509,7 @@
         cleanup,
         getRtc: () => rtc,
         getSharedKey: () => sharedKey,
+        getSessionKeys: () => sessionKeys,
         // True only when key exchange completed AND both sides confirmed
         // the fingerprint. Callers on the send path must consult this
         // before encrypting/transmitting a photo, so a future code change

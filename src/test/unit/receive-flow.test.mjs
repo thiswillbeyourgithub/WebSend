@@ -419,3 +419,50 @@ test('v2 file-start without session keys is ignored; later segments are no-ops',
     assert.equal(fake.calls.length, 0);
     assert.equal(deps.sent.length, 0, 'no nack spam for gated/ignored transfers');
 });
+
+test('v2 resume: getResumeState reports the missing seq, applyResumeAck rekeys', async () => {
+    const rekeys = [];
+    const fake = makeFakeReceiver({ segCount: 5 });
+    fake.rekey = (saltB64, fromSeq) => rekeys.push({ saltB64, fromSeq });
+    const { win } = setupV2(fake);
+
+    assert.equal(await win.ReceiveFlow.getResumeState(), null,
+        'no transfer in flight means nothing to offer');
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
+
+    // Field-wise compare: the state objects come from the jsdom realm,
+    // whose Object.prototype differs from this realm's (deepStrictEqual
+    // compares prototypes).
+    const offer = await win.ReceiveFlow.getResumeState();
+    assert.equal(offer.nextSeq, 2, 'the resume offer must name the first record we are missing');
+    assert.equal(offer.segCount, 5);
+
+    const newSalt = 'B'.repeat(22) + '==';
+    const st = await win.ReceiveFlow.applyResumeAck(2, newSalt);
+    assert.equal(st.segCount, 5, 'ack handling returns what the parser re-arm needs');
+    assert.deepEqual(rekeys, [{ saltB64: newSalt, fromSeq: 2 }],
+        'the fresh salt must be applied before resent records arrive');
+});
+
+test('v2 abandonTransfer drops the in-flight receiver without nacking', async () => {
+    const fake = makeFakeReceiver({ segCount: 5 });
+    const { win, deps } = setupV2(fake);
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.abandonTransfer();
+
+    assert.equal(await win.ReceiveFlow.getResumeState(), null);
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
+    assert.deepEqual(fake.calls, [0], 'segments after the abandon are dropped in O(1)');
+    assert.equal(deps.sent.filter(m => m.type === 'file-nack').length, 0,
+        'a sender-requested restart is not an error; no nack');
+});
+
+test('v2 applyResumeAck with no transfer in flight resolves null and does not throw', async () => {
+    const { win } = setupV2(makeFakeReceiver());
+    assert.equal(await win.ReceiveFlow.applyResumeAck(2, 'B'.repeat(22) + '=='), null);
+});

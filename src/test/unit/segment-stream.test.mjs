@@ -265,6 +265,142 @@ test('createSender rejects oversized metadata before sending anything', async ()
     await assert.rejects(() => sender.next(), /metadata too large/i);
 });
 
+test('estimateWireOffset matches cumulative wire bytes for incompressible content', async () => {
+    const content = C.getRandomBytes(2 * SEG + 1000);
+    const { sender } = await makePair(content);
+    let cumulative = 0;
+    let record;
+    while ((record = await sender.next()) !== null) {
+        assert.equal(cumulative, sender.estimateWireOffset(record.seq),
+            `offset estimate for record ${record.seq} must match bytes sent so far`);
+        cumulative += record.bytes.byteLength;
+    }
+    assert.equal(cumulative, sender.estimateWireOffset(sender.segCount + 1),
+        'past-the-end offset must equal the full wire size');
+    assert.throws(() => sender.estimateWireOffset(sender.segCount + 2), /Invalid/);
+});
+
+test('rewind to segCount+1 is legal (resume that only re-sends file-end)', async () => {
+    const { sender } = await makePair(patternedBytes(SEG + 100));
+    while (await sender.next() !== null) { /* drain */ }
+    await sender.rewind(sender.segCount + 1);
+    assert.equal(await sender.next(), null, 'nothing is left to resend');
+    await assert.rejects(() => sender.rewind(sender.segCount + 2), /Invalid rewind/);
+});
+
+/** In-memory transport io for pump(): collects control frames and the
+ * concatenated chunk bytes, with a per-chunk hook for fault injection. */
+function makePumpIo({ chunkSize = 1000, onChunk = () => {} } = {}) {
+    const controls = [];
+    const chunks = [];
+    return {
+        controls,
+        chunks,
+        get wireBytes() {
+            const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+            const merged = new Uint8Array(total);
+            let off = 0;
+            for (const c of chunks) { merged.set(new Uint8Array(c), off); off += c.byteLength; }
+            return merged;
+        },
+        chunkSize,
+        sendControl: (m) => { controls.push(m); return true; },
+        backlogBytes: () => 0,
+        sendChunk: async (chunk) => {
+            onChunk(chunks.length);
+            chunks.push(chunk);
+        },
+    };
+}
+
+/** Split a concatenated record stream and accept everything into {receiver}. */
+async function acceptWire(receiver, wire) {
+    let off = 0;
+    while (off < wire.length) {
+        const view = new DataView(wire.buffer, off);
+        const seq = view.getUint32(0, false);
+        const ctLen = view.getUint32(4, false);
+        const ct = wire.slice(off + HDR, off + HDR + ctLen).buffer;
+        off += HDR + ctLen;
+        assert.equal((await receiver.accept(seq, ct)).ok, true, `record ${seq} must verify`);
+    }
+}
+
+test('pump drives a fresh transfer end-to-end through a chunking transport', async () => {
+    const content = patternedBytes(600 * 1024);
+    const { senderKeys, receiverKeys } = await makePeers();
+    const blob = new Blob([content]);
+    const sender = await SS.createSender({
+        blob, metadata: { ...METADATA, originalSize: blob.size }, sessionKeys: senderKeys,
+    });
+    const io = makePumpIo({ chunkSize: 1000 }); // records span many chunks
+    const progress = [];
+
+    await SS.pump(sender, io, (percent, delivered, total) => progress.push({ percent, delivered, total }), undefined);
+
+    assert.deepEqual(io.controls.map(m => m.type), ['file-start', 'file-end']);
+    assert.equal(io.controls[0].v, 2);
+    assert.equal(io.controls[0].salt, sender.saltB64);
+
+    const receiver = SS.createReceiver({
+        sessionKeys: receiverKeys, saltB64: io.controls[0].salt, segCount: io.controls[0].segCount,
+    });
+    await acceptWire(receiver, io.wireBytes);
+    const { blob: out } = await receiver.finish();
+    assert.deepEqual(new Uint8Array(await out.arrayBuffer()), content);
+
+    assert.ok(progress.length >= sender.totalRecords, 'progress fires per record');
+    assert.equal(progress.at(-1).percent, 100);
+    assert.ok(progress.every(p => p.total === sender.estimatedWireSize));
+});
+
+test('pump resume skips file-start and the receiver heals via rekey', async () => {
+    const content = patternedBytes(600 * 1024); // 3 data segments
+    const { sender, receiver } = await makePair(content);
+
+    // Records 0 and 1 made it across before the drop.
+    for (let i = 0; i < 2; i++) {
+        const { seq, ct } = parseRecord((await sender.next()).bytes);
+        assert.equal((await receiver.accept(seq, ct)).ok, true);
+    }
+    // Reconnect resume: receiver offered nextSeq=2, sender rewound and
+    // acked with the fresh salt, receiver rekeys (what handleResumeOffer
+    // and handleFileResumeAck do around the transport call).
+    const { saltB64 } = await sender.rewind(2);
+    receiver.rekey(saltB64, 2);
+
+    const io = makePumpIo();
+    await SS.pump(sender, io, null, 2);
+
+    assert.deepEqual(io.controls.map(m => m.type), ['file-end'],
+        'a resume must not send a fresh file-start');
+    await acceptWire(receiver, io.wireBytes);
+    const { blob: out } = await receiver.finish();
+    assert.deepEqual(new Uint8Array(await out.arrayBuffer()), content);
+});
+
+test('pump stamps transient transport errors with the in-flight record seq', async () => {
+    const content = patternedBytes(600 * 1024);
+    const { sender } = await makePair(content);
+
+    // The metadata record (2048 + header + tag = 2072 bytes) occupies
+    // chunks 0..2 at chunkSize 1000, so failing on chunk 3 drops the
+    // transport while record 1 is on the wire.
+    const io = makePumpIo({
+        onChunk: (i) => {
+            if (i === 3) throw new win.TransientDisconnectError('drop');
+        },
+    });
+
+    await assert.rejects(
+        () => SS.pump(sender, io, null, undefined),
+        (e) => {
+            assert.equal(e.transient, true);
+            assert.equal(e.nextSeq, 1, 'the record in flight must be the resume point');
+            return true;
+        });
+});
+
 test('estimatedWireSize is an upper bound and exact for incompressible content', async () => {
     const content = C.getRandomBytes(SEG + 1000);
     const { sender } = await makePair(content);

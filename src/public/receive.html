@@ -147,12 +147,12 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-ru8unTea81AjGWvbBlS67rma6fsxKllB5Gq8wKv8Gapa/mYDTXbdZFZlehK7K898"></script>
     <script src="/js/protocol.js" integrity="sha384-5jC8yuy/x1YJ1ezXThsdGhNcf8iy0usehJOVNae/QAdIEH7Fdu1uTDBBQEYn03do"></script>
-    <script src="/js/webrtc.js" integrity="sha384-KO3xc4LH2Y1a4G2BZoAZ0dEp/+kMFk/XOXG5Vodx+mzHar7UYkU0rITk9YdoOVPp"></script>
-    <script src="/js/transport-assembler.js" integrity="sha384-q0oRCqhrMeGmtsKmQBU6x6fL1dDw8BNpVoOXBZuzgWm+Gz6yCpvsyT+1uAJMOIIh"></script>
-    <script src="/js/segment-stream.js" integrity="sha384-lf7IxSkBJhZueXoOMQf9Q9TFZiQu/NJ/2tuTztT2i/UC8N8+g/msfq5kl3aOX/ev"></script>
-    <script src="/js/ws-transport.js" integrity="sha384-Vu9BVIScT1GNfpENnIRNtET+llG8cFHVkrC7gjkoTcfAKJ979VYJS1I3Zkv6uldT"></script>
-    <script src="/js/lp-transport.js" integrity="sha384-FgcY9WBahaTbVPS8UWfX9Lux247UWxXTKbY+WcwnwCRjSj8CHM+Rm607ATjpf0PF"></script>
-    <script src="/js/transport.js" integrity="sha384-aAaDq3PdhQtmQDQKTmR2Saa7xjNt28TkDFhQdPUCsdD9ukX2IRsT/I+F3CM19o7s"></script>
+    <script src="/js/webrtc.js" integrity="sha384-vt5WFvz3iIpD9fDmY0K77WAredqV+RRKNYXuLCo0Et8XceP2pcuVgUwjPMB98dGM"></script>
+    <script src="/js/transport-assembler.js" integrity="sha384-tNFwcsjbQneiSpM/btB78hP2VUpXYbkkEIy40k0my2PU1Fpcb1U86w4OV2bX5vHa"></script>
+    <script src="/js/segment-stream.js" integrity="sha384-qOluk1goxLPffyoIvsiCV0cV68/1jjXcqV6ZmGy2jF53/pvKZpYdcQBq3k4ekiGG"></script>
+    <script src="/js/ws-transport.js" integrity="sha384-PlBLudBioLhZhrmV038moA6l0AVCRaOfpzDzvAb/vK7qL7opKM6hKxu4vEvB2pvl"></script>
+    <script src="/js/lp-transport.js" integrity="sha384-9l1XOB76FNpAG9TPmdgC+68M7QoFeutIFzkJCCimyh37VxbjuOWA9XInAIxLLKAZ"></script>
+    <script src="/js/transport.js" integrity="sha384-o0peABmlxVieoTuldLPNjPHEZ4NZEgLZ/BRfUt4RlyMDw+Q6zsuCMq4/Le2bn/No"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-WW/PDR2LrwH+LDPGHOqpr1zEZ2ittN4of22aRMSuLRiKCNw+1aSkOP6mHNGwCaW8"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-uMrESk94t8vNbYOfNElA05X6xrtx22R84sVmUFOPMhOuJMf3kxW9EW+Ccpm/O4v0"></script>
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
@@ -164,7 +164,7 @@
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-A0vvgdJ8ktmC65klkTfsPqjIHZXNroXsONfZzY7jVL0rVoRSdExtZid0K+ZXuRTw"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-NH+XRrtXv6xYSNjsbbaYzmJyXTVVdKmnIDrKgUvWXmwSVwnrJV5X5G8UcLvJs5xi"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-DgCbMzjz+dLHajRLh2nDm+gtkHG0wnliEk6C/iqoKATHPp1sLYZ0FkD2fdpk/PDg"></script>
-    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-ERUchYWlBccassO30mSoCKj7EPTSKsnGXPrqUCFXkfLz4KIhtjCSKW5U+m5ZCe8D"></script>
+    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-0WkmmgU7fxfrN98NJp7hYHkwhfCMuX1iNaOBKkOCF4py/xPYQD3xr3xyszdv1FbU"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-+EEuhwDyVsHFYHHBmQGfcVn909daLZh+b/Gv6g8jfFqLUDuhkJZB3i9c2gXCkubt"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -685,19 +685,17 @@
             }
             // If we have a partial in-flight transfer (file-start was
             // received before the drop, file-end never arrived), tell
-            // the sender what byte we got to so it can byte-resume the
-            // same ciphertext rather than re-encrypting from scratch.
+            // the sender the next record seq we are missing so it can
+            // rewind, re-key, and resume from there instead of starting
+            // the whole file over.
             try {
-                if (rtc && window.PayloadAssembler) {
-                    const innerWinner = rtc.winner ? rtc[rtc.winner === 'webrtc' ? 'webrtc' : rtc.winner] : null;
-                    if (innerWinner && window.PayloadAssembler.hasInflightTransfer(innerWinner)) {
-                        const st = window.PayloadAssembler.getResumeState(innerWinner);
-                        logger.info(`Emitting file-resume-offer size=${st.size} received=${st.received}`);
-                        await sendMessageWithRetry(
-                            Protocol.build.fileResumeOffer(st.size, st.received),
-                            'file-resume-offer'
-                        );
-                    }
+                const st = await ReceiveFlow.getResumeState();
+                if (st && rtc) {
+                    logger.info(`Emitting file-resume-offer nextSeq=${st.nextSeq}/${st.segCount + 1}`);
+                    await sendMessageWithRetry(
+                        Protocol.build.fileResumeOfferV2(st.nextSeq),
+                        'file-resume-offer'
+                    );
                 }
             } catch (e) {
                 logger.error('onReconnected: failed to emit file-resume-offer: ' + e.message);
@@ -1185,21 +1183,27 @@
             if (active) Collections.discardIfEmpty(active.id);
         }
 
-        function handleFileResumeAck(msg) {
-            // Sender's reply to our file-resume-offer. offset > 0 means
-            // the sender will continue from that byte; the partial
-            // buffer on our side is kept and binary chunks resume.
-            // offset === 0 means the sender cannot resume (different
-            // photo at head of queue, lost cache, etc.); discard the
-            // partial buffer so a fresh file-start re-opens cleanly.
-            const innerWinner = rtc.winner ? rtc[rtc.winner === 'webrtc' ? 'webrtc' : rtc.winner] : null;
-            if (!innerWinner) return;
-            if (msg.offset === 0) {
-                logger.warn('file-resume-ack offset=0; discarding partial in-flight buffer');
-                window.PayloadAssembler.discardInflightOnResumeReset(innerWinner);
+        async function handleFileResumeAck(msg) {
+            // Sender's reply to our file-resume-offer. nextSeq > 0 means
+            // the sender rewound to that record and re-keyed; we apply
+            // the fresh salt and re-arm the winner's record parser (the
+            // post-reconnect winner is a fresh transport object that
+            // never saw the file-start). nextSeq === 0 means the sender
+            // cannot resume (different file at head of queue, etc.);
+            // drop the partial transfer so a fresh file-start re-opens
+            // cleanly.
+            if (!Number.isInteger(msg.nextSeq)) return;
+            if (msg.nextSeq === 0) {
+                logger.warn('file-resume-ack nextSeq=0; discarding partial transfer, expecting fresh file-start');
+                await ReceiveFlow.abandonTransfer();
                 finalizeReceiveStats();
-            } else {
-                logger.info(`file-resume-ack offset=${msg.offset}; resuming partial receive`);
+                return;
+            }
+            logger.info(`file-resume-ack nextSeq=${msg.nextSeq}; re-keying and resuming`);
+            const st = await ReceiveFlow.applyResumeAck(msg.nextSeq, msg.salt);
+            const innerWinner = rtc && rtc.winner ? rtc[rtc.winner === 'webrtc' ? 'webrtc' : rtc.winner] : null;
+            if (st && innerWinner) {
+                window.PayloadAssembler.armV2Parser(innerWinner, st.segCount, msg.nextSeq);
             }
         }
 

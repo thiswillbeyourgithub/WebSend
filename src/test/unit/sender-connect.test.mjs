@@ -31,10 +31,13 @@ function setup({ deriveSharedKeyCallback } = {}) {
     win.WebSendCrypto = {
         generateKeyPair: async () => ({ privateKey: 'priv', publicKey: 'pub' }),
         importPublicKey: async (k) => ({ __imported: k }),
-        deriveSharedKey: async () => {
+        deriveSessionKeys: async () => {
             deriveCalls++;
             if (deriveSharedKeyCallback) deriveSharedKeyCallback();
-            return { __fake: 'shared' };
+            return {
+                sharedKey: { __fake: 'shared' },
+                deriveFileKey: async () => ({ __fake: 'filekey' }),
+            };
         },
         exportPublicKey: async () => 'b64pubkey',
         // Derive a distinct fingerprint per key so the tests can tell a

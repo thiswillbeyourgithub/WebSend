@@ -20,7 +20,8 @@
  *
  *   Data plane
  *     sendMessage(obj) -> boolean       , JSON control message via the winner
- *     async sendFile(bytes, onProgress) , chunked binary via the winner, awaits ack
+ *     async sendFile(segmentSender, onProgress, resumeFromSeq)
+ *                                       , v2 records via the winner, awaits ack
  *
  *   Event callbacks (set by caller)
  *     onConnected, onDisconnected, onStateChange, onMessage,
@@ -509,12 +510,12 @@
             return this._innerByName(this.winner).sendMessage(message);
         }
 
-        async sendFile(bytes, onProgress, resumeFromOffset) {
+        async sendFile(segmentSender, onProgress, resumeFromSeq) {
             if (!this.winner) throw new Error('Not connected yet');
-            // Propagate resumeFromOffset so SenderSend can byte-resume an
+            // Propagate resumeFromSeq so SenderSend can record-resume an
             // in-flight transfer after a reconnect; all three inners
             // (WebRTC / WS / LP) honour it.
-            return this._innerByName(this.winner).sendFile(bytes, onProgress, resumeFromOffset);
+            return this._innerByName(this.winner).sendFile(segmentSender, onProgress, resumeFromSeq);
         }
 
         close() {
