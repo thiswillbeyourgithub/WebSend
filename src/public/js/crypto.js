@@ -79,13 +79,24 @@ const WebSendCrypto = {
     },
 
     /**
-     * Derive a shared secret from our private key and their public key.
-     * Uses ECDH to compute shared secret, then HKDF to derive AES key.
+     * Derive the session key material from our private key and their public key.
+     * Uses ECDH to compute the shared secret, then HKDF for all derived keys.
+     *
+     * Returns a frozen handle exposing:
+     * - sharedKey: the session-wide AES-GCM key (control payloads, v1 format)
+     * - deriveFileKey(saltBytes): a fresh per-file AES-GCM subkey for the v2
+     *   chunked segment format. Re-deriving with a new random salt is how a
+     *   transfer re-keys on rewind/resume, guaranteeing a (key, nonce) pair
+     *   is never reused with different plaintext.
+     *
+     * The HKDF base key stays captured in the closure (non-extractable, never
+     * exposed), so a leaked file key cannot reveal the session secret.
+     *
      * @param {CryptoKey} privateKey - Our ECDH private key
      * @param {CryptoKey} theirPublicKey - Their ECDH public key
-     * @returns {Promise<CryptoKey>} AES-GCM key derived from shared secret
+     * @returns {Promise<{sharedKey: CryptoKey, deriveFileKey: function(Uint8Array): Promise<CryptoKey>}>}
      */
-    async deriveSharedKey(privateKey, theirPublicKey) {
+    async deriveSessionKeys(privateKey, theirPublicKey) {
         logger.info('Deriving shared secret via ECDH...');
 
         // Perform ECDH key agreement to get shared secret (256 bits for P-256)
@@ -98,7 +109,7 @@ const WebSendCrypto = {
             256 // bits
         );
 
-        // Use HKDF to derive AES key from shared secret.
+        // Use HKDF to derive AES keys from the shared secret.
         // HKDF provides proper key derivation with domain separation.
         const hkdfKey = await crypto.subtle.importKey(
             'raw',
@@ -108,7 +119,7 @@ const WebSendCrypto = {
             ['deriveKey']
         );
 
-        const aesKey = await crypto.subtle.deriveKey(
+        const sharedKey = await crypto.subtle.deriveKey(
             {
                 name: 'HKDF',
                 hash: 'SHA-256',
@@ -127,8 +138,44 @@ const WebSendCrypto = {
             ['encrypt', 'decrypt']
         );
 
+        const fileKeyInfo = new TextEncoder().encode(this.SEGMENT_KDF_INFO);
+
         logger.success('Shared AES key derived');
-        return aesKey;
+        return Object.freeze({
+            sharedKey,
+            deriveFileKey(saltBytes) {
+                // ArrayBuffer.isView is realm-agnostic, unlike instanceof
+                if (!ArrayBuffer.isView(saltBytes) || saltBytes.byteLength !== 16) {
+                    throw new Error('File salt must be 16 bytes');
+                }
+                return crypto.subtle.deriveKey(
+                    {
+                        name: 'HKDF',
+                        hash: 'SHA-256',
+                        salt: saltBytes,
+                        info: fileKeyInfo
+                    },
+                    hkdfKey,
+                    {
+                        name: 'AES-GCM',
+                        length: 256
+                    },
+                    false, // not extractable
+                    ['encrypt', 'decrypt']
+                );
+            }
+        });
+    },
+
+    /**
+     * Derive only the session-wide AES-GCM key (legacy entry point; prefer
+     * deriveSessionKeys which also exposes per-file subkey derivation).
+     * @param {CryptoKey} privateKey - Our ECDH private key
+     * @param {CryptoKey} theirPublicKey - Their ECDH public key
+     * @returns {Promise<CryptoKey>} AES-GCM key derived from shared secret
+     */
+    async deriveSharedKey(privateKey, theirPublicKey) {
+        return (await this.deriveSessionKeys(privateKey, theirPublicKey)).sharedKey;
     },
 
     /**
@@ -300,6 +347,131 @@ const WebSendCrypto = {
         return decryptedData;
     },
 
+    // ============ Chunked AEAD segments (v2, STREAM construction) ============
+    //
+    // The v2 file format encrypts a file as independent AES-GCM segments
+    // instead of one whole-file message, so each segment is individually
+    // authenticated on arrival (the transport never has to be trusted for
+    // integrity) and a corrupted or lost segment costs one segment, not the
+    // file. Each segment is sealed under a per-file subkey from
+    // deriveSessionKeys().deriveFileKey(fileSalt) with a deterministic
+    // counter nonce that is never transmitted:
+    //
+    //   nonce (12 bytes) = 7x00 || 4-byte big-endian seq || 1-byte final flag
+    //
+    // The seq in the nonce makes reordering and duplication fail
+    // authentication; the final flag makes truncation fail authentication
+    // (the last segment only opens when the receiver knows it is last).
+    // Segment plaintext layout (all integers big-endian in v2):
+    //
+    //   [1B flags][4B dataLen][data][random padding]
+    //
+    // flags bit0 = data is gzipped. Padding appears only where the caller
+    // asks for it (metadata record, final data segment).
+
+    /** Segment plaintext flags */
+    SEGMENT_FLAG_GZIP: 0x01,
+    /** Bytes of [flags][dataLen] before the data in a segment plaintext */
+    SEGMENT_HEADER_BYTES: 5,
+    /** HKDF info string for per-file subkeys (domain-separated from the session key) */
+    SEGMENT_KDF_INFO: 'WebSend-segment-v2',
+
+    /**
+     * Build the deterministic AES-GCM nonce for a segment.
+     * @param {number} seq - Record sequence number (0 = metadata record)
+     * @param {boolean} isFinal - True only for the last record of the file
+     * @returns {Uint8Array} 12-byte nonce
+     */
+    buildSegmentNonce(seq, isFinal) {
+        if (!Number.isInteger(seq) || seq < 0 || seq > 0xffffffff) {
+            throw new Error('Invalid segment seq');
+        }
+        const nonce = new Uint8Array(12);
+        new DataView(nonce.buffer).setUint32(7, seq, false); // big-endian
+        nonce[11] = isFinal ? 1 : 0;
+        return nonce;
+    },
+
+    /**
+     * Seal one segment: optionally gzip the data, frame it as
+     * [flags][dataLen][data][padding], and AES-GCM encrypt under the
+     * per-file key with the deterministic nonce for (seq, isFinal).
+     *
+     * @param {CryptoKey} fileKey - From deriveSessionKeys().deriveFileKey(salt)
+     * @param {number} seq - Record sequence number
+     * @param {boolean} isFinal - True only for the last record of the file
+     * @param {Uint8Array|ArrayBuffer} data - Segment payload
+     * @param {Object} [opts]
+     * @param {boolean} [opts.tryGzip] - Compress when it shrinks the data
+     * @param {number} [opts.padToSize] - Pad the plaintext (header + data +
+     *   padding) up to this many bytes with random bytes; ignored when the
+     *   data already reaches it
+     * @returns {Promise<ArrayBuffer>} Ciphertext including the 16-byte tag
+     */
+    async sealSegment(fileKey, seq, isFinal, data, opts = {}) {
+        const raw = ArrayBuffer.isView(data) ? data : new Uint8Array(data);
+        let stored = raw;
+        let flags = 0;
+        if (opts.tryGzip) {
+            const compressed = await this._maybeGzip(raw);
+            if (compressed) {
+                stored = new Uint8Array(compressed);
+                flags |= this.SEGMENT_FLAG_GZIP;
+            }
+        }
+
+        const minSize = this.SEGMENT_HEADER_BYTES + stored.length;
+        const totalSize = Math.max(minSize, opts.padToSize || 0);
+        // Random-fill when padding so the padding bytes are indistinguishable
+        // from data; an unpadded segment is fully overwritten anyway.
+        const plain = totalSize > minSize
+            ? this.getRandomBytes(totalSize)
+            : new Uint8Array(totalSize);
+        plain[0] = flags;
+        new DataView(plain.buffer).setUint32(1, stored.length, false);
+        plain.set(stored, this.SEGMENT_HEADER_BYTES);
+
+        return crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: this.buildSegmentNonce(seq, isFinal) },
+            fileKey,
+            plain
+        );
+    },
+
+    /**
+     * Open one sealed segment. Throws when authentication fails, which is
+     * also how reordering (wrong seq), truncation (wrong final flag), and
+     * any bit corruption surface. Strips padding and undoes gzip.
+     *
+     * @param {CryptoKey} fileKey - Per-file key the segment was sealed with
+     * @param {number} seq - Expected record sequence number
+     * @param {boolean} isFinal - Whether this must be the last record
+     * @param {ArrayBuffer|Uint8Array} ciphertext - Output of sealSegment
+     * @returns {Promise<ArrayBuffer>} The original segment payload
+     */
+    async openSegment(fileKey, seq, isFinal, ciphertext) {
+        const plainBuf = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: this.buildSegmentNonce(seq, isFinal) },
+            fileKey,
+            ciphertext
+        );
+        const plain = new Uint8Array(plainBuf);
+        if (plain.length < this.SEGMENT_HEADER_BYTES) {
+            throw new Error('Segment plaintext too short');
+        }
+        const flags = plain[0];
+        const dataLen = new DataView(plainBuf).getUint32(1, false);
+        if (this.SEGMENT_HEADER_BYTES + dataLen > plain.length) {
+            throw new Error('Invalid segment data length');
+        }
+        // slice() copies, so .buffer is exactly dataLen bytes
+        const stored = plain.slice(this.SEGMENT_HEADER_BYTES, this.SEGMENT_HEADER_BYTES + dataLen);
+        if (flags & this.SEGMENT_FLAG_GZIP) {
+            return this._gunzip(stored.buffer);
+        }
+        return stored.buffer;
+    },
+
     // ============ Hashing ============
 
     /**
@@ -316,6 +488,44 @@ const WebSendCrypto = {
         return Array.from(new Uint8Array(hash))
             .map(b => b.toString(16).padStart(2, '0'))
             .join('');
+    },
+
+    /**
+     * SHA-256 returning raw bytes. Used for per-segment digests in the v2
+     * composite hash (see finalizeCompositeHash).
+     * @param {ArrayBuffer|Uint8Array} data - Data to hash
+     * @returns {Promise<Uint8Array>} 32-byte digest
+     */
+    async sha256Bytes(data) {
+        return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+    },
+
+    /**
+     * Composite file hash for the v2 segment format: SHA-256 over the
+     * concatenated per-segment plaintext digests (data segments only, in
+     * order; the metadata record is excluded). WebCrypto has no streaming
+     * digest, so this is how both sides hash a multi-GiB file without ever
+     * holding it in one buffer: each side digests the SEG_SIZE plaintext
+     * windows of the original (uncompressed) file bytes as they pass, then
+     * hashes the 32-bytes-per-segment digest list once at the end.
+     *
+     * Deterministic in (plaintext, segment size) and independent of file
+     * salt, rewinds, and per-segment gzip, so it serves as the file
+     * identity token everywhere the whole-file SHA-256 did (file-ack,
+     * gallery delete/replace/transform matching).
+     *
+     * @param {Uint8Array[]} segmentDigests - One 32-byte digest per data segment
+     * @returns {Promise<string>} Lowercase hex string (64 chars)
+     */
+    async finalizeCompositeHash(segmentDigests) {
+        const all = new Uint8Array(segmentDigests.length * 32);
+        for (let i = 0; i < segmentDigests.length; i++) {
+            if (!ArrayBuffer.isView(segmentDigests[i]) || segmentDigests[i].byteLength !== 32) {
+                throw new Error('Segment digest must be 32 bytes');
+            }
+            all.set(segmentDigests[i], i * 32);
+        }
+        return this.sha256Hex(all);
     },
 
     // ============ Utilities ============
