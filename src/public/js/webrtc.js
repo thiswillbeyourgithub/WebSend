@@ -59,9 +59,11 @@ class WebSendRTC {
         this._connectionTimeout = null;
         this._CONNECTION_TIMEOUT_MS = 15000; // default, overridden by server config
 
-        // Sender-side wait for the receiver's offer to appear. With trickle
-        // ICE the receiver posts its offer ~1 RTT after the QR renders, so a
-        // sender that joins inside that gap polls briefly instead of failing.
+        // Sender-side wait for the receiver's offer to appear. The receiver
+        // stores its offer before rendering the QR, so this is belt-and-
+        // braces: if a sender still lands in a room-exists-but-no-offer-yet
+        // state (slow receiver network, manual URL entry mid-setup), it
+        // polls briefly instead of failing the whole join.
         this._OFFER_WAIT_MS = 10000;
         this._OFFER_POLL_INTERVAL_MS = 500;
 

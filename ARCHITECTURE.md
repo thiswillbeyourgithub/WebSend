@@ -375,13 +375,14 @@ WebSend/
   1. Generate ECDH key pair
   2. POST /api/rooms ───────────────▶ Create room ◀─────────────── (scans QR later)
      ◀── roomId + secret ───────────
-  3. Display QR code
-     (URL with roomId + secret in
-      hash fragment)
-  4. Create WebRTC offer
-  5. POST /api/rooms/:id/offer ─────▶ Store SDP offer
+  3. Create WebRTC offer
+  4. POST /api/rooms/:id/offer ─────▶ Store SDP offer
      (posted immediately, trickle
       ICE, no gathering wait)
+  5. Display QR code
+     (URL with roomId + secret in
+      hash fragment; the room is
+      already joinable at this point)
                                                                   6. Scan QR code
                                                                   7. GET /api/rooms/:id/offer
                                                                      (polls briefly if the
