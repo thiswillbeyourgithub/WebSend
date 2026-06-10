@@ -325,17 +325,24 @@
                 rtc.onReconnecting = onReconnecting;
                 rtc.onReconnected = onReconnected;
 
-                // Create room and offer
+                // Create the room first: this yields the room id + secret,
+                // which is all the QR code needs.
                 const roomInfo = await rtc.createRoom();
                 roomSecret = roomInfo.secret;
-                await rtc.createOfferAndStore();
 
-                // Generate QR code with room URL
+                // Render the QR immediately. The SDP offer's ICE gathering
+                // (createOfferAndStore -> waitForICE) can take up to
+                // TURN_TIMEOUT (~15s); blocking the QR on it left the user
+                // staring at an empty box for that whole time. Show the QR
+                // now and gather ICE / store the offer in the background,
+                // awaiting it only before we start waiting for the answer.
                 await generateQRCode();
 
                 // Keep screen awake while waiting for sender to scan QR
                 wakeLockMgr.desired = true;
                 await wakeLockMgr.acquire();
+
+                await rtc.createOfferAndStore();
 
                 // Start waiting for answer. If the room expires before the
                 // sender connects (RoomGoneError), recreate the room rather
