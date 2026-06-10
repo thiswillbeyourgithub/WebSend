@@ -59,6 +59,12 @@ class WebSendRTC {
         this._connectionTimeout = null;
         this._CONNECTION_TIMEOUT_MS = 15000; // default, overridden by server config
 
+        // Sender-side wait for the receiver's offer to appear. With trickle
+        // ICE the receiver posts its offer ~1 RTT after the QR renders, so a
+        // sender that joins inside that gap polls briefly instead of failing.
+        this._OFFER_WAIT_MS = 10000;
+        this._OFFER_POLL_INTERVAL_MS = 500;
+
         // AbortController for in-flight long-polls (waitForAnswer). close()
         // aborts it so a subsequent reconnect doesn't run two polling loops
         // concurrently against the same/old room.
@@ -155,10 +161,12 @@ class WebSendRTC {
             iceTransportPolicy: this.iceTransportPolicy
         });
 
-        // Send trickle ICE candidates to server as a best-effort optimization.
-        // These are redundant with the candidates already embedded in the SDP
-        // (both sides call waitForICE() before storing their SDP offer/answer),
-        // so lost POSTs or timing gaps in polling are harmless.
+        // Trickle ICE: candidates are relayed through the server as they are
+        // gathered. This is the PRIMARY candidate-exchange mechanism: both
+        // sides store their SDP immediately after setLocalDescription (with
+        // few or no embedded candidates) so the room is joinable in ~1 RTT
+        // instead of after a full ICE gather (up to 15s with TURNS). The
+        // remote side polls /ice/{offer,answer} at 1 Hz to pick these up.
         this.pc.onicecandidate = (event) => {
             // Browsers emit an "end-of-candidates" signal as a non-null
             // RTCIceCandidate whose .candidate string is empty. Skip it:
@@ -609,28 +617,28 @@ class WebSendRTC {
         this.isOfferer = true;
 
         // Step 1: Create peer connection
-        logger.info('[Step 1/4] Creating peer connection...');
+        logger.info('[Step 1/3] Creating peer connection...');
         this.createPeerConnection();
 
         // Step 2: Create data channel and SDP offer
-        logger.info('[Step 2/4] Creating data channel and SDP offer...');
+        logger.info('[Step 2/3] Creating data channel and SDP offer...');
         const dc = this.pc.createDataChannel('websend', { ordered: true });
         this.setupDataChannel(dc);
 
         const offer = await this.pc.createOffer();
         await this.pc.setLocalDescription(offer);
-        logger.info('[Step 2/4] Offer created, gathering ICE candidates...');
+        logger.info('[Step 2/3] Offer created, gathering ICE candidates in background...');
         logger.debug('SIGNALING', 'Local description set', {
             type: offer.type,
             sdpLength: offer.sdp?.length
         });
 
-        // Step 3: Wait for ICE gathering
-        logger.info('[Step 3/4] Waiting for ICE candidate gathering...');
-        await this.waitForICE();
-
-        // Step 4: Store offer on server
-        logger.info('[Step 4/4] Storing offer on signaling server...');
+        // Step 3: Store the offer immediately (trickle ICE). Candidates are
+        // relayed via POST /api/rooms/:id/ice/offer as they are gathered and
+        // the sender polls that endpoint, so blocking here on full gathering
+        // (up to 15s for a TURNS Allocate) only delayed the room becoming
+        // joinable without making the connection any more reliable.
+        logger.info('[Step 3/3] Storing offer on signaling server...');
         const fullOffer = {
             type: this.pc.localDescription.type,
             sdp: this.pc.localDescription.sdp
@@ -737,24 +745,33 @@ class WebSendRTC {
         this.roomSecret = secret;
         this.isOfferer = false;
 
-        // Step 1: Verify room exists and has an offer
+        // Step 1: Verify room exists and has an offer. The receiver renders
+        // the QR as soon as the room id exists and posts its offer ~1 RTT
+        // later, so a very fast sender (pasted URL, prefetched QR) can land
+        // in the gap where the room exists but the offer is not stored yet.
+        // Poll briefly instead of failing the whole join for that race.
         logger.info(`[Step 1/6] Checking room ${roomId} exists...`);
-        const checkResponse = await fetch(`/api/rooms/${roomId}`, {
-            headers: this.getAuthHeaders()
-        });
-        if (!checkResponse.ok) {
-            if (checkResponse.status === 401) {
-                throw new Error('Invalid room secret — the QR code may be corrupted or expired');
+        const offerDeadline = Date.now() + this._OFFER_WAIT_MS;
+        for (;;) {
+            const checkResponse = await fetch(`/api/rooms/${roomId}`, {
+                headers: this.getAuthHeaders()
+            });
+            if (!checkResponse.ok) {
+                if (checkResponse.status === 401) {
+                    throw new Error('Invalid room secret — the QR code may be corrupted or expired');
+                }
+                if (checkResponse.status === 404) {
+                    throw new Error('Room not found — it may have expired (rooms last 10 minutes)');
+                }
+                throw new Error(`Room check failed (HTTP ${checkResponse.status})`);
             }
-            if (checkResponse.status === 404) {
-                throw new Error('Room not found — it may have expired (rooms last 10 minutes)');
+            const roomInfo = await checkResponse.json();
+            if (roomInfo.hasOffer) break;
+            if (Date.now() >= offerDeadline) {
+                throw new Error('Room exists but the receiver has not finished setting up yet — try again in a moment');
             }
-            throw new Error(`Room check failed (HTTP ${checkResponse.status})`);
-        }
-
-        const roomInfo = await checkResponse.json();
-        if (!roomInfo.hasOffer) {
-            throw new Error('Room exists but the receiver has not finished setting up yet — try again in a moment');
+            logger.info('[Step 1/6] Room found but offer not stored yet, retrying...');
+            await new Promise(resolve => setTimeout(resolve, this._OFFER_POLL_INTERVAL_MS));
         }
         logger.success('[Step 1/6] Room found and offer is ready');
 
@@ -776,11 +793,9 @@ class WebSendRTC {
         this.remoteDescriptionSet = true;
 
         // Step 4: Fetch receiver's trickle ICE candidates and start polling.
-        // Polling must run during waitForICE: under iceTransportPolicy:'relay'
-        // a slow receiver (TURNS gathering >5s) may have posted its offer with
-        // zero embedded candidates, and without trickled candidates arriving in
-        // time the sender's ICE has no pairs and fails immediately on its own
-        // gathering completion.
+        // With trickle ICE the receiver's offer usually carries zero embedded
+        // candidates, so polling /ice/offer is what actually feeds the
+        // sender's checklist as the receiver's candidates arrive.
         logger.info('[Step 4/6] Fetching receiver\'s ICE candidates...');
         await this.fetchRemoteIceCandidates('offer');
         this.startIceCandidatePolling('offer');
@@ -789,11 +804,12 @@ class WebSendRTC {
         logger.info('[Step 5/6] Creating connection answer...');
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
-        logger.info('[Step 5/6] Answer created, gathering ICE candidates...');
+        logger.info('[Step 5/6] Answer created, gathering ICE candidates in background...');
 
-        await this.waitForICE();
-
-        // Step 6: Store answer on server
+        // Step 6: Store the answer immediately (trickle ICE). Our candidates
+        // are relayed via POST /api/rooms/:id/ice/answer as they are gathered
+        // and the receiver polls that endpoint, so there is no reason to sit
+        // through a full gather (up to 15s for a TURNS Allocate) first.
         logger.info('[Step 6/6] Sending answer to signaling server...');
         const fullAnswer = {
             type: this.pc.localDescription.type,
@@ -813,9 +829,10 @@ class WebSendRTC {
         logger.success('[Step 6/6] Answer sent — establishing peer connection...');
 
         // Start the connection-establishment timeout now that both SDPs have
-        // been exchanged. Starting it earlier would let relay ICE gathering
-        // (up to 15s under iceTransportPolicy:'relay') consume the entire
-        // budget before peer connectivity checks even begin.
+        // been exchanged. With trickle ICE the budget also covers any relay
+        // gathering still in flight (it started back at createPeerConnection),
+        // which is why the default TURN_TIMEOUT keeps headroom over a TURNS
+        // TCP+TLS+Allocate round (a few seconds on first use).
         this._startConnectionTimeout();
     }
 
@@ -930,48 +947,6 @@ class WebSendRTC {
                 if (this.onDisconnected) this.onDisconnected();
             }
         }, this._CONNECTION_TIMEOUT_MS);
-    }
-
-    /**
-     * Wait for ICE gathering to complete with timeout
-     */
-    waitForICE() {
-        return new Promise((resolve) => {
-            if (this.pc.iceGatheringState === 'complete') {
-                resolve();
-                return;
-            }
-
-            let done = false;
-            const finish = () => {
-                if (done) return;
-                done = true;
-                clearTimeout(timeout);
-                this.pc.removeEventListener('icegatheringstatechange', onChange);
-                resolve();
-            };
-
-            const onChange = () => {
-                if (this.pc.iceGatheringState === 'complete') finish();
-            };
-
-            // TURNS gathering (TCP + TLS handshake + TURN Allocate) regularly
-            // exceeds 5s on first use. Even under the default mixed policy
-            // we want the relay candidate in the SDP — relying solely on
-            // trickle ICE races against the sender's connection timeout.
-            // Extend the budget whenever a TURN/TURNS server is configured.
-            const hasTurn = (this.iceServers || []).some(s => {
-                const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-                return urls.some(u => typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:')));
-            });
-            const timeoutMs = (this.iceTransportPolicy === 'relay' || hasTurn) ? 15000 : 5000;
-            const timeout = setTimeout(() => {
-                logger.warn('ICE gathering timeout, proceeding with available candidates');
-                finish();
-            }, timeoutMs);
-
-            this.pc.addEventListener('icegatheringstatechange', onChange);
-        });
     }
 
     /**

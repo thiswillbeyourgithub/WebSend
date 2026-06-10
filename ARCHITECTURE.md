@@ -25,8 +25,8 @@ keys. The `ALLOWED_FILE_TYPES` env var controls which file types are accepted
 a ZIP of page images or as a searchable OCR PDF using the bundled scribe.js/MuPDF engine.
 Other server-tunable knobs surfaced via `/api/config` and the startup env-var dump:
 `PORT` (HTTP listen port, default `8080`), `OCR_LANGS` (Tesseract languages, default
-`eng,fra`), `OCR_PSM` (page-segmentation mode, default `12`), `TURN_TIMEOUT` (TURN
-ICE-gather timeout, seconds, default `15`), `DEV_FORCE_CONNECTION` (force `DIRECT` /
+`eng,fra`), `OCR_PSM` (page-segmentation mode, default `12`), `TURN_TIMEOUT` (WebRTC
+connection-establishment timeout, seconds, default `15`), `DEV_FORCE_CONNECTION` (force `DIRECT` /
 `RELAY_HTTPS` / `RELAY_LP` for testing, default `DEFAULT`), `RELAY_ENABLE` (expose the
 HTTP-relay fallback transport, default `true`), `RELAY_LP_ONLY` (long-poll-only
 transport: suppresses WebRTC ICE servers and disables the WS relay endpoint so only
@@ -375,21 +375,29 @@ WebSend/
   1. Generate ECDH key pair
   2. POST /api/rooms ───────────────▶ Create room ◀─────────────── (scans QR later)
      ◀── roomId + secret ───────────
-  3. Create WebRTC offer
-  4. POST /api/rooms/:id/offer ─────▶ Store SDP offer
-  5. Display QR code
+  3. Display QR code
      (URL with roomId + secret in
       hash fragment)
+  4. Create WebRTC offer
+  5. POST /api/rooms/:id/offer ─────▶ Store SDP offer
+     (posted immediately, trickle
+      ICE, no gathering wait)
                                                                   6. Scan QR code
                                                                   7. GET /api/rooms/:id/offer
+                                                                     (polls briefly if the
+                                                                      offer isn't stored yet)
                                                                      ◀── SDP offer ──────────
                                                                   8. Create WebRTC answer
                                                                   9. POST /api/rooms/:id/answer
+                                                                     (also posted immediately)
   10. GET /api/rooms/:id/answer ────▶ Relay SDP answer ──────────
       (long-polling)
       ◀── SDP answer ──────────────
-                                      ICE candidates also relayed
-                                      via /api/rooms/:id/ice/*
+                                      Trickle ICE: candidates are
+                                      relayed via /api/rooms/:id/ice/*
+                                      as they are gathered (this is the
+                                      primary candidate exchange; the
+                                      SDPs carry few or none embedded)
 
   ════════════ WebRTC P2P data channel established ════════════
 

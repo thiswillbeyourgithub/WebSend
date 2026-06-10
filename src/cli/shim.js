@@ -87,14 +87,12 @@
         dc.binaryType = 'arraybuffer';
 
         // Local ICE candidates only need to be logged in -v; we do NOT trickle
-        // them to the server. The production receiver waits for ICE gathering
-        // to complete and posts the offer with all candidates inline (see
-        // webrtc.js:506 createOfferAndStore + waitForICE), and the sender
-        // expects the offer SDP to contain candidates rather than polling
-        // /ice/offer aggressively. Trickling races against TURNS gathering
-        // and the sender's connection-timeout, which is exactly the failure
-        // mode we hit (ICE went straight to disconnected/failed before remote
-        // candidates were added).
+        // them to the server. Unlike the production receiver (which posts its
+        // offer immediately and trickles candidates via /ice/offer), this CLI
+        // keeps the simpler embed-everything approach: wait for gathering,
+        // post the offer with all candidates inline. The production sender
+        // handles both shapes: it reads embedded candidates from the SDP and
+        // also polls /ice/offer at 1 Hz for trickled ones.
         pc.onicecandidate = (ev) => {
             if (!ev.candidate) { log('dbg', 'local ICE gathering complete'); return; }
             log('dbg', `local ICE: ${ev.candidate.candidate.slice(0, 80)}`);
@@ -107,8 +105,8 @@
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        // Wait for ICE gathering to complete with a TURN-aware timeout (matches
-        // production webrtc.js waitForICE).
+        // Wait for ICE gathering to complete with a TURN-aware timeout (the
+        // CLI embeds all candidates in the offer instead of trickling).
         const hasTurn = (rtcConfig.iceServers || []).some(s => {
             const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
             return urls.some(u => typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:')));

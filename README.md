@@ -345,7 +345,7 @@ COMPOSE_PROFILES=auth,turn        # public with SSO and bundled TURN
 | `ALLOWED_FILE_TYPES` | Restrict accepted uploads: `ONLY_IMAGES`, `IMAGE_OR_PDF`, or `ANY` | `ANY` |
 | `OCR_LANGS` | Tesseract languages used by the receiver's OCR (comma-separated) | `eng,fra` |
 | `OCR_PSM` | Tesseract page-segmentation mode | `12` |
-| `TURN_TIMEOUT` | Seconds the client waits for TURN ICE candidates before giving up | `15` |
+| `TURN_TIMEOUT` | Seconds the client waits for the WebRTC connection to establish before giving up | `15` |
 | `DEV_FORCE_CONNECTION` | Force `DIRECT`, `RELAY_HTTPS`, `RELAY_LP`, or other ICE policy for testing (otherwise `DEFAULT`) | `DEFAULT` |
 | `RELAY_ENABLE` | Expose the HTTP-relay fallback transport (WebSocket + long-poll). Set to `false` to disable | `true` |
 | `RELAY_LP_ONLY` | Force long-poll-only transport: suppresses WebRTC ICE servers and 404s the WS relay endpoint so clients only use the long-poll path. Requires `RELAY_ENABLE=true` | `false` |

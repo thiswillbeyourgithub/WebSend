@@ -147,7 +147,7 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-e7WvV/6bT3OcTOMX7KHK1BhRRf30dTZAEolkwNmXm2NeGzhDfcNDk1nMiuJBjEh7"></script>
     <script src="/js/protocol.js" integrity="sha384-8ljBTasCc9Vhe2KnPIyGPeRbD0vVXEx+/DQzYkZ4WaX/pCHSSr+9vUI5LraRIsi/"></script>
-    <script src="/js/webrtc.js" integrity="sha384-wiTPhtuwwUN9oW8REPsfypYY/xcLSk1p+i/hdvXe0hvCupj4qzHh2sNZOoWAT73L"></script>
+    <script src="/js/webrtc.js" integrity="sha384-OsfTsWPqr1/6K5gmyQShgfGRpb48zbSUvgAUascfHKe+dEYEEqOVIlwmI/hGn0ot"></script>
     <script src="/js/transport-assembler.js" integrity="sha384-Bfk+ad/+nGjfQ/LOECACnUHHm+eYXdvC66xt/RzvJMW+dqs/caqQwnXFt7awFQHA"></script>
     <script src="/js/ws-transport.js" integrity="sha384-Vu9BVIScT1GNfpENnIRNtET+llG8cFHVkrC7gjkoTcfAKJ979VYJS1I3Zkv6uldT"></script>
     <script src="/js/lp-transport.js" integrity="sha384-WsbHEr6asvYNaEuthqP0fEyjKUKCMjhpne09J4H+a2pyELZ3lUE5mjGVJcs/F0mr"></script>
@@ -345,12 +345,11 @@
                 const roomInfo = await rtc.createRoom();
                 roomSecret = roomInfo.secret;
 
-                // Render the QR immediately. The SDP offer's ICE gathering
-                // (createOfferAndStore -> waitForICE) can take up to
-                // TURN_TIMEOUT (~15s); blocking the QR on it left the user
-                // staring at an empty box for that whole time. Show the QR
-                // now and gather ICE / store the offer in the background,
-                // awaiting it only before we start waiting for the answer.
+                // Render the QR immediately: it only needs roomId + secret.
+                // createOfferAndStore below is ~1 RTT (trickle ICE: the
+                // offer is posted without waiting for candidate gathering),
+                // and the sender tolerates the tiny QR-before-offer window
+                // by polling hasOffer briefly on join.
                 await generateQRCode();
 
                 // Keep screen awake while waiting for sender to scan QR
