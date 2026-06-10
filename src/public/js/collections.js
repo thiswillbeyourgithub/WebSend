@@ -642,6 +642,30 @@
         }
     }
 
+    /**
+     * Discard a collection that never received any image (empty images
+     * array, or every slot nulled out by deletes). Used by the receiver on
+     * batch-end so a sender batch that failed before any file arrived does
+     * not leave an empty "Document N" section behind. If the discarded
+     * collection was active, the most recent remaining one becomes active
+     * (or none). Returns true if a collection was removed.
+     */
+    function discardIfEmpty(collectionId) {
+        const idx = collections.findIndex(c => c.id === collectionId);
+        if (idx === -1) return false;
+        if (collections[idx].images.some(img => img !== null)) return false;
+        collections.splice(idx, 1);
+        const section = document.querySelector(`.collection-section[data-collection-id="${collectionId}"]`);
+        if (section) section.remove();
+        if (activeCollectionId === collectionId) {
+            activeCollectionId = collections.length ? collections[collections.length - 1].id : null;
+        }
+        if (window.logger) {
+            window.logger.info(`Discarded empty collection ${collectionId} (batch ended with no images)`);
+        }
+        return true;
+    }
+
     /** Set the (display) name of a collection without triggering rename's
      *  download-link rewrite (used when first non-image file arrives). */
     function setName(collectionId, newName) {
@@ -676,5 +700,6 @@
         addReceivedFile,
         deleteByHash,
         removeImageFromOwningCollection,
+        discardIfEmpty,
     };
 })();

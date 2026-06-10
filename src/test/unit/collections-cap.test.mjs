@@ -57,6 +57,53 @@ test('createNew() refuses past MAX_COLLECTIONS_PER_SESSION', () => {
         'activeId should not advance once the cap is hit');
 });
 
+test('discardIfEmpty() removes a collection that never received an image', () => {
+    const win = loadCollections();
+    const id = win.Collections.createNew();
+    assert.equal(win.Collections.list().length, 1);
+    assert.ok(
+        win.document.querySelector(`.collection-section[data-collection-id="${id}"]`),
+        'section should be rendered',
+    );
+
+    const removed = win.Collections.discardIfEmpty(id);
+    assert.equal(removed, true, 'an empty collection should be discarded');
+    assert.equal(win.Collections.list().length, 0, 'collections array emptied');
+    assert.equal(
+        win.document.querySelector(`.collection-section[data-collection-id="${id}"]`),
+        null,
+        'the empty Document section should be removed from the DOM',
+    );
+    assert.equal(win.Collections.activeId(), null, 'no active collection remains');
+});
+
+test('discardIfEmpty() keeps a collection that has at least one image', () => {
+    const win = loadCollections();
+    const id = win.Collections.createNew();
+    // Simulate a received image landing in the collection.
+    win.Collections.getById(id).images.push({ hash: 'abc' });
+
+    const removed = win.Collections.discardIfEmpty(id);
+    assert.equal(removed, false, 'a non-empty collection must not be discarded');
+    assert.equal(win.Collections.list().length, 1);
+    assert.ok(
+        win.document.querySelector(`.collection-section[data-collection-id="${id}"]`),
+        'the section must still be present',
+    );
+});
+
+test('discardIfEmpty() treats all-nulled images (deleted) as empty', () => {
+    const win = loadCollections();
+    const id = win.Collections.createNew();
+    // An image was received then deleted: removeImageFromOwningCollection
+    // nulls the slot rather than splicing it out.
+    win.Collections.getById(id).images.push(null);
+
+    assert.equal(win.Collections.discardIfEmpty(id), true,
+        'a collection whose only image slot is null counts as empty');
+    assert.equal(win.Collections.list().length, 0);
+});
+
 test('reset() releases the cap so a new session can create collections again', () => {
     const win = loadCollections();
     const cap = win.Collections.MAX_COLLECTIONS_PER_SESSION;

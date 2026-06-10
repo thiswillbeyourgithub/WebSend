@@ -111,7 +111,11 @@ WebSend/
         │   │               #   shown as a Document N section). Owns the collections
         │   │               #   array, activeCollectionId, and DOM rendering / drag-
         │   │               #   and-drop wiring. Cross-page state injected via
-        │   │               #   Collections.attach({...}). Exposes window.Collections
+        │   │               #   Collections.attach({...}). discardIfEmpty(id) drops a
+        │   │               #   collection that never received an image, called on
+        │   │               #   batch-end so a sender batch that failed before any
+        │   │               #   file arrived leaves no blank Document N behind.
+        │   │               #   Exposes window.Collections
         │   ├── crypto.js   # ECDH key exchange (P-256) + AES-GCM-256 encryption via
         │   │               #   Web Crypto API. Includes HKDF key derivation, a combined
         │   │               #   two-key verification code for MITM detection, size-bucket padding

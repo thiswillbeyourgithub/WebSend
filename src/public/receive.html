@@ -160,7 +160,7 @@
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-LTPGF18+5jFBGR0I9E2w/S8qCTnPg31f9dtJwBFDrgGI1HalzQMpKf/9ZrcT9zM6"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-r9ZhZZGoBjGXrxfB2k8TfZD8BTEOLdE/KsZ7ZN6mg8VqP0Rq8LriAXUDOF+vyjqA"></script>
-    <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-xsaZg5atM0FVnenDaSF7Ao0FlDxok8uW80Q0VcSdLHEBtUIdQJBOgblLjChniSdN"></script>
+    <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-A0vvgdJ8ktmC65klkTfsPqjIHZXNroXsONfZzY7jVL0rVoRSdExtZid0K+ZXuRTw"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-NH+XRrtXv6xYSNjsbbaYzmJyXTVVdKmnIDrKgUvWXmwSVwnrJV5X5G8UcLvJs5xi"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-DgCbMzjz+dLHajRLh2nDm+gtkHG0wnliEk6C/iqoKATHPp1sLYZ0FkD2fdpk/PDg"></script>
     <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-ZQIldN5cRMATTXeXJEulLoz/XABqO/10Uuz7e0p4Zg4Rw0ilY5U5v/VQuToqXtV+"></script>
@@ -1105,6 +1105,12 @@
 
         function handleBatchEnd(msg) {
             logger.info('Batch end received');
+            // If the sender's batch produced no images (e.g. their send
+            // failed before any file arrived, like a stale file handle after
+            // backgrounding), drop the empty "Document N" we created on
+            // batch-start instead of leaving a blank section behind.
+            const active = Collections.peekActive();
+            if (active) Collections.discardIfEmpty(active.id);
         }
 
         function handleFileResumeAck(msg) {
