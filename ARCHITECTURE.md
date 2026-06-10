@@ -141,6 +141,15 @@ WebSend/
         │   │               #   every candidate-pair with reqSent/respRcvd/RTT.
         │   │               #   diagnoseIceServers({force:true}) runs per-server
         │   │               #   reachability probes even outside DEV mode on failure.
+        │   │               #   Disconnect handling is visibility-aware
+        │   │               #   (_scheduleDisconnectGrace): a "disconnected" ICE
+        │   │               #   state fires whenever the page is backgrounded
+        │   │               #   (native file/photo picker, app switch), so while
+        │   │               #   document.hidden the terminal teardown is deferred
+        │   │               #   and a one-shot visibilitychange listener is armed;
+        │   │               #   the 5s recovery grace only starts once the page is
+        │   │               #   visible again, letting ICE self-heal on resume
+        │   │               #   instead of tearing the pairing down mid-picker.
         │   ├── transport.js # RacingTransport: races WebRTC against the HTTP-relay
         │   │               #   transports under one duck-typed Transport surface
         │   │               #   (init/createRoom/joinRoom/sendMessage/sendFile +

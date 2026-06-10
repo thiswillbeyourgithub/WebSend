@@ -147,7 +147,7 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-e7WvV/6bT3OcTOMX7KHK1BhRRf30dTZAEolkwNmXm2NeGzhDfcNDk1nMiuJBjEh7"></script>
     <script src="/js/protocol.js" integrity="sha384-8ljBTasCc9Vhe2KnPIyGPeRbD0vVXEx+/DQzYkZ4WaX/pCHSSr+9vUI5LraRIsi/"></script>
-    <script src="/js/webrtc.js" integrity="sha384-l+zOrGCnJkpjsb8MLK3zX6EIt1o9u+3t6EKlrBLME9EPyCBLF0pbo+UDpKS6d+H9"></script>
+    <script src="/js/webrtc.js" integrity="sha384-wiTPhtuwwUN9oW8REPsfypYY/xcLSk1p+i/hdvXe0hvCupj4qzHh2sNZOoWAT73L"></script>
     <script src="/js/transport-assembler.js" integrity="sha384-Bfk+ad/+nGjfQ/LOECACnUHHm+eYXdvC66xt/RzvJMW+dqs/caqQwnXFt7awFQHA"></script>
     <script src="/js/ws-transport.js" integrity="sha384-Vu9BVIScT1GNfpENnIRNtET+llG8cFHVkrC7gjkoTcfAKJ979VYJS1I3Zkv6uldT"></script>
     <script src="/js/lp-transport.js" integrity="sha384-WsbHEr6asvYNaEuthqP0fEyjKUKCMjhpne09J4H+a2pyELZ3lUE5mjGVJcs/F0mr"></script>
@@ -284,12 +284,24 @@
             if (wakeLockMgr.desired && !wakeLockMgr.held) {
                 await wakeLockMgr.acquire();
             }
-            // If connection dropped while page was hidden, reconnect
+            // If the connection dropped while the page was hidden, don't
+            // restart immediately: webrtc.js defers its disconnect teardown
+            // while hidden and re-arms a short recovery grace on resume. Give
+            // ICE that window to self-heal before forcing a same-room
+            // reconnect (which re-pairs and re-runs the verification ceremony).
             if (rtc && rtc.pc) {
                 const state = rtc.pc.connectionState;
                 if (state === 'failed' || state === 'disconnected') {
-                    logger.info('Page visible again — connection lost, restarting...');
-                    reconnectReceiverSameRoom();
+                    logger.info('Page visible again, connection lost; waiting for ICE self-heal before reconnect');
+                    setTimeout(() => {
+                        const s = rtc && rtc.pc ? rtc.pc.connectionState : null;
+                        if (s === 'failed' || s === 'disconnected') {
+                            logger.info('Connection did not self-heal; restarting same-room reconnect');
+                            reconnectReceiverSameRoom();
+                        } else {
+                            logger.success('Connection self-healed after resume; no reconnect needed');
+                        }
+                    }, 7000);
                 }
             }
         });

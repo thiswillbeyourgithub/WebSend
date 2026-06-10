@@ -263,6 +263,7 @@ class WebSendRTC {
                     clearTimeout(this._disconnectTimer);
                     this._disconnectTimer = null;
                 }
+                this._clearVisibilityResume();
                 this.stopIceCandidatePolling();
                 if (this.onConnected) this.onConnected();
                 this.detectConnectionType();
@@ -271,17 +272,13 @@ class WebSendRTC {
                 this._logConnectionFailure();
                 if (this.onDisconnected) this.onDisconnected();
             } else if (state === 'disconnected') {
-                // "disconnected" is often transient in WebRTC (ICE may recover).
-                // Wait a grace period before treating it as terminal, to avoid
-                // tearing down connections that could have self-healed.
-                logger.warn('Peer connection disconnected — waiting 5s for recovery...');
-                this._disconnectTimer = setTimeout(() => {
-                    if (this.pc && this.pc.connectionState === 'disconnected') {
-                        logger.error('Peer connection did not recover after 5s');
-                        this._logConnectionFailure();
-                        if (this.onDisconnected) this.onDisconnected();
-                    }
-                }, 5000);
+                // "disconnected" is often transient in WebRTC (ICE may recover),
+                // and is *expected* while the page is backgrounded (the user
+                // opened the native file/photo picker or switched apps) because
+                // the browser suspends the connection. Defer the terminal
+                // decision rather than tearing down a session that will almost
+                // certainly self-heal on resume. See _scheduleDisconnectGrace.
+                this._scheduleDisconnectGrace();
             }
         };
 
@@ -304,6 +301,74 @@ class WebSendRTC {
             logger.info('Received data channel from peer');
             this.setupDataChannel(event.channel);
         };
+    }
+
+    /**
+     * Decide when a transient "disconnected" should be treated as a real
+     * drop. WebRTC frequently reports "disconnected" for a few seconds
+     * before ICE re-establishes, and *always* reports it while the page is
+     * backgrounded (e.g. the user opened the native file/photo picker, or
+     * switched apps) because the browser suspends the connection. Tearing
+     * the session down in that window is the "too eager to disconnect"
+     * pitfall: the user returns from the picker to a dead pairing and a
+     * fresh verification ceremony.
+     *
+     * So while the page is hidden we do NOT declare a disconnect at all.
+     * We arm a one-shot visibilitychange listener and only start the short
+     * recovery grace once the page is visible again, giving ICE a chance to
+     * recover on resume. If it recovers, onconnectionstatechange fires
+     * "connected" and cancels everything; only if the grace expires while
+     * we are visible and still disconnected do we notify onDisconnected.
+     */
+    _scheduleDisconnectGrace() {
+        if (this._disconnectTimer) {
+            clearTimeout(this._disconnectTimer);
+            this._disconnectTimer = null;
+        }
+        const hidden = (typeof document !== 'undefined' && document.visibilityState === 'hidden');
+        if (hidden) {
+            logger.warn('Peer connection disconnected while page hidden (likely file picker / app switch) — deferring teardown until the page is visible again');
+            this._armVisibilityResume();
+            return;
+        }
+        logger.warn('Peer connection disconnected — waiting 5s for recovery...');
+        this._disconnectTimer = setTimeout(() => {
+            if (this.pc && this.pc.connectionState === 'disconnected') {
+                logger.error('Peer connection did not recover after 5s');
+                this._logConnectionFailure();
+                if (this.onDisconnected) this.onDisconnected();
+            }
+        }, 5000);
+    }
+
+    /**
+     * Arm a one-shot visibilitychange listener that re-evaluates the
+     * disconnect once the page returns to the foreground. Idempotent: a
+     * second disconnect event while already armed does not stack listeners.
+     */
+    _armVisibilityResume() {
+        if (this._visibilityResumeHandler) return;
+        if (typeof document === 'undefined') return;
+        this._visibilityResumeHandler = () => {
+            if (document.visibilityState !== 'visible') return;
+            this._clearVisibilityResume();
+            // Back in the foreground. If ICE already recovered, the
+            // "connected" handler cleared our state and pc is no longer
+            // disconnected, so this is a no-op. Otherwise run the normal
+            // short grace now that we can meaningfully time recovery.
+            if (this.pc && this.pc.connectionState === 'disconnected') {
+                this._scheduleDisconnectGrace();
+            }
+        };
+        document.addEventListener('visibilitychange', this._visibilityResumeHandler);
+    }
+
+    /** Remove any armed visibilitychange resume listener. */
+    _clearVisibilityResume() {
+        if (this._visibilityResumeHandler && typeof document !== 'undefined') {
+            document.removeEventListener('visibilitychange', this._visibilityResumeHandler);
+        }
+        this._visibilityResumeHandler = null;
     }
 
     /**
@@ -1273,6 +1338,7 @@ class WebSendRTC {
             clearTimeout(this._disconnectTimer);
             this._disconnectTimer = null;
         }
+        this._clearVisibilityResume();
         if (this._fileAckReject) {
             window.PayloadAssembler.rejectFileAck(this, new Error(
                 'Connection closed before receiver acknowledged transfer'));
