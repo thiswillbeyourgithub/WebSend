@@ -86,3 +86,13 @@ test('window.ReceiveCard is frozen', async () => {
     try { dom.window.ReceiveCard.makeSafeBlobUrl = () => 'blob:evil'; } catch (_) {}
     assert.equal(dom.window.ReceiveCard.makeSafeBlobUrl, original);
 });
+
+test('window.SegmentStream is frozen', async () => {
+    // segment-stream.js reads Protocol / WebSendCrypto only at call time,
+    // so loading it bare is safe for the freeze check.
+    const win = await loadBrowserModule(path.join(pub, 'segment-stream.js'));
+    assert.ok(Object.isFrozen(win.SegmentStream), 'SegmentStream must be frozen');
+    const original = win.SegmentStream.createSender;
+    try { win.SegmentStream.createSender = async () => ({ __evil: true }); } catch (_) {}
+    assert.equal(win.SegmentStream.createSender, original);
+});
