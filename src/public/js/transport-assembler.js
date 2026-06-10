@@ -38,6 +38,7 @@
         host._fileAckResolve = null;
         host._fileAckReject = null;
         host._fileAckTimeout = null;
+        clearV2Parser(host);
     }
 
     function resetReceive(host) {
@@ -46,6 +47,16 @@
         host.expectedSize = 0;
         host._sessionTotalBytes = 0;
         host._abusiveTeardown = false;
+        clearV2Parser(host);
+    }
+
+    function clearV2Parser(host) {
+        host._v2Mode = false;
+        host._v2Pending = null;
+        host._v2NextSeq = 0;
+        host._v2ExpectedRecords = 0;
+        host._v2WireBytes = 0;
+        host._v2WireEstimate = 0;
     }
 
     // Resume helpers: a transient transport drop must preserve the
@@ -83,10 +94,37 @@
         if (msg.type === 'file-start') {
             host.receiveBuffer = [];
             host.receivedSize = 0;
-            host.expectedSize = msg.size;
             host._lastLoggedDecile = -1;
+            if (msg.v === 2) {
+                // v2 chunked format: the assembler stays crypto-free and
+                // only frames [4B BE seq][4B BE ctLen][ct] records out of
+                // the byte stream. Decrypt/verify happens above the
+                // verification gate (ReceiveFlow + SegmentReceiver), so
+                // file-start must be forwarded upward for gating.
+                host.expectedSize = 0;
+                host._v2Mode = true;
+                host._v2Pending = null;
+                host._v2NextSeq = 0;
+                host._v2ExpectedRecords = msg.segCount + 1;
+                host._v2WireBytes = 0;
+                // Wire-size estimate for byte-based rate/ETA display
+                // (upper bound: gzip only shrinks records; percent should
+                // use the exact seq/segCount fields on progress events).
+                host._v2WireEstimate = host._v2ExpectedRecords
+                    * (window.Protocol.SEG_SIZE + V2_RECORD_OVERHEAD);
+                logger.info(`[${host.tag}] receiving v2 chunked file (${msg.segCount} segments)`);
+                return false;
+            }
+            clearV2Parser(host);
+            host.expectedSize = msg.size;
             logger.info(`[${host.tag}] receiving encrypted file (${msg.size} bytes, padded)`);
             return true;
+        }
+        if (msg.type === 'file-end' && host._v2Mode) {
+            // v2: completeness is judged by the SegmentReceiver (it knows
+            // how many records verified), so forward upward.
+            logger.info(`[${host.tag}] v2 file-end after ${host._v2WireBytes} wire bytes`);
+            return false;
         }
         if (msg.type === 'file-end') {
             // Bytes went missing in transit (chunks carry no sequence
@@ -133,8 +171,95 @@
         return false;
     }
 
+    // [4B BE seq][4B BE ctLen] header plus the GCM tag and the sealed
+    // [1B flags][4B dataLen] segment header: every byte of a record that
+    // is not segment payload.
+    const V2_RECORD_OVERHEAD = 8 + 16 + 5;
+
+    // Largest legal record ciphertext: a full segment's plaintext
+    // ([1B flags][4B dataLen] + SEG_SIZE bytes) plus the 16-byte GCM tag.
+    // The metadata record (2 KiB + tag) is far below this. Anything bigger
+    // is a hostile or desynced stream.
+    function v2MaxRecordCt() {
+        return window.Protocol.SEG_SIZE + 21;
+    }
+
+    // Streaming record parser. Records may span transport chunks and one
+    // chunk may carry several records; at most one partial record is ever
+    // buffered (hard-bounded by v2MaxRecordCt), so an unverified or
+    // hostile peer cannot grow receiver memory by streaming binary.
+    function handleBinaryV2(host, buf) {
+        const len = (buf && buf.byteLength) | 0;
+        if (host._sessionTotalBytes + len > window.Protocol.MAX_TOTAL_SESSION_BYTES) {
+            abortAbusiveStream(host,
+                `session byte cap exceeded (${host._sessionTotalBytes + len} > ${window.Protocol.MAX_TOTAL_SESSION_BYTES})`);
+            return;
+        }
+        host._sessionTotalBytes += len;
+        host._v2WireBytes += len;
+
+        const pendingLen = host._v2Pending ? host._v2Pending.length : 0;
+        const merged = new Uint8Array(pendingLen + len);
+        if (pendingLen) merged.set(host._v2Pending, 0);
+        merged.set(new Uint8Array(buf), pendingLen);
+
+        const maxCt = v2MaxRecordCt();
+        let offset = 0;
+        while (merged.length - offset >= 8) {
+            const view = new DataView(merged.buffer, offset);
+            const seq = view.getUint32(0, false);
+            const ctLen = view.getUint32(4, false);
+            if (ctLen < 16 || ctLen > maxCt) {
+                abortAbusiveStream(host, `record ciphertext length ${ctLen} out of bounds`);
+                return;
+            }
+            // seq must never skip forward: over an ordered transport that
+            // means framing desync. Going backward is legitimate (the
+            // sender rewinds after a segment-nack or a reconnect resume).
+            if (seq > host._v2NextSeq) {
+                abortAbusiveStream(host, `record seq ${seq} skipped ahead of expected ${host._v2NextSeq}`);
+                return;
+            }
+            if (merged.length - offset < 8 + ctLen) break; // partial record
+            const ct = merged.slice(offset + 8, offset + 8 + ctLen);
+            offset += 8 + ctLen;
+            host._v2NextSeq = seq + 1;
+            if (host.onMessage) host.onMessage({ type: 'file-segment', seq, ct: ct.buffer });
+        }
+        host._v2Pending = offset < merged.length ? merged.slice(offset) : null;
+
+        const lastSeq = host._v2NextSeq - 1;
+        const decile = Math.floor((host._v2NextSeq / host._v2ExpectedRecords) * 10) * 10;
+        if (decile !== host._lastLoggedDecile) {
+            host._lastLoggedDecile = decile;
+            logger.info(`[${host.tag}] receiving: ${decile}%`);
+        }
+        if (host.onMessage) {
+            host.onMessage({
+                type: 'progress',
+                received: host._v2WireBytes,
+                total: host._v2WireEstimate,
+                seq: lastSeq,
+                segCount: host._v2ExpectedRecords - 1,
+            });
+        }
+    }
+
+    // Reconnect/rewind hygiene: half a record left in the pending buffer
+    // is garbage once the sender rewinds to a record boundary. Callers
+    // pass the seq the stream will continue from.
+    function resetParser(host, nextSeq) {
+        if (!host._v2Mode) return;
+        host._v2Pending = null;
+        host._v2NextSeq = nextSeq;
+    }
+
     function handleBinary(host, buf) {
         if (host._abusiveTeardown) return;
+        if (host._v2Mode) {
+            handleBinaryV2(host, buf);
+            return;
+        }
         const len = (buf && buf.byteLength) | 0;
         if (host.expectedSize <= 0) {
             abortAbusiveStream(host, 'binary chunk before file-start');
@@ -218,6 +343,7 @@
         resetReceive,
         handleControl,
         handleBinary,
+        resetParser,
         abortAbusiveStream,
         setupFileAck,
         clearFileAckState,

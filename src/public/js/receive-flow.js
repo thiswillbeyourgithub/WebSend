@@ -23,6 +23,7 @@
     let _i18n = null;
     let _showToast = null;
     let _getSharedKey = null;
+    let _getSessionKeys = null;
     let _getPendingReplaceHash = null;
     let _setPendingReplaceHash = null;
     let _getConnectionTimestamp = null;
@@ -37,6 +38,7 @@
         _i18n = opts.i18n;
         _showToast = opts.showToast;
         _getSharedKey = opts.getSharedKey;
+        _getSessionKeys = opts.getSessionKeys;
         _getPendingReplaceHash = opts.getPendingReplaceHash;
         _setPendingReplaceHash = opts.setPendingReplaceHash;
         _getConnectionTimestamp = opts.getConnectionTimestamp;
@@ -99,17 +101,21 @@
         return cleaned || 'bin';
     }
 
-    async function decryptIncomingFile(blob) {
-        const sharedKey = _getSharedKey();
-        const encryptedData = await blob.arrayBuffer();
-        const { metadata, data } = await window.WebSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
+    /**
+     * Sanitize peer-supplied metadata and shape a decrypted payload for
+     * display. Shared by the v1 whole-file path (decryptIncomingFile) and
+     * the v2 segment path (file-end finalization).
+     * @param {Object} metadata - Raw peer metadata (sanitized in place)
+     * @param {ArrayBuffer} data - Verified plaintext
+     */
+    function buildDecoded(metadata, data) {
         metadata.name = sanitizeMetadataName(metadata.name);
         // Replace the peer-supplied mimeType with a sanitised value before
         // anything else reads it, so the rest of the pipeline (fileType
         // discrimination, fallback filename, BgOcr / Collections / cards)
         // can never see a malformed or oversized string.
         metadata.mimeType = sanitizeMimeType(metadata.mimeType);
-        _logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${metadata.originalSize} bytes)`);
+        _logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${data.byteLength} bytes)`);
 
         const fileData = new Uint8Array(data);
         const fileMimeType = metadata.mimeType;
@@ -124,6 +130,13 @@
         const fileName = metadata.name || `websend_${_getConnectionTimestamp()}_${seq}.${ext}`;
 
         return { metadata, data, fileData, fileMimeType, fileBlob, fileType, fileName };
+    }
+
+    async function decryptIncomingFile(blob) {
+        const sharedKey = _getSharedKey();
+        const encryptedData = await blob.arrayBuffer();
+        const { metadata, data } = await window.WebSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
+        return buildDecoded(metadata, data);
     }
 
     async function applyImageReplacement(replaceIdx, decoded) {
@@ -145,7 +158,10 @@
 
         window.ReceiveCard.setCardImage(replaceIdx, fileBlob, { filename: fileName });
 
-        const decryptedHash = await window.WebSendCrypto.sha256Hex(data);
+        // v2 transfers arrive with the composite hash already verified
+        // segment by segment; only the v1 whole-file path hashes here.
+        const decryptedHash = decoded.precomputedHash
+            || await window.WebSendCrypto.sha256Hex(data);
         oldImg.hash = decryptedHash;
         _logger.info(`Replacement SHA-256: ${decryptedHash}`);
         if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
@@ -201,7 +217,9 @@
 
         window.BgOcr.queue(imageIndex);
 
-        const decryptedHash = await window.WebSendCrypto.sha256Hex(data);
+        // See applyImageReplacement: v2 ships a precomputed composite hash.
+        const decryptedHash = decoded.precomputedHash
+            || await window.WebSendCrypto.sha256Hex(data);
         imgObj.hash = decryptedHash;
         _logger.info(`Decrypted SHA-256: ${decryptedHash}`);
         if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
@@ -240,6 +258,18 @@
             return;
         }
 
+        await presentDecodedFile(decoded);
+    }
+
+    // Display step, shared by v1 and v2. The bytes already decrypted
+    // correctly, so a failure presenting them must NOT be reported as a
+    // decryption failure: doing so would nack and discard a file that
+    // arrived intact. Worst case the file is shown as a (broken) thumbnail
+    // or a generic download, but it is never thrown away once it decrypted.
+    // The sender no longer mislabels unknown file types as image/png
+    // (sender-send.js), so a disk image and friends arrive as a plain
+    // downloadable file rather than a picture in the first place.
+    async function presentDecodedFile(decoded) {
         let replaceIdx = -1;
         const pendingHash = _getPendingReplaceHash();
         if (pendingHash) {
@@ -250,14 +280,6 @@
             }
         }
 
-        // Step 2 - display. The bytes already decrypted correctly, so a
-        // failure presenting them must NOT be reported as a decryption
-        // failure: doing so would nack and discard a file that arrived
-        // intact. Worst case the file is shown as a (broken) thumbnail or a
-        // generic download, but it is never thrown away once it decrypted.
-        // The sender no longer mislabels unknown file types as image/png
-        // (sender-send.js), so a disk image and friends arrive as a plain
-        // downloadable file rather than a picture in the first place.
         try {
             if (replaceIdx !== -1) {
                 await applyImageReplacement(replaceIdx, decoded);
@@ -269,9 +291,98 @@
         }
     }
 
+    // ============ v2 chunked transfers (file-start / file-segment / file-end) ============
+    //
+    // The transport assembler is crypto-free in v2: it frames wire records
+    // and forwards them here (through receive.html's verification gate) as
+    // 'file-segment' events. This section owns the SegmentReceiver that
+    // decrypts and verifies them in order.
+    //
+    // Segment events arrive synchronously from the parser but accept() is
+    // async, so everything funnels through one promise chain: without it,
+    // back-to-back segments would race and self-reject as out-of-order.
+
+    let _segmentReceiver = null;
+    let _segmentChain = Promise.resolve();
+
+    function _enqueueSegmentWork(fn) {
+        _segmentChain = _segmentChain.then(fn).catch(e => {
+            _logger.error('v2 receive pipeline error: ' + e.message);
+        });
+        return _segmentChain;
+    }
+
+    function _nackTransfer(error) {
+        _segmentReceiver = null;
+        if (!_getRtc().sendMessage(window.Protocol.build.fileNack(error))) {
+            _logger.warn('Nack could not be sent (channel closed) — sender will time out');
+        }
+    }
+
+    /** Gated handler for v2 file-start (v1 never reaches onMessage). */
+    function handleFileStart(msg) {
+        return _enqueueSegmentWork(() => {
+            const sessionKeys = _getSessionKeys();
+            if (!sessionKeys) {
+                _logger.error('v2 file-start before key exchange; ignoring');
+                return;
+            }
+            _segmentReceiver = window.SegmentStream.createReceiver({
+                sessionKeys,
+                saltB64: msg.salt,
+                segCount: msg.segCount,
+            });
+            _logger.info(`v2 transfer started (${msg.segCount} segments)`);
+        });
+    }
+
+    function handleFileSegment(msg) {
+        return _enqueueSegmentWork(async () => {
+            // No receiver: the file-start was dropped (unverified peer) or
+            // the transfer already failed; drop the record in O(1).
+            if (!_segmentReceiver) return;
+            const res = await _segmentReceiver.accept(msg.seq, msg.ct);
+            if (!res.ok) {
+                // The failure reason stays local (a peer-facing distinction
+                // between auth and framing errors would be an oracle).
+                _logger.error(`v2 segment ${msg.seq} rejected (${res.reason})`);
+                _nackTransfer('decrypt-failed');
+            }
+        });
+    }
+
+    function handleFileEnd() {
+        return _enqueueSegmentWork(async () => {
+            if (!_segmentReceiver) return;
+            const receiver = _segmentReceiver;
+            _segmentReceiver = null;
+            _finalizeReceiveStats();
+
+            if (receiver.nextSeq !== receiver.segCount + 1) {
+                // Records went missing in transit. Distinct, non-oracle
+                // error: the record count is public on the wire.
+                _logger.error(`v2 file-end after ${receiver.nextSeq}/${receiver.segCount + 1} records; transfer incomplete`);
+                if (!_getRtc().sendMessage(window.Protocol.build.fileNack('incomplete'))) {
+                    _logger.warn('Incomplete-nack could not be sent (channel closed) — sender will time out');
+                }
+                _showToast(_i18n.t('receive.transferIncomplete'), { type: 'error' });
+                return;
+            }
+
+            const { metadata, blob, compositeHashHex } = await receiver.finish();
+            const decoded = buildDecoded(metadata && typeof metadata === 'object' ? metadata : {},
+                await blob.arrayBuffer());
+            decoded.precomputedHash = compositeHashHex;
+            await presentDecodedFile(decoded);
+        });
+    }
+
     window.ReceiveFlow = {
         attach,
         handleEncryptedFile,
+        handleFileStart,
+        handleFileSegment,
+        handleFileEnd,
         // Exposed for testing the pure pipeline:
         decryptIncomingFile,
         applyImageReplacement,

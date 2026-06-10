@@ -277,3 +277,145 @@ test('handleEncryptedFile: decryption failure sends generic file-nack (no messag
     assert.equal(sent[0].message, 'decrypt-failed',
         'peer-facing reason must be a constant, not the raw error message');
 });
+
+// ---- v2 chunked transfers (file-start / file-segment / file-end) ----
+
+const COMPOSITE = 'c0'.repeat(32);
+
+/**
+ * Fake SegmentReceiver with scriptable accept(); mirrors the real API
+ * surface that receive-flow touches.
+ */
+function makeFakeReceiver({ segCount = 2, acceptImpl, content } = {}) {
+    const calls = [];
+    let nextSeq = 0;
+    return {
+        calls,
+        segCount,
+        get nextSeq() { return nextSeq; },
+        async accept(seq, ct) {
+            calls.push(seq);
+            if (acceptImpl) return acceptImpl(seq, ct);
+            nextSeq = seq + 1;
+            return { ok: true, isLast: seq === segCount };
+        },
+        async finish() {
+            return {
+                metadata: { name: 'big.bin', mimeType: 'application/octet-stream', originalSize: 8 },
+                blob: { arrayBuffer: async () => (content || new ArrayBuffer(8)) },
+                compositeHashHex: COMPOSITE,
+            };
+        },
+    };
+}
+
+function setupV2(fakeReceiver, overrides = {}) {
+    const win = loadIntoJsdom();
+    const createdWith = [];
+    win.SegmentStream = {
+        createReceiver: (opts) => { createdWith.push(opts); return fakeReceiver; },
+    };
+    const deps = makeDeps({
+        ...overrides,
+        optsExtra: {
+            getSessionKeys: () => ({ deriveFileKey: async () => ({ __fake: 'filekey' }) }),
+            ...(overrides.optsExtra || {}),
+        },
+    });
+    win.ReceiveFlow.attach(deps.opts);
+    return { win, deps, createdWith };
+}
+
+const V2_START = { type: 'file-start', v: 2, segSize: 262144, segCount: 2, salt: 'A'.repeat(22) + '==' };
+
+test('v2 happy path: segments verify, file is displayed, ack carries the composite hash', async () => {
+    const images = [];
+    const fake = makeFakeReceiver({ segCount: 2 });
+    const { win, deps, createdWith } = setupV2(fake, { receivedImages: images });
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    assert.equal(createdWith.length, 1);
+    assert.equal(createdWith[0].segCount, 2);
+    assert.equal(createdWith[0].saltB64, V2_START.salt);
+
+    for (let seq = 0; seq <= 2; seq++) {
+        await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq, ct: new ArrayBuffer(32) });
+    }
+    await win.ReceiveFlow.handleFileEnd({ type: 'file-end' });
+
+    assert.deepEqual(fake.calls, [0, 1, 2]);
+    assert.equal(images.length, 1);
+    assert.equal(images[0].hash, COMPOSITE,
+        'the gallery identity hash must be the composite hash, not a recomputed sha256');
+    const ack = deps.sent.find(m => m.type === 'file-ack');
+    assert.equal(ack.hash, COMPOSITE);
+});
+
+test('v2 segment rejection nacks decrypt-failed once and drops later segments', async () => {
+    const fake = makeFakeReceiver({
+        acceptImpl: (seq) => (seq === 1 ? { ok: false, reason: 'auth' } : { ok: true, isLast: false }),
+    });
+    const { win, deps } = setupV2(fake);
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    for (let seq = 0; seq <= 2; seq++) {
+        await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq, ct: new ArrayBuffer(32) });
+    }
+    assert.deepEqual(fake.calls, [0, 1],
+        'after the failure the receiver is gone; segment 2 must not reach accept()');
+    const nacks = deps.sent.filter(m => m.type === 'file-nack');
+    assert.equal(nacks.length, 1);
+    assert.equal(nacks[0].message, 'decrypt-failed');
+});
+
+test('v2 file-end with missing records nacks incomplete', async () => {
+    const fake = makeFakeReceiver({ segCount: 5 }); // only 2 records will arrive
+    const { win, deps } = setupV2(fake);
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileEnd({ type: 'file-end' });
+
+    const nacks = deps.sent.filter(m => m.type === 'file-nack');
+    assert.equal(nacks.length, 1);
+    assert.equal(nacks[0].message, 'incomplete');
+});
+
+test('v2 segments are processed strictly in order even with slow accepts', async () => {
+    const order = [];
+    let seq0Done = false;
+    const fake = makeFakeReceiver({
+        acceptImpl: async (seq) => {
+            order.push(`start-${seq}`);
+            if (seq === 0) {
+                await new Promise(r => setTimeout(r, 20)); // slow first segment
+                seq0Done = true;
+            } else {
+                assert.equal(seq0Done, true, 'segment 1 must not start before segment 0 finished');
+            }
+            order.push(`end-${seq}`);
+            return { ok: true, isLast: false };
+        },
+    });
+    const { win } = setupV2(fake);
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    // Fire both without awaiting, like the parser does within one chunk.
+    const p0 = win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    const p1 = win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
+    await Promise.all([p0, p1]);
+    assert.deepEqual(order, ['start-0', 'end-0', 'start-1', 'end-1']);
+});
+
+test('v2 file-start without session keys is ignored; later segments are no-ops', async () => {
+    const fake = makeFakeReceiver();
+    const { win, deps, createdWith } = setupV2(fake, {
+        optsExtra: { getSessionKeys: () => null },
+    });
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    assert.equal(createdWith.length, 0);
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    assert.equal(fake.calls.length, 0);
+    assert.equal(deps.sent.length, 0, 'no nack spam for gated/ignored transfers');
+});

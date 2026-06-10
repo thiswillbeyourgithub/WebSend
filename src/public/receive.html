@@ -148,7 +148,7 @@
     <script src="/js/crypto.js" integrity="sha384-ru8unTea81AjGWvbBlS67rma6fsxKllB5Gq8wKv8Gapa/mYDTXbdZFZlehK7K898"></script>
     <script src="/js/protocol.js" integrity="sha384-5jC8yuy/x1YJ1ezXThsdGhNcf8iy0usehJOVNae/QAdIEH7Fdu1uTDBBQEYn03do"></script>
     <script src="/js/webrtc.js" integrity="sha384-KO3xc4LH2Y1a4G2BZoAZ0dEp/+kMFk/XOXG5Vodx+mzHar7UYkU0rITk9YdoOVPp"></script>
-    <script src="/js/transport-assembler.js" integrity="sha384-EaqsYuUMBzjFE7NtGlIQ+n3yn6IpniY8DNIlmLRpcsdX2oMFfkwZ3yMr/Wz7Jvch"></script>
+    <script src="/js/transport-assembler.js" integrity="sha384-q0oRCqhrMeGmtsKmQBU6x6fL1dDw8BNpVoOXBZuzgWm+Gz6yCpvsyT+1uAJMOIIh"></script>
     <script src="/js/segment-stream.js" integrity="sha384-lf7IxSkBJhZueXoOMQf9Q9TFZiQu/NJ/2tuTztT2i/UC8N8+g/msfq5kl3aOX/ev"></script>
     <script src="/js/ws-transport.js" integrity="sha384-Vu9BVIScT1GNfpENnIRNtET+llG8cFHVkrC7gjkoTcfAKJ979VYJS1I3Zkv6uldT"></script>
     <script src="/js/lp-transport.js" integrity="sha384-FgcY9WBahaTbVPS8UWfX9Lux247UWxXTKbY+WcwnwCRjSj8CHM+Rm607ATjpf0PF"></script>
@@ -164,7 +164,7 @@
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-A0vvgdJ8ktmC65klkTfsPqjIHZXNroXsONfZzY7jVL0rVoRSdExtZid0K+ZXuRTw"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-NH+XRrtXv6xYSNjsbbaYzmJyXTVVdKmnIDrKgUvWXmwSVwnrJV5X5G8UcLvJs5xi"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-DgCbMzjz+dLHajRLh2nDm+gtkHG0wnliEk6C/iqoKATHPp1sLYZ0FkD2fdpk/PDg"></script>
-    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-ZQIldN5cRMATTXeXJEulLoz/XABqO/10Uuz7e0p4Zg4Rw0ilY5U5v/VQuToqXtV+"></script>
+    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-ERUchYWlBccassO30mSoCKj7EPTSKsnGXPrqUCFXkfLz4KIhtjCSKW5U+m5ZCe8D"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-+EEuhwDyVsHFYHHBmQGfcVn909daLZh+b/Gv6g8jfFqLUDuhkJZB3i9c2gXCkubt"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -189,6 +189,7 @@
         let rtc = null;
         let keyPair = null;
         let sharedKey = null; // AES key derived from ECDH, set after sender connects
+        let sessionKeys = null; // {sharedKey, deriveFileKey} handle for v2 chunked transfers
 
         // Transfer stats state
         let receiveXferStart = null;
@@ -240,6 +241,7 @@
             i18n: i18n,
             showToast: showToast,
             getSharedKey: () => sharedKey,
+            getSessionKeys: () => sessionKeys,
             getPendingReplaceHash: () => pendingReplaceHash,
             setPendingReplaceHash: (h) => { pendingReplaceHash = h; },
             getConnectionTimestamp: () => connectionTimestamp,
@@ -804,6 +806,7 @@
             stopPublicKeyResend();
             keyPair = null;
             sharedKey = null;
+            sessionKeys = null;
             weConfirmed = false;
             theyConfirmed = false;
             cachedSenderFingerprint = null;
@@ -983,6 +986,7 @@
             // Clear crypto + per-pairing state
             keyPair = null;
             sharedKey = null;
+            sessionKeys = null;
             weConfirmed = false;
             theyConfirmed = false;
             cachedSenderFingerprint = null;
@@ -1075,10 +1079,12 @@
             weConfirmed = false;
             theyConfirmed = false;
             sharedKey = null;
+            sessionKeys = null;
             logger.info('Received sender public key, deriving shared secret...');
             try {
                 const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);
-                sharedKey = await WebSendCrypto.deriveSharedKey(keyPair.privateKey, senderPublicKey);
+                sessionKeys = await WebSendCrypto.deriveSessionKeys(keyPair.privateKey, senderPublicKey);
+                sharedKey = sessionKeys.sharedKey;
 
                 // Per-key fingerprints are cached only for the
                 // rekey-on-reconnect peer-identity check above.
@@ -1116,7 +1122,13 @@
             const progressBar = document.getElementById('progress-bar');
             const progressFill = document.getElementById('progress-fill');
             progressBar.classList.remove('hidden');
-            const percent = Math.round((msg.received / msg.total) * 100);
+            // v2 progress events carry exact record counts (seq/segCount);
+            // byte totals are an upper-bound estimate there (gzip shrinks
+            // records), so prefer the count for the percent and keep bytes
+            // for rate/ETA.
+            const percent = (typeof msg.seq === 'number' && msg.segCount > 0)
+                ? Math.min(100, Math.round(((msg.seq + 1) / (msg.segCount + 1)) * 100))
+                : Math.round((msg.received / msg.total) * 100);
             progressFill.style.width = percent + '%';
             if (!receiveXferStart) receiveXferStart = Date.now();
             receiveLastTotal = msg.total;
@@ -1234,6 +1246,14 @@
             'batch-start-if-nonempty': handleBatchStartIfNonempty,
             'batch-end': handleBatchEnd,
             'encrypted-file': (msg) => ReceiveFlow.handleEncryptedFile(msg),
+            // v2 chunked transfers: the assembler forwards the v2
+            // file-start, framed 'file-segment' records, and file-end up
+            // here so they pass the verification gate before any
+            // decrypt/verify work happens (ReceiveFlow owns the
+            // SegmentReceiver).
+            'file-start': (msg) => ReceiveFlow.handleFileStart(msg),
+            'file-segment': (msg) => ReceiveFlow.handleFileSegment(msg),
+            'file-end': (msg) => ReceiveFlow.handleFileEnd(msg),
             // Local synthetic event (like 'progress'): file-end arrived
             // with bytes missing; nacks 'incomplete' back to the sender.
             'file-incomplete': handleFileIncomplete,
@@ -1259,6 +1279,12 @@
             'batch-start-if-nonempty',
             'batch-end',
             'encrypted-file',
+            // v2 chunked transfers: an unverified peer's records are parsed
+            // (bounded memory) below the gate but must never reach the
+            // SegmentReceiver, so the whole v2 trio is gated.
+            'file-start',
+            'file-segment',
+            'file-end',
             // An unverified peer can reach the assembler (it sits below the
             // verification layer), so gate the incomplete-nack path like
             // encrypted-file: the unverified sender just times out.
