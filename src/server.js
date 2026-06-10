@@ -287,6 +287,12 @@ const LP_SLOT_TOKEN_BYTES = 16;             // 128-bit slot token
 // ceiling on top of this.
 const LP_FRAME_BODY_LIMIT = '320kb';
 const LP_SLOT_IDLE_TIMEOUT_MS = 60_000;     // close LP slot after this idle
+// Backpressure cap on a WS peer's outbound socket buffer. When an LP (or WS)
+// sender pushes frames faster than the receiving WS drains them, ws buffers
+// the overflow in server memory with no upper bound short of the 4 GiB
+// session cap. Same order of magnitude as the LP queue bound
+// (LP_QUEUE_MAX_FRAMES x 256 KiB = 8 MiB).
+const WS_PEER_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
 
 // ============ Rate Limiting ============
 // Simple sliding window rate limiter to prevent DoS and room enumeration attacks.
@@ -1132,6 +1138,7 @@ app.post('/api/rooms/:id/relay/handshake', rateLimitMiddleware('general'), valid
         token,
         slotName,
         queue: [],
+        queueBytes: 0,
         waiters: [],
         closed: false,
         idleTimer: null,
@@ -1187,17 +1194,38 @@ app.post(
             r[slotName] = null;
             return res.status(413).json({ error: 'Control message too large' });
         }
+        const peer = slotName === 'a' ? r.b : r.a;
+        // Backpressure: refuse the frame outright when the peer cannot
+        // absorb it (LP queue at LP_QUEUE_MAX_FRAMES, or WS socket buffer
+        // past WS_PEER_BUFFER_MAX_BYTES). deliverToPeer used to silently
+        // drop the oldest queued frame instead, which corrupted any file
+        // transfer whose receiver drained slower than the sender pushed:
+        // chunks carry no sequence numbers, so the receiver only noticed
+        // at the very end when AES-GCM authentication failed. The client
+        // retries the same frame after a short delay. Checked before the
+        // sessionBytes increment so rejected frames are not double-counted
+        // when they are resent.
+        // No Retry-After header here on purpose: the queue usually clears
+        // within one receiver round trip (~100-300 ms) and lp-transport
+        // retries on its own short gap, but it honours a Retry-After when
+        // present (proxies send whole seconds, which would needlessly
+        // halve LP throughput if we sent one too).
+        if (peerBacklogFull(peer)) {
+            return res.status(429).json({ error: 'Peer backlog full' });
+        }
         r.sessionBytes += len;
         if (r.sessionBytes > MAX_TOTAL_SESSION_BYTES) {
             closeLpSlot(slot, 'Session byte cap exceeded');
             r[slotName] = null;
-            const peer = slotName === 'a' ? r.b : r.a;
             teardownPeer(peer, 'Session byte cap exceeded');
             return res.status(413).json({ error: 'Session byte cap exceeded' });
         }
         armLpIdleTimer(slot);
-        const peer = slotName === 'a' ? r.b : r.a;
         deliverToPeer(peer, data, isBinary);
+        // Tell the sender how many bytes the peer has accepted but not yet
+        // drained, so its progress display can show delivered bytes (the
+        // LP analogue of the bufferedAmount correction on the RTC/WS paths).
+        res.set('X-Peer-Backlog-Bytes', String(peerBacklogBytes(peer)));
         res.status(204).send();
     }
 );
@@ -1249,7 +1277,7 @@ app.get('/api/rooms/:id/relay/down', validateRoomSecret, (req, res) => {
 
     // Fast path: a frame is already queued.
     if (slot.queue.length > 0) {
-        return sendFrame(slot.queue.shift());
+        return sendFrame(lpDequeue(slot));
     }
     if (req.query.wait !== 'true') return res.status(204).send();
 
@@ -1384,21 +1412,51 @@ const wss = new WebSocketServer({ noServer: true });
 // interval (ping/pong) only walks live entries.
 const relayPings = new Set();
 
+// Bytes the peer has accepted from us but not yet drained: queued LP frames
+// or the WS socket's outbound buffer. Reported to LP senders via the
+// X-Peer-Backlog-Bytes header so they can display delivered (not merely
+// uploaded) progress.
+function peerBacklogBytes(peer) {
+    if (!peer) return 0;
+    if (peer.kind === 'lp') return peer.queueBytes || 0;
+    return peer.bufferedAmount || 0;
+}
+
+// True when the peer cannot absorb another frame and the feeder must hold
+// off (429 on /relay/up, socket pause on the WS path). A missing peer is
+// not "full": pre-handshake frames are dropped on the floor by design and
+// renegotiated by the client.
+function peerBacklogFull(peer) {
+    if (!peer) return false;
+    if (peer.kind === 'lp') return !peer.closed && peer.queue.length >= LP_QUEUE_MAX_FRAMES;
+    return peer.readyState === peer.OPEN && peer.bufferedAmount > WS_PEER_BUFFER_MAX_BYTES;
+}
+
+// Pop the next frame off an LP slot's queue, keeping queueBytes in sync.
+// Every dequeue must go through here or the backlog accounting drifts.
+function lpDequeue(slot) {
+    const frame = slot.queue.shift();
+    if (frame) slot.queueBytes = Math.max(0, (slot.queueBytes || 0) - frame.bytes);
+    return frame;
+}
+
 function deliverToPeer(peerSlot, data, isBinary) {
     if (!peerSlot) return;
     if (peerSlot.kind === 'lp') {
         if (peerSlot.closed) return;
-        if (peerSlot.queue.length >= LP_QUEUE_MAX_FRAMES) {
-            // Bounded queue: a stalled consumer must not be able to pin
-            // server memory. We drop the oldest frame, not the newest,
-            // because the newest is more useful to the live receiver.
-            peerSlot.queue.shift();
-        }
-        peerSlot.queue.push({ data, isBinary });
+        // No bounded-queue drop here: silently discarding a frame corrupts
+        // any in-flight file (chunks have no sequence numbers, so the loss
+        // only surfaces as an AES-GCM failure at file-end). Both feeders
+        // enforce the LP_QUEUE_MAX_FRAMES bound *before* calling us:
+        // /relay/up answers 429 and the WS message handler pauses the
+        // sender's socket, so the queue can only exceed the bound by the
+        // few frames already in flight when backpressure engaged.
+        const bytes = Buffer.isBuffer(data) ? data.length : (data && data.byteLength) || 0;
+        peerSlot.queue.push({ data, isBinary, bytes });
+        peerSlot.queueBytes = (peerSlot.queueBytes || 0) + bytes;
         const w = peerSlot.waiters.shift();
         if (w) {
-            const next = peerSlot.queue.shift();
-            w.send(next);
+            w.send(lpDequeue(peerSlot));
         }
         return;
     }

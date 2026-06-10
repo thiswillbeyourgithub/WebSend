@@ -465,7 +465,7 @@ the matching photo, it surfaces an error toast and gives up.
 | GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | None            |
 | WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query | 100/min per IP |
 | POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 100/min per IP |
-| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay  | Room secret + `X-Slot-Token` | None (byte caps only) |
+| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay (429 when the peer's queue is full; 204 carries `X-Peer-Backlog-Bytes`) | Room secret + `X-Slot-Token` | None (byte caps only) |
 | GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | None (waiter caps only) |
 | POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Room secret + `X-Slot-Token` | 100/min per IP |
 
@@ -889,6 +889,14 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     `MAX_TOTAL_SESSION_BYTES` (4 GiB) and `MAX_CONTROL_MSG_BYTES`
     (16 KiB) enforced server-side, plus a bounded per-slot queue
     (32 frames) and idle timeout (60 s) on the long-poll path. The
+    queue bound is enforced as backpressure, never as a silent drop:
+    when the peer's queue is full (or a WS peer's socket buffer exceeds
+    8 MiB), `/relay/up` answers 429 and the client retries the same
+    frame on a short gap (bounded at 30 s of solid 429s), so a slow
+    receiver can never cause chunk loss mid-file. Successful `/relay/up`
+    responses carry an `X-Peer-Backlog-Bytes` header (bytes accepted but
+    not yet drained by the peer) which the LP sender subtracts from its
+    progress display so both ends report delivered bytes. The
     long-poll slot tokens are 128-bit randoms compared in constant time
     so the room secret alone cannot hijack a live slot. The sidebar
     surfaces the active path (Direct / Relay (TURN/TURNS) / Relay (HTTP/

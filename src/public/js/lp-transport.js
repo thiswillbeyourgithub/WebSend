@@ -40,6 +40,16 @@
     // sits well below any sane proxy threshold while still pushing
     // ~2.5 MB/sec at CHUNK_SIZE=256 KiB.
     const LP_UP_MIN_GAP_MS = 100;
+    // /relay/up answers 429 when the peer's queue is full (server-side
+    // backpressure, replacing the old silent frame drop that corrupted
+    // transfers). The queue drains one frame per receiver round trip
+    // (~100-300 ms), so retry the same frame on a short fixed gap; a 429
+    // from an upstream proxy carries Retry-After and is honoured instead.
+    // Give up after UP_STALL_MAX_MS of solid 429s: the peer is alive
+    // (otherwise the slot would close with 410) but not draining, e.g. a
+    // suspended background tab.
+    const UP_RETRY_GAP_MS = 250;
+    const UP_STALL_MAX_MS = 30_000;
 
     function sleep(ms) {
         return ms > 0 ? new Promise(r => setTimeout(r, ms)) : Promise.resolve();
@@ -93,6 +103,11 @@
             this._helloSent = false;
             // Last /relay/up POST timestamp for client-side pacing.
             this._lastUpAt = 0;
+            // Peer backlog (bytes accepted by the server but not yet
+            // drained by the peer), from the X-Peer-Backlog-Bytes header
+            // of the last successful /relay/up. Used by sendFile to show
+            // delivered progress instead of uploaded progress.
+            this._peerBacklogBytes = 0;
         }
 
         async _paceUp() {
@@ -337,46 +352,56 @@
             this._sendClose().catch(() => {});
         }
 
+        /**
+         * POST one frame to /relay/up, retrying the same frame while the
+         * server reports the peer's queue full (429). Returns the response
+         * for any other status; the caller decides what non-ok means.
+         * On success, records the peer backlog reported by the server so
+         * sendFile can display delivered (not merely uploaded) progress.
+         */
+        async _postUp(contentType, body) {
+            const deadline = Date.now() + UP_STALL_MAX_MS;
+            for (;;) {
+                await this._paceUp();
+                const res = await fetch(`/api/rooms/${this.roomId}/relay/up`, {
+                    method: 'POST',
+                    headers: {
+                        'X-Room-Secret': this.roomSecret,
+                        'X-Slot-Token': this._slotToken,
+                        'Content-Type': contentType,
+                    },
+                    body,
+                });
+                this._lastUpAt = Date.now();
+                if (res.status !== 429) {
+                    const backlog = parseInt(res.headers.get('X-Peer-Backlog-Bytes') || '', 10);
+                    if (Number.isFinite(backlog) && backlog >= 0) this._peerBacklogBytes = backlog;
+                    return res;
+                }
+                if (this._closed) throw new Error('up aborted: transport closed');
+                if (Date.now() >= deadline) {
+                    throw new Error(`up stalled: peer not draining (429 for ${UP_STALL_MAX_MS / 1000}s)`);
+                }
+                // Our server's queue-full 429 clears within a receiver round
+                // trip; an upstream proxy's 429 carries a Retry-After worth
+                // honouring. parseRetryAfter returns 0 when absent/invalid.
+                const ra = parseRetryAfter(res);
+                await sleep(ra > UP_RETRY_GAP_MS ? ra : UP_RETRY_GAP_MS);
+            }
+        }
+
         async _sendControl(obj) {
             const body = JSON.stringify(obj);
             // Sent as text/plain (not application/json) so the global
             // express.json() body parser leaves it for our route-level
             // express.raw() to read as bytes. The peer parses it as JSON
             // on the receive side identically to a WS text frame.
-            await this._paceUp();
-            const res = await fetch(`/api/rooms/${this.roomId}/relay/up`, {
-                method: 'POST',
-                headers: {
-                    'X-Room-Secret': this.roomSecret,
-                    'X-Slot-Token': this._slotToken,
-                    'Content-Type': 'text/plain',
-                },
-                body,
-            });
-            this._lastUpAt = Date.now();
-            if (res.status === 429) {
-                const ra = parseRetryAfter(res);
-                if (ra > 0) await sleep(ra);
-            }
+            const res = await this._postUp('text/plain', body);
             if (!res.ok) throw new Error(`up status ${res.status}`);
         }
 
         async _sendBinary(chunk) {
-            await this._paceUp();
-            const res = await fetch(`/api/rooms/${this.roomId}/relay/up`, {
-                method: 'POST',
-                headers: {
-                    'X-Room-Secret': this.roomSecret,
-                    'X-Slot-Token': this._slotToken,
-                    'Content-Type': 'application/octet-stream',
-                },
-                body: chunk,
-            });
-            this._lastUpAt = Date.now();
-            if (res.status === 429) {
-                const ra = parseRetryAfter(res);
-                if (ra > 0) await sleep(ra);
-            }
+            const res = await this._postUp('application/octet-stream', chunk);
             if (!res.ok) throw new Error(`up status ${res.status}`);
         }
 
@@ -456,8 +481,17 @@
                         );
                     }
                     offset += chunk.byteLength;
-                    const percent = Math.round((offset / totalSize) * 100);
-                    if (onProgress) onProgress(percent, offset, totalSize);
+                    // Report delivered bytes (server-acked minus the peer's
+                    // undrained backlog), not uploaded bytes. Raw `offset`
+                    // counts frames the server accepted instantly, which on
+                    // a slow receiver read up to a whole queue (8 MiB) and
+                    // roughly 2x in rate ahead of the receiver's display.
+                    // Mirrors the bufferedAmount correction in webrtc.js /
+                    // ws-transport.js. The backlog includes control frames
+                    // and is sampled per-POST, so clamp to [0, offset].
+                    const delivered = Math.max(0, offset - this._peerBacklogBytes);
+                    const percent = Math.round((delivered / totalSize) * 100);
+                    if (onProgress) onProgress(percent, delivered, totalSize);
                 }
                 if (!this.sendMessage(window.Protocol.build.fileEnd())) {
                     throw new TransientDisconnectError(

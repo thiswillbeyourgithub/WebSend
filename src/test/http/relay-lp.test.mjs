@@ -9,6 +9,8 @@
  *   - text frame (control) round-trip
  *   - 204 on down-poll timeout when wait=true and nothing queued
  *   - control msg > 16 KiB -> 413
+ *   - full peer queue -> 429 backpressure, no frame ever dropped
+ *   - X-Peer-Backlog-Bytes header tracks the peer's undrained bytes
  *   - close endpoint tears down peer
  *   - RELAY_ENABLE=false rejects with 404
  *
@@ -143,6 +145,66 @@ test('control msg over MAX_CONTROL_MSG_BYTES returns 413 and closes slot', async
     const big = 'x'.repeat(20_000); // > 16 KiB control cap
     const r = await up(roomId, secret, a.token, big, false);
     assert.equal(r.status, 413);
+});
+
+test('full peer queue returns 429 and loses no frames', async () => {
+    const { roomId, secret } = await newRoom();
+    const a = await (await handshake(roomId, secret)).json();
+    const b = await (await handshake(roomId, secret)).json();
+
+    // Push frames from a without b polling. The server must accept exactly
+    // LP_QUEUE_MAX_FRAMES (32, mirrored here) and answer 429 for the rest:
+    // the old behaviour silently dropped the oldest frame (corrupting any
+    // in-flight file) while still returning 204.
+    const MAX_FRAMES = 32;
+    let accepted = 0;
+    let rejected = 0;
+    for (let i = 0; i < MAX_FRAMES + 4; i++) {
+        const frame = Buffer.from([i, i, i, i]);
+        const r = await up(roomId, secret, a.token, frame, true);
+        if (r.status === 204) accepted++;
+        else if (r.status === 429) rejected++;
+        else assert.fail(`unexpected status ${r.status} on frame ${i}`);
+    }
+    assert.equal(accepted, MAX_FRAMES);
+    assert.equal(rejected, 4);
+
+    // Drain everything: all accepted frames arrive, in order, none dropped.
+    for (let i = 0; i < MAX_FRAMES; i++) {
+        const d = await down(roomId, secret, b.token, false);
+        assert.equal(d.status, 200);
+        const got = Buffer.from(await d.arrayBuffer());
+        assert.deepEqual([...got], [i, i, i, i]);
+    }
+    const empty = await down(roomId, secret, b.token, false);
+    assert.equal(empty.status, 204);
+
+    // Once the queue has room again, up succeeds (the 429 is retryable).
+    const retry = await up(roomId, secret, a.token, Buffer.from([99]), true);
+    assert.equal(retry.status, 204);
+});
+
+test('up reports the peer backlog in X-Peer-Backlog-Bytes', async () => {
+    const { roomId, secret } = await newRoom();
+    const a = await (await handshake(roomId, secret)).json();
+    const b = await (await handshake(roomId, secret)).json();
+
+    // No waiter on b, so each accepted frame stays queued: the header must
+    // reflect the backlog including the frame just enqueued.
+    const r1 = await up(roomId, secret, a.token, Buffer.alloc(100), true);
+    assert.equal(r1.status, 204);
+    assert.equal(r1.headers.get('x-peer-backlog-bytes'), '100');
+
+    const r2 = await up(roomId, secret, a.token, Buffer.alloc(50), true);
+    assert.equal(r2.status, 204);
+    assert.equal(r2.headers.get('x-peer-backlog-bytes'), '150');
+
+    // Draining one frame shrinks the backlog reported on the next up.
+    const d = await down(roomId, secret, b.token, false);
+    assert.equal(d.status, 200);
+    const r3 = await up(roomId, secret, a.token, Buffer.alloc(8), true);
+    assert.equal(r3.status, 204);
+    assert.equal(r3.headers.get('x-peer-backlog-bytes'), '58');
 });
 
 test('close endpoint tears down both sides', async () => {
