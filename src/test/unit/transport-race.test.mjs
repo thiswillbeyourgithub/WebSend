@@ -195,6 +195,64 @@ test('close() closes both inners and clears the grace timer', async () => {
     assert.equal(connected, 0);
 });
 
+test('buffers pre-winner messages and replays them in order when that inner wins', async () => {
+    const { win, webrtc, ws } = await loadTransport();
+    const t = new win.Transport.RacingTransport('receiver');
+    await t.init();
+    const received = [];
+    t.onMessage = (m) => received.push(m);
+
+    // WS connects (arms grace, no winner yet). The peer's public-key (and a
+    // follow-up) arrive before a winner is locked. Old behaviour: dropped,
+    // handshake hangs, verification modal never shows.
+    ws._markConnected();
+    ws.onMessage({ type: 'public-key', key: 'k1' });
+    ws.onMessage({ type: 'fingerprint-confirmed' });
+    assert.deepEqual(received, [], 'nothing should be delivered before a winner is locked');
+
+    // WebRTC fails -> WS wins immediately and replays its buffer in order.
+    webrtc.onDisconnected();
+    assert.equal(t.winner, 'ws');
+    assert.deepEqual(received, [
+        { type: 'public-key', key: 'k1' },
+        { type: 'fingerprint-confirmed' },
+    ], 'buffered messages must be replayed in arrival order on winner lock');
+    t.close();
+});
+
+test('discards the losing inner\'s buffered pre-winner messages', async () => {
+    const { win, webrtc, ws } = await loadTransport();
+    const t = new win.Transport.RacingTransport('receiver');
+    await t.init();
+    const received = [];
+    t.onMessage = (m) => received.push(m);
+
+    ws._markConnected();
+    ws.onMessage({ type: 'from-ws' }); // buffered on the soon-to-be loser
+    webrtc.onConnected();              // WebRTC wins immediately
+    assert.equal(t.winner, 'webrtc');
+    assert.deepEqual(received, [], 'WS buffer must be discarded because WebRTC won');
+
+    ws.onMessage({ type: 'late' });    // loser's live message: still dropped
+    assert.deepEqual(received, []);
+    t.close();
+});
+
+test('caps the pre-winner message buffer so a hostile relay cannot grow it unbounded', async () => {
+    const { win, webrtc, ws } = await loadTransport();
+    const t = new win.Transport.RacingTransport('receiver');
+    await t.init();
+    const received = [];
+    t.onMessage = (m) => received.push(m);
+
+    ws._markConnected();
+    for (let i = 0; i < 100; i++) ws.onMessage({ type: 'flood', i });
+    webrtc.onDisconnected(); // WS wins, replays whatever was buffered
+    assert.ok(received.length > 0 && received.length <= 16,
+        `buffer must be bounded (<=16), replayed ${received.length}`);
+    t.close();
+});
+
 test('Transport namespace exposes RACE_GRACE_MS for the wider system', async () => {
     const { win } = await loadTransport();
     assert.equal(typeof win.Transport.RACE_GRACE_MS, 'number');

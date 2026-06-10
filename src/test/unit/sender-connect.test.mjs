@@ -37,14 +37,21 @@ function setup({ deriveSharedKeyCallback } = {}) {
             return { __fake: 'shared' };
         },
         exportPublicKey: async () => 'b64pubkey',
-        getKeyFingerprint: async () => 'AAAA-BBBB-CCCC-DDDD',
+        // Derive a distinct fingerprint per key so the tests can tell a
+        // genuine mid-session re-key (different key -> different fingerprint,
+        // must be blocked) from a duplicate re-send of the SAME key (same
+        // fingerprint -> idempotent reply). importPublicKey wraps the raw key
+        // as { __imported }, while the sender's own public key arrives as the
+        // bare 'pub' string from generateKeyPair.
+        getKeyFingerprint: async (k) =>
+            'FP-' + (k && k.__imported !== undefined ? k.__imported : k),
         getCombinedFingerprint: async () => 'AAAA-BBBB-CCCC-DDDD',
     };
     win.WebSendRTC = class {
-        constructor() { this.iceServers = []; }
+        constructor() { this.iceServers = []; this.sent = []; }
         async init() {}
         async joinRoom() {}
-        sendMessage() {}
+        sendMessage(m) { this.sent.push(m); }
         close() {}
     };
     // sender-connect.js now obtains its transport through window.Transport
@@ -143,6 +150,38 @@ test('handlePublicKey blocks mid-session re-key after sharedKey established', as
     assert.ok(
         ctx.toasts.some(t => /rekey|re-key/i.test(t.m)),
         `a user-visible toast should fire, got: ${JSON.stringify(ctx.toasts)}`
+    );
+});
+
+test('handlePublicKey re-sends reply idempotently for a DUPLICATE same-key public-key', async () => {
+    const ctx = setup();
+    await ctx.win.SenderConnect.init();
+
+    const rtc = ctx.win.SenderConnect.getRtc();
+    // First public-key: legitimate, derives + answers with sender-public-key.
+    await rtc.onMessage({ type: 'public-key', key: 'aaaa' });
+    assert.equal(ctx.getDeriveCalls(), 1, 'first public-key derives shared key');
+    assert.equal(ctx.getFingerprintReadyCalled(), 1, 'fingerprint UI shown once');
+
+    // Second public-key carrying the SAME key: the receiver never got our
+    // first reply (dropped before a race winner locked) and is re-sending.
+    // This is not an attack: re-send our public-key, do not derive again,
+    // do not re-prompt, do not warn or toast about a re-key.
+    const sentBefore = rtc.sent.length;
+    await rtc.onMessage({ type: 'public-key', key: 'aaaa' });
+    assert.equal(ctx.getDeriveCalls(), 1, 'duplicate public-key must NOT derive again');
+    assert.equal(ctx.getFingerprintReadyCalled(), 1, 'fingerprint UI must not re-fire on a duplicate');
+    assert.ok(
+        rtc.sent.slice(sentBefore).some(m => m && m.type === 'sender-public-key'),
+        `sender must re-send its public-key for a duplicate, sent: ${JSON.stringify(rtc.sent)}`
+    );
+    assert.ok(
+        !ctx.logs.warn.some(m => /unexpected public-key|already completed/i.test(m)),
+        `no re-key warning should fire for a duplicate, got: ${JSON.stringify(ctx.logs.warn)}`
+    );
+    assert.ok(
+        !ctx.toasts.some(t => /rekey|re-key/i.test(t.m)),
+        `no re-key toast should fire for a duplicate, got: ${JSON.stringify(ctx.toasts)}`
     );
 });
 

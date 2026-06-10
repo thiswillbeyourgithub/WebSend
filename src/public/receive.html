@@ -151,7 +151,7 @@
     <script src="/js/transport-assembler.js" integrity="sha384-Bfk+ad/+nGjfQ/LOECACnUHHm+eYXdvC66xt/RzvJMW+dqs/caqQwnXFt7awFQHA"></script>
     <script src="/js/ws-transport.js" integrity="sha384-Vu9BVIScT1GNfpENnIRNtET+llG8cFHVkrC7gjkoTcfAKJ979VYJS1I3Zkv6uldT"></script>
     <script src="/js/lp-transport.js" integrity="sha384-WsbHEr6asvYNaEuthqP0fEyjKUKCMjhpne09J4H+a2pyELZ3lUE5mjGVJcs/F0mr"></script>
-    <script src="/js/transport.js" integrity="sha384-qdaeaQh3ipSDtTbGWhLXxOr5SUv25va00qTe7X5pkdXWh2g9rdLYjF6CkbS8MOiZ"></script>
+    <script src="/js/transport.js" integrity="sha384-oGJ3hjbml/48JY+d+zAAyjuXmONglVCadCSnabVbcLJcMdYh8a1YaD7tVPa0FtuN"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-WW/PDR2LrwH+LDPGHOqpr1zEZ2ittN4of22aRMSuLRiKCNw+1aSkOP6mHNGwCaW8"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-uMrESk94t8vNbYOfNElA05X6xrtx22R84sVmUFOPMhOuJMf3kxW9EW+Ccpm/O4v0"></script>
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
@@ -208,6 +208,9 @@
         // successful re-handshake; lets handleSenderPublicKey take the
         // fingerprint-match branch.
         let inReconnect = false;
+        // Interval that re-sends our public-key until the sender's
+        // sender-public-key reply arrives (see startPublicKeyResend).
+        let publicKeyResendTimer = null;
         let receivedImages = []; // Store {data: Uint8Array, mimeType: string, name: string, ocrPageData: object|null}
         const preBWData = {}; // Pre-BW originals for undo, keyed by imageIndex (used by applyBWToImage and TransformReplay)
         let pendingReplaceHash = null; // Hash of image being replaced by an incoming edit
@@ -537,6 +540,13 @@
                 const sent = await sendMessageWithRetry(Protocol.build.publicKey(publicKeyB64), 'public-key');
                 if (sent) {
                     logger.info('Sent public key to sender');
+                    // Keep re-sending until the sender replies. The sender
+                    // sends sender-public-key only in response, so if our one
+                    // public-key is lost (e.g. the two peers locked different
+                    // race winners and it reached a transport the sender had
+                    // already closed) the handshake would hang and the
+                    // verification modal would never appear.
+                    startPublicKeyResend(publicKeyB64);
                 } else {
                     const errEl = document.querySelector('#step-connected .status');
                     if (errEl) {
@@ -551,6 +561,33 @@
                     errEl.textContent = i18n.t('receive.initFailed');
                     errEl.className = 'status status-error';
                 }
+            }
+        }
+
+        // Re-send our public-key on an interval until the sender replies
+        // with sender-public-key (which clears the timer in
+        // handleSenderPublicKey). Bounded so we never spin forever against a
+        // genuinely dead peer; the in-flight handshake also stops it via the
+        // sharedKey guard once the reply is processed.
+        const PUBLIC_KEY_RESEND_INTERVAL_MS = 2000;
+        const PUBLIC_KEY_MAX_RESENDS = 5;
+        function startPublicKeyResend(publicKeyB64) {
+            stopPublicKeyResend();
+            let attempts = 0;
+            publicKeyResendTimer = setInterval(() => {
+                if (sharedKey || attempts >= PUBLIC_KEY_MAX_RESENDS) {
+                    stopPublicKeyResend();
+                    return;
+                }
+                attempts++;
+                logger.info(`Re-sending public-key (attempt ${attempts}); awaiting sender reply`);
+                rtc.sendMessage(Protocol.build.publicKey(publicKeyB64));
+            }, PUBLIC_KEY_RESEND_INTERVAL_MS);
+        }
+        function stopPublicKeyResend() {
+            if (publicKeyResendTimer) {
+                clearInterval(publicKeyResendTimer);
+                publicKeyResendTimer = null;
             }
         }
 
@@ -765,6 +802,7 @@
 
             // Reset per-pairing crypto state. User data (receivedImages, OCR,
             // preBWData, collections) is intentionally preserved.
+            stopPublicKeyResend();
             keyPair = null;
             sharedKey = null;
             weConfirmed = false;
@@ -909,6 +947,8 @@
          * crypto state should remain in memory.
          */
         function cleanupAllData() {
+            // Stop any in-flight public-key resend loop from a prior pairing.
+            stopPublicKeyResend();
             // Revoke all object URLs from displayed images
             document.querySelectorAll('.received-image-item').forEach(c => ReceiveCard.revokeCardUrls(c));
             // Cancel all background OCR + dispose scribe + null per-image OCR
@@ -970,6 +1010,8 @@
 
 
         async function handleSenderPublicKey(msg) {
+            // The sender replied, so stop re-sending our public-key.
+            stopPublicKeyResend();
             // Sender sent their ECDH public key - derive shared secret.
             //
             // Defense-in-depth: a fresh sender-public-key always closes the
@@ -981,6 +1023,25 @@
             // is blocked by VERIFIED_GATED_HANDLERS. Clearing sharedKey here
             // also means decryption would fail even if the gate were bypassed.
             const isRekey = sharedKey !== null;
+
+            // Idempotent duplicate: a sender-public-key carrying the SAME key
+            // (outside a reconnect) means our reply crossed with the sender's
+            // re-send of its public-key, or our public-key resend prompted a
+            // second reply. Ignore it rather than tearing down the already-
+            // verified session and reshowing the modal. A DIFFERENT key falls
+            // through to the full rekey path below.
+            if (isRekey && !inReconnect && cachedSenderFingerprint) {
+                try {
+                    const dupKey = await WebSendCrypto.importPublicKey(msg.key);
+                    const dupFp = await WebSendCrypto.getKeyFingerprint(dupKey);
+                    if (dupFp === cachedSenderFingerprint) {
+                        logger.info('Ignoring duplicate sender-public-key (same key, reply crossed with a re-send)');
+                        return;
+                    }
+                } catch (e) {
+                    logger.warn('Duplicate sender-public-key check failed: ' + e.message + '; treating as fresh');
+                }
+            }
 
             // Reconnect branch: a rekey arriving while inReconnect was set
             // is verified against the cached fingerprints. If the

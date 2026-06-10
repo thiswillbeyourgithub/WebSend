@@ -162,7 +162,18 @@ WebSend/
         │   │               #   transport type. WebRTC is preferred via a
         │   │               #   RACE_GRACE_MS (10 s) window; the loser is closed when
         │   │               #   a winner locks in. Reconnect loop with cap-5 s backoff
-        │   │               #   re-claims a fresh slot forever on a transient drop
+        │   │               #   re-claims a fresh slot forever on a transient drop.
+        │   │               #   Inbound messages that arrive on an inner BEFORE a
+        │   │               #   winner is locked are buffered per-inner (bounded by
+        │   │               #   MAX_PENDING_MSGS) and replayed in _lockWinner once
+        │   │               #   that inner wins (losers' queues discarded). Without
+        │   │               #   this the peer's once-sent public-key could land in
+        │   │               #   the ~1-RTT gap before the winner locked and be
+        │   │               #   silently dropped, hanging the ECDH handshake so the
+        │   │               #   verification modal never appeared. The receiver also
+        │   │               #   re-sends its public-key (startPublicKeyResend, ~2 s x5)
+        │   │               #   until sender-public-key arrives, as belt-and-braces
+        │   │               #   for the winner-divergence variant
         │   ├── transport-assembler.js # PayloadAssembler: shared receive-state
         │   │               #   machine (file-start / binary chunks / file-end /
         │   │               #   file-ack / file-nack) plus anti-DoS bounds

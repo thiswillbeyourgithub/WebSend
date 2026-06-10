@@ -57,6 +57,13 @@
     // converge at the same retry rate.
     const RECONNECT_BACKOFF_MS = [500, 1_000, 2_000, 5_000];
 
+    // Bound on how many pre-winner inbound messages we buffer per inner.
+    // Only control messages flow before a winner is locked (public-key,
+    // and at most a fingerprint-confirmed / ready behind it), so this is
+    // comfortably above any legitimate need while denying a hostile relay
+    // an unbounded queue.
+    const MAX_PENDING_MSGS = 16;
+
     class RacingTransport {
         constructor(role) {
             this._role = role; // 'receiver' or 'sender', informational
@@ -95,8 +102,16 @@
             // the relay grace path) — without the cache the upward call is
             // dropped because this.winner is still null when CT arrives.
             this._pendingCT = { webrtc: null, ws: null, lp: null };
-            // Cached so we can openSlotA / openSlotB on the LP inner when
-            // we spawn it after WS already had its turn at room setup.
+            // Inbound application messages that arrived on an inner BEFORE a
+            // winner was locked, keyed by inner name. A control message (the
+            // peer's public-key in particular) can arrive the instant an
+            // inner connects, one RTT before our own race-grace timer fires;
+            // without buffering it was silently dropped and, because the peer
+            // sends public-key only once, the ECDH handshake hung forever and
+            // the verification modal never appeared. We queue (bounded) and
+            // replay these in _lockWinner once an inner wins; the losers'
+            // queues are discarded. Same rationale as _pendingCT above.
+            this._pendingMsgs = { webrtc: [], ws: [], lp: [] };
             this._roomId = null;
             this._roomSecret = null;
             // Latched once close() runs so a late inner-connect callback
@@ -322,7 +337,25 @@
 
         _handleInnerMessage(name, msg) {
             if (this._closed) return;
-            if (this.winner === name && this.onMessage) this.onMessage(msg);
+            if (this.winner === name) {
+                if (this.onMessage) this.onMessage(msg);
+                return;
+            }
+            if (!this.winner) {
+                // No winner locked yet. Buffer this inner's message so it is
+                // replayed when (and if) this inner wins. Dropping it here is
+                // what caused the silent "no verification modal" hang on a
+                // fast relay connect.
+                const q = this._pendingMsgs[name];
+                if (q && q.length < MAX_PENDING_MSGS) {
+                    q.push(msg);
+                } else if (q) {
+                    logger.warn(`[Race] pre-winner message buffer for ${name.toUpperCase()} full; dropping a message`);
+                }
+                return;
+            }
+            // A different inner already won: this is a loser's late message.
+            // It was already closed by _lockWinner; drop it.
         }
 
         _handleInnerStateChange(name, state) {
@@ -375,6 +408,19 @@
             const cachedCT = this._pendingCT[name];
             if (cachedCT && this.onConnectionTypeDetected) {
                 this.onConnectionTypeDetected(cachedCT);
+            }
+            // Replay any inbound messages that arrived on the winning inner
+            // before it won (e.g. the peer's public-key on a fast relay
+            // connect), in arrival order. Without this the ECDH handshake
+            // would hang. Discard every inner's queue afterwards: the losers'
+            // buffered messages belong to connections we just closed.
+            const pendingMsgs = this._pendingMsgs[name] || [];
+            this._pendingMsgs = { webrtc: [], ws: [], lp: [] };
+            if (pendingMsgs.length) {
+                logger.info(`[Race] replaying ${pendingMsgs.length} buffered ${name.toUpperCase()} message(s) received before winner lock`);
+                for (const m of pendingMsgs) {
+                    if (this.onMessage) this.onMessage(m);
+                }
             }
         }
 

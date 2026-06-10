@@ -242,10 +242,28 @@
         // with our public-key so the receiver can do its own check.
         if (sharedKey) {
             if (!inReconnect) {
-                // Same refusal as before: a mid-session re-key without a
-                // reconnect signal would silently rotate the encryption
-                // key under fingerprint state the user has already
-                // confirmed.
+                // A duplicate public-key carrying the SAME key is not an
+                // attack: it means the receiver never got our
+                // sender-public-key reply (e.g. it was dropped before a race
+                // winner was locked, or the two peers locked different
+                // winners) and is re-sending. Treat it as idempotent and
+                // just re-send our reply so the handshake completes. Only a
+                // DIFFERENT key is a genuine unexpected mid-session re-key.
+                try {
+                    const incoming = await window.WebSendCrypto.importPublicKey(msg.key);
+                    const fp = await window.WebSendCrypto.getKeyFingerprint(incoming);
+                    if (fp === cachedTheirFingerprint) {
+                        const ourPublicKeyB64 = await window.WebSendCrypto.exportPublicKey(keyPair.publicKey);
+                        rtc.sendMessage(window.Protocol.build.senderPublicKey(ourPublicKeyB64));
+                        _logger.info('Re-sent sender-public-key for a duplicate receiver public-key (reply likely lost)');
+                        return;
+                    }
+                } catch (e) {
+                    _logger.warn('Failed to evaluate duplicate public-key: ' + e.message);
+                }
+                // A mid-session re-key with a DIFFERENT key would silently
+                // rotate the encryption key under fingerprint state the user
+                // has already confirmed.
                 _logger.warn('Ignoring unexpected public-key after key exchange already completed');
                 _showToast(_i18n.t('send.unexpectedRekey') || 'Unexpected re-key attempt blocked', { type: 'error', duration: 5000 });
                 return;
