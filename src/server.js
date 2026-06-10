@@ -1432,6 +1432,51 @@ function peerBacklogFull(peer) {
     return peer.readyState === peer.OPEN && peer.bufferedAmount > WS_PEER_BUFFER_MAX_BYTES;
 }
 
+// Low-water counterpart of peerBacklogFull: a paused WS feeder resumes
+// only once the peer has drained to half the cap, so the pause/resume
+// cycle doesn't flap on every single frame. A gone/closed peer reads as
+// "low" so the feeder is resumed and the normal teardown path runs.
+function peerBacklogLow(peer) {
+    if (!peer) return true;
+    if (peer.kind === 'lp') return peer.closed || peer.queue.length < LP_QUEUE_MAX_FRAMES / 2;
+    return peer.readyState !== peer.OPEN || peer.bufferedAmount < WS_PEER_BUFFER_MAX_BYTES / 2;
+}
+
+// How often a paused WS feeder re-checks its peer's backlog. Neither the
+// LP queue nor ws bufferedAmount emits a drain event, so polling is the
+// only resume signal; 50 ms is far below a receiver round trip.
+const WS_FEEDER_RESUME_POLL_MS = 50;
+
+// WS-path backpressure, the analogue of the 429 on /relay/up: when this
+// socket's peer cannot absorb more frames, stop reading from the sender's
+// TCP socket so the kernel window fills and the sending browser throttles
+// on its own ws.bufferedAmount. Without this the server either buffered
+// the overflow in process memory without bound (WS peer) or overflowed
+// the LP queue (WS sender -> LP receiver), which used to drop frames and
+// corrupt the file. Frames already received by the ws parser still flow
+// after pause(), so the peer queue can exceed its bound by that in-flight
+// sliver only.
+function maybePauseWsFeeder(ws, room, slot) {
+    if (ws._backpressureTimer) return; // already paused
+    // Re-resolve the peer on every check: the peer slot can be replaced
+    // by a re-handshake while we are paused, and holding a stale ref
+    // would watch (and resume on) the wrong object.
+    const peerNow = () => room.relay && (slot === 'a' ? room.relay.b : room.relay.a);
+    if (!peerBacklogFull(peerNow())) return;
+    const sock = ws._socket;
+    if (!sock || typeof sock.pause !== 'function') return;
+    sock.pause();
+    ws._backpressureTimer = setInterval(() => {
+        if (ws.readyState === ws.OPEN && !peerBacklogLow(peerNow())) return;
+        clearInterval(ws._backpressureTimer);
+        ws._backpressureTimer = null;
+        if (ws.readyState === ws.OPEN) {
+            try { sock.resume(); } catch (_) {}
+        }
+    }, WS_FEEDER_RESUME_POLL_MS);
+    ws._backpressureTimer.unref && ws._backpressureTimer.unref();
+}
+
 // Pop the next frame off an LP slot's queue, keeping queueBytes in sync.
 // Every dequeue must go through here or the backlog accounting drifts.
 function lpDequeue(slot) {
@@ -1548,10 +1593,15 @@ function attachRelay(room, ws, slot) {
         // If the peer hasn't joined yet, the frame is dropped on the
         // floor. We don't buffer because the protocol is interactive:
         // dropped pre-handshake frames are renegotiated by the client.
+        maybePauseWsFeeder(ws, room, slot);
     });
 
     ws.on('close', () => {
         relayPings.delete(ws);
+        if (ws._backpressureTimer) {
+            clearInterval(ws._backpressureTimer);
+            ws._backpressureTimer = null;
+        }
         if (room.relay) {
             room.relay[slot] = null;
             // Tear down the peer too: the pair is symmetric; once one

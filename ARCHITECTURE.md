@@ -893,7 +893,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     when the peer's queue is full (or a WS peer's socket buffer exceeds
     8 MiB), `/relay/up` answers 429 and the client retries the same
     frame on a short gap (bounded at 30 s of solid 429s), so a slow
-    receiver can never cause chunk loss mid-file. Successful `/relay/up`
+    receiver can never cause chunk loss mid-file. A WS sender is
+    backpressured the TCP way instead: the server pauses the sender's
+    socket while the peer's backlog is full and resumes it below half
+    the cap, which also keeps a fast WS sender from ballooning server
+    memory toward the 4 GiB session cap. Successful `/relay/up`
     responses carry an `X-Peer-Backlog-Bytes` header (bytes accepted but
     not yet drained by the peer) which the LP sender subtracts from its
     progress display so both ends report delivered bytes. The

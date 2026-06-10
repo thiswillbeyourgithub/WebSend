@@ -75,3 +75,37 @@ export async function createRoom(baseUrl, origin) {
     });
     return res.json();
 }
+
+// Long-poll relay endpoint wrappers, shared by relay-lp.test.mjs and the
+// cross-kind (WS sender -> LP receiver) tests in relay-ws.test.mjs.
+
+export function lpHandshake(baseUrl, roomId, secret) {
+    return fetch(`${baseUrl}/api/rooms/${roomId}/relay/handshake`, {
+        method: 'POST',
+        headers: { 'X-Room-Secret': secret, 'Content-Type': 'application/json' },
+        body: '{}',
+    });
+}
+
+export function lpUp(baseUrl, roomId, secret, token, body, isBinary) {
+    return fetch(`${baseUrl}/api/rooms/${roomId}/relay/up`, {
+        method: 'POST',
+        headers: {
+            'X-Room-Secret': secret,
+            'X-Slot-Token': token,
+            // text/plain (not application/json) so the global express.json()
+            // body parser doesn't intercept the body before our route's raw
+            // parser; matches what lp-transport.js sends from the browser.
+            'Content-Type': isBinary ? 'application/octet-stream' : 'text/plain',
+        },
+        body,
+    });
+}
+
+export function lpDown(baseUrl, roomId, secret, token, wait = false) {
+    const url = `${baseUrl}/api/rooms/${roomId}/relay/down${wait ? '?wait=true' : ''}`;
+    return fetch(url, {
+        method: 'GET',
+        headers: { 'X-Room-Secret': secret, 'X-Slot-Token': token },
+    });
+}

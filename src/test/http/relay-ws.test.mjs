@@ -3,6 +3,7 @@
  *
  * Covers:
  *   - happy path: two peers pair, binary + text frames forwarded both ways
+ *   - WS sender -> slow LP receiver: socket-pause backpressure, no frame loss
  *   - wrong secret  -> 401 close
  *   - missing room  -> 401 close (no enumeration oracle)
  *   - third peer    -> 409 close
@@ -18,7 +19,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import WebSocket from 'ws';
-import { startServer, stopServer } from './helpers.mjs';
+import { startServer, stopServer, lpHandshake, lpDown } from './helpers.mjs';
 
 let srv;
 before(async () => { srv = await startServer({ TEST_DISABLE_RATE_LIMIT: '1' }); });
@@ -121,6 +122,39 @@ test('happy path: two peers pair and exchange binary + text frames', async () =>
     assert.equal(got2.data.toString(), '{"type":"ping"}');
 
     a.close(); b.close();
+});
+
+test('WS sender feeding a slow LP receiver loses no frames (socket pause backpressure)', async () => {
+    const { roomId, secret } = await newRoom();
+    // LP receiver claims slot a first, then the WS sender joins as slot b.
+    const lp = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
+    const ws = await openWs(wsUrl(roomId, secret));
+
+    // Push well past LP_QUEUE_MAX_FRAMES (32) before the receiver drains
+    // anything. 64 KiB frames so the flood cannot fit in the kernel/parser
+    // buffers, forcing the server to actually pause the sender's socket
+    // (the old code silently dropped the oldest queued frame instead,
+    // corrupting the file). First byte of each frame is its sequence
+    // number so order and completeness are both asserted on drain.
+    const TOTAL = 48;
+    const FRAME = 64 * 1024;
+    for (let i = 0; i < TOTAL; i++) {
+        const frame = Buffer.alloc(FRAME, 0xab);
+        frame[0] = i;
+        ws.send(frame, { binary: true });
+    }
+
+    const got = [];
+    while (got.length < TOTAL) {
+        const d = await lpDown(srv.baseUrl, roomId, secret, lp.token, true);
+        if (d.status === 204) continue; // long-poll timeout while paused; repoll
+        assert.equal(d.status, 200);
+        const buf = Buffer.from(await d.arrayBuffer());
+        assert.equal(buf.length, FRAME);
+        got.push(buf[0]);
+    }
+    assert.deepEqual(got, [...Array(TOTAL).keys()]);
+    ws.close();
 });
 
 test('wrong secret rejected with 401 (constant-time, no enumeration leak)', async () => {

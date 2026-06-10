@@ -18,7 +18,7 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startServer, stopServer } from './helpers.mjs';
+import { startServer, stopServer, lpHandshake, lpUp, lpDown } from './helpers.mjs';
 
 let srv;
 before(async () => { srv = await startServer({ TEST_DISABLE_RATE_LIMIT: '1' }); });
@@ -29,36 +29,11 @@ async function newRoom() {
     return res.json();
 }
 
-async function handshake(roomId, secret) {
-    return fetch(`${srv.baseUrl}/api/rooms/${roomId}/relay/handshake`, {
-        method: 'POST',
-        headers: { 'X-Room-Secret': secret, 'Content-Type': 'application/json' },
-        body: '{}',
-    });
-}
-
-async function up(roomId, secret, token, body, isBinary) {
-    return fetch(`${srv.baseUrl}/api/rooms/${roomId}/relay/up`, {
-        method: 'POST',
-        headers: {
-            'X-Room-Secret': secret,
-            'X-Slot-Token': token,
-            // text/plain (not application/json) so the global express.json()
-            // body parser doesn't intercept the body before our route's raw
-            // parser; matches what lp-transport.js sends from the browser.
-            'Content-Type': isBinary ? 'application/octet-stream' : 'text/plain',
-        },
-        body,
-    });
-}
-
-async function down(roomId, secret, token, wait = false) {
-    const url = `${srv.baseUrl}/api/rooms/${roomId}/relay/down${wait ? '?wait=true' : ''}`;
-    return fetch(url, {
-        method: 'GET',
-        headers: { 'X-Room-Secret': secret, 'X-Slot-Token': token },
-    });
-}
+// Thin aliases over the shared wrappers (helpers.mjs) so the test bodies
+// don't have to thread srv.baseUrl through every call.
+const handshake = (roomId, secret) => lpHandshake(srv.baseUrl, roomId, secret);
+const up = (roomId, secret, token, body, isBinary) => lpUp(srv.baseUrl, roomId, secret, token, body, isBinary);
+const down = (roomId, secret, token, wait = false) => lpDown(srv.baseUrl, roomId, secret, token, wait);
 
 test('handshake assigns slot a then b, third gets 409', async () => {
     const { roomId, secret } = await newRoom();
