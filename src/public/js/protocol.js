@@ -7,16 +7,18 @@
     const PROTOCOL_VERSION = 1;
 
     // Hard upper bound on a single file. Bounds MAX_SEG_COUNT below, so a
-    // hostile or buggy peer cannot request a multi-GB allocation or break
-    // progress arithmetic.
-    const MAX_FILE_SIZE = 1024 * 1024 * 1024;
+    // hostile or buggy peer cannot request an oversized record stream or
+    // break progress arithmetic. 4 GiB: the v2 chunked format holds one
+    // segment at a time, so receiver memory no longer scales with this.
+    const MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024;
 
     // Hard ceiling on the cumulative bytes a single peer may push across the
-    // entire data-channel session. Even with the per-file expectedSize cap a
-    // hostile peer could otherwise loop file-start/binary/file-end forever and
-    // exhaust the receiver tab. 4 GiB is well above legitimate use (a camera
-    // session of dozens of high-res photos rarely exceeds a few hundred MB).
-    const MAX_TOTAL_SESSION_BYTES = 4 * 1024 * 1024 * 1024;
+    // entire data-channel session. Even with the per-file segCount cap a
+    // hostile peer could otherwise loop file-start/binary/file-end forever
+    // and exhaust the receiver tab. 8 GiB = one max-size file plus wire
+    // overhead plus a full rewound resend of its tail (every rewind/resume
+    // re-sends records that already counted against the session).
+    const MAX_TOTAL_SESSION_BYTES = 8 * 1024 * 1024 * 1024;
 
     // v2 chunked-file format: plaintext bytes per data segment. Fixed for
     // now (the file-start field exists for forward compatibility); both the

@@ -264,13 +264,26 @@ app.use(express.json({ limit: '50kb' }));
 
 // In-memory room storage (in production, use Redis or similar)
 const rooms = new Map();
-const ROOM_TTL = 10 * 60 * 1000; // 10 minutes TTL
+// Idle TTL. Signaling-only rooms expire ROOM_TTL after creation
+// (anti-squatting); once a relay session exists, every relayed frame
+// refreshes room.lastActivity, so a long transfer (a multi-GiB file on
+// the long-poll path can run for tens of minutes) is never killed
+// mid-flight while a stalled one still dies after ROOM_TTL of silence.
+// Env override is a test-only escape hatch (TTL-expiry http tests).
+const ROOM_TTL = parseInt(process.env.WEBSEND_ROOM_TTL_MS, 10) > 0
+    ? parseInt(process.env.WEBSEND_ROOM_TTL_MS, 10)
+    : 10 * 60 * 1000; // 10 minutes
+const ROOM_CLEANUP_INTERVAL_MS = parseInt(process.env.WEBSEND_ROOM_CLEANUP_INTERVAL_MS, 10) > 0
+    ? parseInt(process.env.WEBSEND_ROOM_CLEANUP_INTERVAL_MS, 10)
+    : 60 * 1000;
 
 // Server-side mirror of the protocol.js anti-DoS caps. These are enforced on
 // the HTTP-relay transport (commits 2 + 4) so a hostile client cannot ignore
 // the client-side bounds and force the relay container to forward unbounded
 // bytes between paired peers. Keep these in sync with public/js/protocol.js.
-const MAX_TOTAL_SESSION_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB
+// 8 GiB = one max-size file (4 GiB) plus wire overhead plus a full rewound
+// resend of its tail.
+const MAX_TOTAL_SESSION_BYTES = 8 * 1024 * 1024 * 1024; // 8 GiB
 const MAX_CONTROL_MSG_BYTES = 16 * 1024; // 16 KiB
 
 // Long-poll relay constants (commit 4). The LP transport uses two HTTP
@@ -280,18 +293,18 @@ const LP_DOWN_TIMEOUT_MS = 25_000;          // long-poll hold time
 const LP_QUEUE_MAX_FRAMES = 32;             // bounded per-slot incoming queue
 const LP_SLOT_TOKEN_BYTES = 16;             // 128-bit slot token
 // Per-frame body cap on /relay/up. 320 KiB sits just above the LP
-// CHUNK_SIZE (256 KiB, see lp-transport.js) with framing headroom. The
+// CHUNK_SIZE (300 KiB, see lp-transport.js) with headroom. The
 // WS/WebRTC paths still use 16 KiB chunks; the LP path is larger so a
 // big file does not need thousands of round-trips on the long-poll
-// transport. MAX_TOTAL_SESSION_BYTES (4 GiB) is the session-level
-// ceiling on top of this.
+// transport. MAX_TOTAL_SESSION_BYTES is the session-level ceiling on
+// top of this.
 const LP_FRAME_BODY_LIMIT = '320kb';
 const LP_SLOT_IDLE_TIMEOUT_MS = 60_000;     // close LP slot after this idle
 // Backpressure cap on a WS peer's outbound socket buffer. When an LP (or WS)
 // sender pushes frames faster than the receiving WS drains them, ws buffers
-// the overflow in server memory with no upper bound short of the 4 GiB
-// session cap. Same order of magnitude as the LP queue bound
-// (LP_QUEUE_MAX_FRAMES x 256 KiB = 8 MiB).
+// the overflow in server memory with no upper bound short of the session
+// byte cap. Same order of magnitude as the LP queue bound
+// (LP_QUEUE_MAX_FRAMES x ~300 KiB ≈ 9 MiB).
 const WS_PEER_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
 
 // ============ Rate Limiting ============
@@ -529,12 +542,20 @@ function validateRoomSecret(req, res, next) {
 }
 
 /**
- * Clean up expired rooms periodically
+ * Clean up expired rooms periodically.
+ *
+ * Two regimes: a room that never opened a relay session is pure
+ * signaling state and dies a fixed ROOM_TTL after creation, so a
+ * squatter cannot keep rooms alive by re-polling. Once a relay session
+ * exists, expiry is based on lastActivity (refreshed per relayed frame):
+ * an in-flight transfer lives as long as data moves, a dead pair still
+ * expires after ROOM_TTL of silence.
  */
 function cleanupRooms() {
     const now = Date.now();
     for (const [id, room] of rooms.entries()) {
-        if (now - room.created > ROOM_TTL) {
+        const reference = room.relay ? (room.lastActivity || room.created) : room.created;
+        if (now - reference > ROOM_TTL) {
             // Drain pending long-pollers with 404 before deleting the room.
             // Each waiter's settle() decrements _totalWaiters, so the global
             // counter stays consistent across normal and TTL-expiry paths.
@@ -576,8 +597,8 @@ const MAX_WAITERS_PER_ROOM = 4;
 const MAX_TOTAL_WAITERS = 10_000;
 let _totalWaiters = 0;
 
-// Run cleanup every minute
-setInterval(cleanupRooms, 60 * 1000);
+// Run cleanup every minute (env-shrunk in TTL-expiry tests)
+setInterval(cleanupRooms, ROOM_CLEANUP_INTERVAL_MS);
 
 // ============ Umami Analytics Injection ============
 // When Umami is configured, serve HTML files with the tracking script injected
@@ -808,6 +829,10 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
 
     rooms.set(roomId, {
         created: Date.now(),
+        // Refreshed by every relayed frame (LP up, WS message, LP down
+        // delivery). cleanupRooms expires relay rooms on inactivity but
+        // signaling-only rooms strictly on `created`.
+        lastActivity: Date.now(),
         secret: secret,
         offer: null,
         answer: null,
@@ -1162,7 +1187,7 @@ app.post('/api/rooms/:id/relay/handshake', rateLimitMiddleware('general'), valid
  */
 // No rateLimitMiddleware on /relay/up: the data path is already bounded by
 // the per-frame body cap (LP_FRAME_BODY_LIMIT), the per-pairing byte cap
-// (MAX_TOTAL_SESSION_BYTES = 4 GiB), the bounded peer queue (LP_QUEUE_MAX_FRAMES),
+// (MAX_TOTAL_SESSION_BYTES), the bounded peer queue (LP_QUEUE_MAX_FRAMES),
 // and the slot idle timeout (LP_SLOT_IDLE_TIMEOUT_MS). The slot token is
 // constant-time-compared so an attacker without the token cannot drive
 // this endpoint at all. The per-IP general bucket made multi-MB transfers
@@ -1221,6 +1246,7 @@ app.post(
             return res.status(413).json({ error: 'Session byte cap exceeded' });
         }
         armLpIdleTimer(slot);
+        room.lastActivity = Date.now();
         deliverToPeer(peer, data, isBinary);
         // Tell the sender how many bytes the peer has accepted but not yet
         // drained, so its progress display can show delivered bytes (the
@@ -1263,6 +1289,9 @@ app.get('/api/rooms/:id/relay/down', validateRoomSecret, (req, res) => {
     armLpIdleTimer(slot);
 
     const sendFrame = (frame) => {
+        // Delivery of an actual frame counts as activity; an empty poll
+        // does not, so polling alone cannot keep a room alive.
+        room.lastActivity = Date.now();
         if (frame.isBinary) {
             res.set('Content-Type', 'application/octet-stream');
             res.status(200).send(Buffer.isBuffer(frame.data) ? frame.data : Buffer.from(frame.data));
@@ -1580,7 +1609,7 @@ function attachRelay(room, ws, slot) {
         }
         r.sessionBytes += len;
         if (r.sessionBytes > MAX_TOTAL_SESSION_BYTES) {
-            // 4 GiB cap shared with the receiver-side cap (protocol.js
+            // Cap shared with the receiver-side cap (protocol.js
             // MAX_TOTAL_SESSION_BYTES). Tear down both sides so the
             // session is over end-to-end, not just on the hostile peer.
             const peer = slot === 'a' ? r.b : r.a;
@@ -1588,6 +1617,7 @@ function attachRelay(room, ws, slot) {
             teardownPeer(peer, 'Session byte cap exceeded');
             return;
         }
+        room.lastActivity = Date.now();
         const peer = slot === 'a' ? r.b : r.a;
         deliverToPeer(peer, data, isBinary);
         // If the peer hasn't joined yet, the frame is dropped on the

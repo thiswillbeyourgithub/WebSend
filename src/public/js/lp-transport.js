@@ -25,10 +25,10 @@
 
     const FILE_ACK_TIMEOUT_MS = 30_000;
     // LP uses larger chunks than WS/WebRTC because every chunk is a full
-    // HTTP round-trip; 256 KiB keeps a 10 MB transfer at ~40 POSTs instead
+    // HTTP round-trip; 300 KiB keeps a 10 MB transfer at ~35 POSTs instead
     // of 640. Must stay under the server's LP_FRAME_BODY_LIMIT (320 KiB)
-    // with headroom for framing.
-    const CHUNK_SIZE = 262_144; // 256 KiB
+    // with headroom.
+    const CHUNK_SIZE = 300 * 1024; // 300 KiB
     // The /relay/down endpoint blocks up to LP_SERVER_HOLD_MS server-side;
     // the client immediately re-polls on timeout. POLL_BACKOFF_MS is the
     // minimum gap between failed polls so a server-side error storm does
@@ -36,10 +36,11 @@
     const POLL_BACKOFF_MS = 1_000;
     // Voluntary client-side pacing on /relay/up. The server no longer
     // rate-limits the data path (see server.js commit), but a corporate
-    // proxy in front of the server might. 100 ms = ~10 req/sec which
-    // sits well below any sane proxy threshold while still pushing
-    // ~2.5 MB/sec at CHUNK_SIZE=256 KiB.
-    const LP_UP_MIN_GAP_MS = 100;
+    // proxy in front of the server might. 50 ms = 20 req/sec which
+    // still sits below typical proxy thresholds while pushing
+    // ~6 MB/sec at CHUNK_SIZE=300 KiB (a 4 GiB file in ~12 min rather
+    // than ~28, comfortably inside the activity-refreshed room TTL).
+    const LP_UP_MIN_GAP_MS = 50;
     // /relay/up answers 429 when the peer's queue is full (server-side
     // backpressure, replacing the old silent frame drop that corrupted
     // transfers). The queue drains one frame per receiver round trip
