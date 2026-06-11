@@ -30,8 +30,10 @@ connection-establishment timeout, seconds, default `15`), `DEV_FORCE_CONNECTION`
 `RELAY_HTTPS` / `RELAY_LP` for testing, default `DEFAULT`), `RELAY_ENABLE` (expose the
 HTTP-relay fallback transport, default `true`), `RELAY_LP_ONLY` (long-poll-only
 transport: suppresses WebRTC ICE servers and disables the WS relay endpoint so only
-the long-poll path is exposed, default `false`), and `TEST_DISABLE_RATE_LIMIT` (test
-escape hatch).
+the long-poll path is exposed, default `false`), `WEBSEND_ROOM_TTL_MS` /
+`WEBSEND_ROOM_CLEANUP_INTERVAL_MS` (room TTL and cleanup-sweep interval in ms,
+defaults 10 min / 1 min; mainly a test escape hatch), and `TEST_DISABLE_RATE_LIMIT`
+(test escape hatch).
 
 ## Directory Structure
 
@@ -116,17 +118,25 @@ WebSend/
         │   │               #   batch-end so a sender batch that failed before any
         │   │               #   file arrived leaves no blank Document N behind.
         │   │               #   Exposes window.Collections
-        │   ├── crypto.js   # ECDH key exchange (P-256) + AES-GCM-256 encryption via
-        │   │               #   Web Crypto API. Includes HKDF key derivation, a combined
-        │   │               #   two-key verification code for MITM detection, size-bucket padding
-        │   │               #   to hide exact file sizes, and metadata bundling (filename,
-        │   │               #   MIME type encrypted inside the payload)
+        │   ├── crypto.js   # ECDH key exchange (P-256) + AES-GCM-256 via Web Crypto.
+        │   │               #   deriveSessionKeys retains the ECDH bits as an HKDF base
+        │   │               #   key so each file gets its own subkey (deriveFileKey on a
+        │   │               #   random 16 B salt). sealSegment/openSegment implement the
+        │   │               #   STREAM-style chunked AEAD (counter nonce + final flag);
+        │   │               #   composite-hash helpers digest per-segment plaintexts into
+        │   │               #   the file identity hash. Also the combined two-key
+        │   │               #   verification code for MITM detection
         │   ├── protocol.js # Data-channel message schemas, validation, and builders.
         │   │               #   Exposes window.Protocol.validate(msg) → {ok,error} and
         │   │               #   Protocol.build.* typed builder functions (one per wire
         │   │               #   message type). Every builder stamps protocolVersion:1.
-        │   │               #   Includes bounded integer / size validation on file-start
-        │   │               #   so a hostile peer cannot trigger huge allocations.
+        │   │               #   v2 chunked-transfer messages: file-start {v:2, segSize,
+        │   │               #   segCount, salt}, segment-nack {seq}, segment-rewind
+        │   │               #   {seq, salt}, file-resume-offer {nextSeq},
+        │   │               #   file-resume-ack {nextSeq, salt}. Bounded validation
+        │   │               #   (segCount <= MAX_SEG_COUNT derived from the 4 GiB
+        │   │               #   MAX_FILE_SIZE, 16 B salts, seq ranges) so a hostile
+        │   │               #   peer cannot trigger huge allocations.
         │   │               #   Must be loaded before webrtc.js
         │   ├── webrtc.js   # WebRTC peer connection management: room creation/joining,
         │   │               #   SDP offer/answer exchange via server API, trickle ICE
@@ -174,11 +184,18 @@ WebSend/
         │   │               #   re-sends its public-key (startPublicKeyResend, ~2 s x5)
         │   │               #   until sender-public-key arrives, as belt-and-braces
         │   │               #   for the winner-divergence variant
-        │   ├── transport-assembler.js # PayloadAssembler: shared receive-state
-        │   │               #   machine (file-start / binary chunks / file-end /
-        │   │               #   file-ack / file-nack) plus anti-DoS bounds
+        │   ├── transport-assembler.js # PayloadAssembler: shared, crypto-free
+        │   │               #   streaming record parser for the v2 binary plane
+        │   │               #   ([4B seq][4B ctLen][ct] records that may span
+        │   │               #   transport chunks; at most one bounded partial record
+        │   │               #   buffered) plus control-plane handling (file-ack /
+        │   │               #   file-nack / segment-nack waiters) and anti-DoS bounds
         │   │               #   (MAX_TOTAL_SESSION_BYTES, MAX_CONTROL_MSG_BYTES,
-        │   │               #   MIN_FILE_START_SIZE). Operates on a host instance
+        │   │               #   record ctLen bounds, seq monotonicity). Emits
+        │   │               #   {type:'file-segment', seq, ct} upward; decryption
+        │   │               #   happens in receive-flow.js behind the verification
+        │   │               #   gate. resetParser() clears the partial buffer on
+        │   │               #   reconnect/rewind. Operates on a host instance
         │   │               #   (the transport itself) so WebRTC, WS, and LP share
         │   │               #   one implementation instead of three copies that can
         │   │               #   drift. Exposes window.PayloadAssembler
@@ -197,12 +214,16 @@ WebSend/
         │   │               #   Wire format identical to ws-transport.js. The
         │   │               #   per-slot token returned by /handshake authenticates
         │   │               #   subsequent up/down calls in addition to the room
-        │   │               #   secret. 256 KiB CHUNK_SIZE (vs. 16 KiB on WS/WebRTC)
-        │   │               #   because every chunk is a full HTTPS round-trip, plus
-        │   │               #   self-throttling at ~10 req/sec so a corp proxy in
+        │   │               #   secret. 300 KiB CHUNK_SIZE (vs. 16 KiB on WS/WebRTC,
+        │   │               #   under the server's 320kb frame body limit) because
+        │   │               #   every chunk is a full HTTPS round-trip, paced at a
+        │   │               #   50 ms minimum gap (~6 MB/s) so a corp proxy in
         │   │               #   front of us cannot trip us with its own bucket;
-        │   │               #   honours Retry-After on 429. Same DoS bounds and
-        │   │               #   PayloadAssembler reuse as ws-transport.js
+        │   │               #   honours Retry-After on 429. ALL /relay/up POSTs
+        │   │               #   (control + binary) ride one FIFO promise chain so
+        │   │               #   in-band ordering holds (segment-rewind must arrive
+        │   │               #   before the records resent under its salt). Same DoS
+        │   │               #   bounds and PayloadAssembler reuse as ws-transport.js
         │   ├── logger.js   # In-memory log buffer with UI panel (slide-up overlay).
         │   │               #   Supports info/success/warn/error/debug levels.
         │   │               #   DEV mode (toggled via server config) enables verbose output
@@ -249,13 +270,28 @@ WebSend/
         │   │               #   that hide the clear-vs-terminate API fork. Receive.html
         │   │               #   uses it for preloaded, background-queue, and per-export
         │   │               #   scribe lifecycles
-        │   ├── receive-flow.js # Decrypt-and-display pipeline for incoming
-        │   │               #   encrypted-file messages: decryptIncomingFile →
-        │   │               #   addNewReceivedImage / applyImageReplacement, plus
-        │   │               #   the handleEncryptedFile entry-point used by the
-        │   │               #   receive.html messageHandlers map. Cross-page state
-        │   │               #   (sharedKey, receivedImages, pendingReplaceHash, …)
-        │   │               #   passed via ReceiveFlow.attach({...}). Exposes
+        │   ├── segment-stream.js # v2 chunked-file streaming, loaded on both
+        │   │               #   pages. createSender turns a Blob into sealed wire
+        │   │               #   records one segment at a time (blob.slice, constant
+        │   │               #   memory, per-segment gzip when it shrinks, final-
+        │   │               #   segment padding); createReceiver verifies records in
+        │   │               #   order and accumulates plaintext as Blob parts.
+        │   │               #   transfer() drives a sender over any transport's io
+        │   │               #   primitives and owns the segment-nack → rewind →
+        │   │               #   resend retry tail (budget 3) so the three transports
+        │   │               #   share one state machine. Any rewind re-keys with a
+        │   │               #   fresh salt. Exposes window.SegmentStream
+        │   ├── receive-flow.js # Decrypt-and-display pipeline for incoming v2
+        │   │               #   chunked transfers: handleFileStart/handleFileSegment/
+        │   │               #   handleFileEnd own the SegmentReceiver lifecycle (all
+        │   │               #   decryption behind receive.html's verification gate),
+        │   │               #   the segment-nack/rewind retry state (budget 3, then
+        │   │               #   file-nack), reconnect resume state, and the display
+        │   │               #   flow (addNewReceivedImage / applyImageReplacement).
+        │   │               #   Files above the 64 MiB materialize threshold stay
+        │   │               #   Blob-backed and present as plain downloads. Cross-page
+        │   │               #   state (sessionKeys, receivedImages, pendingReplaceHash,
+        │   │               #   …) passed via ReceiveFlow.attach({...}). Exposes
         │   │               #   window.ReceiveFlow
         │   ├── receive-export.js # Export pipeline for the receive page: ZIP,
         │   │               #   plain PDF (via pdf-builder.js), OCR PDF (scribe.js
@@ -408,15 +444,68 @@ WebSend/
   14. Show same combined verification code ◀────────────────────▶ Show same combined code
   15. Both check the two screens match, confirm
 
-  ◀──────────────────────────────────── Encrypt photo (AES-GCM, padded)
-                                        Send via data channel chunks
-  16. Decrypt, display, offer download
-      Compute SHA-256 of decrypted data
-      Send file-ack {sha256} ─────────────────────────────────────────▶
-                                                                       17. Compare SHA-256 hashes
+  ◀──────────────────────────────────── Seal file as chunked AEAD records
+                                        (per-file subkey, 256 KiB segments)
+                                        Send records via data channel chunks
+  16. Verify each record as it arrives
+      (bad/missing record → segment-nack,
+       sender rewinds + re-keys + resends)
+      Display, offer download
+      Send file-ack {composite hash} ─────────────────────────────────▶
+                                                                       17. Compare composite hashes
                                                                            Match → "Verified!", clear photo
                                                                            Mismatch → error, offer retry
 ```
+
+### v2 chunked wire format (STREAM construction)
+
+Since v4.6.0 a file travels as independently authenticated AEAD records
+instead of one whole-file AES-GCM message, so the relay path never has to be
+trusted for integrity, a corrupted or dropped record is detected and retried
+at segment granularity, and both sides run in near-constant memory (raising
+the file cap to 4 GiB).
+
+- **Key schedule**: `deriveSessionKeys` retains the ECDH bits as an HKDF base
+  key. Per file the sender draws a random 16 B `fileSalt` and derives a
+  non-extractable AES-GCM-256 `fileKey` (`info="WebSend-segment-v2"`). The
+  salt travels in plaintext in `file-start`; without the ECDH secret it is
+  useless to an observer.
+- **Wire records**: `[4B BE seq][4B BE ctLen][ct]`. Record 0 seals the
+  metadata (JSON `{name, mimeType, originalSize}`, padded to a fixed 2 KiB so
+  the name length is not observable); records 1..segCount seal `SEG_SIZE`
+  (256 KiB) plaintext windows of the file.
+- **Segment plaintext**: `[1B flags][4B dataLen][data][random padding]`;
+  flags bit 0 = gzipped (per-segment `CompressionStream`, used only when it
+  shrinks). Only the final segment is padded (up to the nearest of 16 KiB /
+  64 KiB / 256 KiB); the segment count already reveals the size to SEG_SIZE
+  granularity on the wire.
+- **Nonce** (never on the wire): `7×0x00 || 4B BE seq || 1B isFinal`. The
+  counter defeats reordering/replay within the file, the final flag defeats
+  truncation.
+- **File identity / ack hash**: SHA-256 over the concatenation of the
+  per-segment plaintext SHA-256 digests (a composite hash; WebCrypto has no
+  streaming digest and the digest list is rewind-safe). Still hex64, so the
+  gallery `sentHash` / replace / delete / transform flows are unchanged
+  token comparisons.
+- **Retry and resume are one mechanism, and every rewind re-keys.** Because
+  per-segment gzip output is not guaranteed deterministic, a (key, nonce)
+  pair is never reused with possibly different plaintext: any rewind draws a
+  fresh salt that reaches the receiver strictly before the resent records
+  (`segment-rewind {seq, salt}` in-connection, `file-resume-ack {nextSeq,
+  salt}` across reconnects). In-connection: the receiver detects a bad record
+  (AEAD auth failure) or a short `file-end`, sends `segment-nack {seq}`, and
+  drops everything until the matching rewind; both sides budget 3 rounds,
+  then the receiver gives up with `file-nack` (`decrypt-failed` /
+  `incomplete`). Across reconnects: the receiver offers
+  `file-resume-offer {nextSeq}` and the sender either resumes from there
+  (rewinding its SegmentSender, which re-reads plaintext via `blob.slice()`;
+  no ciphertext is ever cached) or answers `{nextSeq: 0}` for a fresh start.
+- **Receiver memory**: each verified segment becomes its own Blob part; the
+  file is assembled with `new Blob(parts)` so the browser can spill to disk.
+  Files at or below 64 MiB are additionally materialized as a `Uint8Array`
+  for thumbnails / transforms / OCR / PDF rendering; larger files stay
+  Blob-only and present as plain downloads (ZIP export streams the stored
+  Blob).
 
 ### Image Edit Protocol (Transform Replay)
 
@@ -517,7 +606,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 - **Compromise of the user's HTTPS certificate authority.** Rationale: a forged certificate breaks the TLS layer underneath everything; the fingerprint ceremony still catches an active ECDH MITM on top of that, but confidentiality of the room ID and timing metadata is gone.
 - **Side-channel attacks against the browser's Web Crypto implementation.** Rationale: Web Crypto is the trusted cryptographic primitive; reimplementing it in user-space would expose worse side channels, not better ones.
 - **Vulnerabilities inside coturn or oauth2-proxy themselves.** Rationale: these are external components; WebSend's threat model assumes they are correct. `misc/check_turn.py` is provided as a manual probe.
-- **Traffic analysis beyond fixed-bucket size padding.** Rationale: padding to power-of-2 buckets hides the *exact* file size, but an observer can still see that some transfer happened, roughly when, and within which bucket. Hiding the timing pattern would require constant-rate padding traffic, which is not implemented.
+- **Traffic analysis beyond final-segment padding.** Rationale: padding the final segment (and the fixed-size metadata record) hides the *exact* file size, but an observer can still see that some transfer happened, roughly when, and its size to 256 KiB segment-count granularity. Hiding the timing pattern would require constant-rate padding traffic, which is not implemented.
 - **Targeted ECDH key-grinding to make the 96-bit combined code match.** Rationale: the code length (96 bits) is fixed regardless of server load; a determined attacker willing to spend significant compute can in principle grind a colliding combined code, but the cost is significant and the length is held constant for that reason. (See the explanatory paragraph at Layer §4.)
 
 ### Trust assumptions
@@ -533,7 +622,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 1. **End-to-end encryption**: ECDH P-256 key exchange + HKDF + AES-GCM-256. Server never
    sees keys or plaintext. Fresh ephemeral key pairs per session provide forward secrecy.
 2. **Zero server trust**: The server is a signaling relay only — it never sees encryption
-   keys, plaintext photos, or file metadata. Rooms are ephemeral (10-minute TTL, in-memory).
+   keys, plaintext photos, or file metadata. Rooms are ephemeral and in-memory: a
+   signaling-only room dies a fixed 10 minutes after creation (anti-squatting), a room
+   with a relay session expires after 10 minutes of inactivity (refreshed only when a
+   frame actually moves, so an in-flight transfer lives as long as data flows but a
+   poller cannot keep a dead room alive).
 3. **Room secrets**: 16-byte random token required for any room access. Passed in URL hash
    fragment (never sent to server in HTTP requests). Constant-time comparison prevents
    timing attacks. Prevents room enumeration even if the short room ID is guessed.
@@ -551,25 +644,27 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
    version (3-12 hex) was removed because at 3 hex chars the search is feasible in
    sub-second time on a laptop. `getKeyFingerprint` (64-bit, per key) is retained only
    for the reconnect peer-identity check and is not shown to the user.
-5. **Size obfuscation**: Photos are padded to power-of-2 bucket sizes before encryption,
-   hiding exact file sizes from network observers. Padding uses random bytes to prevent
-   compression-based attacks.
-6. **Pre-encryption compression**: `encryptWithMetadata` attempts `gzip` via
-   `CompressionStream` before encrypting and uses the compressed bytes only if they
-   shrink the payload (so JPEG/PNG/MP4 fall through unchanged). The `encoding=gzip`
-   flag travels inside the encrypted metadata block so an on-path observer cannot
-   tell whether a given payload was compressed. Compression happens before padding
-   so the bucket boundary still hides the underlying size.
+5. **Size obfuscation**: The exact file size lives only inside the encrypted metadata
+   record; the final segment is padded with random bytes (to the nearest of 16 / 64 /
+   256 KiB) so an observer learns the size only to segment-count granularity, which the
+   record stream reveals anyway. The metadata record is padded to a fixed 2 KiB so the
+   filename length is not observable either.
+6. **Pre-encryption compression**: each data segment attempts `gzip` via
+   `CompressionStream` before sealing and uses the compressed bytes only if they
+   shrink the segment (so JPEG/PNG/MP4 fall through unchanged). The gzip flag
+   travels inside the sealed segment, so an on-path observer cannot tell whether
+   a given segment was compressed.
 7. **Metadata encryption**: Filename, MIME type, and original size are encrypted inside the
-   payload, not sent in plaintext over the data channel.
-8. **Transfer integrity verification**: After decryption, the receiver computes SHA-256 of the
-   plaintext data and sends it back via `file-ack`. The sender compares it against its own
-   pre-encryption hash to confirm end-to-end integrity. On mismatch or timeout, the sender
-   can retry without losing the photo. Before decryption is even attempted, the assembler
-   checks that the byte count at `file-end` matches the `file-start` size; a short transfer
-   is nacked with the distinct `incomplete` error (byte counts are public, so this is not a
-   decryption oracle) and the sender shows a "data lost in transit, retry" message instead
-   of an opaque checksum failure.
+   metadata record (seq 0), not sent in plaintext over the data channel.
+8. **Transfer integrity verification**: every record is independently authenticated
+   (AES-GCM with a counter nonce and final-record flag), so corruption, reordering,
+   truncation, and stale-key records are all detected at the segment where they happen —
+   the relay never has to be trusted for integrity. A bad or missing record triggers the
+   segment-nack → rewind → re-key → resend retry path (budget 3) instead of failing the
+   file; budget exhaustion nacks with a failure class (`decrypt-failed` / `incomplete`)
+   that the sender maps to an informative toast. After the last record, the receiver
+   acks with the composite hash (SHA-256 over per-segment plaintext digests) which the
+   sender compares against its own to confirm end-to-end identity.
 9. **No phone storage**: Photos are captured directly in the browser and stay in memory only —
    never written to the phone's gallery, filesystem, or local storage. Photos are kept in
    memory until the receiver confirms successful receipt.
@@ -592,7 +687,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     `/relay/down`) is intentionally exempt: a single LP transfer is many POSTs,
     and corp NATs share one egress IP across many users, so a per-IP cap on the
     data path made multi-MB transfers impossible. The relay endpoints are still
-    bounded by the per-frame body cap, the per-pairing 4 GiB session cap, the
+    bounded by the per-frame body cap, the per-pairing 8 GiB session cap, the
     bounded peer queue, the slot idle timeout, and the constant-time slot-token
     check that gates every up/down call.
 13. **Origin validation**: API rejects requests from unauthorized origins (CSRF protection).
@@ -602,19 +697,21 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 16. **TURN relay security**: Time-based HMAC-SHA1 credentials with configurable TTL. Even
     when relayed through TURN, photos remain end-to-end encrypted — the TURN server only
     sees encrypted blobs.
-17. **Receiver-side payload bounding (anti-DoS)**: The data-channel binary branch refuses
-    chunks that arrive before a valid `file-start`, refuses any chunk that would push the
-    in-flight file past its declared `expectedSize`, and refuses any chunk that would
-    push the cumulative session bytes past `Protocol.MAX_TOTAL_SESSION_BYTES` (4 GiB).
-    On any of those, the data channel and peer connection are torn down immediately and
-    the application is notified via `onDisconnected`. `Protocol.MIN_FILE_START_SIZE`
-    (16 KiB, the smallest legitimate padded ciphertext) tightens the file-start size
-    validator so a hostile peer cannot smuggle a tiny declared size to keep the buffer
-    growing under the radar. These caps fire before fingerprint verification, so a
-    not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
-    The CLI shim (`src/cli/shim.js`) mirrors the same three bound checks plus a
-    verified-fingerprint gate on `file-start`/`file-end`/`batch-end` and binary chunks,
-    so the optional Node CLI receiver path enjoys the same protection as the browser path.
+17. **Receiver-side payload bounding (anti-DoS)**: the binary plane is a streaming
+    record parser (`transport-assembler.js handleBinaryV2`) that buffers at most one
+    partial record, hard-bounds every record's declared ciphertext length (16 bytes to
+    one sealed segment), refuses a record seq that skips ahead of the expected one
+    (framing desync), and refuses bytes that would push the cumulative session total
+    past `Protocol.MAX_TOTAL_SESSION_BYTES` (8 GiB; sized as one 4 GiB max file plus
+    overhead plus a fully rewound tail resend). On any of those, the data channel and
+    peer connection are torn down immediately and the application is notified via
+    `onDisconnected`. Records from an unverified peer are parsed and dropped in
+    constant memory (decryption only happens behind the verification gate in
+    receive-flow.js), so a not-yet-verified peer cannot OOM the receiver tab while the
+    verification modal is up. The CLI shim (`src/cli/shim.js`) mirrors the same parser
+    bounds plus a verified-fingerprint gate on `file-start`/`file-end`/`batch-end` and
+    binary chunks, so the optional Node CLI receiver path enjoys the same protection
+    as the browser path.
 18. **Transform-replay hardening (anti-DoS)**: `Protocol.isTransformArray` caps
     `transforms[]` length at `MAX_TRANSFORMS_PER_MSG` (32) and, for `op:'crop'`,
     requires `corners` to be `{tl,tr,br,bl}` with each `{x,y}` being a finite number
@@ -734,9 +831,10 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     user's PWA cache. Browser-level SRI on `<script integrity>` still
     rejects any tampered cached body at execution time; the SW filter
     is the belt-and-braces layer that avoids storing it in the first
-    place. The cache version was bumped (`websend-v1` → `websend-v2`)
-    so the activate handler evicts any cross-origin junk that earlier
-    SW versions may already have stored.
+    place. The cache version is bumped on releases that change cached
+    assets (`websend-v3` as of v4.6.0) so the activate handler evicts
+    stale entries, including any cross-origin junk that pre-filter SW
+    versions may have stored.
 26. **QR foreign-origin refusal**: the sender's scan / paste path runs
     every input through `QrParse.parseSendInvite(data, currentOrigin)`
     in `js/qr-parse.js`. If the input parses as a URL whose origin is
@@ -813,8 +911,9 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     sender disconnect keeps the same room/QR alive (so the same phone can re-scan and
     reconnect with data preserved), and a deliberate "Start new pairing" button rotates
     to a fresh room and shreds everything. The signaling relay stores **only** ephemeral
-    SDP + ICE in an in-memory `Map` with a 10-minute TTL and complete deletion on expiry —
-    no database, no filesystem writes for room data, and no cross-room caching.
+    SDP + ICE in an in-memory `Map` with a 10-minute TTL (inactivity-based once a relay
+    session exists, see §2) and complete deletion on expiry — no database, no filesystem
+    writes for room data, and no cross-room caching.
 33. **Frozen security-critical globals**: `Object.freeze` is applied at
     export time to every namespace object that holds a cryptographic
     primitive, a protocol builder, the verification gate, or the safe
@@ -856,27 +955,27 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     handler returns `{"error":"Not found"}` and crucially does not echo
     the requested path, denying an attacker the ability to smuggle
     HTML or ANSI into log scrapers via the URL.
-35. **Relay reconnect with byte-level resume**: When the WS or LP relay
+35. **Relay reconnect with record-level resume**: When a transport
     drops mid-transfer (proxy hiccup, network blip), the
     `RacingTransport` reconnect loop in `js/transport.js` re-claims a
-    fresh slot forever with a cap-5 s backoff. `js/ws-transport.js` and
-    `js/lp-transport.js` distinguish a transient close (new
-    `onTransientDisconnect` callback) from an explicit teardown, and
-    `js/transport-assembler.js` keeps the in-flight `receiveBuffer` /
-    `expectedSize` / `receivedSize` intact across the drop. On
+    fresh slot forever with a cap-5 s backoff. All three transports
+    (including WebRTC since v4.6.0) throw a tagged
+    `TransientDisconnectError` carrying the next record seq, so
+    `js/sender-send.js` pauses the queue head instead of failing the
+    file. The receiver's `ReceiveFlow` keeps its in-flight
+    SegmentReceiver (every record below `nextSeq` already verified). On
     reconnect, the receiver re-sends its public key (so the sender can
-    verify the cached fingerprint hasn't changed) and, if a partial
-    transfer exists, emits `file-resume-offer {size, received}`. The
-    sender's `js/sender-send.js` caches the encrypted ciphertext on the
-    queue head so the resume reuses the same GCM nonce (the receiver's
-    partial buffer remains decryptable); it replies with
-    `file-resume-ack {offset}` and continues binary chunks from that
-    offset. A peer-fingerprint mismatch on reconnect is treated as a
-    peer-swap and forces a fresh verification ceremony. All three
-    transports honour the resume offset in `sendFile` (a resumed send
-    skips `file-start` so the receiver's partial buffer is preserved);
-    WebRTC drops are still fatal in v1 (no ICE-restart reconnect yet),
-    so in practice resume engages on the relay paths.
+    verify the cached fingerprint hasn't changed) and emits
+    `file-resume-offer {nextSeq}`. The sender rewinds its SegmentSender
+    to that record — re-keying with a fresh salt, since a rewind must
+    never reuse a (key, nonce) pair — answers `file-resume-ack
+    {nextSeq, salt}`, and resends from there; plaintext is re-read via
+    `blob.slice()`, no ciphertext is ever cached. A resumed send skips
+    `file-start` so the receiver's verified prefix is preserved, and
+    the record parser is re-armed (`resetParser`) so a half-buffered
+    record from before the drop cannot poison the resumed stream. A
+    peer-fingerprint mismatch on reconnect is treated as a peer-swap
+    and forces a fresh verification ceremony.
 36. **HTTP-relay fallback transport**: Corporate networks that block UDP
     and strip TURNS-over-TCP at the proxy used to leave WebSend with no
     working path. v3.7.0 adds an HTTPS-only fallback that runs over the
@@ -892,7 +991,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     opaque ciphertext between the two paired peers; the existing ECDH +
     AES-GCM + fingerprint stack is transport-agnostic, so the server
     never sees plaintext. Anti-DoS caps mirror the WebRTC bounds:
-    `MAX_TOTAL_SESSION_BYTES` (4 GiB) and `MAX_CONTROL_MSG_BYTES`
+    `MAX_TOTAL_SESSION_BYTES` (8 GiB) and `MAX_CONTROL_MSG_BYTES`
     (16 KiB) enforced server-side, plus a bounded per-slot queue
     (32 frames) and idle timeout (60 s) on the long-poll path. The
     queue bound is enforced as backpressure, never as a silent drop:
@@ -903,7 +1002,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     backpressured the TCP way instead: the server pauses the sender's
     socket while the peer's backlog is full and resumes it below half
     the cap, which also keeps a fast WS sender from ballooning server
-    memory toward the 4 GiB session cap. Successful `/relay/up`
+    memory toward the 8 GiB session cap. Successful `/relay/up`
     responses carry an `X-Peer-Backlog-Bytes` header (bytes accepted but
     not yet drained by the peer) which the LP sender subtracts from its
     progress display so both ends report delivered bytes. The
@@ -979,7 +1078,7 @@ A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and abort
 **Not yet covered** (intentional gaps — documented so the picture is honest):
 - Frontend modules with no unit tests: `webrtc.js` (peer-connection state machine, chunked transfer, connection-type detection), `logger.js`, `i18n.js` — tightly coupled to real `RTCPeerConnection` / DOM, so the E2E tier exercises them instead.
 - Receiver UI logic: the perspective-crop tool and the **transform-replay protocol** (`transform-image` messages for `rotateCW` / `flipH` / `bw` / `crop`); the receiver-side replay handler lives in `js/transform-replay.js` (`window.TransformReplay`) and dispatches into `js/image-transforms.js`. The export modal (PDF / ZIP / B&W Otsu / scribe.js OCR / per-PDF actions) lives in `js/receive-export.js`; the hand-crafted minimal PDF generator lives in `js/pdf-builder.js` and has unit tests covering xref offsets, trailer size, and multi-image structure.
-- Protocol edge paths: fingerprint **mismatch / abort**, `file-ack` integrity **mismatch or timeout → retry**, room TTL expiry (10 min), SRI-mismatch failure mode. E2E only drives the happy path.
+- Protocol edge paths: fingerprint **mismatch / abort**, `file-ack` integrity **mismatch or timeout → retry**, SRI-mismatch failure mode. E2E only drives the happy path. (The segment-nack/rewind retry and resume paths ARE unit-covered — `segment-stream.test.mjs`, `receive-flow.test.mjs`, `v2-retry-integration.test.mjs`, `webrtc-send-resume.test.mjs` — and room TTL expiry/refresh is HTTP-covered by `room-ttl.test.mjs`.)
 - PWA service-worker caching + `controllerchange` auto-reload.
 - `src/healthcheck.js` and SSO / oauth2-proxy endpoints. The `TRUST_PROXY` env-var parsing in `server.js` is also uncovered (default `loopback` is exercised by the HTTP tier, but non-default values are not).
 - TURN time-based HMAC-SHA1 credential derivation (coturn itself is out of scope; `misc/check_turn.py` is the manual probe).
@@ -1039,7 +1138,7 @@ The client races three transports in parallel from the start:
    spawned on demand if the WS path disconnects before either side wins.
 
 A `relay-hello` handshake on top of the wire signals that both peers
-have actually joined before the racer fires `onConnected`. The 4 GiB
+have actually joined before the racer fires `onConnected`. The 8 GiB
 session cap and 16 KiB control-message cap are mirrored server-side so
 a malicious client cannot ignore the receiver-side bounds.
 

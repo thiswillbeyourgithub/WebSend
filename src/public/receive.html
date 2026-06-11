@@ -140,7 +140,7 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-0dSvlv3SiYAl7CSpPZuYlRMNgUe1tOUMDi9eU5ibRUHY0XaAoUNXmMUn3dv7Kh1A"></script>
+    <script src="/js/i18n.js" integrity="sha384-T+85V6n1SKAJhoPOoTWBNeCCzz7q4rgvQ5GNvImadeg9MJgsGGGMEyLCKUGPGonS"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-fst2l+qnD3PVySYzIxn0U+k9Ro9avFWmm7PiCJ3vW8k724XkJ6ooz084uzoApo0k"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-C9g9PypkkEoJ52ceSAwRjcc90zW8ndip0HK3IhCpQ8x233C1AIM+qpVUu41oa8hQ"></script>
@@ -163,8 +163,8 @@
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-r9ZhZZGoBjGXrxfB2k8TfZD8BTEOLdE/KsZ7ZN6mg8VqP0Rq8LriAXUDOF+vyjqA"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-A0vvgdJ8ktmC65klkTfsPqjIHZXNroXsONfZzY7jVL0rVoRSdExtZid0K+ZXuRTw"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-NH+XRrtXv6xYSNjsbbaYzmJyXTVVdKmnIDrKgUvWXmwSVwnrJV5X5G8UcLvJs5xi"></script>
-    <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-DgCbMzjz+dLHajRLh2nDm+gtkHG0wnliEk6C/iqoKATHPp1sLYZ0FkD2fdpk/PDg"></script>
-    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-1+5VRPYWvSqbXzV/112m9wTsYZ4liyHaEV4FHLYAbJYXC9A45vtr1Dh8Bu9CbyBr"></script>
+    <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-k/ah8ateHuYpet8W4GcGZ+A7kOq4oU5IyRquOUI/N4e6Nd2cC9sHdyuimkaOTN4g"></script>
+    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-ibr1472MItzRdV1jAs+IuPIEfhTHlGSbDsbqbZmrmi+lDCjCQreGtw70fuGeJkvf"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-+EEuhwDyVsHFYHHBmQGfcVn909daLZh+b/Gv6g8jfFqLUDuhkJZB3i9c2gXCkubt"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -966,6 +966,7 @@
                 const img = receivedImages[i];
                 if (img && typeof img === 'object') {
                     img.data = null;
+                    img.blob = null;
                     img.originalData = null;
                     img.ocrPageData = null;
                     img.pendingOcr = null;

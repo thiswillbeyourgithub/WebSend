@@ -101,26 +101,46 @@
     }
 
     /**
+     * Files at or below this many plaintext bytes are materialized as a
+     * Uint8Array (imgObj.data) so thumbnails, transforms, OCR, and PDF
+     * rendering work on them. Above it the file stays Blob-backed only:
+     * a 4 GiB ArrayBuffer would defeat the whole point of the chunked
+     * format's constant-memory receive path.
+     */
+    const MATERIALIZE_MAX_BYTES = 64 * 1024 * 1024;
+
+    /**
      * Sanitize peer-supplied metadata and shape a decrypted payload for
      * display (file-end finalization).
      * @param {Object} metadata - Raw peer metadata (sanitized in place)
-     * @param {ArrayBuffer} data - Verified plaintext
+     * @param {ArrayBuffer|null} data - Verified plaintext, or null for a
+     *     blob-only file above MATERIALIZE_MAX_BYTES
+     * @param {Blob} blob - The verified plaintext as a Blob
      */
-    function buildDecoded(metadata, data) {
+    function buildDecoded(metadata, data, blob) {
         metadata.name = sanitizeMetadataName(metadata.name);
         // Replace the peer-supplied mimeType with a sanitised value before
         // anything else reads it, so the rest of the pipeline (fileType
         // discrimination, fallback filename, BgOcr / Collections / cards)
         // can never see a malformed or oversized string.
         metadata.mimeType = sanitizeMimeType(metadata.mimeType);
-        _logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${data.byteLength} bytes)`);
+        _logger.info(`Decrypted file: ${metadata.name} (${metadata.mimeType}, ${blob.size} bytes)`);
 
-        const fileData = new Uint8Array(data);
+        const fileData = data !== null ? new Uint8Array(data) : null;
         const fileMimeType = metadata.mimeType;
-        const fileBlob = new Blob([fileData], { type: fileMimeType });
+        // Re-wrap with the sanitized MIME; Blob parts are referenced, not
+        // copied, so this is O(1) even for a multi-GiB blob-only file.
+        const fileBlob = fileData !== null
+            ? new Blob([fileData], { type: fileMimeType })
+            : new Blob([blob], { type: fileMimeType });
         const isImage = fileMimeType.startsWith('image/');
         const isPdf = fileMimeType === 'application/pdf';
-        const fileType = isImage ? 'image' : isPdf ? 'pdf' : 'other';
+        // Blob-only files are presented as generic downloads regardless of
+        // MIME: every image/pdf affordance (thumbnail decode, lightbox,
+        // transforms, OCR, mupdf page rendering) needs the materialized
+        // bytes and would otherwise re-inflate the file into memory.
+        const fileType = fileData === null ? 'other'
+            : isImage ? 'image' : isPdf ? 'pdf' : 'other';
         const ext = safeExtFromMime(fileMimeType);
         // photoCount is read here only to seed a fallback filename; the real
         // index is allocated below from receivedImages.length.
@@ -136,6 +156,7 @@
         _logger.info(`Replacing image at index ${replaceIdx}`);
 
         oldImg.data = fileData;
+        oldImg.blob = fileBlob;
         oldImg.mimeType = fileMimeType;
         oldImg.name = fileName;
         oldImg.fileType = fileType;
@@ -172,10 +193,11 @@
         // navigating to the URL (right-click "Open in New Tab" on the
         // download link or the thumbnail) cannot render peer-supplied
         // text/html or image/svg+xml inside our origin.
-        const fileUrl = window.ReceiveCard.makeSafeBlobUrl(fileData);
+        const fileUrl = window.ReceiveCard.makeSafeBlobUrl(fileBlob);
         const imageIndex = receivedImages.length;
         const imgObj = {
             data: fileData,
+            blob: fileBlob,
             mimeType: fileMimeType,
             name: fileName,
             hash: null,
@@ -197,9 +219,13 @@
         }
 
         _incrementPhotoCount();
-        window.Collections.addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileData.byteLength);
+        window.Collections.addReceivedFile(fileUrl, fileName, imageIndex, col.id, fileType, fileBlob.size);
 
         _updateExportButton();
+
+        if (fileData === null) {
+            _showToast(_i18n.t('receive.largeFileBlobOnly'), { type: 'info' });
+        }
 
         if (receivedImages.filter(img => img !== null && img.fileType === 'image').length === 1) {
             window.ReceiveExport.preloadClientZip();
@@ -442,8 +468,12 @@
             _finalizeReceiveStats();
 
             const { metadata, blob, compositeHashHex } = await receiver.finish();
+            // Above the threshold the file stays Blob-backed: never pull a
+            // multi-GiB ArrayBuffer into the tab. buildDecoded presents
+            // such files as plain downloads (fileType 'other').
+            const materialize = blob.size <= MATERIALIZE_MAX_BYTES;
             const decoded = buildDecoded(metadata && typeof metadata === 'object' ? metadata : {},
-                await blob.arrayBuffer());
+                materialize ? await blob.arrayBuffer() : null, blob);
             decoded.precomputedHash = compositeHashHex;
             await presentDecodedFile(decoded);
         });

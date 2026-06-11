@@ -25,7 +25,7 @@
   - [Receiver Payload Bounding (Anti-DoS)](#receiver-payload-bounding-anti-dos)
   - [Transform-Replay Hardening (Anti-DoS)](#transform-replay-hardening-anti-dos)
   - [Receiver UI DoS Hardening (Anti-DoS)](#receiver-ui-dos-hardening-anti-dos)
-  - [Metadata Protection](#metadata-protection)
+  - [Chunked Authenticated Encryption (v2 wire format)](#chunked-authenticated-encryption-v2-wire-format)
   - [Transfer Verification](#transfer-verification)
   - [No Phone Storage](#no-phone-storage)
   - [Cross-Session Data Isolation](#cross-session-data-isolation)
@@ -90,7 +90,7 @@ The protections listed in [Security Features](#security-features) below address 
 - Compromise of the user's HTTPS certificate authority.
 - Side-channel attacks against the browser's Web Crypto implementation.
 - Vulnerabilities inside coturn or oauth2-proxy themselves.
-- Traffic-analysis attacks beyond the fixed power-of-2 size-bucket padding (an observer can still see that *some* transfer happened and roughly when).
+- Traffic-analysis attacks beyond the built-in size obfuscation (random padding of the final segment and a fixed-size metadata record; an observer can still see that *some* transfer happened, roughly when, and its size to 256 KiB granularity).
 
 **Trust assumptions**:
 - Both endpoint devices, their operating systems, and their browsers behave honestly.
@@ -109,7 +109,7 @@ The protections listed in [Security Features](#security-features) below address 
 - The server acts as a **signaling relay only** (exchanges SDP connection metadata between peers)
 - The server **never sees encryption keys, plaintext photos, or file metadata**
 - All photo data travels **peer-to-peer** via WebRTC data channels (or encrypted through TURN/TURNS if relaying is needed)
-- Rooms and signaling data are **ephemeral** (10-minute TTL, stored in memory only)
+- Rooms and signaling data are **ephemeral** (stored in memory only; a signaling-only room dies 10 minutes after creation, a room carrying a relay transfer expires after 10 minutes of inactivity so long transfers are never cut off mid-flight)
 
 ### Supply Chain Attack Resistance
 - **No frameworks, no bundlers, no build tools**: the entire frontend is vanilla HTML, CSS, and JavaScript -- there is no `node_modules` in the browser, no transpilation step, and no dependency tree that could be poisoned
@@ -131,7 +131,7 @@ The protections listed in [Security Features](#security-features) below address 
 - This prevents room enumeration and unauthorized room access even if an attacker guesses or brute-forces the short room ID
 
 ### Rate Limiting and Origin Validation
-- **Per-IP rate limiting** on room creation (5/min), room lookups (30/min), and general API calls (100/min) to prevent DoS and enumeration. The general 100/min cap also covers `GET /api/rooms/:id/answer?wait=true` so a peer holding a valid secret cannot pipeline long-polls to exhaust memory. The HTTP-relay data path (`/relay/up`, `/relay/down`) is exempt: a single LP transfer is many POSTs and corporate NATs share one egress IP across many users, so a per-IP cap on the data path made multi-MB transfers impossible. The relay endpoints are still bounded by the per-frame body cap, the 4 GiB per-pairing session cap, the bounded peer queue (enforced as backpressure: `/relay/up` answers 429 when the peer's queue is full and a WS sender's socket is paused, so a slow receiver throttles the sender instead of losing frames), the slot idle timeout, and the per-slot token gating every call.
+- **Per-IP rate limiting** on room creation (5/min), room lookups (30/min), and general API calls (100/min) to prevent DoS and enumeration. The general 100/min cap also covers `GET /api/rooms/:id/answer?wait=true` so a peer holding a valid secret cannot pipeline long-polls to exhaust memory. The HTTP-relay data path (`/relay/up`, `/relay/down`) is exempt: a single LP transfer is many POSTs and corporate NATs share one egress IP across many users, so a per-IP cap on the data path made multi-MB transfers impossible. The relay endpoints are still bounded by the per-frame body cap, the 8 GiB per-pairing session cap, the bounded peer queue (enforced as backpressure: `/relay/up` answers 429 when the peer's queue is full and a WS sender's socket is paused, so a slow receiver throttles the sender instead of losing frames), the slot idle timeout, and the per-slot token gating every call.
 - **Origin header validation** blocks cross-origin API requests from unauthorized websites (CSRF-like protection)
 - Express **trusts proxy headers only from loopback**, so `X-Forwarded-For` cannot be spoofed by external clients (designed to run behind [Caddy](https://caddyserver.com/))
 - **Long-poll waiter caps**: layered defense for `?wait=true`. A per-room cap (4 concurrent waiters) refuses extras with 429, and a process-wide ceiling (10000 in-flight waiters) refuses extras with 503, before any socket / closure / timer is allocated.
@@ -142,9 +142,8 @@ The protections listed in [Security Features](#security-features) below address 
 - The default `ALLOWED_ORIGINS` no longer accepts the cleartext `http://{DOMAIN}` origin unless `DOMAIN` is the local-dev sentinel `localhost`.
 
 ### Receiver Payload Bounding (Anti-DoS)
-- The data-channel binary branch refuses chunks that arrive before a valid `file-start`, refuses any chunk that would push the in-flight file past its declared size, and refuses any chunk that would push the cumulative session bytes past 4 GiB. On any of those, the data channel and peer connection are torn down immediately.
-- The `file-start` size validator enforces a 16 KiB floor (the smallest legitimate padded ciphertext) so a hostile peer cannot smuggle a tiny declared size to keep the receive buffer growing under the radar.
-- These caps fire at the WebRTC layer, before fingerprint verification, so a not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
+- The binary plane is a streaming record parser that buffers at most one partial record, hard-bounds every record's declared ciphertext length, refuses a record sequence number that skips ahead (framing desync), and refuses bytes that would push the cumulative session total past 8 GiB (one 4 GiB max-size file plus protocol overhead plus a fully retried tail). On any of those, the data channel and peer connection are torn down immediately.
+- Decryption only happens after fingerprint verification; records from an unverified peer are parsed and dropped in constant memory, so a not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
 
 ### Transform-Replay Hardening (Anti-DoS)
 - The `transform-image` validator caps `transforms[]` length (32 ops max) and, for `op:'crop'`, requires four `{tl, tr, br, bl}` corners with normalized `{x, y}` in `[0, 1]`. Peer-supplied corners outside that range are rejected before any pixel work happens.
@@ -159,16 +158,17 @@ The protections listed in [Security Features](#security-features) below address 
 - `Collections.createNew()` refuses to allocate past 64 collections per session, so a verified-but-hostile peer flooding `batch-start` cannot grow receiver-side DOM/state without bound. The cap is reset on cross-session shred.
 - The logs panel does not append DOM nodes while it is hidden, and when visible trims its children to `logger.maxLogs` (500). On next open it rebuilds from the bounded in-memory log buffer. A pre-verification flood of invalid wire messages (each producing a `logger.warn`/`error`) can no longer grow the panel forever and OOM the tab.
 
-### Metadata Protection
-- File metadata (name, MIME type, original size) is **encrypted inside the payload**, not sent in plaintext over the data channel
-- Encrypted payloads are **padded to fixed bucket sizes** (16 KB to 32 MB, power-of-2) to hide the exact file size from network observers
-- Padding uses **random bytes** (not zeros) to prevent compression-based attacks
+### Chunked Authenticated Encryption (v2 wire format)
+- Since v4.6.0 every file travels as a stream of **independently authenticated AES-GCM records** (STREAM construction): a per-file key is derived via HKDF from the ECDH secret and a fresh random salt, each 256 KiB segment is sealed with a counter nonce plus a final-record flag, so **corruption, reordering, truncation, and replay are all detected at the exact segment where they happen** — no relay or network hop ever has to be trusted for integrity
+- A bad or missing record triggers an automatic **segment-level retry** (`segment-nack` → the sender rewinds, re-keys with a fresh salt, and resends just the tail), so a flaky relay or spotty connection costs a few segments, not the whole file
+- Both sides run in **near-constant memory** (the sender reads the file one segment at a time, the receiver accumulates verified segments as Blob parts), which raises the file cap to **4 GiB**
+- File metadata (name, MIME type, original size) is **encrypted inside a fixed-size metadata record**, not sent in plaintext over the data channel; the final segment is padded with random bytes so observers learn the size only to 256 KiB granularity
 
 ### Transfer Verification
-- After decryption, the receiver computes a **SHA-256 checksum** of the plaintext data and sends it back to the sender via a `file-ack` message
-- The sender compares this against its own pre-encryption hash to **verify end-to-end integrity** (encryption, transfer, and decryption all succeeded)
-- If verification fails or times out, the sender is notified and can **retry** without losing the photo
-- Before decryption is attempted, the receiver checks that the byte count at `file-end` matches the announced size; a short transfer is rejected with a distinct "incomplete" error so both sides see "data lost in transit, retry" instead of an opaque checksum failure
+- Every record is verified as it arrives (AEAD authentication); after the last one, the receiver acks with a **composite SHA-256 hash** (a hash over the per-segment plaintext digests)
+- The sender compares this against its own composite hash to **verify end-to-end identity** (encryption, transfer, and decryption all succeeded)
+- If verification fails or times out, the sender is notified and can **retry** without losing the photo; transient failures are first retried automatically at segment granularity (see above) before anything is surfaced to the user
+- A `file-end` with records missing is answered with the same segment-retry path, and only after the retry budget is exhausted does the receiver reject with a distinct "incomplete" error so both sides see "data lost in transit, retry" instead of an opaque checksum failure
 
 ### No Phone Storage
 - Photos are captured directly in the browser (no camera app) and **stay in browser memory only**
@@ -226,16 +226,17 @@ The protections listed in [Security Features](#security-features) below address 
 - On networks that block UDP and strip TURNS at the proxy, WebSend now falls back to a pure-HTTPS path that runs through the same `:443` reverse-proxy listener as the rest of the app. No separate container or port; the same Caddy reverse proxy upgrades the WebSocket and handles the long-poll endpoints to the Node process.
 - The client races three transports in parallel: WebRTC (preferred), WebSocket to `/api/rooms/:id/relay`, and an on-demand long-poll over `/api/rooms/:id/relay/{handshake,up,down,close}` (auto-spawned when the WS path is refused). A 10 s grace window lets WebRTC win when it can; afterwards the relay path wins.
 - The relay forwards opaque ciphertext between two paired peers. The existing ECDH + AES-GCM + fingerprint stack is transport-agnostic, so the server never sees plaintext on this path either.
-- Anti-DoS caps are mirrored server-side: 4 GiB `MAX_TOTAL_SESSION_BYTES`, 16 KiB `MAX_CONTROL_MSG_BYTES`, plus a 32-frame bounded queue and 60 s idle timeout on the long-poll slots. Long-poll slot tokens (128-bit random) are validated in constant time alongside the room secret.
-- The long-poll transport uses 256 KiB chunks (vs. 16 KiB on the WebSocket / WebRTC paths) because every chunk is a full HTTPS round-trip, and self-throttles at ~10 req/sec so an unfriendly corporate proxy in front of the server cannot trip us with its own rate limit. `Retry-After` is honoured on 429 so a saturated upstream bucket drains instead of looping.
-- Before encryption, the sender attempts `gzip` via `CompressionStream` and uses the compressed bytes only if they shrink the payload, flagging it inside the encrypted metadata. Highly compressible payloads (text, JSON, logs) shrink dramatically; already-compressed media (JPEG, PNG, MP4) fall through unchanged. Compression happens before the size-hiding padding pass, so the padded-bucket boundary still hides the underlying size.
+- Anti-DoS caps are mirrored server-side: 8 GiB `MAX_TOTAL_SESSION_BYTES`, 16 KiB `MAX_CONTROL_MSG_BYTES`, plus a 32-frame bounded queue and 60 s idle timeout on the long-poll slots. Long-poll slot tokens (128-bit random) are validated in constant time alongside the room secret.
+- The long-poll transport uses 300 KiB chunks (vs. 16 KiB on the WebSocket / WebRTC paths) because every chunk is a full HTTPS round-trip, paced at a 50 ms minimum gap (~6 MB/s) so an unfriendly corporate proxy in front of the server cannot trip us with its own rate limit. `Retry-After` is honoured on 429 so a saturated upstream bucket drains instead of looping.
+- Before sealing, each segment attempts `gzip` via `CompressionStream` and the compressed bytes are used only if they shrink the segment, flagged inside the sealed record. Highly compressible payloads (text, JSON, logs) shrink dramatically; already-compressed media (JPEG, PNG, MP4) fall through unchanged.
 - The sidebar shows the active path: **Direct**, **Relay (TURN)**, **Relay (TURNS)**, **Relay (HTTP)**, or **Relay (HTTPS)**.
 - Disable by setting `RELAY_ENABLE=false` on the server (default is `true`).
 - **Long-poll-only mode**: set `RELAY_LP_ONLY=true` (or the debug equivalent `DEV_FORCE_CONNECTION=RELAY_LP`) to force the long-poll relay path only. WebRTC ICE servers are suppressed and the WebSocket relay endpoint returns 404, so the client uses only `/api/rooms/:id/relay/{handshake,up,down,close}`. Useful behind proxies that strip WS upgrades or for deployments standardising on a single, well-understood transport. Requires `RELAY_ENABLE=true`; the server aborts startup otherwise.
-- **Relay reconnect with byte-level resume** (added with [Claude Code](https://claude.ai/claude-code)): a transient drop on the relay path no longer kills the session. The `RacingTransport` retries forever with a cap-5 s backoff, the receiver preserves the partial in-flight buffer across the drop, and the resume protocol (`file-resume-offer` + `file-resume-ack`) lets the sender continue from the receiver's last contiguous byte with the same ciphertext (same GCM nonce). If the peer's public-key fingerprint matches the one verified at pairing time, the verification modal is not re-shown; a mismatch is treated as a possible peer-swap and forces re-verification.
+- **Reconnect with segment-level resume** (added with [Claude Code](https://claude.ai/claude-code)): a transient drop no longer kills the session on any transport. The `RacingTransport` retries forever with a cap-5 s backoff, the receiver keeps every already-verified segment across the drop, and the resume protocol (`file-resume-offer {nextSeq}` + `file-resume-ack {nextSeq, salt}`) lets the sender continue from the first record the receiver is missing, re-keyed with a fresh salt (a key/nonce pair is never reused). If the peer's public-key fingerprint matches the one verified at pairing time, the verification modal is not re-shown; a mismatch is treated as a possible peer-swap and forces re-verification.
 
 ## Non-Security Features
 
+- **Large file transfers (up to 4 GiB)**: the chunked wire format streams files segment by segment in near-constant memory and survives connection drops with segment-level resume, so multi-GiB files work even on spotty connections. Files above 64 MiB are kept Blob-backed on the receiver and offered as a plain download (no preview, edits, or OCR, which would require pulling the whole file into memory). Note: iOS Safari has known multi-GiB Blob limits; for files in that range prefer a desktop receiver
 - **PWA (Progressive Web App)**: installable on mobile home screens, with service worker for fast UI shell loading and an auto-reload on each deploy (the cache name is timestamped during SRI regeneration)
 - **Internationalization (i18n)**: supports English and French, auto-detected from browser locale
 - **Live document edge detection** on the sender camera: pure-JS pipeline (downscale → Sobel → Otsu → foreground masks cleaned by morphological opening + largest-connected-component → multi-candidate quad fitting scored by perimeter edge alignment and page-mask coverage) overlays a green outline of the detected page in real time, and pre-fills corner positions when entering the crop tool. The coverage term keeps an on-page shadow from collapsing a corner inward
@@ -436,7 +437,7 @@ Known testing gaps (frontend modules like `webrtc.js`/`logger.js`/`i18n.js`, the
 
 ### CLI receiver (advanced)
 
-A minimal Node script `src/cli/receive.js` pairs as a receiver from a terminal — useful for remote-instance smoke testing and headless captures. It reuses the production `crypto.js` + `protocol.js` verbatim by driving them inside a Playwright-launched headless Chromium (already a devDependency for the e2e tests), so no native node-webrtc dependency is added and the wire protocol cannot drift. See [src/cli/README.md](src/cli/README.md) for usage. Not intended for end users.
+A minimal Node script `src/cli/receive.js` pairs as a receiver from a terminal — useful for remote-instance smoke testing and headless captures. It reuses the production `crypto.js` + `protocol.js` + `segment-stream.js` verbatim by driving them inside a Playwright-launched headless Chromium (already a devDependency for the e2e tests), so no native node-webrtc dependency is added and the wire protocol cannot drift. See [src/cli/README.md](src/cli/README.md) for usage. Not intended for end users.
 
 ## Third-Party Libraries
 

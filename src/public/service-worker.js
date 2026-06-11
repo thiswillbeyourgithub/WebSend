@@ -14,7 +14,7 @@
 // pre-existing cache, which is the only way to clear out cross-origin
 // responses that earlier SW versions may have stored before this
 // version restricted caching to same-origin basic responses.
-const CACHE_NAME = 'websend-v2';
+const CACHE_NAME = 'websend-v3';
 
 // Static assets to cache on install
 const STATIC_ASSETS = [

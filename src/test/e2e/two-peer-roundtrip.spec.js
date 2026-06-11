@@ -61,17 +61,27 @@ function ensureFixture() {
     fs.writeFileSync(FIXTURE_PNG, png);
 }
 
+// Multi-segment fixture: ~1.5 MiB of random bytes spans 7 SEG_SIZE
+// (256 KiB) records and is incompressible, so it exercises the chunked
+// v2 path (per-segment AEAD, uncompressed flag, partial final segment)
+// that the single-record 8x8 PNG cannot reach. Random, so the SHA-256
+// integrity check is computed per run, not hard-coded.
+const FIXTURE_BIG = path.resolve(__dirname, '../fixtures/test-large.bin');
+const BIG_SIZE = 1536 * 1024 + 7; // deliberately not record-aligned
+
+function ensureBigFixture() {
+    if (fs.existsSync(FIXTURE_BIG) && fs.statSync(FIXTURE_BIG).size === BIG_SIZE) return;
+    fs.mkdirSync(path.dirname(FIXTURE_BIG), { recursive: true });
+    fs.writeFileSync(FIXTURE_BIG, require('crypto').randomBytes(BIG_SIZE));
+}
+
 test.beforeAll(ensureFixture);
 
-test('receiver page creates a room and shows a QR/URL', async ({ page }) => {
-    await page.goto('/receive.html');
-    await page.waitForSelector('#qr-url-input', { timeout: 12000 });
-    const url = await page.inputValue('#qr-url-input');
-    expect(url).toContain('/send/');
-    expect(url).toContain('#');
-});
-
-test('two-peer file transfer round-trip', async ({ browser }) => {
+/**
+ * Pair a receiver and sender context and walk both through the
+ * verification modal. Returns the pages ready for file transfers.
+ */
+async function pairAndVerify(browser) {
     // Context A = receiver
     const ctxA = await browser.newContext();
     const pageA = await ctxA.newPage();
@@ -118,6 +128,20 @@ test('two-peer file transfer round-trip', async ({ browser }) => {
         { timeout: 10000 }
     ).catch(() => null);
 
+    return { ctxA, pageA, ctxB, pageB };
+}
+
+test('receiver page creates a room and shows a QR/URL', async ({ page }) => {
+    await page.goto('/receive.html');
+    await page.waitForSelector('#qr-url-input', { timeout: 12000 });
+    const url = await page.inputValue('#qr-url-input');
+    expect(url).toContain('/send/');
+    expect(url).toContain('#');
+});
+
+test('two-peer file transfer round-trip', async ({ browser }) => {
+    const { ctxA, pageA, ctxB, pageB } = await pairAndVerify(browser);
+
     // Sender: set file directly on the hidden input (bypasses the visible button click)
     await pageB.setInputFiles('#file-input', FIXTURE_PNG);
 
@@ -146,4 +170,45 @@ test('two-peer file transfer round-trip', async ({ browser }) => {
 
     await ctxA.close();
     await ctxB.close();
+});
+
+test('multi-segment file (>1 MiB) arrives byte-identical', async ({ browser }) => {
+    ensureBigFixture();
+    const expectedSha = require('crypto')
+        .createHash('sha256').update(fs.readFileSync(FIXTURE_BIG)).digest('hex');
+
+    const { ctxA, pageA, ctxB, pageB } = await pairAndVerify(browser);
+    try {
+        // A single non-image file is queued and sent automatically once a
+        // shared key exists; wait for it so handleFileSelect doesn't bail.
+        await pageB.waitForFunction(
+            () => window.SenderConnect && window.SenderConnect.getSharedKey() != null,
+            { timeout: 15000 }
+        );
+        await pageB.setInputFiles('#file-input', FIXTURE_BIG);
+
+        // Non-image files render as a generic file card with a download link.
+        await pageA.waitForFunction(
+            () => document.querySelector('#received-images a[id^="download-"]') !== null,
+            { timeout: 60000 }
+        );
+
+        // Download the received file through the real UI (in-page fetch of
+        // the blob: URL is blocked by the connect-src 'self' CSP) and hash
+        // it node-side: end-to-end integrity across chunked AEAD, per-segment
+        // (de)compression decisions, and reassembly. The download anchor
+        // lives in the card's kebab menu, which starts hidden.
+        await pageA.click('#received-images .card-kebab-btn');
+        const downloadPromise = pageA.waitForEvent('download', { timeout: 30000 });
+        await pageA.click('#received-images a[id^="download-"]');
+        const download = await downloadPromise;
+        const gotSha = require('crypto')
+            .createHash('sha256')
+            .update(fs.readFileSync(await download.path()))
+            .digest('hex');
+        expect(gotSha).toBe(expectedSha);
+    } finally {
+        await ctxA.close();
+        await ctxB.close();
+    }
 });

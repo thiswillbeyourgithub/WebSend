@@ -15,9 +15,12 @@
  *   3. Bridge file saves and the y/n fingerprint prompt back to Node via
  *      previously-exposed window.__nodeLog / __nodeSaveFile / __nodePromptFp.
  *
- * Reuses src/public/js/crypto.js and src/public/js/protocol.js verbatim — the
- * wire protocol cannot drift because we load the same files the production
- * receiver loads.
+ * Reuses src/public/js/crypto.js, protocol.js, and segment-stream.js
+ * verbatim — the wire protocol cannot drift because we load the same files
+ * the production receiver loads. Receives the v2 chunked format (sealed
+ * segment records); the in-connection segment-nack retry dance is NOT
+ * implemented (WebRTC's ordered reliable channel makes record corruption
+ * a non-event), so any verification failure nacks the whole file.
  *
  * Built with the help of Claude Code (Opus 4.7).
  */
@@ -58,7 +61,8 @@
     async function start({ baseUrl, autoAccept }) {
         const C = window.WebSendCrypto;
         const P = window.Protocol;
-        if (!C || !P) throw new Error('crypto.js / protocol.js not loaded');
+        const SS = window.SegmentStream;
+        if (!C || !P || !SS) throw new Error('crypto.js / protocol.js / segment-stream.js not loaded');
         log('info', `Protocol v${P.VERSION}`);
 
         const config = await httpJson(`${baseUrl}/api/config`);
@@ -179,8 +183,16 @@
         });
         log('ok', 'Data channel open');
 
-        let sharedKey = null;
-        let buffer = [], bufSize = 0, expected = 0;
+        let sessionKeys = null;
+        // v2 receive state: the SegmentReceiver for the in-flight file plus
+        // the streaming record parser's partial-record buffer and the next
+        // record seq the wire may carry (mirrors transport-assembler.js).
+        let receiver = null;
+        let pending = null;      // Uint8Array, at most one partial record
+        let wireNextSeq = 0;
+        // Records funnel through one promise chain because accept() is
+        // async and records must verify strictly in order.
+        let recordChain = Promise.resolve();
         // Verified-fingerprint gate. Mirrors VERIFIED_GATED_HANDLERS in
         // receive.html: state-mutating peer messages and binary chunks are
         // dropped until both sides confirm the ECDH fingerprint.
@@ -202,10 +214,23 @@
             if (abusiveTeardown) return;
             abusiveTeardown = true;
             log('err', `Aborting peer connection: ${reason}`);
-            buffer = []; bufSize = 0; expected = 0;
+            receiver = null; pending = null;
             try { dc.close(); } catch (_) {}
             try { pc.close(); } catch (_) {}
             try { window.__nodeDone({ ...state, abusive: true, reason }); } catch (_) {}
+        };
+
+        // Verify one framed record against the in-flight SegmentReceiver.
+        // No segment-nack retry here (see header comment): a failure nacks
+        // the whole file and the sender surfaces its retry toast.
+        const acceptRecord = async (seq, ct) => {
+            if (!receiver) return; // dropped transfer; ignore tail records
+            const res = await receiver.accept(seq, ct);
+            if (!res.ok) {
+                log('err', `record ${seq} rejected (${res.reason})`);
+                receiver = null;
+                send(P.build.fileNack('decrypt-failed'));
+            }
         };
 
         dc.onmessage = async (ev) => {
@@ -231,7 +256,7 @@
                     }
                     if (msg.type === 'sender-public-key') {
                         const theirPub = await C.importPublicKey(msg.key);
-                        sharedKey = await C.deriveSharedKey(keyPair.privateKey, theirPub);
+                        sessionKeys = await C.deriveSessionKeys(keyPair.privateKey, theirPub);
                         const code = await C.getCombinedFingerprint(keyPair.publicKey, theirPub);
                         const ok = autoAccept ? true : await window.__nodePromptFp(code);
                         if (ok) {
@@ -247,26 +272,44 @@
                         log('err', 'sender denied');
                         try { dc.close(); } catch {}
                     } else if (msg.type === 'file-start') {
-                        buffer = []; bufSize = 0; expected = msg.size;
-                        log('info', `Receiving file (${msg.size} bytes encrypted+padded)...`);
-                    } else if (msg.type === 'file-end') {
-                        const blob = new Blob(buffer);
-                        const arr = await blob.arrayBuffer();
-                        buffer = []; bufSize = 0; expected = 0;
-                        if (!sharedKey) { log('err', 'file-end before key derived'); return; }
-                        try {
-                            const dec = await C.decryptWithMetadata(arr, sharedKey);
-                            const b64 = arrayBufferToBase64(dec.data);
-                            const sha = await C.sha256Hex(dec.data);
-                            const path = await window.__nodeSaveFile(dec.metadata.name || 'unnamed', dec.metadata.mimeType || '', b64);
-                            send(P.build.fileAck(sha));
-                            state.savedCount += 1;
-                            state.savedBytes += dec.data.byteLength;
-                            log('ok', `Saved ${path} (${dec.data.byteLength} bytes)`);
-                        } catch (e) {
-                            send(P.build.fileNack(`decrypt failed: ${e.message}`));
-                            log('err', `decryption failed: ${e.message}`);
+                        if (msg.v !== 2) {
+                            log('err', `file-start with unsupported version (v=${msg.v}); nacking`);
+                            send(P.build.fileNack('unsupported-version'));
+                            return;
                         }
+                        if (!sessionKeys) { log('err', 'file-start before key derived'); return; }
+                        receiver = SS.createReceiver({
+                            sessionKeys,
+                            saltB64: msg.salt,
+                            segCount: msg.segCount,
+                        });
+                        pending = null;
+                        wireNextSeq = 0;
+                        log('info', `Receiving file (${msg.segCount} segments)...`);
+                    } else if (msg.type === 'file-end') {
+                        recordChain = recordChain.then(async () => {
+                            if (!receiver) return;
+                            const r = receiver;
+                            receiver = null; pending = null;
+                            if (r.nextSeq !== r.segCount + 1) {
+                                log('err', `file-end after ${r.nextSeq}/${r.segCount + 1} records`);
+                                send(P.build.fileNack('incomplete'));
+                                return;
+                            }
+                            const { metadata, blob, compositeHashHex } = await r.finish();
+                            const b64 = arrayBufferToBase64(await blob.arrayBuffer());
+                            const path = await window.__nodeSaveFile(
+                                (metadata && metadata.name) || 'unnamed',
+                                (metadata && metadata.mimeType) || '', b64);
+                            send(P.build.fileAck(compositeHashHex));
+                            state.savedCount += 1;
+                            state.savedBytes += blob.size;
+                            log('ok', `Saved ${path} (${blob.size} bytes)`);
+                        }).catch((e) => {
+                            send(P.build.fileNack('decrypt-failed'));
+                            log('err', `finalize failed: ${e.message}`);
+                        });
+                        await recordChain;
                     } else if (msg.type === 'batch-end') {
                         log('ok', 'Batch ended');
                     } else {
@@ -274,29 +317,50 @@
                     }
                 } else {
                     // Binary chunk (ArrayBuffer because dc.binaryType = 'arraybuffer').
-                    // Defense-in-depth bounds — mirror webrtc.js:351-379 so the CLI
-                    // does not absorb unbounded peer-controlled bytes before
-                    // fingerprint verification completes.
+                    // Streaming v2 record parser with the same defense-in-depth
+                    // bounds as transport-assembler.js handleBinaryV2: at most
+                    // one partial record buffered, ctLen hard-bounded, seq may
+                    // never skip ahead, session bytes capped.
                     if (!(weConfirmed && theyConfirmed)) {
                         return abortAbusive('binary chunk from unverified peer');
                     }
                     const len = d.byteLength | 0;
-                    if (expected <= 0) {
-                        return abortAbusive('binary chunk before file-start');
-                    }
-                    if (bufSize + len > expected) {
-                        return abortAbusive(
-                            `chunk overflow: received ${bufSize} + ${len} > expected ${expected}`
-                        );
-                    }
                     if (sessionTotalBytes + len > P.MAX_TOTAL_SESSION_BYTES) {
                         return abortAbusive(
                             `session byte cap exceeded (${sessionTotalBytes + len} > ${P.MAX_TOTAL_SESSION_BYTES})`
                         );
                     }
-                    buffer.push(d);
-                    bufSize += len;
                     sessionTotalBytes += len;
+                    if (!receiver) return; // no transfer in flight: drop in O(1)
+
+                    const pendingLen = pending ? pending.length : 0;
+                    const merged = new Uint8Array(pendingLen + len);
+                    if (pendingLen) merged.set(pending, 0);
+                    merged.set(new Uint8Array(d), pendingLen);
+
+                    // Largest legal record ct: a full segment's plaintext
+                    // ([1B flags][4B dataLen] + SEG_SIZE) plus the GCM tag.
+                    const maxCt = P.SEG_SIZE + 21;
+                    let offset = 0;
+                    while (merged.length - offset >= 8) {
+                        const view = new DataView(merged.buffer, offset);
+                        const seq = view.getUint32(0, false);
+                        const ctLen = view.getUint32(4, false);
+                        if (ctLen < 16 || ctLen > maxCt) {
+                            return abortAbusive(`record ciphertext length ${ctLen} out of bounds`);
+                        }
+                        if (seq > wireNextSeq) {
+                            return abortAbusive(`record seq ${seq} skipped ahead of expected ${wireNextSeq}`);
+                        }
+                        if (merged.length - offset < 8 + ctLen) break; // partial record
+                        const ct = merged.slice(offset + 8, offset + 8 + ctLen);
+                        offset += 8 + ctLen;
+                        wireNextSeq = seq + 1;
+                        recordChain = recordChain
+                            .then(() => acceptRecord(seq, ct.buffer))
+                            .catch((e) => log('err', `record ${seq}: ${e.message}`));
+                    }
+                    pending = offset < merged.length ? merged.slice(offset) : null;
                 }
             } catch (e) {
                 log('err', `handler: ${e.message}`);

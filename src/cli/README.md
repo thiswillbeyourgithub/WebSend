@@ -46,8 +46,9 @@ Playwright-launched headless Chromium. The Node script:
 
 1. Launches Chromium and navigates to the instance URL (so `fetch()` carries
    the right `Origin` header).
-2. Loads `/js/crypto.js` and `/js/protocol.js` from the live server via
-   `page.addScriptTag` — exactly the production receiver code.
+2. Loads `/js/crypto.js`, `/js/protocol.js`, and `/js/segment-stream.js`
+   from the live server via `page.addScriptTag` — exactly the production
+   receiver code.
 3. Injects `shim.js` (in this directory) as the in-browser driver.
 4. Bridges the y/n fingerprint prompt and file saves back to Node via
    `page.exposeFunction`.
@@ -62,6 +63,9 @@ the browser receiver.
 - Saves raw decrypted files; no OCR / B&W / PDF assembly (run those manually
   with `tesseract` / `magick` if needed)
 - Ignores `transform-image`, `replace-image`, `delete-image` messages
+- No in-connection segment retry (`segment-nack`) and no reconnect resume:
+  WebRTC's ordered reliable channel makes record corruption a non-event, so
+  a verification failure simply nacks the whole file
 
 If the browser modules change in a way that breaks this client, fix the
 client — do not duplicate the protocol here.

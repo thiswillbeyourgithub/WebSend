@@ -123,6 +123,8 @@
             _showToast(_i18n.t('send.transferIncomplete'));
         } else if (msg.includes('Receiver decryption failed')) {
             _showToast(_i18n.t('send.checksumMismatch'));
+        } else if (msg.includes('file-too-large')) {
+            _showToast(_i18n.t('send.fileTooLarge'), { type: 'error' });
         } else if ((e && e.name === 'NotReadableError') || /could not be read/i.test(msg)) {
             // The blob/File handle went stale: classically the OS reclaimed
             // the picked file after the app was backgrounded during the
@@ -235,6 +237,14 @@
             throw new Error('Refusing to send: peer not verified');
         }
         const blob = item.blob;
+
+        // Protocol-level cap: a larger blob would need more than
+        // MAX_SEG_COUNT records and the receiver would reject the
+        // file-start anyway. Refuse up front with a clear toast
+        // (showSendFailureToast keys on the 'file-too-large' marker).
+        if (blob.size > window.Protocol.MAX_FILE_SIZE) {
+            throw new Error(`file-too-large: ${blob.size} bytes exceeds the ${window.Protocol.MAX_FILE_SIZE}-byte cap`);
+        }
 
         if (!item._segmentSender) {
             const filename = blob.name || `websend_${Date.now()}.png`;

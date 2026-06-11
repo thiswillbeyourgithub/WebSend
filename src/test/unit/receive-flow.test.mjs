@@ -105,7 +105,7 @@ function makeFakeReceiver({ segCount = 2, acceptImpl, content } = {}) {
         async finish() {
             return {
                 metadata: { name: 'big.bin', mimeType: 'application/octet-stream', originalSize: 8 },
-                blob: { arrayBuffer: async () => (content || new ArrayBuffer(8)) },
+                blob: { size: 8, arrayBuffer: async () => (content || new ArrayBuffer(8)) },
                 compositeHashHex: COMPOSITE,
             };
         },
@@ -386,7 +386,7 @@ async function receiveWithMetadata(metadata) {
     const fake = makeFakeReceiver({ segCount: 1 });
     fake.finish = async () => ({
         metadata,
-        blob: { arrayBuffer: async () => new ArrayBuffer(4) },
+        blob: { size: 4, arrayBuffer: async () => new ArrayBuffer(4) },
         compositeHashHex: COMPOSITE,
     });
     const { win } = setupV2(fake, { receivedImages: images });
@@ -451,6 +451,43 @@ test('safeExtFromMime: ext is bounded to ≤8 alnum chars', async () => {
     const tail = img.name.split('.').pop();
     assert.ok(tail.length <= 8, `ext should be ≤8 chars, got "${tail}"`);
     assert.match(tail, /^[a-z0-9]+$/i, 'ext should be alnum only');
+});
+
+test('files above the materialize threshold stay blob-only and present as fileType=other', async () => {
+    // A 4 GiB image must never be pulled into an ArrayBuffer: imgObj.data
+    // stays null, the Blob is kept, and the image/pdf affordances are
+    // disabled by forcing fileType 'other' (no thumbnail decode, no OCR,
+    // no transforms, no mupdf rendering).
+    const images = [];
+    const toasts = [];
+    const BIG = 64 * 1024 * 1024 + 1;
+    const fake = makeFakeReceiver({ segCount: 1 });
+    fake.finish = async () => ({
+        metadata: { name: 'huge.jpg', mimeType: 'image/jpeg', originalSize: BIG },
+        blob: {
+            size: BIG,
+            arrayBuffer: async () => { throw new Error('blob-only files must not be materialized'); },
+        },
+        compositeHashHex: COMPOSITE,
+    });
+    const { win, deps } = setupV2(fake, {
+        receivedImages: images,
+        optsExtra: { showToast: (msg) => toasts.push(msg) },
+    });
+    await win.ReceiveFlow.handleFileStart({ ...V2_START, segCount: 1 });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileEnd({ type: 'file-end' });
+
+    assert.equal(images.length, 1, 'the transfer completes without materializing');
+    assert.equal(images[0].data, null, 'no byte buffer for a blob-only file');
+    assert.equal(images[0].originalData, null, 'no transform source either');
+    assert.ok(images[0].blob, 'the Blob is retained for download/zip export');
+    assert.equal(images[0].fileType, 'other', 'image affordances are disabled');
+    assert.equal(images[0].hash, COMPOSITE);
+    const ack = deps.sent.find(m => m.type === 'file-ack');
+    assert.equal(ack.hash, COMPOSITE, 'blob-only files still ack normally');
+    assert.ok(toasts.includes('receive.largeFileBlobOnly'), 'the user is told why there is no preview');
 });
 
 test('generic mime is classified as fileType=other and a filename is synthesized', async () => {

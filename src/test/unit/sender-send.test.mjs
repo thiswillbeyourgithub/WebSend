@@ -62,6 +62,7 @@ function loadIntoJsdom({ verified }) {
         },
     };
     win.Protocol = {
+        MAX_FILE_SIZE: 4 * 1024 * 1024 * 1024,
         build: {
             replaceImage: (h) => ({ type: 'replace-image', hash: h }),
             batchEnd: () => ({ type: 'batch-end' }),
@@ -130,6 +131,19 @@ test('sendOnePhoto transmits when peer is verified', async () => {
     assert.equal(created[0].metadata.originalSize, 4);
     assert.deepEqual(created[0].sessionKeys, { __fake: 'sessionKeys' },
         'the session key handles must reach SegmentStream.createSender');
+});
+
+test('a blob over Protocol.MAX_FILE_SIZE is refused with the fileTooLarge toast', async () => {
+    const { win, sentFiles, created, toasts } = loadIntoJsdom({ verified: true });
+    // Shrink the cap instead of allocating a >4 GiB blob in the test.
+    win.Protocol.MAX_FILE_SIZE = 2;
+    win.SenderSend.push({ blob: makeBlob(win) }); // 4 bytes > 2
+    await win.SenderSend.drain();
+    assert.equal(created.length, 0, 'no SegmentSender may be created for an oversized blob');
+    assert.equal(sentFiles.length, 0, 'nothing reaches the wire');
+    assert.ok(toasts.includes('send.fileTooLarge'),
+        `the user must learn why the send failed, got toasts: ${JSON.stringify(toasts)}`);
+    assert.equal(win.SenderSend.size(), 0, 'the oversized item leaves the queue (no retry loop)');
 });
 
 test('transient drop pauses the queue; resume-offer rewinds before acking and resumes from seq', async () => {

@@ -308,7 +308,13 @@
                     const name = img.name.replace(/\.[^.]+$/, '.png');
                     return { name, input: pngBlob };
                 } else {
-                    return { name: img.name, input: new Blob([img.data], { type: img.mimeType }) };
+                    // Blob-only files (above receive-flow's materialize
+                    // threshold) have no img.data; stream the stored Blob
+                    // into the zip instead of inflating it into memory.
+                    const input = img.data
+                        ? new Blob([img.data], { type: img.mimeType })
+                        : img.blob;
+                    return { name: img.name, input };
                 }
             }));
 

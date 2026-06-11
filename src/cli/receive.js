@@ -189,10 +189,12 @@ async function main() {
         process.exit(1);
     }
 
-    // Inject the production crypto + protocol modules from the live server.
-    // Any change to those files automatically flows through — zero drift.
+    // Inject the production crypto + protocol + segment-stream modules from
+    // the live server. Any change to those files automatically flows
+    // through — zero drift.
     await page.addScriptTag({ url: '/js/crypto.js' });
     await page.addScriptTag({ url: '/js/protocol.js' });
+    await page.addScriptTag({ url: '/js/segment-stream.js' });
 
     // Inject our minimal driver from disk.
     const driverSrc = fs.readFileSync(path.join(__dirname, 'shim.js'), 'utf8');
