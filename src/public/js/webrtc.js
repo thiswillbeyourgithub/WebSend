@@ -535,6 +535,9 @@ class WebSendRTC {
             throw new Error('sendFile already in progress, wait for the previous transfer to finish');
         }
         this._fileAckInFlight = true;
+        // Forget any segment-nack left over from a previous, concluded
+        // transfer; only nacks for THIS transfer may trigger a rewind.
+        this._segmentNackSeq = null;
 
         try {
             const io = {
@@ -555,17 +558,17 @@ class WebSendRTC {
                     }
                     this.dataChannel.send(chunk);
                 },
+                // Receiver verdict: file-ack value, or {segmentNack: seq}.
+                // PayloadAssembler.handleControl routes the ack messages into
+                // resolveFileAck/rejectFileAck so the in-flight flag and ack
+                // state are cleared exactly once across all three transports.
+                waitForAck: () => new Promise((resolve, reject) => {
+                    window.PayloadAssembler.setupFileAck(this, resolve, reject, this._FILE_ACK_TIMEOUT_MS);
+                }),
             };
-            await window.SegmentStream.pump(segmentSender, io, onProgress, resumeFromSeq);
-            logger.info('All records sent, waiting for receiver acknowledgment...');
-
-            // Wait for file-ack / file-nack from receiver, or timeout.
-            // PayloadAssembler.handleControl routes the ack messages into
-            // resolveFileAck/rejectFileAck so the in-flight flag and ack
-            // state are cleared exactly once across all three transports.
-            return await new Promise((resolve, reject) => {
-                window.PayloadAssembler.setupFileAck(this, resolve, reject, this._FILE_ACK_TIMEOUT_MS);
-            });
+            // transfer() owns the record pump, the file-end, and the
+            // segment-nack → rewind → resend retry tail.
+            return await window.SegmentStream.transfer(segmentSender, io, onProgress, resumeFromSeq);
         } finally {
             // Clear in-flight flag in every exit path. Ack-state pointers are
             // already null after resolveFileAck/rejectFileAck; if we threw

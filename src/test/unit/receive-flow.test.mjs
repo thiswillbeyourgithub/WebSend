@@ -29,6 +29,7 @@ function loadIntoJsdom() {
         build: {
             fileAck: (h) => ({ type: 'file-ack', hash: h }),
             fileNack: (m) => ({ type: 'file-nack', message: m }),
+            segmentNack: (seq) => ({ type: 'segment-nack', seq }),
         },
     };
     win.Collections = {
@@ -153,7 +154,7 @@ test('v2 happy path: segments verify, file is displayed, ack carries the composi
     assert.equal(ack.hash, COMPOSITE);
 });
 
-test('v2 segment rejection nacks decrypt-failed once and drops later segments', async () => {
+test('v2 segment rejection sends segment-nack once and drops later segments', async () => {
     const fake = makeFakeReceiver({
         acceptImpl: (seq) => (seq === 1 ? { ok: false, reason: 'auth' } : { ok: true, isLast: false }),
     });
@@ -164,13 +165,15 @@ test('v2 segment rejection nacks decrypt-failed once and drops later segments', 
         await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq, ct: new ArrayBuffer(32) });
     }
     assert.deepEqual(fake.calls, [0, 1],
-        'after the failure the receiver is gone; segment 2 must not reach accept()');
-    const nacks = deps.sent.filter(m => m.type === 'file-nack');
-    assert.equal(nacks.length, 1);
-    assert.equal(nacks[0].message, 'decrypt-failed');
+        'while waiting for the rewind, segment 2 must not reach accept()');
+    const nacks = deps.sent.filter(m => m.type === 'segment-nack');
+    assert.deepEqual(nacks.map(n => n.seq), [fake.nextSeq],
+        'one nack naming the first record we lack');
+    assert.equal(deps.sent.filter(m => m.type === 'file-nack').length, 0,
+        'a single bad record must not fail the whole transfer any more');
 });
 
-test('v2 file-end with missing records nacks incomplete', async () => {
+test('v2 file-end with missing records requests a rewind instead of failing', async () => {
     const fake = makeFakeReceiver({ segCount: 5 }); // only 2 records will arrive
     const { win, deps } = setupV2(fake);
 
@@ -179,9 +182,90 @@ test('v2 file-end with missing records nacks incomplete', async () => {
     await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
     await win.ReceiveFlow.handleFileEnd({ type: 'file-end' });
 
+    const nacks = deps.sent.filter(m => m.type === 'segment-nack');
+    assert.deepEqual(nacks.map(n => n.seq), [2]);
+    assert.equal(deps.sent.filter(m => m.type === 'file-nack').length, 0);
+    assert.ok(await win.ReceiveFlow.getResumeState(),
+        'the transfer must stay alive across the retry');
+});
+
+test('v2 matching segment-rewind re-keys and the retried tail completes', async () => {
+    const images = [];
+    let failOnce = true;
+    const rekeys = [];
+    let nextSeq = 0;
+    const calls = [];
+    const receiver = {
+        calls,
+        segCount: 2,
+        get nextSeq() { return nextSeq; },
+        async accept(seq) {
+            calls.push(seq);
+            if (seq === 1 && failOnce) { failOnce = false; return { ok: false, reason: 'auth' }; }
+            nextSeq = seq + 1;
+            return { ok: true, isLast: seq === 2 };
+        },
+        rekey(saltB64, fromSeq) { rekeys.push({ saltB64, fromSeq }); nextSeq = fromSeq; },
+        finish: makeFakeReceiver().finish,
+    };
+    const { win, deps } = setupV2(receiver, { receivedImages: images });
+    const SALT2 = 'B'.repeat(22) + '==';
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) }); // fails
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 2, ct: new ArrayBuffer(32) }); // dropped
+    await win.ReceiveFlow.handleFileEnd({ type: 'file-end' }); // dropped (awaiting rewind)
+    assert.equal(images.length, 0, 'the stale file-end must not finish the file');
+
+    await win.ReceiveFlow.handleSegmentRewind({ type: 'segment-rewind', seq: 1, salt: SALT2 });
+    assert.deepEqual(rekeys, [{ saltB64: SALT2, fromSeq: 1 }]);
+
+    // Sender resends the tail under the new salt, then a fresh file-end.
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 2, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileEnd({ type: 'file-end' });
+
+    assert.deepEqual(calls, [0, 1, 1, 2], 'records resent after the rewind reach accept()');
+    assert.equal(images.length, 1, 'the healed transfer completes');
+    const ack = deps.sent.find(m => m.type === 'file-ack');
+    assert.equal(ack.hash, COMPOSITE);
+});
+
+test('v2 unsolicited segment-rewind is ignored (no re-key, no replay)', async () => {
+    const rekeys = [];
+    const fake = makeFakeReceiver({ segCount: 5 });
+    fake.rekey = (saltB64, fromSeq) => rekeys.push({ saltB64, fromSeq });
+    const { win } = setupV2(fake);
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleSegmentRewind({ type: 'segment-rewind', seq: 0, salt: 'B'.repeat(22) + '==' });
+    assert.deepEqual(rekeys, [], 'only a rewind answering our own nack may re-key');
+});
+
+test('v2 retry budget exhaustion file-nacks with the last failure class', async () => {
+    const fake = makeFakeReceiver({
+        segCount: 2,
+        acceptImpl: () => ({ ok: false, reason: 'auth' }), // every pass fails
+    });
+    fake.rekey = () => {};
+    const { win, deps } = setupV2(fake);
+    const SALT2 = 'B'.repeat(22) + '==';
+
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    for (let round = 0; round < 4; round++) {
+        await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+        if (round < 3) {
+            await win.ReceiveFlow.handleSegmentRewind({ type: 'segment-rewind', seq: 0, salt: SALT2 });
+        }
+    }
+    const segNacks = deps.sent.filter(m => m.type === 'segment-nack');
+    assert.equal(segNacks.length, 3, 'three retries were attempted');
     const nacks = deps.sent.filter(m => m.type === 'file-nack');
-    assert.equal(nacks.length, 1);
-    assert.equal(nacks[0].message, 'incomplete');
+    assert.equal(nacks.length, 1, 'the fourth failure gives up');
+    assert.equal(nacks[0].message, 'decrypt-failed');
+    assert.equal(await win.ReceiveFlow.getResumeState(), null, 'the transfer is dead');
 });
 
 test('v2 segments are processed strictly in order even with slow accepts', async () => {

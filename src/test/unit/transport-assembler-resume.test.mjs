@@ -22,8 +22,9 @@ const assemblerPath = path.resolve(__dirname, '../../public/js/transport-assembl
 // the same window object as Protocol.
 const win = {};
 const logger = { info: () => {}, success: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
-// Blob is passed in for the file-end assembly path (node's global Blob).
-const ctx = createContext({ window: win, logger, console, Blob });
+// Blob is passed in for the file-end assembly path (node's global Blob);
+// timers back the file-ack timeout in setupFileAck.
+const ctx = createContext({ window: win, logger, console, Blob, setTimeout, clearTimeout });
 runInContext(readFileSync(protocolPath, 'utf8'), ctx);
 runInContext(readFileSync(assemblerPath, 'utf8'), ctx);
 
@@ -211,6 +212,43 @@ test('v2 session byte cap still aborts the stream', () => {
     PA.handleBinary(host, wireRecord(0).buffer);
     assert.equal(aborts.length, 1);
     assert.match(aborts[0], /session byte cap/);
+});
+
+test('segment-nack with an ack waiter resolves it with {segmentNack: seq}', async () => {
+    const { host } = makeV2Host();
+    const verdict = new Promise((resolve, reject) => {
+        PA.setupFileAck(host, resolve, reject, 60_000);
+    });
+    assert.equal(PA.handleControl(host, { type: 'segment-nack', seq: 4 }), true,
+        'segment-nack is consumed by the assembler, never forwarded');
+    // Field-wise compare: the verdict object comes from the vm realm,
+    // whose Object.prototype differs from this realm's.
+    assert.equal((await verdict).segmentNack, 4);
+    assert.equal(host._segmentNackSeq, null, 'a delivered nack leaves nothing stored');
+});
+
+test('segment-nack arriving before the ack waiter is stored and delivered once', async () => {
+    const { host } = makeV2Host();
+    // Nack lands while records are still being pumped (no waiter yet).
+    assert.equal(PA.handleControl(host, { type: 'segment-nack', seq: 2 }), true);
+    assert.equal(host._segmentNackSeq, 2);
+
+    const verdict = await new Promise((resolve, reject) => {
+        PA.setupFileAck(host, resolve, reject, 60_000);
+    });
+    assert.equal(verdict.segmentNack, 2);
+    assert.equal(host._segmentNackSeq, null);
+
+    // The next wait must NOT see the same nack again (that would loop
+    // the retry tail forever); it waits for a real verdict.
+    let settled = false;
+    const second = new Promise((resolve, reject) => {
+        PA.setupFileAck(host, resolve, reject, 60_000);
+    }).then((v) => { settled = true; return v; });
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(settled, false, 'stale nack must not re-resolve');
+    PA.handleControl(host, { type: 'file-ack', sha256: 'a'.repeat(64) });
+    assert.equal((await second).acknowledged, true);
 });
 
 test('armV2Parser readies a fresh host for resumed records without a file-start', () => {

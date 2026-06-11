@@ -401,6 +401,115 @@ test('pump stamps transient transport errors with the in-flight record seq', asy
         });
 });
 
+// ---- transfer(): the segment-nack → rewind → resend retry tail ----
+
+/**
+ * Transfer io whose waitForAck() pops scripted verdicts. chunkSize is
+ * larger than any record so chunks map 1:1 to wire records.
+ */
+function makeTransferIo(verdicts) {
+    const io = makePumpIo({ chunkSize: 1 << 20 });
+    io.waitForAck = async () => {
+        if (!verdicts.length) throw new Error('test script ran out of verdicts');
+        return verdicts.shift();
+    };
+    return io;
+}
+
+function wireSeqs(io) {
+    return io.chunks.map(c => parseRecord(c).seq);
+}
+
+test('transfer returns the ack verdict when no nack arrives', async () => {
+    const { sender } = await makePair(patternedBytes(1000));
+    const io = makeTransferIo([{ acknowledged: true, sha256: 'x'.repeat(64) }]);
+    const verdict = await SS.transfer(sender, io, null, undefined);
+    assert.equal(verdict.acknowledged, true);
+    assert.deepEqual(io.controls.map(m => m.type), ['file-start', 'file-end']);
+});
+
+test('transfer heals a segment-nack: rewind control, fresh salt, tail resent, receiver completes', async () => {
+    const content = patternedBytes(600 * 1024); // 3 data segments
+    const { sender, receiver } = await makePair(content);
+    const originalSalt = sender.saltB64;
+    const io = makeTransferIo([
+        { segmentNack: 2 },
+        { acknowledged: true, sha256: 'x'.repeat(64) },
+    ]);
+
+    const verdict = await SS.transfer(sender, io, null, undefined);
+    assert.equal(verdict.acknowledged, true);
+
+    assert.deepEqual(io.controls.map(m => m.type),
+        ['file-start', 'file-end', 'segment-rewind', 'file-end'],
+        'no second file-start: the receiver keeps its verified prefix');
+    const rewind = io.controls[2];
+    assert.equal(rewind.seq, 2);
+    assert.notEqual(rewind.salt, originalSalt, 'a rewind must re-key');
+    assert.deepEqual(wireSeqs(io), [0, 1, 2, 3, 2, 3], 'only the tail is resent');
+
+    // Receiver's view: first-pass records up to the nack verify under the
+    // original salt, the resent tail under the rewind salt.
+    for (const i of [0, 1]) {
+        const { seq, ct } = parseRecord(io.chunks[i]);
+        assert.equal((await receiver.accept(seq, ct)).ok, true);
+    }
+    receiver.rekey(rewind.salt, 2);
+    for (const i of [4, 5]) {
+        const { seq, ct } = parseRecord(io.chunks[i]);
+        assert.equal((await receiver.accept(seq, ct)).ok, true, `resent record must verify under the fresh salt`);
+    }
+    const { blob: out } = await receiver.finish();
+    assert.deepEqual(new Uint8Array(await out.arrayBuffer()), content);
+});
+
+test('transfer rewinds to record 0 without resending file-start', async () => {
+    const content = patternedBytes(1000);
+    const { sender, receiver } = await makePair(content);
+    const io = makeTransferIo([
+        { segmentNack: 0 },
+        { acknowledged: true, sha256: 'x'.repeat(64) },
+    ]);
+    await SS.transfer(sender, io, null, undefined);
+    assert.deepEqual(io.controls.map(m => m.type),
+        ['file-start', 'file-end', 'segment-rewind', 'file-end']);
+    assert.deepEqual(wireSeqs(io), [0, 1, 0, 1]);
+
+    // Even the metadata record is replayable under the fresh salt.
+    receiver.rekey(io.controls[2].salt, 0);
+    for (const i of [2, 3]) {
+        const { seq, ct } = parseRecord(io.chunks[i]);
+        assert.equal((await receiver.accept(seq, ct)).ok, true);
+    }
+    const { metadata } = await receiver.finish();
+    assert.equal(metadata.name, 'test.bin');
+});
+
+test('transfer gives up after MAX_SEGMENT_RETRIES nacks with a non-transient error', async () => {
+    const { sender } = await makePair(patternedBytes(1000));
+    const nacks = Array.from({ length: SS.MAX_SEGMENT_RETRIES + 1 }, () => ({ segmentNack: 1 }));
+    const io = makeTransferIo(nacks);
+    await assert.rejects(
+        () => SS.transfer(sender, io, null, undefined),
+        (e) => {
+            assert.match(e.message, /rewinds/);
+            assert.notEqual(e.transient, true, 'budget exhaustion is fatal, not resumable');
+            return true;
+        });
+    assert.equal(io.controls.filter(m => m.type === 'segment-rewind').length,
+        SS.MAX_SEGMENT_RETRIES);
+});
+
+test('transfer rejects a hostile nack outside the record range', async () => {
+    const { sender } = await makePair(patternedBytes(1000));
+    const io = makeTransferIo([{ segmentNack: sender.segCount + 2 }]);
+    await assert.rejects(
+        () => SS.transfer(sender, io, null, undefined),
+        /outside the file's record range/);
+    assert.equal(io.controls.filter(m => m.type === 'segment-rewind').length, 0,
+        'no rewind may be sent for an unsatisfiable nack');
+});
+
 test('estimatedWireSize is an upper bound and exact for incompressible content', async () => {
     const content = C.getRandomBytes(SEG + 1000);
     const { sender } = await makePair(content);

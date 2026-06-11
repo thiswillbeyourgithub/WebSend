@@ -100,6 +100,21 @@
             // of the last successful /relay/up. Used by sendFile to show
             // delivered progress instead of uploaded progress.
             this._peerBacklogBytes = 0;
+            // FIFO chain for ALL /relay/up POSTs (control and binary
+            // alike). sendMessage is fire-and-forget, so without this an
+            // unawaited control frame could overtake or trail the binary
+            // records around it; in-band ordering is what guarantees
+            // file-start, segment-rewind and file-resume-ack reach the
+            // receiver strictly before the records that depend on them.
+            this._upQueue = Promise.resolve();
+        }
+
+        _enqueueUp(fn) {
+            const run = this._upQueue.then(fn);
+            // Keep the chain alive whatever fn does; the error still
+            // propagates to this caller through `run`.
+            this._upQueue = run.then(() => {}, () => {});
+            return run;
         }
 
         async _paceUp() {
@@ -388,12 +403,12 @@
             // express.json() body parser leaves it for our route-level
             // express.raw() to read as bytes. The peer parses it as JSON
             // on the receive side identically to a WS text frame.
-            const res = await this._postUp('text/plain', body);
+            const res = await this._enqueueUp(() => this._postUp('text/plain', body));
             if (!res.ok) throw new Error(`up status ${res.status}`);
         }
 
         async _sendBinary(chunk) {
-            const res = await this._postUp('application/octet-stream', chunk);
+            const res = await this._enqueueUp(() => this._postUp('application/octet-stream', chunk));
             if (!res.ok) throw new Error(`up status ${res.status}`);
         }
 
@@ -437,6 +452,9 @@
                 throw new Error('sendFile already in progress, wait for the previous transfer to finish');
             }
             this._fileAckInFlight = true;
+            // Forget any segment-nack left over from a previous, concluded
+            // transfer; only nacks for THIS transfer may trigger a rewind.
+            this._segmentNackSeq = null;
             try {
                 const io = {
                     chunkSize: CHUNK_SIZE,
@@ -468,12 +486,17 @@
                                 `LP _sendBinary failed: ${e.message}`);
                         }
                     },
+                    // Receiver verdict: file-ack value, or {segmentNack: seq}.
+                    waitForAck: () => new Promise((resolve, reject) => {
+                        window.PayloadAssembler.setupFileAck(this, resolve, reject, FILE_ACK_TIMEOUT_MS);
+                    }),
                 };
-                await window.SegmentStream.pump(segmentSender, io, onProgress, resumeFromSeq);
-                logger.info('[LP] all records sent, waiting for receiver acknowledgment...');
-                return await new Promise((resolve, reject) => {
-                    window.PayloadAssembler.setupFileAck(this, resolve, reject, FILE_ACK_TIMEOUT_MS);
-                });
+                // transfer() owns the record pump, the file-end, and the
+                // segment-nack → rewind → resend retry tail. Control frames
+                // it emits ride the same FIFO up-queue as the binary
+                // records, so a segment-rewind can never be overtaken by
+                // the records resent after it.
+                return await window.SegmentStream.transfer(segmentSender, io, onProgress, resumeFromSeq);
             } finally {
                 this._fileAckInFlight = false;
             }

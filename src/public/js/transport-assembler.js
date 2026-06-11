@@ -20,8 +20,8 @@
  *                                           event aborts the stream.
  * After PayloadAssembler.initState(host), the host gains these fields:
  *   _lastLoggedDecile, _sessionTotalBytes, _abusiveTeardown,
- *   _fileAckResolve, _fileAckReject, _fileAckTimeout, and the _v2* record
- *   parser fields.
+ *   _fileAckResolve, _fileAckReject, _fileAckTimeout, _segmentNackSeq,
+ *   and the _v2* record parser fields.
  *
  * Generated with the help of Claude Code.
  */
@@ -35,6 +35,7 @@
         host._fileAckResolve = null;
         host._fileAckReject = null;
         host._fileAckTimeout = null;
+        host._segmentNackSeq = null;
         clearV2Parser(host);
     }
 
@@ -90,6 +91,20 @@
         if (msg.type === 'file-nack') {
             logger.error(`[${host.tag}] received file-nack: ${msg.error}`);
             rejectFileAck(host, new Error(`Receiver decryption failed: ${msg.error}`));
+            return true;
+        }
+        if (msg.type === 'segment-nack') {
+            // The receiver rejected (or never got) records from msg.seq;
+            // the sendFile tail (SegmentStream.transfer) answers with a
+            // rewind. The nack can arrive while records are still being
+            // pumped, before the ack waiter exists, so it is stored on
+            // the host until setupFileAck picks it up.
+            logger.warn(`[${host.tag}] segment-nack: receiver needs records from seq ${msg.seq}`);
+            if (host._fileAckResolve) {
+                resolveFileAck(host, { segmentNack: msg.seq });
+            } else {
+                host._segmentNackSeq = msg.seq;
+            }
             return true;
         }
         return false;
@@ -221,6 +236,15 @@
     }
 
     function setupFileAck(host, resolve, reject, timeoutMs) {
+        if (Number.isInteger(host._segmentNackSeq)) {
+            // A segment-nack arrived while records were still going out;
+            // deliver it to the retry tail instead of waiting for an ack
+            // that will never come.
+            const seq = host._segmentNackSeq;
+            host._segmentNackSeq = null;
+            resolve({ segmentNack: seq });
+            return;
+        }
         host._fileAckResolve = resolve;
         host._fileAckReject = reject;
         host._fileAckTimeout = setTimeout(() => {

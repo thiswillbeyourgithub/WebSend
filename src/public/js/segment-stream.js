@@ -57,6 +57,12 @@
     /** AES-GCM auth tag length, for wire-size estimates */
     const GCM_TAG_BYTES = 16;
 
+    /** How many segment-nack → rewind → resend rounds transfer() runs
+     * before giving up. Also the sender-side bound against a hostile
+     * receiver nacking forever to make us re-encrypt for free; the
+     * receiver enforces its own budget (ReceiveFlow). */
+    const MAX_SEGMENT_RETRIES = 3;
+
     function b64encode(bytes) {
         return btoa(String.fromCharCode(...bytes));
     }
@@ -328,10 +334,15 @@
      *
      * When {resumeFromSeq} > 0 no file-start is sent: the receiver kept
      * its partial state and was re-keyed via file-resume-ack before this
-     * call. The caller still owns the file-ack wait that follows.
+     * call. {omitFileStart} forces the same even at seq 0 (an
+     * in-connection rewind to the metadata record re-keys via
+     * segment-rewind; the receiver keeps its SegmentReceiver and must
+     * not see a second file-start). The caller still owns the file-ack
+     * wait that follows.
      */
-    async function pump(sender, io, onProgress, resumeFromSeq) {
-        const isResume = Number.isInteger(resumeFromSeq) && resumeFromSeq > 0;
+    async function pump(sender, io, onProgress, resumeFromSeq, omitFileStart) {
+        const isResume = omitFileStart === true
+            || (Number.isInteger(resumeFromSeq) && resumeFromSeq > 0);
         if (!isResume) {
             if (!io.sendControl(Protocol.build.fileStartV2(sender.segCount, sender.saltB64))) {
                 throw new TransientDisconnectError('transport closed before file-start', 0);
@@ -372,13 +383,56 @@
         }
     }
 
+    /**
+     * Full send with the in-connection retry tail, shared by all three
+     * transports: pump every record plus file-end, then wait for the
+     * receiver's verdict via {io.waitForAck()}. That promise resolves
+     * with the file-ack value, or with {segmentNack: seq} when the
+     * receiver reported a record failed verification or went missing
+     * (corruption on an untrusted relay, a lost frame); it rejects on
+     * file-nack or ack timeout.
+     *
+     * On a segment-nack: rewind the sender to the nacked record (fresh
+     * salt, never reuse a (key, nonce) pair), announce the re-key with
+     * segment-rewind strictly before any resent record, and resend the
+     * tail. No file-start is resent: the receiver keeps its verified
+     * prefix. After MAX_SEGMENT_RETRIES rounds, or on a nack outside
+     * the file's record range, give up with a plain (non-transient)
+     * error so the sender's failure toast fires instead of an endless
+     * re-encrypt loop against a hostile or hopeless channel.
+     */
+    async function transfer(sender, io, onProgress, resumeFromSeq) {
+        let fromSeq = resumeFromSeq;
+        let omitFileStart = false;
+        for (let retries = 0; ; retries++) {
+            await pump(sender, io, onProgress, fromSeq, omitFileStart);
+            const verdict = await io.waitForAck();
+            if (!verdict || !Number.isInteger(verdict.segmentNack)) return verdict;
+            const seq = verdict.segmentNack;
+            if (retries >= MAX_SEGMENT_RETRIES) {
+                throw new Error(`Receiver still rejecting records after ${MAX_SEGMENT_RETRIES} rewinds (last nack: seq ${seq})`);
+            }
+            if (seq < 0 || seq > sender.segCount + 1) {
+                throw new Error(`segment-nack seq ${seq} outside the file's record range`);
+            }
+            const { saltB64 } = await sender.rewind(seq);
+            if (!io.sendControl(Protocol.build.segmentRewind(seq, saltB64))) {
+                throw new TransientDisconnectError('transport closed before segment-rewind', seq);
+            }
+            fromSeq = seq;
+            omitFileStart = true;
+        }
+    }
+
     window.TransientDisconnectError = TransientDisconnectError;
     window.SegmentStream = Object.freeze({
         META_RECORD_PLAINTEXT,
         FINAL_PAD_BUCKETS,
         RECORD_HEADER_BYTES,
+        MAX_SEGMENT_RETRIES,
         createSender,
         createReceiver,
         pump,
+        transfer,
     });
 })();

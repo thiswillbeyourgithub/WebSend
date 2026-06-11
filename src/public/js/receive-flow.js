@@ -262,6 +262,12 @@
 
     let _segmentReceiver = null;
     let _segmentChain = Promise.resolve();
+    // In-connection retry state: while non-null, a segment-nack went out
+    // and every incoming record is dropped until the sender's matching
+    // segment-rewind re-keys the receiver. Bounded by _retryCount.
+    let _awaitingRewindSeq = null;
+    let _retryCount = 0;
+    const MAX_TRANSFER_RETRIES = 3;
 
     function _enqueueSegmentWork(fn) {
         _segmentChain = _segmentChain.then(fn).catch(e => {
@@ -272,8 +278,37 @@
 
     function _nackTransfer(error) {
         _segmentReceiver = null;
+        _awaitingRewindSeq = null;
         if (!_getRtc().sendMessage(window.Protocol.build.fileNack(error))) {
-            _logger.warn('Nack could not be sent (channel closed) — sender will time out');
+            _logger.warn('Nack could not be sent (channel closed), sender will time out');
+        }
+    }
+
+    /**
+     * A record failed verification ('decrypt-failed') or file-end came
+     * with records missing ('incomplete'): ask the sender to rewind to
+     * the first record we lack and resend (it re-keys with a fresh salt,
+     * announced via segment-rewind). The transfer stays alive; incoming
+     * records are dropped until that rewind arrives. After
+     * MAX_TRANSFER_RETRIES rounds, give up with a file-nack carrying the
+     * last failure class (the record count is public on the wire and the
+     * auth/missing distinction is not an oracle; both are visible to the
+     * transport anyway).
+     */
+    function _requestRewind(failure) {
+        const seq = _segmentReceiver.nextSeq;
+        _retryCount++;
+        if (_retryCount > MAX_TRANSFER_RETRIES) {
+            _logger.error(`v2 transfer still failing after ${MAX_TRANSFER_RETRIES} rewinds; giving up (${failure})`);
+            _finalizeReceiveStats();
+            _nackTransfer(failure);
+            _showToast(_i18n.t('receive.transferIncomplete'), { type: 'error' });
+            return;
+        }
+        _awaitingRewindSeq = seq;
+        _logger.warn(`v2 ${failure} at record ${seq}; requesting rewind (retry ${_retryCount}/${MAX_TRANSFER_RETRIES})`);
+        if (!_getRtc().sendMessage(window.Protocol.build.segmentNack(seq))) {
+            _logger.warn('segment-nack could not be sent (channel closed), sender will time out');
         }
     }
 
@@ -298,6 +333,8 @@
                 saltB64: msg.salt,
                 segCount: msg.segCount,
             });
+            _awaitingRewindSeq = null;
+            _retryCount = 0;
             _logger.info(`v2 transfer started (${msg.segCount} segments)`);
         });
     }
@@ -307,13 +344,34 @@
             // No receiver: the file-start was dropped (unverified peer) or
             // the transfer already failed; drop the record in O(1).
             if (!_segmentReceiver) return;
+            // Nacked and waiting for the sender's rewind: everything the
+            // sender pipelined before seeing our nack is dead weight.
+            if (_awaitingRewindSeq !== null) return;
             const res = await _segmentReceiver.accept(msg.seq, msg.ct);
             if (!res.ok) {
-                // The failure reason stays local (a peer-facing distinction
-                // between auth and framing errors would be an oracle).
                 _logger.error(`v2 segment ${msg.seq} rejected (${res.reason})`);
-                _nackTransfer('decrypt-failed');
+                _requestRewind('decrypt-failed');
             }
+        });
+    }
+
+    /**
+     * Gated handler for segment-rewind: the sender's answer to our
+     * segment-nack. Re-keys the receiver with the fresh salt so the
+     * resent records verify. Only a rewind matching the seq WE nacked is
+     * honoured; an unsolicited one would let a peer re-key and replay at
+     * will.
+     */
+    function handleSegmentRewind(msg) {
+        return _enqueueSegmentWork(() => {
+            if (!_segmentReceiver) return;
+            if (msg.seq !== _awaitingRewindSeq) {
+                _logger.warn(`unsolicited segment-rewind to ${msg.seq} (awaiting ${_awaitingRewindSeq}); ignoring`);
+                return;
+            }
+            _segmentReceiver.rekey(msg.salt, msg.seq);
+            _awaitingRewindSeq = null;
+            _logger.info(`re-keyed after rewind; resuming verification at record ${msg.seq}`);
         });
     }
 
@@ -343,6 +401,9 @@
                 return null;
             }
             _segmentReceiver.rekey(saltB64, nextSeq);
+            // The reconnect re-key supersedes any in-connection rewind we
+            // were waiting for when the transport dropped.
+            _awaitingRewindSeq = null;
             return { segCount: _segmentReceiver.segCount };
         });
     }
@@ -353,26 +414,32 @@
      * fresh file-start).
      */
     function abandonTransfer() {
-        return _enqueueSegmentWork(() => { _segmentReceiver = null; });
+        return _enqueueSegmentWork(() => {
+            _segmentReceiver = null;
+            _awaitingRewindSeq = null;
+        });
     }
 
     function handleFileEnd() {
         return _enqueueSegmentWork(async () => {
             if (!_segmentReceiver) return;
+            // The sender sent this file-end before seeing our nack; the
+            // retried tail ends with a fresh one. Drop it like the
+            // records around it.
+            if (_awaitingRewindSeq !== null) return;
+
+            if (_segmentReceiver.nextSeq !== _segmentReceiver.segCount + 1) {
+                // Records went missing in transit (e.g. a relay dropped
+                // frames). Same retry path as a corrupted record: ask for
+                // the tail again instead of failing the whole file.
+                _logger.error(`v2 file-end after ${_segmentReceiver.nextSeq}/${_segmentReceiver.segCount + 1} records`);
+                _requestRewind('incomplete');
+                return;
+            }
+
             const receiver = _segmentReceiver;
             _segmentReceiver = null;
             _finalizeReceiveStats();
-
-            if (receiver.nextSeq !== receiver.segCount + 1) {
-                // Records went missing in transit. Distinct, non-oracle
-                // error: the record count is public on the wire.
-                _logger.error(`v2 file-end after ${receiver.nextSeq}/${receiver.segCount + 1} records; transfer incomplete`);
-                if (!_getRtc().sendMessage(window.Protocol.build.fileNack('incomplete'))) {
-                    _logger.warn('Incomplete-nack could not be sent (channel closed) — sender will time out');
-                }
-                _showToast(_i18n.t('receive.transferIncomplete'), { type: 'error' });
-                return;
-            }
 
             const { metadata, blob, compositeHashHex } = await receiver.finish();
             const decoded = buildDecoded(metadata && typeof metadata === 'object' ? metadata : {},
@@ -386,6 +453,7 @@
         attach,
         handleFileStart,
         handleFileSegment,
+        handleSegmentRewind,
         handleFileEnd,
         getResumeState,
         applyResumeAck,

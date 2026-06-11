@@ -306,6 +306,9 @@
                 throw new Error('sendFile already in progress, wait for the previous transfer to finish');
             }
             this._fileAckInFlight = true;
+            // Forget any segment-nack left over from a previous, concluded
+            // transfer; only nacks for THIS transfer may trigger a rewind.
+            this._segmentNackSeq = null;
 
             try {
                 const io = {
@@ -331,13 +334,14 @@
                         }
                         this.ws.send(chunk);
                     },
+                    // Receiver verdict: file-ack value, or {segmentNack: seq}.
+                    waitForAck: () => new Promise((resolve, reject) => {
+                        window.PayloadAssembler.setupFileAck(this, resolve, reject, FILE_ACK_TIMEOUT_MS);
+                    }),
                 };
-                await window.SegmentStream.pump(segmentSender, io, onProgress, resumeFromSeq);
-                logger.info('[WS] all records sent, waiting for receiver acknowledgment...');
-
-                return await new Promise((resolve, reject) => {
-                    window.PayloadAssembler.setupFileAck(this, resolve, reject, FILE_ACK_TIMEOUT_MS);
-                });
+                // transfer() owns the record pump, the file-end, and the
+                // segment-nack → rewind → resend retry tail.
+                return await window.SegmentStream.transfer(segmentSender, io, onProgress, resumeFromSeq);
             } finally {
                 this._fileAckInFlight = false;
             }
