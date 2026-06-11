@@ -30,11 +30,11 @@ class WebSendRTC {
         this.onConnectionTypeDetected = null; // Called when we know if direct or relay
 
         // Receive state + file-ack state are managed by PayloadAssembler so
-        // WS, LP, and WebRTC all share a single chunk-assembly implementation
+        // WS, LP, and WebRTC all share a single record-parsing implementation
         // (see transport-assembler.js). The host fields installed here are:
-        //   receiveBuffer, receivedSize, expectedSize, _lastLoggedDecile,
-        //   _sessionTotalBytes, _abusiveTeardown, _fileAckResolve,
-        //   _fileAckReject, _fileAckTimeout.
+        //   _lastLoggedDecile, _sessionTotalBytes, _abusiveTeardown,
+        //   _fileAckResolve, _fileAckReject, _fileAckTimeout, and the
+        //   _v2* record parser fields.
         window.PayloadAssembler.initState(this);
         this._FILE_ACK_TIMEOUT_MS = 30000; // 30s timeout for receiver to ack
 
@@ -452,7 +452,7 @@ class WebSendRTC {
                 logger.error('Failed to parse message: ' + e.message);
                 return;
             }
-            // Validate wire messages. 'progress' and 'encrypted-file' are local
+            // Validate wire messages. 'progress' and 'file-segment' are local
             // synthetic events (never on the wire) so they bypass this path.
             const vr = Protocol.validate(msg);
             if (!vr.ok) {
@@ -468,10 +468,10 @@ class WebSendRTC {
             }
             return;
         }
-        // Binary data (file chunk). PayloadAssembler enforces the same
+        // Binary data (record chunk). PayloadAssembler enforces the same
         // defense-in-depth bounds the WS/LP transports use:
-        //   1. chunk arrives before a valid file-start (expectedSize <= 0)
-        //   2. cumulative receivedSize would exceed expectedSize
+        //   1. chunk arrives before a valid file-start (parser disarmed)
+        //   2. record length or seq out of bounds (framing desync/hostile)
         //   3. session aggregate would exceed Protocol.MAX_TOTAL_SESSION_BYTES
         // On any breach it calls back into _abortTransport(reason) below.
         const buf = (data instanceof ArrayBuffer) ? data : (data && data.buffer) || data;

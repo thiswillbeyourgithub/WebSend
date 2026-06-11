@@ -1,10 +1,10 @@
 /**
  * transport-assembler.js, shared receive-state machine for all transports.
  *
- * The WS, LP, and WebRTC transports all need the same chunk-assembly state
- * machine (file-start / binary chunks / file-end / file-ack / file-nack)
- * plus the same anti-DoS bounds (MAX_TOTAL_SESSION_BYTES, MAX_CONTROL_MSG_BYTES,
- * MIN_FILE_START_SIZE indirectly via expectedSize). Without a shared module
+ * The WS, LP, and WebRTC transports all need the same crypto-free record
+ * parser (file-start / binary record framing / file-end / file-ack /
+ * file-nack) plus the same anti-DoS bounds (MAX_TOTAL_SESSION_BYTES,
+ * MAX_CONTROL_MSG_BYTES, record-length bounds). Without a shared module
  * this code lived in three places verbatim, which is fragile (a fix in one
  * transport can silently miss the others).
  *
@@ -19,9 +19,9 @@
  *                                           violation or session-byte-cap
  *                                           event aborts the stream.
  * After PayloadAssembler.initState(host), the host gains these fields:
- *   receiveBuffer, receivedSize, expectedSize, _lastLoggedDecile,
- *   _sessionTotalBytes, _abusiveTeardown, _fileAckResolve, _fileAckReject,
- *   _fileAckTimeout.
+ *   _lastLoggedDecile, _sessionTotalBytes, _abusiveTeardown,
+ *   _fileAckResolve, _fileAckReject, _fileAckTimeout, and the _v2* record
+ *   parser fields.
  *
  * Generated with the help of Claude Code.
  */
@@ -29,9 +29,6 @@
     'use strict';
 
     function initState(host) {
-        host.receiveBuffer = [];
-        host.receivedSize = 0;
-        host.expectedSize = 0;
         host._lastLoggedDecile = -1;
         host._sessionTotalBytes = 0;
         host._abusiveTeardown = false;
@@ -42,9 +39,6 @@
     }
 
     function resetReceive(host) {
-        host.receiveBuffer = [];
-        host.receivedSize = 0;
-        host.expectedSize = 0;
         host._sessionTotalBytes = 0;
         host._abusiveTeardown = false;
         clearV2Parser(host);
@@ -59,41 +53,11 @@
         host._v2WireEstimate = 0;
     }
 
-    // Resume helpers: a transient transport drop must preserve the
-    // in-flight file-start buffer so we can byte-level-resume after
-    // reconnect. Callers gate on these helpers; resetReceive() above
-    // is reserved for explicit teardown (cleanup / startNewPairing /
-    // a fresh file-start that invalidates the in-flight one).
-
-    function hasInflightTransfer(host) {
-        return host.expectedSize > 0 && host.receivedSize < host.expectedSize;
-    }
-
-    function getResumeState(host) {
-        if (!hasInflightTransfer(host)) return null;
-        return { size: host.expectedSize, received: host.receivedSize };
-    }
-
-    // Sender-side: called when our peer responds to file-resume-offer
-    // with file-resume-ack {offset: 0} (sender cannot or chose not to
-    // resume; expect a fresh file-start). Drops the partial buffer
-    // without touching the session-byte counter, which is independent
-    // of any particular file.
-    function discardInflightOnResumeReset(host) {
-        host.receiveBuffer = [];
-        host.receivedSize = 0;
-        host.expectedSize = 0;
-        host._lastLoggedDecile = -1;
-    }
-
     // Consume a control-frame message (already parsed + Protocol.validate'd).
-    // Returns true if the assembler handled it (file-start / file-end /
-    // file-ack / file-nack); returns false if the caller should forward it
-    // to onMessage.
+    // Returns true if the assembler handled it (file-ack / file-nack);
+    // returns false if the caller should forward it to onMessage.
     function handleControl(host, msg) {
         if (msg.type === 'file-start') {
-            host.receiveBuffer = [];
-            host.receivedSize = 0;
             host._lastLoggedDecile = -1;
             if (msg.v === 2) {
                 // v2 chunked format: the assembler stays crypto-free and
@@ -105,48 +69,18 @@
                 logger.info(`[${host.tag}] receiving v2 chunked file (${msg.segCount} segments)`);
                 return false;
             }
+            // Unknown/legacy version: forward upward so the receive flow
+            // answers file-nack('unsupported-version'). The parser stays
+            // disarmed; any binary that follows aborts the stream.
             clearV2Parser(host);
-            host.expectedSize = msg.size;
-            logger.info(`[${host.tag}] receiving encrypted file (${msg.size} bytes, padded)`);
-            return true;
-        }
-        if (msg.type === 'file-end' && host._v2Mode) {
-            // v2: completeness is judged by the SegmentReceiver (it knows
-            // how many records verified), so forward upward.
-            logger.info(`[${host.tag}] v2 file-end after ${host._v2WireBytes} wire bytes`);
+            logger.warn(`[${host.tag}] file-start with unsupported version (v=${msg.v})`);
             return false;
         }
         if (msg.type === 'file-end') {
-            // Bytes went missing in transit (chunks carry no sequence
-            // numbers, so this is the first place a loss is detectable).
-            // Don't hand the short blob to the decrypt path: AES-GCM would
-            // fail anyway and the sender would see an opaque "decryption
-            // failed" instead of the actionable "data was lost, retry".
-            if (host.receivedSize !== host.expectedSize) {
-                logger.error(`[${host.tag}] file-end after ${host.receivedSize}/${host.expectedSize} bytes; transfer incomplete`);
-                if (host.onMessage) {
-                    host.onMessage({
-                        type: 'file-incomplete',
-                        received: host.receivedSize,
-                        expected: host.expectedSize,
-                    });
-                }
-                host.receiveBuffer = [];
-                host.receivedSize = 0;
-                host.expectedSize = 0;
-                return true;
-            }
-            logger.info(`[${host.tag}] file transfer complete, assembling...`);
-            const blob = new Blob(host.receiveBuffer, { type: 'application/octet-stream' });
-            if (host.onMessage) host.onMessage({ type: 'encrypted-file', blob });
-            host.receiveBuffer = [];
-            host.receivedSize = 0;
-            // Also clear expectedSize: the transfer is over. Leaving it set
-            // made hasInflightTransfer() true again (receivedSize dropped
-            // back to 0), so a reconnect after a *completed* transfer sent
-            // the sender a bogus file-resume-offer {received: 0}.
-            host.expectedSize = 0;
-            return true;
+            // Completeness is judged by the SegmentReceiver (it knows how
+            // many records verified), so forward upward.
+            logger.info(`[${host.tag}] file-end after ${host._v2WireBytes} wire bytes`);
+            return false;
         }
         if (msg.type === 'file-ack') {
             logger.info(`[${host.tag}] received file-ack with SHA-256: ${msg.sha256}`);
@@ -252,7 +186,6 @@
     // at 0; the receiver's percent display uses the exact seq/segCount
     // fields on progress events, the byte fields only feed rate/ETA.
     function armV2Parser(host, segCount, nextSeq) {
-        host.expectedSize = 0;
         host._v2Mode = true;
         host._v2Pending = null;
         host._v2NextSeq = nextSeq;
@@ -267,49 +200,18 @@
 
     function handleBinary(host, buf) {
         if (host._abusiveTeardown) return;
-        if (host._v2Mode) {
-            handleBinaryV2(host, buf);
-            return;
-        }
-        const len = (buf && buf.byteLength) | 0;
-        if (host.expectedSize <= 0) {
+        if (!host._v2Mode) {
             abortAbusiveStream(host, 'binary chunk before file-start');
             return;
         }
-        if (host.receivedSize + len > host.expectedSize) {
-            abortAbusiveStream(host,
-                `chunk overflow: received ${host.receivedSize} + ${len} > expected ${host.expectedSize}`);
-            return;
-        }
-        if (host._sessionTotalBytes + len > window.Protocol.MAX_TOTAL_SESSION_BYTES) {
-            abortAbusiveStream(host,
-                `session byte cap exceeded (${host._sessionTotalBytes + len} > ${window.Protocol.MAX_TOTAL_SESSION_BYTES})`);
-            return;
-        }
-        host.receiveBuffer.push(buf);
-        host.receivedSize += len;
-        host._sessionTotalBytes += len;
-        const decile = Math.floor((host.receivedSize / host.expectedSize) * 10) * 10;
-        if (decile !== host._lastLoggedDecile) {
-            host._lastLoggedDecile = decile;
-            logger.info(`[${host.tag}] receiving: ${decile}%`);
-        }
-        if (host.onMessage) {
-            host.onMessage({
-                type: 'progress',
-                received: host.receivedSize,
-                total: host.expectedSize,
-            });
-        }
+        handleBinaryV2(host, buf);
     }
 
     function abortAbusiveStream(host, reason) {
         if (host._abusiveTeardown) return;
         host._abusiveTeardown = true;
         logger.error(`[${host.tag}] aborting transport: ${reason}`);
-        host.receiveBuffer = [];
-        host.receivedSize = 0;
-        host.expectedSize = 0;
+        clearV2Parser(host);
         if (typeof host._abortTransport === 'function') {
             try { host._abortTransport(reason); } catch (_) {}
         }
@@ -361,8 +263,5 @@
         clearFileAckState,
         resolveFileAck,
         rejectFileAck,
-        hasInflightTransfer,
-        getResumeState,
-        discardInflightOnResumeReset,
     });
 })();

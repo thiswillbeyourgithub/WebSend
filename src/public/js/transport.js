@@ -550,16 +550,6 @@
 
         get pc() { return this.webrtc.pc; }
         get iceServers() { return this.webrtc.iceServers || []; }
-
-        get receiveBuffer() {
-            const w = this._innerByName(this.winner);
-            return w ? w.receiveBuffer : this.webrtc.receiveBuffer;
-        }
-        set receiveBuffer(v) {
-            this.webrtc.receiveBuffer = v;
-            if (this.ws) this.ws.receiveBuffer = v;
-            if (this.lp) this.lp.receiveBuffer = v;
-        }
     }
 
     function createForReceiver() {

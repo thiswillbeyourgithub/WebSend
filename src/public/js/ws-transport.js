@@ -17,7 +17,6 @@
  *     wins the race here still requires the same out-of-band ceremony.
  *   - Anti-DoS bounds are mirrored from webrtc.js handleMessage:
  *       Protocol.MAX_CONTROL_MSG_BYTES (16 KiB)
- *       Protocol.MIN_FILE_START_SIZE  (16 KiB)
  *       Protocol.MAX_TOTAL_SESSION_BYTES (4 GiB)
  *     The server (server.js, commit 2) also enforces the cumulative caps
  *     so a malicious client cannot ignore them.
@@ -244,7 +243,7 @@
             logger.warn(`  URL: ${url}`);
             logger.warn(`  Close: code=${code} reason=${reason || '?'}`);
             logger.warn(`  Session bytes received: ${this._sessionTotalBytes}`);
-            logger.warn(`  Last expected/received: ${this.receivedSize}/${this.expectedSize}`);
+            logger.warn(`  Last record seq expected: ${this._v2Mode ? this._v2NextSeq : '(no transfer)'}`);
             logger.warn(`  Buffered amount on close: ${this.ws ? this.ws.bufferedAmount : '?'}`);
         }
 

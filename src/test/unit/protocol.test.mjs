@@ -7,7 +7,7 @@ import path from 'node:path';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const modulePath = path.resolve(__dirname, '../../public/js/protocol.js');
 const win = await loadBrowserModule(modulePath);
-const { validate, build, VERSION, MIN_FILE_START_SIZE, MAX_FILE_SIZE,
+const { validate, build, VERSION, MAX_FILE_SIZE,
         MAX_TOTAL_SESSION_BYTES, MAX_TRANSFORMS_PER_MSG,
         MAX_CONTROL_MSG_BYTES } = win.Protocol;
 
@@ -47,25 +47,7 @@ test('validate: ready (no fields) is ok', () => {
     assert.equal(validate({ type: 'ready' }).ok, true);
 });
 
-test('validate: file-start with number size at the bucket floor is ok', () => {
-    assert.equal(validate({ type: 'file-start', size: MIN_FILE_START_SIZE }).ok, true);
-});
-
-test('validate: file-start with size below MIN_FILE_START_SIZE is rejected', () => {
-    assert.equal(validate({ type: 'file-start', size: MIN_FILE_START_SIZE - 1 }).ok, false);
-    assert.equal(validate({ type: 'file-start', size: 1024 }).ok, false);
-    assert.equal(validate({ type: 'file-start', size: 0 }).ok, false);
-    assert.equal(validate({ type: 'file-start', size: -1 }).ok, false);
-});
-
-test('validate: file-start with size above MAX_FILE_SIZE is rejected', () => {
-    assert.equal(validate({ type: 'file-start', size: MAX_FILE_SIZE + 1 }).ok, false);
-    assert.equal(validate({ type: 'file-start', size: Number.MAX_SAFE_INTEGER }).ok, false);
-});
-
-test('Protocol exposes MIN_FILE_START_SIZE, MAX_TOTAL_SESSION_BYTES, MAX_TRANSFORMS_PER_MSG', () => {
-    assert.equal(typeof MIN_FILE_START_SIZE, 'number');
-    assert.ok(MIN_FILE_START_SIZE >= 16 * 1024);
+test('Protocol exposes MAX_TOTAL_SESSION_BYTES, MAX_TRANSFORMS_PER_MSG', () => {
     assert.equal(typeof MAX_TOTAL_SESSION_BYTES, 'number');
     assert.ok(MAX_TOTAL_SESSION_BYTES >= MAX_FILE_SIZE);
     assert.equal(typeof MAX_TRANSFORMS_PER_MSG, 'number');
@@ -230,11 +212,6 @@ test('validate: public-key with non-string key returns error', () => {
     assert.equal(r.ok, false);
 });
 
-test('validate: file-start with string size returns error', () => {
-    const r = validate({ type: 'file-start', size: '1024' });
-    assert.equal(r.ok, false);
-});
-
 test('validate: file-ack with 63-char hash returns error', () => {
     const r = validate({ type: 'file-ack', sha256: 'a'.repeat(63) });
     assert.equal(r.ok, false);
@@ -282,12 +259,6 @@ test('build.fingerprintConfirmed produces valid message', () => {
     assert.equal(m.protocolVersion, 1);
 });
 
-test('build.fileStart produces valid message', () => {
-    const m = build.fileStart(MIN_FILE_START_SIZE);
-    assert.equal(m.size, MIN_FILE_START_SIZE);
-    assert.equal(validate(m).ok, true);
-});
-
 test('build.fileAck produces valid message', () => {
     const m = build.fileAck(VALID_HASH);
     assert.equal(validate(m).ok, true);
@@ -332,89 +303,6 @@ test('build.batchEnd produces valid message', () => {
 
 test('build.ready produces valid message', () => {
     assert.equal(validate(build.ready()).ok, true);
-});
-
-// ---- file-resume-offer / file-resume-ack (relay-reconnect resume protocol) ----
-
-test('validate: file-resume-offer with valid size+received is ok', () => {
-    const r = validate({
-        type: 'file-resume-offer',
-        size: MIN_FILE_START_SIZE,
-        received: 0,
-    });
-    assert.equal(r.ok, true);
-});
-
-test('validate: file-resume-offer with received < size is ok', () => {
-    const r = validate({
-        type: 'file-resume-offer',
-        size: MIN_FILE_START_SIZE * 4,
-        received: MIN_FILE_START_SIZE * 2,
-    });
-    assert.equal(r.ok, true);
-});
-
-test('validate: file-resume-offer rejects size below MIN_FILE_START_SIZE', () => {
-    assert.equal(validate({ type: 'file-resume-offer', size: 1024, received: 0 }).ok, false);
-});
-
-test('validate: file-resume-offer rejects size above MAX_FILE_SIZE', () => {
-    assert.equal(validate({ type: 'file-resume-offer', size: MAX_FILE_SIZE + 1, received: 0 }).ok, false);
-});
-
-test('validate: file-resume-offer rejects negative received', () => {
-    assert.equal(validate({ type: 'file-resume-offer', size: MIN_FILE_START_SIZE, received: -1 }).ok, false);
-});
-
-test('validate: file-resume-offer rejects non-integer received', () => {
-    assert.equal(validate({ type: 'file-resume-offer', size: MIN_FILE_START_SIZE, received: 1.5 }).ok, false);
-});
-
-test('validate: file-resume-offer rejects missing fields', () => {
-    assert.equal(validate({ type: 'file-resume-offer', size: MIN_FILE_START_SIZE }).ok, false);
-    assert.equal(validate({ type: 'file-resume-offer', received: 0 }).ok, false);
-});
-
-test('validate: file-resume-ack with offset 0 is ok', () => {
-    assert.equal(validate({ type: 'file-resume-ack', offset: 0 }).ok, true);
-});
-
-test('validate: file-resume-ack with positive offset is ok', () => {
-    assert.equal(validate({ type: 'file-resume-ack', offset: 1024 }).ok, true);
-});
-
-test('validate: file-resume-ack rejects negative offset', () => {
-    assert.equal(validate({ type: 'file-resume-ack', offset: -1 }).ok, false);
-});
-
-test('validate: file-resume-ack rejects non-integer offset', () => {
-    assert.equal(validate({ type: 'file-resume-ack', offset: 1.5 }).ok, false);
-});
-
-test('validate: file-resume-ack rejects offset above MAX_FILE_SIZE', () => {
-    assert.equal(validate({ type: 'file-resume-ack', offset: MAX_FILE_SIZE + 1 }).ok, false);
-});
-
-test('build.fileResumeOffer produces valid stamped message', () => {
-    const m = build.fileResumeOffer(MIN_FILE_START_SIZE * 4, MIN_FILE_START_SIZE);
-    assert.equal(m.type, 'file-resume-offer');
-    assert.equal(m.size, MIN_FILE_START_SIZE * 4);
-    assert.equal(m.received, MIN_FILE_START_SIZE);
-    assert.equal(m.protocolVersion, 1);
-    assert.equal(validate(m).ok, true);
-});
-
-test('build.fileResumeAck produces valid stamped message', () => {
-    const m = build.fileResumeAck(2048);
-    assert.equal(m.type, 'file-resume-ack');
-    assert.equal(m.offset, 2048);
-    assert.equal(m.protocolVersion, 1);
-    assert.equal(validate(m).ok, true);
-});
-
-test('build.fileResumeAck with 0 offset (cannot-resume signal) is valid', () => {
-    const m = build.fileResumeAck(0);
-    assert.equal(validate(m).ok, true);
 });
 
 // ---- v2 chunked-file messages (file-start v2, segment-nack/rewind, seq resume) ----
@@ -464,14 +352,24 @@ test('validate: file-start v2 rejects malformed salts', () => {
     }
 });
 
-test('validate: file-start rejects unknown format versions', () => {
-    assert.equal(validate({
-        type: 'file-start', v: 3, segSize: SEG_SIZE, segCount: 3, salt: VALID_SALT,
-    }).ok, false);
+test('validate: non-v2 file-start shapes pass validation (graceful unsupported-version nack)', () => {
+    // Legacy (v undefined) and future-version file-starts intentionally
+    // pass shape validation so they reach the receive flow, which answers
+    // with file-nack('unsupported-version') instead of silently dropping
+    // the message and stalling the sender.
+    assert.equal(validate({ type: 'file-start', size: 262144 }).ok, true,
+        'v1 shape forwarded for the unsupported-version nack');
+    assert.equal(validate({ type: 'file-start', v: 3, blocks: 9 }).ok, true,
+        'unknown future version forwarded for the unsupported-version nack');
+    assert.equal(validate({ type: 'file-start', v: -1 }).ok, false);
+    assert.equal(validate({ type: 'file-start', v: 'x' }).ok, false);
 });
 
-test('validate: file-start v1 shape still accepted during transition', () => {
-    assert.equal(validate({ type: 'file-start', size: MIN_FILE_START_SIZE }).ok, true);
+test('validate: v1-shaped resume messages are rejected', () => {
+    assert.equal(validate({ type: 'file-resume-offer', size: 262144, received: 0 }).ok, false,
+        'v1 offer carried size/received, v2 requires nextSeq');
+    assert.equal(validate({ type: 'file-resume-ack', offset: 2048 }).ok, false,
+        'v1 ack carried a byte offset, v2 requires nextSeq');
 });
 
 test('validate: segment-nack seq bounds', () => {

@@ -19,37 +19,6 @@ const win = await loadBrowserModule(modulePath, {
 });
 const C = win.WebSendCrypto;
 
-// ---- PADDING ----
-
-test('PADDING_BUCKETS is monotonically increasing', () => {
-    for (let i = 1; i < C.PADDING_BUCKETS.length; i++) {
-        assert.ok(C.PADDING_BUCKETS[i] > C.PADDING_BUCKETS[i - 1],
-            `Bucket ${i} not larger than bucket ${i - 1}`);
-    }
-});
-
-test('getPaddedSize: 1 byte returns smallest bucket', () => {
-    assert.equal(C.getPaddedSize(1), C.PADDING_BUCKETS[0]);
-});
-
-test('getPaddedSize: exactly at bucket boundary', () => {
-    const bucket = C.PADDING_BUCKETS[2]; // 256 KB
-    assert.equal(C.getPaddedSize(bucket), bucket);
-});
-
-test('getPaddedSize: one byte over bucket returns next bucket', () => {
-    const bucket = C.PADDING_BUCKETS[2];
-    assert.equal(C.getPaddedSize(bucket + 1), C.PADDING_BUCKETS[3]);
-});
-
-test('getPaddedSize: size beyond max bucket rounds to multiple of max', () => {
-    const max = C.PADDING_BUCKETS[C.PADDING_BUCKETS.length - 1];
-    const oversized = max * 2 + 1;
-    const result = C.getPaddedSize(oversized);
-    assert.equal(result % max, 0);
-    assert.ok(result >= oversized);
-});
-
 // ---- getRandomBytes ----
 
 test('getRandomBytes: returns correct length', () => {
@@ -79,39 +48,6 @@ test('sha256Hex: deterministic for same input', async () => {
     assert.equal(h1, h2);
 });
 
-// ---- encrypt / decrypt ----
-
-test('encrypt/decrypt round-trip', async () => {
-    const kp1 = await C.generateKeyPair();
-    const kp2 = await C.generateKeyPair();
-    const pub1 = await C.exportPublicKey(kp1.publicKey);
-    const importedPub1 = await C.importPublicKey(pub1);
-    const key = await C.deriveSharedKey(kp2.privateKey, importedPub1);
-
-    const original = new TextEncoder().encode('secret message').buffer;
-    const encrypted = await C.encrypt(original, key);
-    const decrypted = await C.decrypt(encrypted, key);
-
-    assert.deepEqual(new Uint8Array(decrypted), new Uint8Array(original));
-});
-
-test('decrypt rejects tampered ciphertext (tag mismatch)', async () => {
-    const kp1 = await C.generateKeyPair();
-    const kp2 = await C.generateKeyPair();
-    const pub1 = await C.exportPublicKey(kp1.publicKey);
-    const importedPub1 = await C.importPublicKey(pub1);
-    const key = await C.deriveSharedKey(kp2.privateKey, importedPub1);
-
-    const original = new TextEncoder().encode('tamper test').buffer;
-    const encrypted = await C.encrypt(original, key);
-
-    // Flip a byte in the ciphertext body (after the 12-byte IV)
-    const tampered = new Uint8Array(encrypted);
-    tampered[20] ^= 0xff;
-
-    await assert.rejects(() => C.decrypt(tampered.buffer, key));
-});
-
 // ---- deriveSharedKey symmetry ----
 
 test('deriveSharedKey is symmetric across two key pairs', async () => {
@@ -129,32 +65,14 @@ test('deriveSharedKey is symmetric across two key pairs', async () => {
     // A derives using B's public key
     const keyByA = await C.deriveSharedKey(kpA.privateKey, importedPubB);
 
-    // Both keys should decrypt the same ciphertext
-    const plaintext = new TextEncoder().encode('symmetry check').buffer;
-    const encryptedByA = await C.encrypt(plaintext, keyByA);
-    const decryptedByB = await C.decrypt(encryptedByA, keyByB);
-    assert.deepEqual(new Uint8Array(decryptedByB), new Uint8Array(plaintext));
-});
-
-// ---- encryptWithMetadata / decryptWithMetadata ----
-
-test('encryptWithMetadata/decryptWithMetadata round-trip', async () => {
-    const kpA = await C.generateKeyPair();
-    const kpB = await C.generateKeyPair();
-    const pubA = await C.exportPublicKey(kpA.publicKey);
-    const keyB = await C.deriveSharedKey(kpB.privateKey, await C.importPublicKey(pubA));
-    const pubB = await C.exportPublicKey(kpB.publicKey);
-    const keyA = await C.deriveSharedKey(kpA.privateKey, await C.importPublicKey(pubB));
-
-    const data = new TextEncoder().encode('image data here').buffer;
-    const metadata = { name: 'test.jpg', mimeType: 'image/jpeg', originalSize: data.byteLength };
-
-    const encrypted = await C.encryptWithMetadata(data, metadata, keyA);
-    const { metadata: meta2, data: data2 } = await C.decryptWithMetadata(encrypted, keyB);
-
-    assert.equal(meta2.name, 'test.jpg');
-    assert.equal(meta2.mimeType, 'image/jpeg');
-    assert.deepEqual(new Uint8Array(data2), new Uint8Array(data));
+    // The keys are non-extractable, so prove symmetry by encrypting with
+    // one and decrypting with the other (raw WebCrypto; the module no
+    // longer exposes a whole-buffer encrypt helper).
+    const iv = C.getRandomBytes(12);
+    const plaintext = new TextEncoder().encode('symmetry check');
+    const ct = await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, keyByA, plaintext);
+    const pt = await globalThis.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, keyByB, ct);
+    assert.deepEqual(new Uint8Array(pt), plaintext);
 });
 
 // ---- getKeyFingerprint ----
@@ -256,10 +174,15 @@ test('deriveSessionKeys: sharedKey matches deriveSharedKey and is symmetric', as
     const pubB = await C.importPublicKey(await C.exportPublicKey(kpB.publicKey));
     const legacyA = await C.deriveSharedKey(kpA.privateKey, pubB);
 
-    const plaintext = new TextEncoder().encode('session key parity').buffer;
-    const encrypted = await C.encrypt(plaintext, keysB.sharedKey);
-    const decrypted = await C.decrypt(encrypted, legacyA);
-    assert.deepEqual(new Uint8Array(decrypted), new Uint8Array(plaintext));
+    // Both keys are non-extractable; parity is proven by a raw WebCrypto
+    // encrypt-with-one / decrypt-with-the-other round trip.
+    const iv = C.getRandomBytes(12);
+    const plaintext = new TextEncoder().encode('session key parity');
+    const ct = await globalThis.crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv }, keysB.sharedKey, plaintext);
+    const pt = await globalThis.crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv }, legacyA, ct);
+    assert.deepEqual(new Uint8Array(pt), plaintext);
 });
 
 test('deriveFileKey: rejects bad salts', async () => {

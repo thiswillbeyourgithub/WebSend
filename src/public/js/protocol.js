@@ -6,18 +6,10 @@
 (function () {
     const PROTOCOL_VERSION = 1;
 
-    // Hard upper bound on a single encrypted-file payload. Padding tops out
-    // around the next power of two above the largest plausible photo, so 1 GiB
-    // is generous and still small enough that a hostile or buggy peer cannot
-    // request a multi-GB allocation or break progress arithmetic.
+    // Hard upper bound on a single file. Bounds MAX_SEG_COUNT below, so a
+    // hostile or buggy peer cannot request a multi-GB allocation or break
+    // progress arithmetic.
     const MAX_FILE_SIZE = 1024 * 1024 * 1024;
-
-    // Hard lower bound on a single encrypted-file payload. The smallest legitimate
-    // ciphertext is one padding bucket (16 KiB) plus AES-GCM IV (12 B) and tag
-    // (16 B). Anything below this is a malformed or hostile file-start that
-    // upstream callers should drop. Defense-in-depth alongside the receiver-side
-    // actual-byte cap.
-    const MIN_FILE_START_SIZE = 16 * 1024;
 
     // Hard ceiling on the cumulative bytes a single peer may push across the
     // entire data-channel session. Even with the per-file expectedSize cap a
@@ -52,10 +44,6 @@
 
     // Predicates used in schemas
     function isHex64(v) { return typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v); }
-    function isBoundedSize(v) {
-        return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v)
-            && v >= MIN_FILE_START_SIZE && v <= MAX_FILE_SIZE;
-    }
     function isNormalizedCoord(v) {
         return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
     }
@@ -70,15 +58,6 @@
     function isNonNegativeInt(v) {
         return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v >= 0;
     }
-    function isReceivedInRange(v) {
-        // file-resume-offer.received is bounded by size; the cross-field
-        // (received <= size) check is enforced in the receiver-side
-        // handler since per-field validators don't see siblings.
-        return isNonNegativeInt(v) && v <= MAX_FILE_SIZE;
-    }
-    function isOffsetInRange(v) {
-        return isNonNegativeInt(v) && v <= MAX_FILE_SIZE;
-    }
     function isFileSalt(v) {
         // base64 of exactly 16 bytes: 22 significant chars + '==' padding
         return typeof v === 'string' && /^[A-Za-z0-9+/]{22}==$/.test(v);
@@ -90,32 +69,33 @@
         // nextSeq may be segCount + 1 ("I had everything but the file-end")
         return isNonNegativeInt(v) && v <= MAX_SEG_COUNT + 1;
     }
-    // file-start ships in two formats during the v1 -> v2 transition:
-    // v1 {size} (whole-file ciphertext) and v2 {v: 2, segSize, segCount,
-    // salt} (chunked AEAD). v2 deliberately carries NO plaintext size; the
-    // exact size lives inside the encrypted metadata record so padding
-    // keeps hiding it, and segCount only reveals size to SEG_SIZE
-    // granularity (which the wire traffic reveals anyway).
+    // file-start v2 {v: 2, segSize, segCount, salt} (chunked AEAD). It
+    // deliberately carries NO plaintext size; the exact size lives inside
+    // the encrypted metadata record so padding keeps hiding it, and
+    // segCount only reveals size to SEG_SIZE granularity (which the wire
+    // traffic reveals anyway).
     function isFileStartShape(msg) {
-        if (msg.v === undefined) return isBoundedSize(msg.size);
-        return msg.v === 2
-            && msg.segSize === SEG_SIZE
-            && isNonNegativeInt(msg.segCount) && msg.segCount >= 1 && msg.segCount <= MAX_SEG_COUNT
-            && isFileSalt(msg.salt);
-    }
-    // file-resume-offer: v1 {size, received} (byte-offset resume) or
-    // v2 {nextSeq} (segment resume).
-    function isFileResumeOfferShape(msg) {
-        if (msg.nextSeq === undefined) {
-            return isBoundedSize(msg.size) && isReceivedInRange(msg.received);
+        if (msg.v === 2) {
+            return msg.segSize === SEG_SIZE
+                && isNonNegativeInt(msg.segCount) && msg.segCount >= 1 && msg.segCount <= MAX_SEG_COUNT
+                && isFileSalt(msg.salt);
         }
+        // Unknown or legacy version (the removed v1 whole-file format has
+        // no v field): allowed through validation only so the receive flow
+        // can answer file-nack('unsupported-version') instead of silently
+        // dropping (the sender would otherwise time out unexplained). Any
+        // binary that follows is rejected by the record parser.
+        return msg.v === undefined || isNonNegativeInt(msg.v);
+    }
+    // file-resume-offer {nextSeq}: "I have an in-flight v2 transfer and
+    // verified every record below nextSeq; resume from there if you can."
+    function isFileResumeOfferShape(msg) {
         return isNextSeqInRange(msg.nextSeq);
     }
-    // file-resume-ack: v1 {offset} or v2 {nextSeq, salt}. nextSeq === 0
-    // means "cannot resume, expect a fresh file-start" and needs no salt;
-    // a positive nextSeq re-keys the tail, so the fresh salt is mandatory.
+    // file-resume-ack {nextSeq, salt}. nextSeq === 0 means "cannot resume,
+    // expect a fresh file-start" and needs no salt; a positive nextSeq
+    // re-keys the tail, so the fresh salt is mandatory.
     function isFileResumeAckShape(msg) {
-        if (msg.nextSeq === undefined) return isOffsetInRange(msg.offset);
         if (!isNextSeqInRange(msg.nextSeq)) return false;
         return msg.nextSeq === 0 || isFileSalt(msg.salt);
     }
@@ -134,9 +114,9 @@
     // Schema: { required: { field: 'string'|'number'|'boolean'|predicateFn },
     //           check: wholeMessagePredicate }
     // `check` runs after the required fields and sees the full message; it
-    // exists for the messages whose valid shape depends on which format
-    // (v1 whole-file / v2 chunked) they belong to. Fields not listed are
-    // allowed (forward-compat).
+    // exists for the messages whose valid shape depends on another field
+    // (file-start versioning, resume-ack salt rules). Fields not listed
+    // are allowed (forward-compat).
     const schemas = {
         'public-key':              { required: { key: 'string' } },
         'sender-public-key':       { required: { key: 'string' } },
@@ -159,8 +139,8 @@
         // "I have an in-flight transfer; here is how far I verifiably got;
         // resume from there if you can."
         'file-resume-offer':       { check: isFileResumeOfferShape },
-        // file-resume-ack: sender → receiver. Zero (offset or nextSeq)
-        // means "I cannot resume, expect a fresh file-start".
+        // file-resume-ack: sender → receiver. nextSeq 0 means "I cannot
+        // resume, expect a fresh file-start".
         'file-resume-ack':         { check: isFileResumeAckShape },
         'delete-image':            { required: { hash: isHex64 } },
         'transform-image':         { required: { oldHash: isHex64, transforms: isTransformArray } },
@@ -207,16 +187,13 @@
         fingerprintConfirmed:  ()                        => stamp({ type: 'fingerprint-confirmed' }),
         fingerprintDenied:     ()                        => stamp({ type: 'fingerprint-denied' }),
         ready:                 ()                        => stamp({ type: 'ready' }),
-        fileStart:             (size)                    => stamp({ type: 'file-start',              size }),
         fileStartV2:           (segCount, salt)          => stamp({ type: 'file-start',              v: 2, segSize: SEG_SIZE, segCount, salt }),
         fileEnd:               ()                        => stamp({ type: 'file-end' }),
         fileAck:               (sha256)                  => stamp({ type: 'file-ack',                sha256 }),
         fileNack:              (error)                   => stamp({ type: 'file-nack',               error }),
         segmentNack:           (seq)                     => stamp({ type: 'segment-nack',            seq }),
         segmentRewind:         (seq, salt)               => stamp({ type: 'segment-rewind',          seq, salt }),
-        fileResumeOffer:       (size, received)          => stamp({ type: 'file-resume-offer',       size, received }),
         fileResumeOfferV2:     (nextSeq)                 => stamp({ type: 'file-resume-offer',       nextSeq }),
-        fileResumeAck:         (offset)                  => stamp({ type: 'file-resume-ack',         offset }),
         fileResumeAckV2:       (nextSeq, salt)           => stamp(salt === undefined
             ? { type: 'file-resume-ack', nextSeq }
             : { type: 'file-resume-ack', nextSeq, salt }),
@@ -236,7 +213,6 @@
     window.Protocol = Object.freeze({
         VERSION: PROTOCOL_VERSION,
         MAX_FILE_SIZE,
-        MIN_FILE_START_SIZE,
         SEG_SIZE,
         MAX_SEG_COUNT,
         MAX_TOTAL_SESSION_BYTES,

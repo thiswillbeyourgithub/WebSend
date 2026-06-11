@@ -30,7 +30,6 @@ const STUB_RTC = `
             this.onMessage = null;
             this.onStateChange = null;
             this.onConnectionTypeDetected = null;
-            this.receiveBuffer = [];
             this.pc = null;
             this._isStub = true;
         }
@@ -88,7 +87,6 @@ test('createForReceiver returns an object that satisfies the Transport interface
     assert.equal(t.onConnectionTypeDetected, null);
     // State surface
     assert.ok(Array.isArray(t.iceServers));
-    assert.ok(Array.isArray(t.receiveBuffer));
 });
 
 test('createForSender returns an object that satisfies the Transport interface', () => {

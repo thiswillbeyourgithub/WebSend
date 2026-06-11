@@ -466,7 +466,6 @@
 
     function cleanup() {
         if (rtc) {
-            rtc.receiveBuffer = [];
             try { rtc.close(); } catch (_) {}
         }
         rtc = null;

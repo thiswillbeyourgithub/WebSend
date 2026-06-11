@@ -335,7 +335,7 @@
             logger.warn(`  URL: ${url}`);
             logger.warn(`  Slot: ${this._slot || '?'} reason=${reason || '?'}`);
             logger.warn(`  Session bytes received: ${this._sessionTotalBytes}`);
-            logger.warn(`  Last expected/received: ${this.receivedSize}/${this.expectedSize}`);
+            logger.warn(`  Last record seq expected: ${this._v2Mode ? this._v2NextSeq : '(no transfer)'}`);
         }
 
         _abortTransport(_reason) {

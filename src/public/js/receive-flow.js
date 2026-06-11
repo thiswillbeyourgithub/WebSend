@@ -1,14 +1,15 @@
 /**
  * receive-flow.js
  *
- * Decrypt-and-display pipeline for incoming encrypted-file messages on the
- * receiver page. Owns the three-step flow:
- *   handleEncryptedFile → decryptIncomingFile → addNewReceivedImage
+ * Decrypt-and-display pipeline for incoming v2 chunked transfers on the
+ * receiver page. Owns the SegmentReceiver lifecycle and the display flow:
+ *   handleFileStart → handleFileSegment* → handleFileEnd
+ *                                            ↘ addNewReceivedImage
  *                                            ↘ applyImageReplacement
  *
- * Cross-page state (sharedKey, receivedImages, pendingReplaceHash, etc.) is
+ * Cross-page state (sessionKeys, receivedImages, pendingReplaceHash, etc.) is
  * passed in via ReceiveFlow.attach({...}) once during page init. Globals it
- * reaches via window: WebSendCrypto, Protocol, Collections, ReceiveCard,
+ * reaches via window: SegmentStream, Protocol, Collections, ReceiveCard,
  * ReceiveExport, BgOcr.
  *
  * Exposed as window.ReceiveFlow.
@@ -22,7 +23,6 @@
     let _logger = null;
     let _i18n = null;
     let _showToast = null;
-    let _getSharedKey = null;
     let _getSessionKeys = null;
     let _getPendingReplaceHash = null;
     let _setPendingReplaceHash = null;
@@ -37,7 +37,6 @@
         _logger = opts.logger;
         _i18n = opts.i18n;
         _showToast = opts.showToast;
-        _getSharedKey = opts.getSharedKey;
         _getSessionKeys = opts.getSessionKeys;
         _getPendingReplaceHash = opts.getPendingReplaceHash;
         _setPendingReplaceHash = opts.setPendingReplaceHash;
@@ -103,8 +102,7 @@
 
     /**
      * Sanitize peer-supplied metadata and shape a decrypted payload for
-     * display. Shared by the v1 whole-file path (decryptIncomingFile) and
-     * the v2 segment path (file-end finalization).
+     * display (file-end finalization).
      * @param {Object} metadata - Raw peer metadata (sanitized in place)
      * @param {ArrayBuffer} data - Verified plaintext
      */
@@ -132,15 +130,8 @@
         return { metadata, data, fileData, fileMimeType, fileBlob, fileType, fileName };
     }
 
-    async function decryptIncomingFile(blob) {
-        const sharedKey = _getSharedKey();
-        const encryptedData = await blob.arrayBuffer();
-        const { metadata, data } = await window.WebSendCrypto.decryptWithMetadata(encryptedData, sharedKey);
-        return buildDecoded(metadata, data);
-    }
-
     async function applyImageReplacement(replaceIdx, decoded) {
-        const { data, fileData, fileMimeType, fileBlob, fileType, fileName } = decoded;
+        const { fileData, fileMimeType, fileBlob, fileType, fileName } = decoded;
         const oldImg = receivedImages[replaceIdx];
         _logger.info(`Replacing image at index ${replaceIdx}`);
 
@@ -158,10 +149,9 @@
 
         window.ReceiveCard.setCardImage(replaceIdx, fileBlob, { filename: fileName });
 
-        // v2 transfers arrive with the composite hash already verified
-        // segment by segment; only the v1 whole-file path hashes here.
-        const decryptedHash = decoded.precomputedHash
-            || await window.WebSendCrypto.sha256Hex(data);
+        // The composite hash was already verified segment by segment;
+        // it is the file's identity token on both sides.
+        const decryptedHash = decoded.precomputedHash;
         oldImg.hash = decryptedHash;
         _logger.info(`Replacement SHA-256: ${decryptedHash}`);
         if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
@@ -177,7 +167,7 @@
     }
 
     async function addNewReceivedImage(decoded) {
-        const { metadata, data, fileData, fileMimeType, fileBlob, fileType, fileName } = decoded;
+        const { metadata, fileData, fileMimeType, fileBlob, fileType, fileName } = decoded;
         // makeSafeBlobUrl always wraps in application/octet-stream so that
         // navigating to the URL (right-click "Open in New Tab" on the
         // download link or the thumbnail) cannot render peer-supplied
@@ -217,9 +207,8 @@
 
         window.BgOcr.queue(imageIndex);
 
-        // See applyImageReplacement: v2 ships a precomputed composite hash.
-        const decryptedHash = decoded.precomputedHash
-            || await window.WebSendCrypto.sha256Hex(data);
+        // See applyImageReplacement: the composite hash ships precomputed.
+        const decryptedHash = decoded.precomputedHash;
         imgObj.hash = decryptedHash;
         _logger.info(`Decrypted SHA-256: ${decryptedHash}`);
         if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
@@ -230,45 +219,14 @@
         _logger.success('File decrypted, displayed, and ack sent');
     }
 
-    async function handleEncryptedFile(msg) {
-        _logger.info('Received encrypted file, decrypting with metadata...');
-        _finalizeReceiveStats();
-
-        if (!_getSharedKey()) {
-            _logger.error('Cannot decrypt - key exchange not complete');
-            return;
-        }
-
-        // Step 1 - decryption. A failure here is content-agnostic (AES-GCM
-        // tag mismatch, malformed metadata length, missing key) and must
-        // nack so the sender can retry. Local logger gets the full message;
-        // the peer only ever sees the constant 'decrypt-failed'. A
-        // peer-facing string would otherwise turn the receiver into an
-        // oracle for distinguishing AES-GCM tag failures from JSON parse
-        // errors / metadata-length overflows / missing keys, which lets a
-        // hostile sender narrow down probing attacks against the crypto layer.
-        let decoded;
-        try {
-            decoded = await decryptIncomingFile(msg.blob);
-        } catch (e) {
-            _logger.error('Failed to decrypt photo: ' + e.message);
-            if (!_getRtc().sendMessage(window.Protocol.build.fileNack('decrypt-failed'))) {
-                _logger.warn('Nack could not be sent (channel closed) — sender will time out');
-            }
-            return;
-        }
-
-        await presentDecodedFile(decoded);
-    }
-
-    // Display step, shared by v1 and v2. The bytes already decrypted
-    // correctly, so a failure presenting them must NOT be reported as a
-    // decryption failure: doing so would nack and discard a file that
-    // arrived intact. Worst case the file is shown as a (broken) thumbnail
-    // or a generic download, but it is never thrown away once it decrypted.
-    // The sender no longer mislabels unknown file types as image/png
-    // (sender-send.js), so a disk image and friends arrive as a plain
-    // downloadable file rather than a picture in the first place.
+    // Display step. The bytes already decrypted correctly, so a failure
+    // presenting them must NOT be reported as a decryption failure: doing
+    // so would nack and discard a file that arrived intact. Worst case the
+    // file is shown as a (broken) thumbnail or a generic download, but it
+    // is never thrown away once it decrypted. The sender no longer
+    // mislabels unknown file types as image/png (sender-send.js), so a
+    // disk image and friends arrive as a plain downloadable file rather
+    // than a picture in the first place.
     async function presentDecodedFile(decoded) {
         let replaceIdx = -1;
         const pendingHash = _getPendingReplaceHash();
@@ -319,9 +277,17 @@
         }
     }
 
-    /** Gated handler for v2 file-start (v1 never reaches onMessage). */
+    /** Gated handler for file-start. */
     function handleFileStart(msg) {
         return _enqueueSegmentWork(() => {
+            if (msg.v !== 2) {
+                // A peer running a different protocol version (e.g. the
+                // removed v1 whole-file format). Tell it explicitly instead
+                // of letting it time out unexplained.
+                _logger.error(`file-start with unsupported version (v=${msg.v}); nacking`);
+                _nackTransfer('unsupported-version');
+                return;
+            }
             const sessionKeys = _getSessionKeys();
             if (!sessionKeys) {
                 _logger.error('v2 file-start before key exchange; ignoring');
@@ -418,7 +384,6 @@
 
     window.ReceiveFlow = {
         attach,
-        handleEncryptedFile,
         handleFileStart,
         handleFileSegment,
         handleFileEnd,
@@ -426,7 +391,6 @@
         applyResumeAck,
         abandonTransfer,
         // Exposed for testing the pure pipeline:
-        decryptIncomingFile,
         applyImageReplacement,
         addNewReceivedImage,
     };

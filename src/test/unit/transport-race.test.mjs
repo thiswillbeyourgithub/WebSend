@@ -26,7 +26,6 @@ function makeInner() {
         roomId: null,
         roomSecret: null,
         iceServers: [],
-        receiveBuffer: [],
         pc: null,
         onConnected: null,
         onDisconnected: null,
