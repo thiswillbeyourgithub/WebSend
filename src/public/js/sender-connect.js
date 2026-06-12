@@ -135,6 +135,31 @@
 
     // ============ WebRTC state callbacks ============
 
+    /**
+     * Repair the send UI after the connection comes back (state flips
+     * to 'connected', a relay onReconnected fires, or a reconnect
+     * re-key verifies). Removes the stale "Back to scan" retry button
+     * and, when the wizard was dumped onto the connecting step while
+     * the session is still verified, returns to the capture/choose
+     * step. Without this the page could dead-end on a "Connected"
+     * status with only a back-to-scan button after a drop + recovery
+     * (classically: connection dropped while the file picker was
+     * open). Also flushes anything queued while the transport was down.
+     */
+    function restoreSendUiAfterRecovery() {
+        const retryBtn = document.getElementById('error-retry-btn');
+        if (retryBtn) retryBtn.remove();
+        if (!sharedKey || !weConfirmed || !theyConfirmed) return;
+        const connecting = document.getElementById('step-connecting');
+        if (connecting && !connecting.classList.contains('hidden')) {
+            _logger.info('Connection recovered while stuck on the connecting step; restoring capture UI');
+            if (_onReadyToCapture) _onReadyToCapture();
+        }
+        if (window.SenderSend && window.SenderSend.size() > 0 && !window.SenderSend.isActive()) {
+            window.SenderSend.drain();
+        }
+    }
+
     function onStateChange(state) {
         const statusEl = document.getElementById('connection-status');
         if (state === 'connecting') {
@@ -143,6 +168,7 @@
         } else if (state === 'connected') {
             statusEl.textContent = _i18n.t('send.connected');
             statusEl.className = 'status status-connected';
+            restoreSendUiAfterRecovery();
         } else if (state === 'failed') {
             let detail = _i18n.t('send.failed');
             if (!window.PeerUI.hasTurn(rtc.iceServers)) {
@@ -201,6 +227,7 @@
         }
         // inReconnect stays true until handlePublicKey verifies the
         // peer's fingerprint matches the cached one.
+        restoreSendUiAfterRecovery();
     }
 
     // ============ Reconnect ============
@@ -218,7 +245,11 @@
             try { rtc.close(); } catch (_) {}
         }
 
-        // Reset crypto and queue state
+        // Reset crypto state. The send queue is NOT cleared: files the
+        // user picked while the transport was down must survive the
+        // re-pairing. Only their session-bound state (SegmentSenders
+        // keyed with the old sessionKeys) is dropped; drain() stays
+        // paused until the new session is verified.
         keyPair = await window.WebSendCrypto.generateKeyPair();
         sharedKey = null;
         sessionKeys = null;
@@ -228,7 +259,7 @@
         cachedTheirFingerprint = null;
         cachedOurFingerprint = null;
         inReconnect = false;
-        window.SenderSend.clear();
+        window.SenderSend.resetForReconnect();
 
         rtc = window.Transport.createForSender();
         await rtc.init();
@@ -305,6 +336,7 @@
                 inReconnect = false;
                 // weConfirmed / theyConfirmed are kept from the original
                 // session so the sender stays past the verification gate.
+                restoreSendUiAfterRecovery();
             } catch (e) {
                 _logger.error('Failed to verify peer on reconnect: ' + e.message);
             }
@@ -369,6 +401,13 @@
         _logger.success('Both parties verified, can now send photos');
         window.PeerUI.showVerifiedInSidebar();
         if (_onReadyToCapture) _onReadyToCapture();
+        // Flush files queued while disconnected: drain() paused itself on
+        // the verification gate and needs a kick now that both sides
+        // confirmed (covers the full-reconnect path, where the queue
+        // survives via resetForReconnect).
+        if (window.SenderSend && window.SenderSend.size() > 0) {
+            window.SenderSend.drain();
+        }
     }
 
     function maybeFlushReady() {

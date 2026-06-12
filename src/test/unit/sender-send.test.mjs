@@ -1,11 +1,11 @@
 /**
- * Unit tests for js/sender-send.js, focused on the defense-in-depth
- * verification gate inside sendOnePhoto. The drain loop is allowed to
- * pull items off the queue and try to send; the test asserts that
- * sending is refused (and the photo marked failed) when isVerified()
- * is false, and proceeds normally when it is true. This catches a
- * regression where any future code path that advances the UI past
- * verification would silently leak plaintext over the wire.
+ * Unit tests for js/sender-send.js, focused on the verification gate
+ * around the drain loop. When isVerified() is false the loop pauses
+ * with the queue intact (files picked while the transport was down
+ * must survive a reconnect, not be dropped) and no bytes leave the
+ * host; once verification completes, a fresh drain() sends everything
+ * that was queued. This catches both a plaintext leak (sending while
+ * unverified) and the "file refused while reconnecting" regression.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -65,6 +65,7 @@ function loadIntoJsdom({ verified }) {
         MAX_FILE_SIZE: 4 * 1024 * 1024 * 1024,
         build: {
             replaceImage: (h) => ({ type: 'replace-image', hash: h }),
+            batchStart: () => ({ type: 'batch-start' }),
             batchEnd: () => ({ type: 'batch-end' }),
             fileResumeAckV2: (nextSeq, salt) => (salt === undefined
                 ? { type: 'file-resume-ack', nextSeq }
@@ -83,10 +84,11 @@ function loadIntoJsdom({ verified }) {
 
     const logs = { info: [], warn: [], error: [], success: [] };
     const toasts = [];
+    let isVerifiedNow = verified;
     const deps = {
         getRtc: () => fakeRtc,
         getSessionKeys: () => ({ __fake: 'sessionKeys' }),
-        isVerified: () => verified,
+        isVerified: () => isVerifiedNow,
         i18n: { t: (k) => k },
         logger: {
             info: (m) => logs.info.push(m),
@@ -103,22 +105,76 @@ function loadIntoJsdom({ verified }) {
     script.call(win);
 
     win.SenderSend.attach(deps);
-    return { win, fakeRtc, sentFiles, sentMessages, created, rewinds, logs, toasts };
+    return {
+        win, fakeRtc, sentFiles, sentMessages, created, rewinds, logs, toasts,
+        setVerified: (v) => { isVerifiedNow = v; },
+    };
 }
 
 function makeBlob(win) {
     return new win.Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/png' });
 }
 
-test('sendOnePhoto refuses to transmit when peer is not verified', async () => {
-    const { win, sentFiles, logs } = loadIntoJsdom({ verified: false });
+test('drain pauses while peer is not verified, keeping the queue, and resumes once verified', async () => {
+    const { win, sentFiles, logs, setVerified } = loadIntoJsdom({ verified: false });
     win.SenderSend.push({ blob: makeBlob(win) });
     await win.SenderSend.drain();
     assert.equal(sentFiles.length, 0, 'no file bytes should leave the host');
+    assert.equal(win.SenderSend.size(), 1,
+        'a file queued while unverified (e.g. mid-reconnect) must survive, not be refused');
     assert.ok(
-        logs.error.some(m => /not verified|Refusing to send/.test(m)),
-        `error log should mention verification refusal, got: ${JSON.stringify(logs.error)}`
+        logs.info.some(m => /paused.*not verified/i.test(m)),
+        `info log should mention the pause, got: ${JSON.stringify(logs.info)}`
     );
+
+    // Verification completes (reconnect handshake done): a fresh drain
+    // flushes the queue.
+    setVerified(true);
+    await win.SenderSend.drain();
+    assert.equal(sentFiles.length, 1, 'the queued file goes out after verification');
+    assert.equal(win.SenderSend.size(), 0);
+});
+
+test('batch-start marked while unverified is sent right before the first item after verification', async () => {
+    const { win, sentFiles, sentMessages, setVerified } = loadIntoJsdom({ verified: false });
+    win.SenderSend.markBatchStartPending();
+    win.SenderSend.markBatchEndPending();
+    win.SenderSend.push({ blob: makeBlob(win) });
+    await win.SenderSend.drain();
+    assert.equal(sentMessages.length, 0, 'no control message goes out while unverified');
+
+    setVerified(true);
+    await win.SenderSend.drain();
+    assert.deepEqual(sentMessages.map(m => m.type), ['batch-start', 'batch-end'],
+        'the deferred batch-start must open the batch and batch-end close it');
+    assert.equal(sentFiles.length, 1);
+});
+
+test('resetForReconnect keeps queued blobs but rebuilds session-bound SegmentSenders', async () => {
+    const { win, fakeRtc, sentFiles, created } = loadIntoJsdom({ verified: true });
+    let calls = 0;
+    fakeRtc.sendFile = async (sender, onProgress, resumeFromSeq) => {
+        sentFiles.push({ sender, resumeFromSeq });
+        if (++calls === 1) {
+            const e = new Error('drop');
+            e.transient = true;
+            throw e;
+        }
+    };
+    win.SenderSend.push({ blob: makeBlob(win) });
+    await win.SenderSend.drain();
+    assert.equal(win.SenderSend.size(), 1, 'transient drop pauses with the item kept');
+
+    // Full reconnect: new session keys, the old SegmentSender (and the
+    // transient pause) are unusable; the blob itself must survive.
+    win.SenderSend.resetForReconnect();
+    await win.SenderSend.drain();
+    assert.equal(sentFiles.length, 2, 'the kept blob is re-sent after the reconnect');
+    assert.equal(created.length, 2,
+        'a fresh SegmentSender (re-keyed with the new sessionKeys) must be built');
+    assert.notEqual(sentFiles[1].sender, sentFiles[0].sender);
+    assert.equal(sentFiles[1].resumeFromSeq, undefined, 'fresh send from record 0, not a resume');
+    assert.equal(win.SenderSend.size(), 0);
 });
 
 test('sendOnePhoto transmits when peer is verified', async () => {

@@ -284,7 +284,7 @@
 
     <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-T+85V6n1SKAJhoPOoTWBNeCCzz7q4rgvQ5GNvImadeg9MJgsGGGMEyLCKUGPGonS"></script>
+    <script src="/js/i18n.js" integrity="sha384-C6BlAtUy49n18WM2jSB7DgQ/NFjo6J+vB1ZJrMmwhzQFmhzwnkdgTqdPUKWWj5M0"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-fst2l+qnD3PVySYzIxn0U+k9Ro9avFWmm7PiCJ3vW8k724XkJ6ooz084uzoApo0k"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-C9g9PypkkEoJ52ceSAwRjcc90zW8ndip0HK3IhCpQ8x233C1AIM+qpVUu41oa8hQ"></script>
@@ -301,8 +301,8 @@
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-uMrESk94t8vNbYOfNElA05X6xrtx22R84sVmUFOPMhOuJMf3kxW9EW+Ccpm/O4v0"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-LTPGF18+5jFBGR0I9E2w/S8qCTnPg31f9dtJwBFDrgGI1HalzQMpKf/9ZrcT9zM6"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
-    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-Hv55zsFuKdWBBbuyEUqo23JYVAgJfrBQT1MvOAuWO2mVGoYhuuL7MrXGCXq8zRJy"></script>
-    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-Rf+UNirrrgApG7QmdEbjf2E6RLmmUeOFBNg7GejFyfZpMlYcVQDCAjqJ09rt3cc3"></script>
+    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-0Awu85DDtPdNF9AS2g4o3DAa6U1NYNOjtULN2vPe30vujWsdR95mtbhUnoght8VK"></script>
+    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-fk1Kyv/4We+VzeAPx0LuXxSrwnluxidKwdg4Ax5aao2CzguyKrgRIiiMjzH/4eKK"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-fcGrrLyX4p4ezy27wAN+wf7dd2a42zAkTHbILlB6rjauzOh70XuQJIrzWSHKlee2"></script>
     <script src="/js/qr-parse.js" crossorigin="anonymous" integrity="sha384-WAVjGaW7/8LbUYIxmiRgeQNvbiuRqzJmqEz4TwPFQQc5yyHWHgnCg8BqCO+9A+mM"></script>
     <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-FswQQCZnOdEDc4CTFf3AG/vBJEW6Hc+I5V6RjG/jRovXFiWTuMKtKFRpab/VEBMF"></script>
@@ -720,15 +720,20 @@
                     originalPhotoBlob = currentPhotoBlob;
                     showPreview(currentPhotoBlob);
                 } else {
-                    // Non-image: queue directly for sending
-                    if (!SenderConnect.getSharedKey()) {
-                        showToast(i18n.t('error.noPhotoOrKey'), { type: 'warn' });
-                        return;
-                    }
+                    // Non-image: queue directly for sending. The file is
+                    // queued even when the connection dropped while the
+                    // picker was open (classic on mobile, where the picker
+                    // backgrounds the page): drain() pauses on the
+                    // verification gate and the queue is flushed after the
+                    // reconnect, instead of refusing the file outright.
                     SenderSend.push({ blob: processed, photoId: null });
-                    showToast(`${processed.name} queued for sending`, { type: 'success' });
-                    SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
+                    SenderSend.markBatchStartPending();
                     SenderSend.markBatchEndPending();
+                    if (SenderConnect.isVerified()) {
+                        showToast(`${processed.name} queued for sending`, { type: 'success' });
+                    } else {
+                        showToast(i18n.t('send.queuedAwaitingReconnect'), { type: 'warn', duration: 6000 });
+                    }
                     SenderSend.drain();
                 }
                 event.target.value = '';
@@ -740,10 +745,9 @@
             // The previous "strip-all-then-drain" path peaked at N x ~30MB on
             // Android Chrome and killed the renderer, which dropped the data
             // channel and forced both peers to reconnect.
-            if (!SenderConnect.getSharedKey()) {
-                showToast(i18n.t('error.selectImage'), { type: 'warn' });
-                return;
-            }
+            // No connection check here: files queue even while the
+            // connection is down/re-pairing (drain() waits on the
+            // verification gate) instead of being refused.
 
             // Hard cap on selection size. PNG re-encoding bloats each phone
             // photo to ~20-40MB, so even with pipelining a runaway selection
@@ -769,7 +773,7 @@
                     continue;
                 }
                 if (!batchStarted) {
-                    SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
+                    SenderSend.markBatchStartPending();
                     batchStarted = true;
                 }
                 SenderSend.push({ blob: processed, photoId: null });
@@ -785,7 +789,11 @@
                 showToast(`${failed} image(s) could not be processed`, { type: 'warn' });
             }
             if (queued > 0) {
-                showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
+                if (SenderConnect.isVerified()) {
+                    showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
+                } else {
+                    showToast(i18n.t('send.queuedAwaitingReconnect'), { type: 'warn', duration: 6000 });
+                }
                 // markBatchEndPending + drain() flushes batch-end whether
                 // drain is still mid-flight (the flag is picked up after the
                 // last queued item finishes) or already idle (a fresh drain
@@ -874,9 +882,15 @@
          * Multiple photos can be queued; they are sent one by one by SenderSend.drain().
          */
         async function sendPhoto() {
-            if (!currentPhotoBlob || !SenderConnect.getSharedKey()) {
-                logger.error('No photo or key exchange not complete');
+            if (!currentPhotoBlob) {
+                logger.error('No photo to send');
                 return;
+            }
+            // Queue even when the connection is down/re-pairing: drain()
+            // pauses on the verification gate and the photo goes out after
+            // the reconnect instead of being silently refused.
+            if (!SenderConnect.isVerified()) {
+                showToast(i18n.t('send.queuedAwaitingReconnect'), { type: 'warn', duration: 6000 });
             }
 
             SenderSend.push({ blob: currentPhotoBlob, photoId: null });
@@ -895,7 +909,7 @@
             }
 
             showStep(stepChoose);
-            SenderConnect.getRtc().sendMessage(Protocol.build.batchStart());
+            SenderSend.markBatchStartPending();
             SenderSend.markBatchEndPending();
             SenderSend.drain();
         }

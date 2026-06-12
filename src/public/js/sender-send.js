@@ -18,6 +18,11 @@
     const queue = [];
     let isSending = false;
     let pendingBatchEnd = false;
+    // True when a batch-start should be sent right before the next item
+    // goes out. Call sites set this instead of sending batch-start
+    // directly so a batch queued while the transport is down still
+    // opens correctly once the connection is re-verified.
+    let pendingBatchStart = false;
     // True between a TransientDisconnectError caught in drain() and a
     // file-resume-offer (or fatal teardown). While paused, the head
     // of the queue keeps its SegmentSender so the resume can rewind it
@@ -80,6 +85,11 @@
         pendingBatchEnd = true;
     }
 
+    /** Mark that batch-start should be sent before the next item goes out. */
+    function markBatchStartPending() {
+        pendingBatchStart = true;
+    }
+
     /**
      * Remove a queued (not-yet-sent) photo by gallery photoId.
      * Used by Gallery.deleteGalleryPhoto.
@@ -93,12 +103,32 @@
         return true;
     }
 
-    /** Reset all queue state. Called on reconnect / cleanup. */
+    /** Reset all queue state. Called on cleanup / new pairing. */
     function clear() {
         queue.length = 0;
         isSending = false;
         pendingBatchEnd = false;
+        pendingBatchStart = false;
         pausedOnTransient = false;
+        updateBanner();
+    }
+
+    /**
+     * Keep the queued blobs across a full reconnect (fresh ECDH keys)
+     * but drop everything bound to the old session: SegmentSenders are
+     * keyed with the old sessionKeys and must be rebuilt, and a
+     * transient pause can no longer be resumed (the receiver's partial
+     * transfer used the old keys). Called by SenderConnect.reconnect()
+     * instead of clear() so files picked while the transport was down
+     * survive the re-pairing; drain() stays paused via the verification
+     * gate until the new session is verified.
+     */
+    function resetForReconnect() {
+        pausedOnTransient = false;
+        for (const item of queue) {
+            item._segmentSender = null;
+            item._replaceSent = false;
+        }
         updateBanner();
     }
 
@@ -153,6 +183,25 @@
 
         let successCount = 0;
         while (queue.length > 0) {
+            // Verification gate for the whole loop. During a (re)connect
+            // the session keys are not derived/confirmed yet; instead of
+            // failing each item (which used to drop files picked while
+            // the transport was down), pause with the queue intact.
+            // handleReady / the recovery path in sender-connect.js call
+            // drain() again once the peer is verified.
+            if (!_isVerified()) {
+                _logger.info('drain paused: peer not verified yet; queue kept, will resume after (re)connect');
+                isSending = false;
+                updateBanner();
+                return;
+            }
+            // batch-start deferred by the call site (possibly while the
+            // transport was down): open the batch just before the first
+            // item actually goes out.
+            if (pendingBatchStart) {
+                pendingBatchStart = false;
+                _getRtc().sendMessage(window.Protocol.build.batchStart());
+            }
             const item = queue[0];
             try {
                 if (item.replaceHash && !item._replaceSent) {
@@ -192,7 +241,9 @@
             updateBanner();
         }
 
-        if (pendingBatchEnd) {
+        // Only close the batch while verified: an unverified flush would
+        // silently fail in sendMessage and lose the batch-end marker.
+        if (pendingBatchEnd && _isVerified()) {
             _getRtc().sendMessage(window.Protocol.build.batchEnd());
             pendingBatchEnd = false;
         }
@@ -384,9 +435,11 @@
     window.SenderSend = Object.freeze({
         attach,
         push,
+        markBatchStartPending,
         markBatchEndPending,
         removePhotoById,
         clear,
+        resetForReconnect,
         size,
         isActive,
         drain,

@@ -74,6 +74,17 @@ function setup({ deriveSharedKeyCallback } = {}) {
     win.PeerUI = { onConnectionTypeDetected: () => {}, showVerifiedInSidebar: () => {}, hasTurn: () => true };
     win.wakeLockMgr = { desired: false, acquire: async () => {}, release: () => {} };
     win.Gallery = { size: () => 0, shredLocal: () => {}, photos: () => [] };
+    // Minimal SenderSend double; individual tests override the spies
+    // they care about (drain kick on recovery, queue preservation on
+    // reconnect).
+    win.SenderSend = {
+        push: () => {},
+        size: () => 0,
+        isActive: () => false,
+        drain: () => {},
+        clear: () => {},
+        resetForReconnect: () => {},
+    };
 
     const logs = { info: [], warn: [], error: [], success: [] };
     const toasts = [];
@@ -224,4 +235,62 @@ test('handleTransformNack caps per-photo re-sends (anti-pin)', async () => {
         ctx.logs.error.some(m => /refusing to re-send.*more than/i.test(m)),
         `error log should mention the cap, got: ${JSON.stringify(ctx.logs.error)}`
     );
+});
+
+// Regression: a drop + recovery while the wizard sat on the connecting
+// step (classically: the connection died while the OS file picker was
+// open) used to dead-end the UI on a "Connected" status with only a
+// stale "Back to scan" button — no way to pick a file again.
+test('connection recovery removes the stale retry button and restores the capture step', async () => {
+    const ctx = setup();
+    const { win } = ctx;
+    let drains = 0;
+    win.SenderSend = {
+        push: () => {}, clear: () => {}, resetForReconnect: () => {},
+        size: () => 1,
+        isActive: () => false,
+        drain: () => { drains++; },
+    };
+    await win.SenderConnect.init();
+    const rtc = win.SenderConnect.getRtc();
+
+    // Complete verification: public-key, local confirm, peer confirm, ready.
+    await rtc.onMessage({ type: 'public-key', key: 'aaaa' });
+    await win.SenderConnect.confirmFingerprint();
+    await rtc.onMessage({ type: 'fingerprint-confirmed' });
+    await rtc.onMessage({ type: 'ready' });
+    assert.equal(ctx.getReadyToCaptureCalled(), 1, 'verified session reaches the capture step');
+
+    // Transport failure dumps the user onto the connecting step with a
+    // retry button.
+    rtc.onStateChange('failed');
+    assert.ok(win.document.getElementById('error-retry-btn'),
+        'the failure path must offer the back-to-scan button');
+
+    // Recovery: state flips back to connected while step-connecting is
+    // still the visible step (no hidden class in this DOM).
+    const drainsBefore = drains;
+    rtc.onStateChange('connected');
+    assert.equal(win.document.getElementById('error-retry-btn'), null,
+        'the stale retry button must be removed on recovery');
+    assert.equal(ctx.getReadyToCaptureCalled(), 2,
+        'the wizard must return to the capture step instead of dead-ending');
+    assert.ok(drains > drainsBefore, 'files queued while down must drain after recovery');
+});
+
+test('reconnect() preserves the send queue via resetForReconnect instead of clearing it', async () => {
+    const ctx = setup();
+    const { win } = ctx;
+    let resets = 0;
+    let clears = 0;
+    win.SenderSend = {
+        push: () => {}, size: () => 0, isActive: () => false, drain: () => {},
+        clear: () => { clears++; },
+        resetForReconnect: () => { resets++; },
+    };
+    await win.SenderConnect.init();
+    await win.SenderConnect.join('ROOM01', 'secret');
+    await win.SenderConnect.reconnect();
+    assert.equal(resets, 1, 'resetForReconnect must run so queued blobs re-key with the new session');
+    assert.equal(clears, 0, 'files picked while the transport was down must not be wiped');
 });
