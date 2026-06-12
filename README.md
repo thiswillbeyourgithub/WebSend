@@ -178,6 +178,7 @@ The protections listed in [Security Features](#security-features) below address 
 ### Cross-Session Data Isolation
 - A **new pairing on either device shreds all in-memory user data** (decrypted images, OCR text, preBW pixel buffers, blob URLs, scribe WASM state, crypto keys) before establishing the new session
 - **Sender**: scanning a QR with a different `roomId` triggers a confirm prompt (when the gallery is non-empty) and then a local shred. The same-room reconnect path keeps the gallery intact, so a phone can re-pair after a network blip without losing unsent photos
+- **Sender**: files picked while the connection is down (e.g. the OS file picker backgrounded the page and the link dropped) are not refused: they queue locally, a toast explains they will go out after the reconnect, and the send loop flushes them automatically once the session is re-verified. A recovered connection also restores the send screen instead of stranding the user on the connecting step
 - **Receiver**: a sender disconnect keeps the same room and QR alive (so the same phone can re-scan and reconnect with data preserved). A deliberate **"Start new pairing"** button in the disconnect banner rotates to a fresh room and shreds everything
 - The signaling relay stores **only ephemeral SDP + ICE in an in-memory `Map`** with a 10-minute TTL and complete deletion on expiry — no database, no filesystem writes for room data, no cross-room caching
 

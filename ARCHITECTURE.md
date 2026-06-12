@@ -332,7 +332,13 @@ WebSend/
         │   │               #   reconnect-after-disconnect, transform-nack retry, and
         │   │               #   the inbound message dispatcher. Owns rtc/keyPair/
         │   │               #   sharedKey. Exposes window.SenderConnect with getRtc/
-        │   │               #   getSharedKey getters consumed by the other modules
+        │   │               #   getSharedKey getters consumed by the other modules.
+        │   │               #   On recovery (state back to 'connected', relay
+        │   │               #   onReconnected, or verified reconnect re-key) it removes
+        │   │               #   the stale back-to-scan retry button, restores the
+        │   │               #   capture step if the UI was stuck on step-connecting,
+        │   │               #   and kicks SenderSend.drain(); reconnect() preserves
+        │   │               #   the send queue via SenderSend.resetForReconnect()
         │   ├── sender-camera.js # Sender camera concerns: QR scanner, photo-capture
         │   │               #   camera, flash/torch + ImageCapture fallback, live
         │   │               #   document-corner detection overlay, pinch-to-zoom,
@@ -350,7 +356,13 @@ WebSend/
         │   ├── sender-send.js # Sender outgoing photo queue: enqueue, serial drain,
         │   │               #   encryption + transmit (sendOnePhoto), per-photo
         │   │               #   gallery status updates, sticky progress banner, and
-        │   │               #   the optional batch-end signal. Exposes window.SenderSend
+        │   │               #   deferred batch-start/batch-end signals. The drain loop
+        │   │               #   pauses (queue intact) while the peer is not verified,
+        │   │               #   so files picked while the connection is down are sent
+        │   │               #   after the reconnect instead of refused;
+        │   │               #   resetForReconnect() keeps queued blobs across a full
+        │   │               #   reconnect, dropping only their session-bound
+        │   │               #   SegmentSenders. Exposes window.SenderSend
         │   ├── sidebar.js # Shared sidebar (kebab button, overlay, language selector,
         │   │               #   connection info, logs/about actions, DEV badge, app version)
         │   │               #   used by index/receive/send. Exposes buildSidebar(),
@@ -1018,6 +1030,24 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     behind proxies that strip WS or for deployments standardising on a
     single transport. `/api/config` exposes an `lpOnly` flag so the
     client honours the same mode and skips both racers locally.
+37. **Sender queue survives disconnects (no dead-end UI)**: On mobile,
+    opening the OS file picker backgrounds the page and the connection
+    can drop while the user picks a file. The sender no longer refuses
+    the file in that window: `handleFileSelect` / `sendPhoto` in
+    `send.html` always queue the blob, and the `js/sender-send.js`
+    drain loop pauses on the verification gate (queue intact, nothing
+    encrypted or sent) until the peer is verified again, then flushes.
+    `batch-start` is deferred the same way (`markBatchStartPending`,
+    consumed by the drain loop just before the first item) so a batch
+    queued while offline still opens correctly. A full
+    `SenderConnect.reconnect()` keeps the queued blobs and only drops
+    their session-bound SegmentSenders (`SenderSend.resetForReconnect`),
+    which are rebuilt with the new session keys on the next drain.
+    Finally, when the connection recovers while the wizard sits on the
+    connecting step (status "Connected" but only a stale "Back to scan"
+    button — the historical dead-end), `restoreSendUiAfterRecovery` in
+    `js/sender-connect.js` removes the stale retry button, returns the
+    UI to the capture/choose step, and kicks the drain.
 
 ## SSO (Experimental)
 
