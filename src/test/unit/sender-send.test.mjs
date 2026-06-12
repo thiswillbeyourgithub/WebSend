@@ -269,3 +269,83 @@ test('resume-offer the head cannot match is answered with nextSeq=0 and a fresh 
     assert.deepEqual(rewinds, [0],
         'the advanced sender must be rewound to 0 so the fresh file-start re-keys');
 });
+
+test('drain pauses with the queue intact while the transport is disconnected, resumes on reconnect', async () => {
+    const { win, fakeRtc, sentFiles, sentMessages, logs } = loadIntoJsdom({ verified: true });
+    // Transient relay drop: the session keys are still good (isVerified
+    // stays true) but the socket is closed. This is the "picked a file
+    // while the WS was down" regression: drain used to push batch-start
+    // and the file into the closed socket and fail the file with
+    // "finishHash before all segments were read".
+    let connected = false;
+    fakeRtc.isConnected = () => connected;
+
+    win.SenderSend.markBatchStartPending();
+    win.SenderSend.push({ blob: makeBlob(win) });
+    await win.SenderSend.drain();
+
+    assert.equal(sentMessages.length, 0, 'no batch-start may be consumed while disconnected');
+    assert.equal(sentFiles.length, 0, 'no file bytes reach a closed transport');
+    assert.equal(win.SenderSend.size(), 1, 'the file stays queued across the outage');
+    assert.ok(logs.info.some(m => /paused.*not connected/i.test(m)),
+        `info log should mention the connectivity pause, got: ${JSON.stringify(logs.info)}`);
+
+    // Reconnect (sender-connect's recovery paths kick drain again).
+    connected = true;
+    await win.SenderSend.drain();
+    assert.deepEqual(sentMessages.map(m => m.type), ['batch-start'],
+        'the deferred batch-start opens the batch once the transport is back');
+    assert.equal(sentFiles.length, 1, 'the queued file goes out after reconnect');
+    assert.equal(win.SenderSend.size(), 0);
+});
+
+test('a transient drop before file-start keeps the file queued without wedging on a resume-offer', async () => {
+    const { win, fakeRtc, sentFiles } = loadIntoJsdom({ verified: true });
+    // The transport raced shut between the drain gate and sendFile: the
+    // entry guard throws a transient error tagged beforeFileStart. The
+    // receiver never saw file-start, so no file-resume-offer will ever
+    // arrive; drain must NOT enter the pausedOnTransient state (which
+    // only a resume-offer clears) or the queue wedges forever.
+    let calls = 0;
+    fakeRtc.sendFile = async (sender, onProgress, resumeFromSeq) => {
+        sentFiles.push({ sender, resumeFromSeq });
+        if (++calls === 1) {
+            const e = new Error('WS not open at sendFile start');
+            e.transient = true;
+            e.nextSeq = 0;
+            e.beforeFileStart = true;
+            throw e;
+        }
+    };
+
+    win.SenderSend.push({ blob: makeBlob(win) });
+    await win.SenderSend.drain();
+    assert.equal(win.SenderSend.size(), 1, 'the file survives the failed attempt');
+
+    // Reconnect kicks drain again; were the queue paused on transient,
+    // this drain would log-and-return without sending anything.
+    await win.SenderSend.drain();
+    assert.equal(sentFiles.length, 2, 'the head is retried from scratch after reconnect');
+    assert.equal(sentFiles[1].resumeFromSeq, undefined, 'fresh send, not a resume');
+    assert.equal(win.SenderSend.size(), 0);
+});
+
+test('batch-end stays pending when its send fails and goes out on the next drain', async () => {
+    const { win, fakeRtc, sentMessages } = loadIntoJsdom({ verified: true });
+    // The transport drops right after the last file: batch-end's
+    // sendMessage fails. The flag must survive so the marker still
+    // closes the batch after the reconnect.
+    let messagesGoThrough = false;
+    const realSend = fakeRtc.sendMessage;
+    fakeRtc.sendMessage = (m) => messagesGoThrough ? realSend(m) : false;
+
+    win.SenderSend.markBatchEndPending();
+    win.SenderSend.push({ blob: makeBlob(win) });
+    await win.SenderSend.drain();
+    assert.equal(sentMessages.length, 0, 'batch-end could not be delivered');
+
+    messagesGoThrough = true;
+    await win.SenderSend.drain();
+    assert.deepEqual(sentMessages.map(m => m.type), ['batch-end'],
+        'the kept flag must close the batch on the next drain');
+});

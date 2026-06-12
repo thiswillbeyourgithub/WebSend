@@ -509,6 +509,15 @@ class WebSendRTC {
     }
 
     /**
+     * True when the data channel can carry traffic right now. Same
+     * probe the WS/LP transports expose, so RacingTransport (and the
+     * SenderSend drain gate behind it) can ask any inner uniformly.
+     */
+    isConnected() {
+        return !!this.dataChannel && this.dataChannel.readyState === 'open';
+    }
+
+    /**
      * Send (or resume sending) a file over the data channel as sealed v2
      * records. This transport never sees plaintext: SegmentStream.pump
      * pulls already-encrypted records from {segmentSender} and slices
@@ -527,8 +536,15 @@ class WebSendRTC {
      */
     async sendFile(segmentSender, onProgress, resumeFromSeq) {
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-            logger.error('Data channel not open');
-            return false;
+            // Throw (not `return false`): a falsy resolve would let
+            // sendOnePhoto run its post-transfer tail (finishHash) and
+            // fail the file even though nothing was sent. Same contract
+            // as ws-transport.js / lp-transport.js.
+            logger.error('Data channel not open, cannot send file');
+            const err = new window.TransientDisconnectError(
+                'Data channel not open at sendFile start', resumeFromSeq || 0);
+            if (!resumeFromSeq) err.beforeFileStart = true;
+            throw err;
         }
 
         if (this._fileAckInFlight) {

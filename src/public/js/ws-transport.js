@@ -299,8 +299,16 @@
          */
         async sendFile(segmentSender, onProgress, resumeFromSeq) {
             if (!this._isOpen()) {
+                // Throwing (instead of the old `return false`) matters:
+                // a falsy resolve let sendOnePhoto fall through to its
+                // "Transfer complete" log and finishHash(), failing the
+                // file and dropping it from the queue even though no
+                // byte ever left this host.
                 logger.error('[WS] not open, cannot send file');
-                return false;
+                const err = new window.TransientDisconnectError(
+                    'WS not open at sendFile start', resumeFromSeq || 0);
+                if (!resumeFromSeq) err.beforeFileStart = true;
+                throw err;
             }
             if (this._fileAckInFlight) {
                 throw new Error('sendFile already in progress, wait for the previous transfer to finish');

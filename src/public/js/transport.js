@@ -518,6 +518,19 @@
             return this._innerByName(this.winner).sendFile(segmentSender, onProgress, resumeFromSeq);
         }
 
+        /**
+         * True when the race has a winner AND that winner can carry
+         * traffic right now. SenderSend.drain() gates on this so files
+         * picked during a transient relay drop stay queued instead of
+         * being pushed into a closed socket (which used to fail the
+         * file with "finishHash before all segments were read").
+         */
+        isConnected() {
+            if (!this.winner) return false;
+            const inner = this._innerByName(this.winner);
+            return !!(inner && typeof inner.isConnected === 'function' && inner.isConnected());
+        }
+
         close() {
             this._closed = true;
             this._reconnectAbort = true;

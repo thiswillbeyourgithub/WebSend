@@ -195,12 +195,33 @@
                 updateBanner();
                 return;
             }
+            // Connectivity gate: verification state survives a transient
+            // relay drop (the keys are still good), so isVerified() alone
+            // let the loop push files into a closed socket; every message
+            // silently failed and the file died on "finishHash before all
+            // segments were read". Pause exactly like the verification
+            // gate; the recovery paths in sender-connect.js re-kick
+            // drain() once the transport is back.
+            const rtc = _getRtc();
+            if (!rtc || (typeof rtc.isConnected === 'function' && !rtc.isConnected())) {
+                _logger.info('drain paused: transport not connected; queue kept, will resume after reconnect');
+                isSending = false;
+                updateBanner();
+                return;
+            }
             // batch-start deferred by the call site (possibly while the
             // transport was down): open the batch just before the first
-            // item actually goes out.
+            // item actually goes out. Keep the flag on a failed send
+            // (transport raced shut after the gate above) so the batch
+            // still opens on the post-reconnect drain.
             if (pendingBatchStart) {
+                if (!rtc.sendMessage(window.Protocol.build.batchStart())) {
+                    _logger.warn('drain paused: batch-start did not go out; queue and batch kept');
+                    isSending = false;
+                    updateBanner();
+                    return;
+                }
                 pendingBatchStart = false;
-                _getRtc().sendMessage(window.Protocol.build.batchStart());
             }
             const item = queue[0];
             try {
@@ -220,6 +241,18 @@
                 }
                 _logger.success('Queued photo sent and verified by receiver');
             } catch (e) {
+                // Transient drop before file-start ever left this host:
+                // the receiver saw nothing of this file and will never
+                // emit a file-resume-offer, so pausing on pausedOnTransient
+                // would wedge the queue forever. Stop with the queue
+                // intact; the reconnect kicks drain() and the head
+                // restarts from scratch.
+                if (e && e.transient && e.beforeFileStart) {
+                    _logger.warn('Transport closed before file-start; queue kept, will retry after reconnect');
+                    isSending = false;
+                    updateBanner();
+                    return;
+                }
                 // Transient transport drop mid-send: keep the head of the
                 // queue (with its SegmentSender) and pause until a
                 // file-resume-offer arrives via handleResumeOffer.
@@ -241,10 +274,12 @@
             updateBanner();
         }
 
-        // Only close the batch while verified: an unverified flush would
-        // silently fail in sendMessage and lose the batch-end marker.
-        if (pendingBatchEnd && _isVerified()) {
-            _getRtc().sendMessage(window.Protocol.build.batchEnd());
+        // Only close the batch while verified, and only forget the marker
+        // once the message actually went out: a silent sendMessage failure
+        // (unverified flush, transport racing shut) must leave the flag
+        // set for the next drain.
+        if (pendingBatchEnd && _isVerified()
+            && _getRtc().sendMessage(window.Protocol.build.batchEnd())) {
             pendingBatchEnd = false;
         }
         isSending = false;

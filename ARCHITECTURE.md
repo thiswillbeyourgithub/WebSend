@@ -1059,6 +1059,18 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     button — the historical dead-end), `restoreSendUiAfterRecovery` in
     `js/sender-connect.js` removes the stale retry button, returns the
     UI to the capture/choose step, and kicks the drain.
+    Since v4.7.3 the drain loop also gates on transport connectivity
+    (`RacingTransport.isConnected()`, delegating to the winning inner):
+    verification state survives a transient relay drop, so the
+    verification gate alone let files picked during the outage drain
+    into a closed socket and die on `finishHash`. The deferred
+    `batch-start` / `batch-end` flags are only consumed when their
+    `sendMessage` actually went out, and all three transports' `sendFile`
+    entry guards throw a `TransientDisconnectError` instead of resolving
+    `false`. A transient error tagged `beforeFileStart` (nothing reached
+    the wire, so the receiver will never emit a `file-resume-offer`)
+    keeps the queue intact without entering the resume-wait pause, and
+    the head restarts from scratch on the post-reconnect drain.
 
 ## SSO (Experimental)
 

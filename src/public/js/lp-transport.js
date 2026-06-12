@@ -446,8 +446,15 @@
 
         async sendFile(segmentSender, onProgress, resumeFromSeq) {
             if (!this._connected) {
+                // Throw (not `return false`): a falsy resolve would let
+                // sendOnePhoto run its post-transfer tail (finishHash)
+                // and fail the file even though nothing was sent. Same
+                // contract as ws-transport.js / webrtc.js.
                 logger.error('[LP] not connected, cannot send file');
-                return false;
+                const err = new window.TransientDisconnectError(
+                    'LP not connected at sendFile start', resumeFromSeq || 0);
+                if (!resumeFromSeq) err.beforeFileStart = true;
+                throw err;
             }
             if (this._fileAckInFlight) {
                 throw new Error('sendFile already in progress, wait for the previous transfer to finish');

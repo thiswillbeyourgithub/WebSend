@@ -51,6 +51,11 @@
             this.name = 'TransientDisconnectError';
             this.transient = true;
             if (Number.isInteger(nextSeq)) this.nextSeq = nextSeq;
+            // When true, the drop happened before file-start ever left
+            // this host: the receiver has no partial transfer and will
+            // never emit a file-resume-offer, so the caller must retry
+            // from scratch after reconnect instead of pausing for one.
+            this.beforeFileStart = false;
         }
     }
 
@@ -345,7 +350,9 @@
             || (Number.isInteger(resumeFromSeq) && resumeFromSeq > 0);
         if (!isResume) {
             if (!io.sendControl(Protocol.build.fileStartV2(sender.segCount, sender.saltB64))) {
-                throw new TransientDisconnectError('transport closed before file-start', 0);
+                const err = new TransientDisconnectError('transport closed before file-start', 0);
+                err.beforeFileStart = true;
+                throw err;
             }
         }
         const total = sender.estimatedWireSize;
