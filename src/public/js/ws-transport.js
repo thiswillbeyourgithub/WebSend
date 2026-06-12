@@ -73,6 +73,15 @@
             window.PayloadAssembler.initState(this);
             this._fileAckInFlight = false;
 
+            // Last relay-backlog report from the server: bytes the relay
+            // accepted from us that the peer has not drained yet (the WS
+            // analogue of LP's X-Peer-Backlog-Bytes header). Added to
+            // bufferedAmount in sendFile's backlogBytes so the progress
+            // display reports delivered bytes; without it the sender ran
+            // up to the server's 8 MiB peer buffer ahead of the receiver
+            // (roughly a 2x rate gap on asymmetric links). Display-only.
+            this._peerBacklogBytes = 0;
+
             this._connected = false;
             this._closed = false;
         }
@@ -129,6 +138,10 @@
                 logger.warn('[WS] openWs called without room/secret');
                 return;
             }
+            // Fresh socket = fresh server-side relay slot, whose peer
+            // buffer starts empty; a stale backlog figure from the old
+            // slot would deflate the next transfer's progress.
+            this._peerBacklogBytes = 0;
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             const url = `${proto}//${location.host}/api/rooms/${this.roomId}/relay`
                 + `?secret=${encodeURIComponent(this.roomSecret)}`;
@@ -214,6 +227,17 @@
                         } catch (_) {}
                         this._markConnected();
                     }
+                    return;
+                }
+
+                // Server-side backlog report (see _peerBacklogBytes).
+                // Like relay-hello this never reaches onMessage. The
+                // relay forwards peer frames verbatim, so a hostile peer
+                // could forge one; the value only skews the local rate
+                // display, the same trust class as relay-hello itself.
+                if (msg && msg.type === 'relay-backlog') {
+                    const bytes = Number(msg.bytes);
+                    this._peerBacklogBytes = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
                     return;
                 }
 
@@ -322,11 +346,14 @@
                 const io = {
                     chunkSize: CHUNK_SIZE,
                     sendControl: (message) => this.sendMessage(message),
-                    // Report bytes actually handed off to the network rather
-                    // than bytes buffered locally, so the sender's % and rate
-                    // match the receiver's instead of running ahead by up to
-                    // the bufferedAmount high-water mark.
-                    backlogBytes: () => (this.ws ? this.ws.bufferedAmount : 0),
+                    // Report bytes actually delivered to the peer, not bytes
+                    // buffered locally or inside the relay: local
+                    // bufferedAmount plus the server's relay-backlog report
+                    // (bytes the relay accepted that the peer hasn't drained,
+                    // up to its 8 MiB buffer). Keeps the sender's % and rate
+                    // tracking the receiver's display.
+                    backlogBytes: () => (this.ws ? this.ws.bufferedAmount : 0)
+                        + this._peerBacklogBytes,
                     sendChunk: async (chunk) => {
                         // Backpressure via WS bufferedAmount. If buffered keeps
                         // climbing past STUCK_PIPE_BYTES, the consumer is dead;

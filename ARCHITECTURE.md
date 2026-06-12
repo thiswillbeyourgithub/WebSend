@@ -1028,7 +1028,15 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     memory toward the 8 GiB session cap. Successful `/relay/up`
     responses carry an `X-Peer-Backlog-Bytes` header (bytes accepted but
     not yet drained by the peer) which the LP sender subtracts from its
-    progress display so both ends report delivered bytes. The
+    progress display so both ends report delivered bytes. The WS path
+    gets the same correction since v4.7.4 via server-injected
+    `{type:'relay-backlog', bytes}` frames (throttled to 250 ms, only
+    while a backlog exists or has just drained to zero, intercepted by
+    `js/ws-transport.js` like `relay-hello` and added to its
+    `backlogBytes()`); without them the WS sender only saw its local
+    `bufferedAmount` and its rate display ran up to the server's 8 MiB
+    peer buffer ahead of the receiver, reading as a roughly 2x gap on
+    asymmetric links. The
     long-poll slot tokens are 128-bit randoms compared in constant time
     so the room secret alone cannot hijack a live slot. The sidebar
     surfaces the active path (Direct / Relay (TURN/TURNS) / Relay (HTTP/

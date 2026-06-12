@@ -1476,6 +1476,15 @@ function peerBacklogLow(peer) {
 // only resume signal; 50 ms is far below a receiver round trip.
 const WS_FEEDER_RESUME_POLL_MS = 50;
 
+// Minimum gap between relay-backlog reports to a WS feeder. The report is
+// the WS analogue of the X-Peer-Backlog-Bytes header on /relay/up: bytes
+// the relay accepted from the feeder that its peer has not drained yet
+// (up to WS_PEER_BUFFER_MAX_BYTES plus socket buffers). Without it the
+// sending browser only sees its own ws.bufferedAmount and its progress
+// display runs up to a whole peer buffer (8 MiB) ahead of the receiver,
+// which read as roughly a 2x rate gap on asymmetric links.
+const WS_BACKLOG_REPORT_INTERVAL_MS = 250;
+
 // WS-path backpressure, the analogue of the 429 on /relay/up: when this
 // socket's peer cannot absorb more frames, stop reading from the sender's
 // TCP socket so the kernel window fills and the sending browser throttles
@@ -1624,6 +1633,24 @@ function attachRelay(room, ws, slot) {
         // floor. We don't buffer because the protocol is interactive:
         // dropped pre-handshake frames are renegotiated by the client.
         maybePauseWsFeeder(ws, room, slot);
+        // Tell the feeder how far its peer is lagging (the WS analogue
+        // of X-Peer-Backlog-Bytes) so its progress display can subtract
+        // undelivered bytes. Throttled, and only while there is (or just
+        // was) a backlog, so a fast pipe sees no extra frames and the
+        // client's stored value still decays to zero once the peer
+        // catches up. Piggybacks on inbound traffic; reports stop when
+        // the feeder stops sending, which is fine: the value only feeds
+        // the sender's rate display.
+        const nowMs = Date.now();
+        const backlog = peerBacklogBytes(peer);
+        if (peer && (backlog > 0 || ws._lastBacklogSent > 0)
+            && nowMs - (ws._lastBacklogReportAt || 0) >= WS_BACKLOG_REPORT_INTERVAL_MS) {
+            ws._lastBacklogReportAt = nowMs;
+            ws._lastBacklogSent = backlog;
+            try {
+                ws.send(JSON.stringify({ type: 'relay-backlog', bytes: backlog }));
+            } catch (_) {}
+        }
     });
 
     ws.on('close', () => {

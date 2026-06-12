@@ -157,6 +157,68 @@ test('WS sender feeding a slow LP receiver loses no frames (socket pause backpre
     ws.close();
 });
 
+test('WS feeder gets throttled relay-backlog reports while its peer lags, decaying to 0', async () => {
+    const { roomId, secret } = await newRoom();
+    // LP receiver that does not poll: every frame the WS feeder pushes
+    // sits in the LP queue, i.e. a real peer backlog.
+    const lp = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
+    const ws = await openWs(wsUrl(roomId, secret));
+
+    const reports = [];
+    ws.on('message', (data, isBinary) => {
+        if (isBinary) return;
+        try {
+            const msg = JSON.parse(data.toString());
+            if (msg.type === 'relay-backlog') reports.push(msg.bytes);
+        } catch (_) {}
+    });
+
+    const FRAME = 16 * 1024;
+    const SENT = 8;
+    for (let i = 0; i < SENT; i++) ws.send(Buffer.alloc(FRAME, 0xcd), { binary: true });
+
+    // Reports piggyback on inbound frames and are throttled to 250 ms,
+    // so trickle tiny frames until one arrives. These extra bytes also
+    // land in the LP queue and are accounted for below.
+    let trickled = 0;
+    const deadline = Date.now() + 5000;
+    while (!reports.some(b => b >= SENT * FRAME) && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 100));
+        ws.send(Buffer.alloc(1, 0xee), { binary: true });
+        trickled++;
+    }
+    assert.ok(reports.some(b => b >= SENT * FRAME),
+        `the report must expose the peer's undrained bytes (>= ${SENT * FRAME}), got ${JSON.stringify(reports)}`);
+
+    // Drain the LP queue completely, then keep trickling: the next
+    // report must decay to 0 so the sender's display catches up.
+    let drainedFrames = 0;
+    while (drainedFrames < SENT + trickled) {
+        const d = await lpDown(srv.baseUrl, roomId, secret, lp.token, false);
+        if (d.status === 204) { trickled += 0; break; }
+        assert.equal(d.status, 200);
+        await d.arrayBuffer();
+        drainedFrames++;
+    }
+
+    reports.length = 0;
+    const decayDeadline = Date.now() + 5000;
+    while (!reports.some(b => b === 0) && Date.now() < decayDeadline) {
+        // Park a long-poll waiter BEFORE the trickle frame so the server
+        // hands the frame straight to it: the backlog is then 0 at the
+        // moment the report is computed.
+        const pending = lpDown(srv.baseUrl, roomId, secret, lp.token, true);
+        await new Promise(r => setTimeout(r, 50));
+        ws.send(Buffer.alloc(1, 0xee), { binary: true });
+        const d = await pending;
+        if (d.status === 200) await d.arrayBuffer();
+        await new Promise(r => setTimeout(r, 60));
+    }
+    assert.ok(reports.some(b => b === 0),
+        `a zero report must follow once the peer drained, got ${JSON.stringify(reports)}`);
+    ws.close();
+});
+
 test('wrong secret rejected with 401 (constant-time, no enumeration leak)', async () => {
     const { roomId } = await newRoom();
     const r = await expectUpgradeRejection(wsUrl(roomId, 'definitely-not-the-secret'));
