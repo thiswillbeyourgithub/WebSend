@@ -265,3 +265,24 @@ test('armV2Parser readies a fresh host for resumed records without a file-start'
     const progress = events.filter(e => e.type === 'progress');
     assert.equal(progress.at(-1).segCount, 3, 'progress keeps the exact segment count');
 });
+
+test('resume re-arm seeds wire-byte progress with the delivered prefix estimate', () => {
+    // Re-arming mid-file used to restart _v2WireBytes at 0, so the
+    // receiver's byte-based ETA counted the already-verified prefix as
+    // still-remaining and its displayed rate deflated for the rest of
+    // the transfer. The seed uses the same uniform per-record estimate
+    // as _v2WireEstimate; a fresh file-start (nextSeq 0) still seeds 0.
+    const fresh = makeV2Host();
+    PA.armV2Parser(fresh.host, 3, 0);
+    assert.equal(fresh.host._v2WireBytes, 0, 'fresh arm starts at zero');
+
+    const { host, events } = makeV2Host();
+    PA.armV2Parser(host, 3, 2);
+    const perRecord = host._v2WireEstimate / 4; // segCount + 1 records
+    assert.equal(host._v2WireBytes, 2 * perRecord,
+        'resume arm credits the prefix already delivered');
+    PA.handleBinary(host, wireRecord(2, 32).buffer);
+    const prog = events.filter(e => e.type === 'progress').at(-1);
+    assert.equal(prog.received, 2 * perRecord + 8 + 32,
+        'progress bytes stay absolute across the resume');
+});

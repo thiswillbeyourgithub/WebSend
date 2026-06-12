@@ -143,12 +143,12 @@
     <script src="/js/i18n.js" integrity="sha384-C6BlAtUy49n18WM2jSB7DgQ/NFjo6J+vB1ZJrMmwhzQFmhzwnkdgTqdPUKWWj5M0"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-fst2l+qnD3PVySYzIxn0U+k9Ro9avFWmm7PiCJ3vW8k724XkJ6ooz084uzoApo0k"></script>
-    <script src="/js/transfer-stats.js" integrity="sha384-C9g9PypkkEoJ52ceSAwRjcc90zW8ndip0HK3IhCpQ8x233C1AIM+qpVUu41oa8hQ"></script>
+    <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-S+vBH4Trc75ooxKyRtdLlprxDsa541cJyioDfb0pW4oTRlZjFvbceu5Y2rfpZw1Q"></script>
     <script src="/js/protocol.js" integrity="sha384-89vOW/06rvZE/z0eUFyeMuo9zO39iZuClDSL03fXaQECagydV0oEExolJbxp+/nJ"></script>
     <script src="/js/webrtc.js" integrity="sha384-MSW/LElSQbJo4h2NxuX2FBMiAI9gdntOhuyJHB976dv31pnSKXnqPackU7bW0lnY"></script>
-    <script src="/js/transport-assembler.js" integrity="sha384-MF/64lwxxK/fsxBLskbbqogg1LHwV8/6hIr8dPlH7h/4YLLCOaceOijjnolV4i0y"></script>
+    <script src="/js/transport-assembler.js" integrity="sha384-UCZoJWT8EYqihn3Wsw1PE/M5u+eXT5QMZY2Rvs2ezp2c6HeHXvQLhes/dsoslCIU"></script>
     <script src="/js/segment-stream.js" integrity="sha384-0sKwu2GCHN0bIyXOLc+n9HLrTi7w+XZErEZ3WtiM3NHho/wj6lDvURWvCNSMS2US"></script>
     <script src="/js/ws-transport.js" integrity="sha384-uD0bxHlW8XmGDwaqP+Gz0P/q3vWbvSIUqqK1tJRuCt+KLgOBbhM7PFWhwGD5ie5L"></script>
     <script src="/js/lp-transport.js" integrity="sha384-3NSpnnrjGyl6VFXHjUMNXwD2+y8cfbhTMjF0fE3FB06uSHXgqWAcx4xoUgvx525d"></script>
@@ -195,6 +195,11 @@
         let receiveXferStart = null;
         let receiveLastStatsUpdate = 0;
         let receiveLastTotal = 0;
+        // Attempt-local rate (shared tracker, see transfer-stats.js): it
+        // self-rebases on backward byte jumps (parser re-arm after a
+        // reconnect resume) and on stalls, so the displayed rate matches
+        // the sender's instead of deflating after a resume.
+        const receiveRateTracker = createRateTracker();
 
         let photoCount = 0;
         let roomSecret = ''; // Cryptographic secret for room access
@@ -1130,10 +1135,9 @@
             if (!receiveXferStart) receiveXferStart = Date.now();
             receiveLastTotal = msg.total;
             const now = Date.now();
+            const rate = receiveRateTracker.update(msg.received, now);
             if (now - receiveLastStatsUpdate >= 200) {
                 receiveLastStatsUpdate = now;
-                const elapsed = (now - receiveXferStart) / 1000;
-                const rate = elapsed > 0 ? msg.received / elapsed : 0;
                 const remaining = rate > 0 ? (msg.total - msg.received) / rate : Infinity;
                 const statsEl = document.getElementById('transfer-stats');
                 if (statsEl) statsEl.textContent = formatTransferStats(percent, rate, remaining);

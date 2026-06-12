@@ -195,7 +195,10 @@ WebSend/
         │   │               #   {type:'file-segment', seq, ct} upward; decryption
         │   │               #   happens in receive-flow.js behind the verification
         │   │               #   gate. resetParser() clears the partial buffer on
-        │   │               #   reconnect/rewind. Operates on a host instance
+        │   │               #   reconnect/rewind; armV2Parser() on a resume seeds the
+        │   │               #   wire-byte progress counter with the per-record estimate
+        │   │               #   for the already-delivered prefix so byte-based ETA stays
+        │   │               #   absolute across reconnects. Operates on a host instance
         │   │               #   (the transport itself) so WebRTC, WS, and LP share
         │   │               #   one implementation instead of three copies that can
         │   │               #   drift. Exposes window.PayloadAssembler
@@ -374,8 +377,16 @@ WebSend/
         │   │               #   notice (via formatStartAge) so users know the instance was
         │   │               #   recently restarted and may be temporarily broken
         │   ├── transfer-stats.js # Pure helpers to format transfer progress (rate,
-        │   │               #   percent, ETA) into "42%  1.2 MB/s  14s" labels. Used by
-        │   │               #   both send.html and receive.html
+        │   │               #   percent, ETA) into "42%  1.2 MB/s  14s" labels, plus
+        │   │               #   createRateTracker(), the attempt-local rate tracker both
+        │   │               #   pages share: it rebases on backward progress jumps
+        │   │               #   (segment rewind / parser re-arm) and on stalls > 3 s
+        │   │               #   (reconnect, backpressure), so a resumed transfer shows
+        │   │               #   the same rate on sender and receiver instead of the
+        │   │               #   sender inflating (full byte credit over a fresh clock)
+        │   │               #   while the receiver deflates (restarted byte counter over
+        │   │               #   the original clock). Used by both send.html and
+        │   │               #   receive.html
         │   ├── transform-replay.js # Receiver-side handler for `transform-image`
         │   │               #   messages: looks up image by oldHash, replays the transform
         │   │               #   list against stored originalData via image-transforms.js,

@@ -2,8 +2,54 @@
  * Shared transfer-statistics formatting helpers.
  *
  * Used by both receive.html and send.html to format progress displays
- * such as "42%  1.2 MB/s  14s". Pure functions with no side-effects.
+ * such as "42%  1.2 MB/s  14s". Pure functions with no side-effects,
+ * plus the attempt-local rate tracker both progress displays share.
  */
+
+/**
+ * Attempt-local transfer-rate tracker, shared by the sender and receiver
+ * progress displays.
+ *
+ * Both sides used to divide cumulative progress bytes by the time since
+ * the transfer first started, which falls apart after a transient
+ * reconnect: the resumed sender keeps full byte credit for the already
+ * delivered prefix but restarts its clock (rate inflated), while the
+ * receiver's wire-byte counter restarts against the original clock that
+ * also spans the outage (rate deflated). In practice the sender displayed
+ * roughly twice the receiver's rate for the rest of the file.
+ *
+ * The tracker instead measures the current attempt: it rebases whenever
+ * progress jumps backward (segment rewind, parser re-arm) or after a
+ * stall longer than stallMs (reconnect, backpressure stall), so the rate
+ * is always bytes actually moved over the time spent moving them.
+ *
+ * @param {number} stallMs - progress gap that starts a new attempt
+ * @returns {{update: function(number, number): number}}
+ */
+function createRateTracker(stallMs = 3000) {
+    let baseAt = null;   // timestamp of the current attempt's baseline
+    let baseBytes = 0;   // progress value at that baseline
+    let lastAt = 0;
+    let lastBytes = 0;
+    return {
+        /**
+         * Record one progress sample and return the attempt-local rate.
+         * @param {number} bytes - cumulative progress in bytes
+         * @param {number} now   - Date.now()
+         * @returns {number} bytes per second (0 until measurable)
+         */
+        update(bytes, now) {
+            if (baseAt === null || bytes < lastBytes || now - lastAt > stallMs) {
+                baseAt = now;
+                baseBytes = bytes;
+            }
+            lastAt = now;
+            lastBytes = bytes;
+            const elapsed = (now - baseAt) / 1000;
+            return elapsed > 0 ? (bytes - baseBytes) / elapsed : 0;
+        },
+    };
+}
 
 /**
  * Format a byte-per-second rate as a human-readable string.
@@ -39,3 +85,4 @@ function formatTransferStats(percent, rate, remaining) {
 
 window.formatRate = formatRate;
 window.formatTransferStats = formatTransferStats;
+window.createRateTracker = createRateTracker;

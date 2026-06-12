@@ -74,6 +74,7 @@ function loadIntoJsdom({ verified }) {
     };
     win.formatRate = () => '0 kB/s';
     win.formatTransferStats = () => '';
+    win.createRateTracker = () => ({ update: () => 0 });
 
     const fakeRtc = {
         sendMessage: (m) => sentMessages.push(m),

@@ -326,23 +326,32 @@
 
         const xferStart = Date.now();
         let lastStatsUpdate = 0;
+        // Rate/ETA via the shared attempt-local tracker: a resume
+        // re-enters here with full byte credit for the already-delivered
+        // prefix (offset baselines at estimateWireOffset) but a fresh
+        // clock, so dividing the absolute offset by this attempt's
+        // elapsed showed wildly inflated rates after a reconnect while
+        // the receiver's display deflated symmetrically.
+        const rateTracker = window.createRateTracker();
         await _getRtc().sendFile(segmentSender, (percent, offset, totalSize) => {
             const fill = document.getElementById('queue-progress-fill');
             if (fill) fill.style.width = percent + '%';
             const now = Date.now();
+            const rate = rateTracker.update(offset, now);
             if (now - lastStatsUpdate >= 200) {
                 lastStatsUpdate = now;
-                const elapsed = (now - xferStart) / 1000;
-                const rate = elapsed > 0 ? offset / elapsed : 0;
                 const remaining = rate > 0 ? (totalSize - offset) / rate : Infinity;
                 const statsEl = document.getElementById('queue-transfer-stats');
                 if (statsEl) statsEl.textContent = window.formatTransferStats(percent, rate, remaining);
             }
         }, resumeFromSeq);
         const elapsed = (Date.now() - xferStart) / 1000;
-        const wireSize = segmentSender.estimatedWireSize;
-        const actualRate = elapsed > 0 ? wireSize / elapsed : 0;
-        _logger.info(`Transfer complete: ${window.formatRate(actualRate)} avg (${elapsed.toFixed(1)}s, ~${wireSize} bytes)`);
+        // Average over THIS attempt's bytes only; on a resume the prefix
+        // delivered before the reconnect was not sent during `elapsed`.
+        const attemptWire = segmentSender.estimatedWireSize
+            - (resumeFromSeq ? segmentSender.estimateWireOffset(resumeFromSeq) : 0);
+        const actualRate = elapsed > 0 ? attemptWire / elapsed : 0;
+        _logger.info(`Transfer complete: ${window.formatRate(actualRate)} avg (${elapsed.toFixed(1)}s, ~${attemptWire} bytes this attempt)`);
         const statsEl = document.getElementById('queue-transfer-stats');
         if (statsEl) statsEl.textContent = '';
         // The composite hash is the file's identity token on both sides

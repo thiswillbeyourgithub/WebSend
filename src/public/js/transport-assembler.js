@@ -197,15 +197,20 @@
     // file-start (nextSeq 0), and the reconnect resume path, where the
     // post-reconnect winner is a fresh transport object whose parser
     // never saw the file-start, so records would otherwise be rejected
-    // as "binary chunk before file-start". Wire-byte progress restarts
-    // at 0; the receiver's percent display uses the exact seq/segCount
-    // fields on progress events, the byte fields only feed rate/ETA.
+    // as "binary chunk before file-start". The receiver's percent
+    // display uses the exact seq/segCount fields on progress events,
+    // the byte fields only feed rate/ETA.
     function armV2Parser(host, segCount, nextSeq) {
         host._v2Mode = true;
         host._v2Pending = null;
         host._v2NextSeq = nextSeq;
         host._v2ExpectedRecords = segCount + 1;
-        host._v2WireBytes = 0;
+        // A resume re-arm starts mid-file: seed the wire-byte counter
+        // with the uniform per-record estimate for the records already
+        // delivered, so byte-based ETA math doesn't count the verified
+        // prefix as still-remaining (same uniform estimate as
+        // _v2WireEstimate below; zero for a fresh file-start).
+        host._v2WireBytes = nextSeq * (window.Protocol.SEG_SIZE + V2_RECORD_OVERHEAD);
         // Wire-size estimate for byte-based rate/ETA display (upper
         // bound: gzip only shrinks records).
         host._v2WireEstimate = host._v2ExpectedRecords
