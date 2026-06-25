@@ -157,6 +157,70 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
         ? [`https://${DOMAIN}`, `http://${DOMAIN}`]
         : [`https://${DOMAIN}`];
 
+// ============ Asymmetric Auth (receiver-only SSO) ============
+// AUTH_SCOPE selects who the oauth2-proxy SSO gate covers when the `auth`
+// deployment is used. The gate itself lives in the reverse proxy, NOT here;
+// these knobs only make the app cooperate with a receiver-only setup.
+//   both     (default) every peer authenticates. The proxy gates the whole
+//            app, so this server needs no per-role logic and the block below
+//            is inert.
+//   receiver only the receiver authenticates. The receiver host is gated by
+//            oauth2-proxy; the sender reaches this same app over a SEPARATE
+//            open host (SENDER_PUBLIC_ORIGIN) with no SSO. To keep the
+//            "only authenticated staff may receive" guarantee, room creation
+//            (POST /api/rooms) is the load-bearing boundary: it is refused
+//            unless the request carries the trusted identity header that the
+//            auth proxy injects after a successful login (AUTH_IDENTITY_HEADER,
+//            e.g. oauth2-proxy's X-Auth-Request-User).
+//
+// SECURITY: the in-app header check is DEFENSE-IN-DEPTH, and is only sound
+// because the deployment guarantees that (a) the open sender host's proxy
+// STRIPS any client-supplied AUTH_IDENTITY_HEADER (so a sender cannot forge an
+// identity) and ideally (b) the open host returns 403 for POST /api/rooms
+// outright. The non-forgeable gate is the proxy network path; this header
+// check is the second layer that fails CLOSED (refuses room creation) if the
+// proxy is misrouted or forgets --set-xauthrequest. See ARCHITECTURE.md
+// "SSO (Experimental)" / README "Receiver-only authentication".
+const AUTH_SCOPE = (process.env.AUTH_SCOPE || 'both').toLowerCase();
+if (!['both', 'receiver'].includes(AUTH_SCOPE)) {
+    console.error(`FATAL: AUTH_SCOPE must be 'both' or 'receiver', got "${AUTH_SCOPE}". Aborting startup.`);
+    process.exit(1);
+}
+// SENDER_PUBLIC_ORIGIN: the open origin (scheme://host[:port]) the receiver's
+// QR / invite link must point the sender at, so an unauthenticated sender is
+// not bounced to the SSO login page. Required when AUTH_SCOPE=receiver.
+// Surfaced to the receiver page via /api/config (see senderOrigin) so
+// receive.html builds the invite URL against it instead of its own (gated)
+// origin. Trailing slashes trimmed so it concatenates cleanly with /send/...
+const SENDER_PUBLIC_ORIGIN = (process.env.SENDER_PUBLIC_ORIGIN || '').replace(/\/+$/, '');
+// AUTH_IDENTITY_HEADER: the request header the auth proxy injects carrying the
+// authenticated user id. oauth2-proxy sets X-Auth-Request-User when started
+// with --set-xauthrequest. Lower-cased because Express header keys are
+// lower-cased; only its PRESENCE is checked (we do no user/group mapping).
+const AUTH_IDENTITY_HEADER = (process.env.AUTH_IDENTITY_HEADER || 'x-auth-request-user').toLowerCase();
+
+if (AUTH_SCOPE === 'receiver') {
+    if (!SENDER_PUBLIC_ORIGIN) {
+        console.error('FATAL: AUTH_SCOPE=receiver requires SENDER_PUBLIC_ORIGIN (the open host the sender uses, e.g. https://send.example.com). Aborting startup.');
+        process.exit(1);
+    }
+    try {
+        // Reject a value with a path/query/fragment: it must be a bare origin.
+        const u = new URL(SENDER_PUBLIC_ORIGIN);
+        if (u.origin !== SENDER_PUBLIC_ORIGIN) {
+            console.error(`FATAL: SENDER_PUBLIC_ORIGIN must be a bare origin (scheme://host[:port]), got "${SENDER_PUBLIC_ORIGIN}" (parsed origin: ${u.origin}). Aborting startup.`);
+            process.exit(1);
+        }
+    } catch {
+        console.error(`FATAL: SENDER_PUBLIC_ORIGIN is not a valid URL: "${SENDER_PUBLIC_ORIGIN}". Aborting startup.`);
+        process.exit(1);
+    }
+    if (!ALLOWED_ORIGINS.includes(SENDER_PUBLIC_ORIGIN)) {
+        console.error(`FATAL: AUTH_SCOPE=receiver but SENDER_PUBLIC_ORIGIN (${SENDER_PUBLIC_ORIGIN}) is not in ALLOWED_ORIGINS (${ALLOWED_ORIGINS.join(', ')}). The sender's API calls would be rejected by origin validation. Add it to ALLOWED_ORIGINS. Aborting startup.`);
+        process.exit(1);
+    }
+}
+
 // Trust proxy headers only from loopback by default (Caddy runs on same host).
 // This ensures X-Forwarded-For cannot be spoofed by external clients.
 //
@@ -786,6 +850,11 @@ app.get('/api/config', (req, res) => {
         ocrLangs: OCR_LANGS.split(',').map(l => l.trim()),
         ocrPsm: OCR_PSM,
         allowedFileTypes: ALLOWED_FILE_TYPES,
+        // Asymmetric auth: when AUTH_SCOPE=receiver, the receiver page builds
+        // the sender invite URL (QR + link) against this open origin so the
+        // unauthenticated sender is not bounced to SSO. null in the default
+        // 'both' mode, where the client keeps using its own origin.
+        senderOrigin: AUTH_SCOPE === 'receiver' ? SENDER_PUBLIC_ORIGIN : null,
         // HTTP-relay fallback transport flag (commit 2). Clients open
         // a WebSocket to /api/rooms/:id/relay?secret=... when WebRTC
         // fails to connect within the 10s race window. The relay
@@ -808,6 +877,22 @@ app.get('/api/config', (req, res) => {
  * Rate limited: 5 rooms per minute per IP
  */
 app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
+    // Receiver-only auth gate (AUTH_SCOPE=receiver). Creating a room is what
+    // makes you a *receiver*, so this is where "only authenticated staff may
+    // receive" is enforced in the app: the auth proxy injects
+    // AUTH_IDENTITY_HEADER after a successful SSO login, and the open sender
+    // host's proxy strips it, so the header's presence proves the request came
+    // through the gated path. This is the in-app, fail-closed half of the
+    // guarantee; the non-forgeable half is the open host's proxy refusing this
+    // route outright (see the AUTH_SCOPE notes above). In 'both' mode the proxy
+    // already gates every request, so this block is skipped.
+    if (AUTH_SCOPE === 'receiver') {
+        const identity = req.headers[AUTH_IDENTITY_HEADER];
+        if (typeof identity !== 'string' || identity.trim() === '') {
+            debugLog('AUTH', `Room creation refused: AUTH_SCOPE=receiver and no "${AUTH_IDENTITY_HEADER}" identity header`);
+            return res.status(401).json({ error: 'Authentication required to create a room' });
+        }
+    }
     let roomId;
     // Ensure unique room ID. Bounded by MAX_ROOM_ID_TRIES so a future
     // pathological state (huge live-room set, broken RNG, etc.) cannot
@@ -1801,6 +1886,8 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'UMAMI_DNT',             value: process.env.UMAMI_DNT,            used: UMAMI_DNT },
         { name: 'OCR_LANGS',             value: process.env.OCR_LANGS,            used: OCR_LANGS },
         { name: 'OCR_PSM',               value: process.env.OCR_PSM,              used: OCR_PSM },
+        { name: 'AUTH_SCOPE',            value: process.env.AUTH_SCOPE,           used: AUTH_SCOPE },
+        { name: 'SENDER_PUBLIC_ORIGIN',  value: process.env.SENDER_PUBLIC_ORIGIN, used: SENDER_PUBLIC_ORIGIN || '(none)' },
     ];
 
     for (const v of envVars) {
@@ -1821,6 +1908,17 @@ httpServer.listen(PORT, '0.0.0.0', () => {
     }
     if (DEV) {
         console.log('  DEV MODE ENABLED - verbose debug logging active');
+    }
+    if (AUTH_SCOPE === 'receiver') {
+        console.log('-'.repeat(60));
+        console.log('  AUTH_SCOPE=receiver: only the RECEIVER authenticates.');
+        console.log(`    Sender invite origin (open host): ${SENDER_PUBLIC_ORIGIN}`);
+        console.log(`    Room creation requires the "${AUTH_IDENTITY_HEADER}" header from the auth proxy.`);
+        console.log('    DEPLOYMENT MUST, or the guarantee is void:');
+        console.log('      1. gate the receiver host via oauth2-proxy with --set-xauthrequest');
+        console.log(`         (OAUTH2_PROXY_SET_XAUTHREQUEST=true) so it injects ${AUTH_IDENTITY_HEADER};`);
+        console.log(`      2. on the OPEN sender host: STRIP any client-sent ${AUTH_IDENTITY_HEADER}`);
+        console.log('         header AND return 403 for POST /api/rooms.');
     }
 
     // Print the exact ICE URL list that /api/config will hand out (without

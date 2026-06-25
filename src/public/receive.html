@@ -396,7 +396,16 @@
             // Build the URL using the current domain the user connected from.
             // This ensures the QR code works regardless of which whitelisted domain is used.
             // The secret is in the URL hash fragment (not sent to server in HTTP requests).
-            const url = `${window.location.origin}/send/${rtc.roomId}#${roomSecret}`;
+            //
+            // Receiver-only auth (AUTH_SCOPE=receiver): the server hands us a
+            // senderOrigin (the OPEN host) so the unauthenticated sender lands
+            // there instead of this gated receiver host (which would bounce
+            // them to SSO). It is still same-origin from the sender's point of
+            // view, so the QR parser's foreign-origin defense is unaffected. In
+            // the default 'both' mode senderOrigin is null and we keep using our
+            // own origin exactly as before.
+            const inviteOrigin = (window.__wsConfig && window.__wsConfig.senderOrigin) || window.location.origin;
+            const url = `${inviteOrigin}/send/${rtc.roomId}#${roomSecret}`;
 
             logger.info(`QR code URL: ${url}`);
 
