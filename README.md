@@ -34,6 +34,7 @@
   - [TURN Relay Security](#turn-relay-security)
 - [Non-Security Features](#non-security-features)
 - [Keycloak SSO (Experimental)](#keycloak-sso-experimental)
+  - [Receiver-only authentication (Experimental)](#receiver-only-authentication-experimental)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -274,6 +275,26 @@ The oauth2-proxy service is wired up in `docker-compose.yml` under the `auth` [c
 
 **Status**: Experimental. WebSocket signaling passes through oauth2-proxy and an established WS tunnel survives cookie expiry; what fails is the next upgrade attempt after a transient blip, because the new HTTP upgrade needs a valid session cookie. The compose block sets `OAUTH2_PROXY_COOKIE_REFRESH=4m` (slightly below Keycloak's default 5-minute access-token lifetime) so the cookie is rotated silently and reconnects keep working. coturn (TURN/TURNS/STUN) traffic is not protected by oauth2-proxy (it uses UDP/TCP, not HTTP), but is indirectly secured because TURN credentials are minted by `/api/config`, which sits behind oauth2-proxy, so unauthenticated clients never receive them.
 
+### Receiver-only authentication (Experimental)
+
+The SSO gate above (`AUTH_SCOPE=both`, the default) requires **every** peer to log in. `AUTH_SCOPE=receiver` requires login only for the **receiver** (the side that creates the room) and leaves the **sender** on a separate open host with no login. This fits the common case where the receiver is a staff member inside a corporate network that can do SSO, while the sender is an external person who cannot. Enable it with `COMPOSE_PROFILES=auth-split` (not `auth`).
+
+```
+RECEIVER ──▶ gated host (SSO) ──▶ oauth2-proxy :4180 ──▶ websend :8080
+SENDER   ──▶ open host (no SSO) ─────────────────────▶ websend :7395
+```
+
+**Why "only staff may receive" holds.** Creating a room is what makes you a receiver, and `POST /api/rooms` is the only endpoint that mints one. In receiver mode the app **refuses room creation** unless the request carries the identity header oauth2-proxy injects after login (`AUTH_IDENTITY_HEADER`, default `x-auth-request-user`). So an unauthenticated sender cannot become a receiver. The actual file transfer (WebRTC/relay) is shared between the two peers and stays open, protected by the per-room 128-bit secret exactly as in the non-SSO `direct` profile, so a transfer is no less private than a `direct` deploy; only *who may start one as the receiver* is restricted.
+
+**You MUST configure the reverse proxy, or the guarantee is void.** The app-side header check is defense in depth; the non-forgeable gate is the network path you control:
+
+- Route the **receiver** (gated) hostname to `127.0.0.1:4180` (oauth2-proxy), as with the `auth` profile.
+- Route the **sender** (open) hostname to `127.0.0.1:7395` (websend) and, on that host, **(a)** return `403` for `POST /api/rooms` (senders never create rooms), and **(b)** strip any client-supplied `AUTH_IDENTITY_HEADER`.
+- On **both** hostnames, never let a client set the identity header; only oauth2-proxy may. The `auth-split` proxy sets `OAUTH2_PROXY_SET_XAUTHREQUEST=true` so it emits `X-Auth-Request-User`.
+- Set `SENDER_PUBLIC_ORIGIN` to the open hostname's origin and add it to `ALLOWED_ORIGINS`. The receiver's QR/invite link is built against it (so the sender lands on the open host, not the SSO login), and the server aborts at boot if it is missing or not whitelisted. The link stays same-origin from the sender's perspective, so the QR phishing defense is unaffected.
+
+This feature was added with assistance from [Claude Code](https://claude.ai/claude-code).
+
 ## Requirements
 
 - Docker and Docker Compose
@@ -316,7 +337,8 @@ Every service in `docker-compose.yml` is opt-in via a [Docker Compose profile](h
 | Profile | Brings up | Use case |
 |---------|-----------|----------|
 | `direct` | `websend` bound to `127.0.0.1:7395` | Local / LAN / trusted-network deploys, Caddy fronts websend directly |
-| `auth`   | `websend` (no host port) + `oauth2-proxy` on `127.0.0.1:4180` | Public deploys gated behind Keycloak SSO |
+| `auth`   | `websend` (no host port) + `oauth2-proxy` on `127.0.0.1:4180` | Public deploys gated behind Keycloak SSO for **all** peers |
+| `auth-split` | `websend` on `127.0.0.1:7395` (open, sender) + `oauth2-proxy` on `127.0.0.1:4180` (gated, receiver) | Receiver-only SSO: receiver inside a corporate network, external sender. See [Receiver-only authentication](#receiver-only-authentication-experimental) |
 | `turn`   | bundled `coturn` TURN relay | Anyone using the in-repo TURN server (skip if you have an external one) |
 
 Typical combinations to put in `.env`:
@@ -326,9 +348,10 @@ COMPOSE_PROFILES=direct           # local / LAN, external TURN
 COMPOSE_PROFILES=direct,turn      # local / LAN with bundled TURN
 COMPOSE_PROFILES=auth             # public with SSO, external TURN
 COMPOSE_PROFILES=auth,turn        # public with SSO and bundled TURN
+COMPOSE_PROFILES=auth-split       # receiver-only SSO (two hosts), external TURN
 ```
 
-`direct` and `auth` are mutually exclusive: both define `container_name: websend`, so Compose refuses to start both at once. That refusal is the safety property that makes it impossible to leave websend exposed on `127.0.0.1:7395` while the oauth2-proxy gate is also running (the failure mode the old "comment out the ports block" instructions tried to prevent by hand).
+`direct`, `auth` and `auth-split` are mutually exclusive: all define `container_name: websend`, so Compose refuses to start more than one at once. For `direct` and `auth` that refusal is the safety property that makes it impossible to leave websend exposed on `127.0.0.1:7395` while the oauth2-proxy gate is also running (the failure mode the old "comment out the ports block" instructions tried to prevent by hand). `auth-split` deliberately runs both at once and replaces that invariant with the room-creation gate described under [Receiver-only authentication](#receiver-only-authentication-experimental).
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -355,6 +378,9 @@ COMPOSE_PROFILES=auth,turn        # public with SSO and bundled TURN
 | `RELAY_LP_ONLY` | Force long-poll-only transport: suppresses WebRTC ICE servers and 404s the WS relay endpoint so clients only use the long-poll path. Requires `RELAY_ENABLE=true` | `false` |
 | `PORT` | HTTP port the Node server listens on inside the container | `8080` |
 | `TRUST_PROXY` | Comma-separated [Express trust-proxy](https://expressjs.com/en/guide/behind-proxies.html) specifiers. Automatically set to `loopback,linklocal,uniquelocal` by the `auth` compose profile; only override if you have extra proxy hops upstream of Caddy | `loopback` (`direct`) / `loopback,linklocal,uniquelocal` (`auth`) |
+| `AUTH_SCOPE` | `both` gates every peer behind SSO; `receiver` gates only the room creator and leaves the sender on an open host. See [Receiver-only authentication](#receiver-only-authentication-experimental) | `both` |
+| `SENDER_PUBLIC_ORIGIN` | Required when `AUTH_SCOPE=receiver`: the open sender host's origin (`scheme://host[:port]`) the receiver's QR/invite link targets. Must also be in `ALLOWED_ORIGINS` (server aborts at boot otherwise) | _(empty)_ |
+| `AUTH_IDENTITY_HEADER` | The proxy-injected identity header the room-creation gate checks when `AUTH_SCOPE=receiver` | `x-auth-request-user` |
 | `TEST_DISABLE_RATE_LIMIT` | Disable per-IP rate limiting (test escape hatch only) | _(unset)_ |
 
 ## Firewall (UFW)

@@ -32,8 +32,12 @@ HTTP-relay fallback transport, default `true`), `RELAY_LP_ONLY` (long-poll-only
 transport: suppresses WebRTC ICE servers and disables the WS relay endpoint so only
 the long-poll path is exposed, default `false`), `WEBSEND_ROOM_TTL_MS` /
 `WEBSEND_ROOM_CLEANUP_INTERVAL_MS` (room TTL and cleanup-sweep interval in ms,
-defaults 10 min / 1 min; mainly a test escape hatch), and `TEST_DISABLE_RATE_LIMIT`
-(test escape hatch).
+defaults 10 min / 1 min; mainly a test escape hatch), `TEST_DISABLE_RATE_LIMIT`
+(test escape hatch), and the receiver-only-auth trio `AUTH_SCOPE`
+(`both` default / `receiver`), `SENDER_PUBLIC_ORIGIN` (the open sender host,
+surfaced to the receiver page as `senderOrigin`), and `AUTH_IDENTITY_HEADER`
+(the proxy header the room-creation gate checks; see
+[SSO (Experimental)](#sso-experimental)).
 
 ## Directory Structure
 
@@ -48,15 +52,17 @@ WebSend/
 │   ├── Dockerfile          # Node 20 Alpine image, non-root user, production build
 │   ├── docker-compose.yml  # Service definition with security hardening (read-only FS,
 │   │                       #   dropped capabilities, resource limits, health check).
-│   │                       #   Defines three opt-in profiles selected via
+│   │                       #   Defines four opt-in profiles selected via
 │   │                       #   COMPOSE_PROFILES: `direct` (websend on 127.0.0.1:7395),
 │   │                       #   `auth` (websend with no host port + oauth2-proxy on
-│   │                       #   127.0.0.1:4180), `turn` (bundled coturn relay).
-│   │                       #   Shared websend config lives in an x-websend-base YAML
-│   │                       #   anchor; the `direct` and `auth` websend variants both
+│   │                       #   127.0.0.1:4180), `auth-split` (receiver-only SSO: open
+│   │                       #   :7395 for the sender + oauth2-proxy for the receiver),
+│   │                       #   `turn` (bundled coturn relay).
+│   │                       #   Shared config lives in x-websend-* and x-oauth2-* YAML
+│   │                       #   anchors; the direct/auth/auth-split websend variants all
 │   │                       #   set container_name=websend so Compose enforces their
 │   │                       #   mutual exclusion automatically.
-│   └── env.example         # Documented env vars: COMPOSE_PROFILES, DOMAIN, ICE servers, TURN credentials, ALLOWED_FILE_TYPES
+│   └── env.example         # Documented env vars: COMPOSE_PROFILES, DOMAIN, ICE servers, TURN credentials, ALLOWED_FILE_TYPES, AUTH_SCOPE/SENDER_PUBLIC_ORIGIN
 │
 └── src/
     ├── cli/                # Optional Node CLI receiver (advanced; not for end users).
@@ -565,7 +571,7 @@ the matching photo, it surfaces an error toast and gives up.
 |--------|------------------------------|--------------------------------------|-------------|-----------------|
 | GET    | `/send/:roomId`              | Pretty-URL redirect into the sender flow | None    | None            |
 | GET    | `/api/config`                | ICE server list + DEV flag + OCR / file-type config | None | None     |
-| POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None        | 5/min per IP    |
+| POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None (or proxy identity header when `AUTH_SCOPE=receiver`) | 5/min per IP    |
 | GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 30/min per IP   |
 | POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Room secret | 100/min per IP  |
 | GET    | `/api/rooms/:id/offer`       | Retrieve SDP offer                   | Room secret | 30/min per IP   |
@@ -1123,6 +1129,49 @@ Browser ──▶ Caddy (HTTPS) ──▶ oauth2-proxy (:4180) ──▶ websend
   the per-IP buckets degrade into one shared bucket.
 - No user, group, or permission mapping is performed; it is a simple authentication gate.
 
+### Receiver-only auth (`AUTH_SCOPE=receiver`)
+
+The default `AUTH_SCOPE=both` gates every peer (above). `AUTH_SCOPE=receiver`
+gates only the **receiver** (the side that creates the room) and leaves the
+**sender** on a separate open host with no login. The use case: a receiver
+inside a corporate network that can do SSO, and an external sender that cannot.
+Selected with the `auth-split` compose profile.
+
+```
+RECEIVER ──▶ gated host ──▶ oauth2-proxy (:4180) ──▶ websend (:8080)   (login required)
+SENDER   ──▶ open host  ─────────────────────────▶ websend (:7395)    (no login)
+```
+
+- **Why this is sound.** Creating a room is what makes you a receiver, and
+  `POST /api/rooms` is the only room-minting endpoint. In receiver mode the app
+  refuses room creation (HTTP 401) unless the request carries the trusted
+  identity header `AUTH_IDENTITY_HEADER` (default `x-auth-request-user`) that
+  oauth2-proxy injects after login (`OAUTH2_PROXY_SET_XAUTHREQUEST=true` on
+  `oauth2-proxy-split`). So an unauthenticated sender cannot become a receiver.
+  The data plane (WebRTC/relay) is shared and symmetric between the two peers
+  and stays open, protected by the per-room 128-bit secret exactly as in the
+  non-SSO `direct` profile, so the security posture for the *transfer* is
+  unchanged from `direct`; only *who may start one as receiver* is restricted.
+- **The gate is the load-bearing control.** The `direct`-vs-`auth` mutual
+  exclusion (no host port while SSO is up) is deliberately relaxed by
+  `auth-split`, which runs both the open `127.0.0.1:7395` port and oauth2-proxy
+  at once. The room-creation gate replaces that compose-level invariant.
+- **Defense in depth / non-forgeable layer.** The in-app header check is only
+  trustworthy because the deployment guarantees the open sender host's reverse
+  proxy (a) returns 403 for `POST /api/rooms` outright (senders never create
+  rooms) and (b) strips any client-supplied `AUTH_IDENTITY_HEADER`, on both
+  hosts, so only the auth proxy can ever set it. The network path (proxy) is
+  the non-forgeable gate; the app check fails **closed** (refuses room creation)
+  if the proxy is misconfigured or forgets `--set-xauthrequest`. Startup aborts
+  if `AUTH_SCOPE=receiver` and `SENDER_PUBLIC_ORIGIN` is unset, not a bare
+  origin, or not present in `ALLOWED_ORIGINS`.
+- **Sender invite URL.** `/api/config` surfaces `senderOrigin`
+  (= `SENDER_PUBLIC_ORIGIN`) in receiver mode; `receive.html` builds the QR /
+  invite link against it so the unauthenticated sender lands on the open host
+  instead of the gated one. It remains same-origin from the sender's point of
+  view, so `qr-parse.js`'s foreign-origin (phishing) defense is unaffected. In
+  `both` mode `senderOrigin` is `null` and the page uses its own origin.
+
 This feature is experimental and was added with assistance from
 [Claude Code](https://claude.ai/claude-code).
 
@@ -1131,7 +1180,7 @@ This feature is experimental and was added with assistance from
 Three tiers, layered from fast/cheap to slow/realistic:
 
 - **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed. `doc-detect-samples.test.mjs` runs the document-edge detector against real camera shots in `test/fixtures/doc-samples/`, warps the detected quad to the ground-truth dimensions in `test/fixtures/doc-target-result/` via `ImageTransforms.perspectiveTransform`, and asserts both mean luminance and mean Sobel edge density of the crop match the target within 1% of 0..255 (BW + math, no colour classifier). It also applies a per-corner **geometry guard** (`EXPECTED_CORNERS`, tolerance 0.06 normalized) because the content metrics stay green even when a corner collapses inward over a uniform page; the guard catches that class of failure. Skips automatically when the optional `canvas` devDep is not installed.
-- **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, and the `/vendor` `/scribe` `/tessdata` static mounts. A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
+- **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, the `/vendor` `/scribe` `/tessdata` static mounts, and the receiver-only-auth gate (`auth-scope.test.mjs`: `AUTH_SCOPE=receiver` refuses `POST /api/rooms` without the proxy identity header, honors a custom `AUTH_IDENTITY_HEADER`, surfaces `senderOrigin`, and aborts startup on the misconfiguration cases). A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
 - **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer.
 
 A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and aborts the push on failure. The hook is auto-wired by the `prepare` script in `src/package.json` (sets `core.hooksPath=.githooks` on `npm install`).
@@ -1141,7 +1190,7 @@ A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and abort
 - Receiver UI logic: the perspective-crop tool and the **transform-replay protocol** (`transform-image` messages for `rotateCW` / `flipH` / `bw` / `crop`); the receiver-side replay handler lives in `js/transform-replay.js` (`window.TransformReplay`) and dispatches into `js/image-transforms.js`. The export modal (PDF / ZIP / B&W Otsu / scribe.js OCR / per-PDF actions) lives in `js/receive-export.js`; the hand-crafted minimal PDF generator lives in `js/pdf-builder.js` and has unit tests covering xref offsets, trailer size, and multi-image structure.
 - Protocol edge paths: fingerprint **mismatch / abort**, `file-ack` integrity **mismatch or timeout → retry**, SRI-mismatch failure mode. E2E only drives the happy path. (The segment-nack/rewind retry and resume paths ARE unit-covered — `segment-stream.test.mjs`, `receive-flow.test.mjs`, `v2-retry-integration.test.mjs`, `webrtc-send-resume.test.mjs` — and room TTL expiry/refresh is HTTP-covered by `room-ttl.test.mjs`.)
 - PWA service-worker caching + `controllerchange` auto-reload.
-- `src/healthcheck.js` and SSO / oauth2-proxy endpoints. The `TRUST_PROXY` env-var parsing in `server.js` is also uncovered (default `loopback` is exercised by the HTTP tier, but non-default values are not).
+- `src/healthcheck.js` and the live oauth2-proxy/Keycloak integration (the app-side receiver-only-auth gate IS covered by `auth-scope.test.mjs`, but the proxy injecting the header and the open host's 403/header-strip are deployment config, not app code, so they are not unit/HTTP tested). The `TRUST_PROXY` env-var parsing in `server.js` is also uncovered (default `loopback` is exercised by the HTTP tier, but non-default values are not).
 - TURN time-based HMAC-SHA1 credential derivation (coturn itself is out of scope; `misc/check_turn.py` is the manual probe).
 
 ## Deployment
