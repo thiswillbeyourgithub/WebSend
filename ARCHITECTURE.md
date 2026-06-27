@@ -259,13 +259,18 @@ WebSend/
         │   │               #   then snapped to the strongest local edge. Corners are
         │   │               #   emitted in a consistent CW order (TL→TR→BR→BL) and
         │   │               #   segmentation is hardened against degenerate contours.
-        │   │               #   Used by sender camera live overlay and the crop modal's
-        │   │               #   auto-corner-detection. Exposes DocDetect
+        │   │               #   Used by the sender camera live overlay, the auto-crop on
+        │   │               #   capture (re-run at full resolution on the still), and the
+        │   │               #   crop modal's auto-corner-detection on both pages via
+        │   │               #   detectFromImage(imgEl). Exposes DocDetect
         │   ├── image-transforms.js # Shared image-transform utilities (applyOtsu,
         │   │               #   perspectiveTransform, distance, rotateImage, flipImage,
-        │   │               #   binarize, cropPerspective). All transform results go through
-        │   │               #   a central toBlob() normalizer. Used by sender gallery edits
-        │   │               #   and receiver transform-replay. Exposes window.ImageTransforms
+        │   │               #   binarize, cropPerspective). applyOp(input, transform) and
+        │   │               #   applyOps(input, ops) are the single source of truth for the
+        │   │               #   op vocabulary (rotateCW/flipH/bw/crop), shared by the sender
+        │   │               #   gallery and the receiver replay handler so the switch isn't
+        │   │               #   duplicated. All transform results go through a central
+        │   │               #   toBlob() normalizer. Exposes window.ImageTransforms
         │   ├── ocr-rescale.js # Pure helper: rescales scribe-OCR coordinates from the
         │   │               #   downscaled OCR-input dims back to the original image dims.
         │   │               #   Used by both the cached-assembly path and the on-demand
@@ -351,7 +356,10 @@ WebSend/
         │   ├── sender-camera.js # Sender camera concerns: QR scanner, photo-capture
         │   │               #   camera, flash/torch + ImageCapture fallback, live
         │   │               #   document-corner detection overlay, pinch-to-zoom,
-        │   │               #   per-frame capture. Exposes window.SenderCamera
+        │   │               #   per-frame capture. isDetectEnabled() lets send.html
+        │   │               #   decide whether to auto-crop a capture, and
+        │   │               #   consumeDetectedCorners() hands off the last live
+        │   │               #   overlay quad as a fallback. Exposes window.SenderCamera
         │   ├── qr-parse.js # Pure parsing helper for QR / pasted URLs on the
         │   │               #   sender's scan step (kept out of send.html so it can
         │   │               #   be unit-tested without WebRTC / camera deps).
@@ -395,9 +403,11 @@ WebSend/
         │   │               #   receive.html
         │   ├── transform-replay.js # Receiver-side handler for `transform-image`
         │   │               #   messages: looks up image by oldHash, replays the transform
-        │   │               #   list against stored originalData via image-transforms.js,
-        │   │               #   swaps the card blob URL, restarts BgOcr. Sends `transform-
-        │   │               #   nack` on failure. State injected via attach(). Exposes
+        │   │               #   list against stored originalData via ImageTransforms.applyOps,
+        │   │               #   swaps the card blob URL, restarts BgOcr, and clears the
+        │   │               #   card's lastCropCorners (the remembered crop handles no
+        │   │               #   longer match the new pixels). Sends `transform-nack` on
+        │   │               #   failure. State injected via attach(). Exposes
         │   │               #   window.TransformReplay
         │   ├── verification-modal.js # Shared blocking modal for ECDH fingerprint
         │   │               #   verification. Used by both send.html and receive.html;
@@ -411,8 +421,15 @@ WebSend/
         │   ├── sender-gallery.js # Genius-Scan-like gallery for the sender page.
         │   │               #   Owns galleryPhotos state, thumbnail grid, per-photo
         │   │               #   edit (rotate/flip/BW/crop), drag-and-drop reorder,
-        │   │               #   and batch finalization. Cross-page state injected
-        │   │               #   via Gallery.attach({...}). Exposes window.Gallery
+        │   │               #   and batch finalization. Each photo keeps a pristine
+        │   │               #   originalBlob (the full image) as the crop source plus
+        │   │               #   its last cropCorners; applyCropResult crops from the
+        │   │               #   full image, bakes any post-crop transforms into the
+        │   │               #   bytes, and RE-SENDS the whole image (replace-image, or
+        │   │               #   SenderSend.updateQueuedBlob if still queued) rather than
+        │   │               #   a transform-image, because the receiver only ever holds
+        │   │               #   the cropped pixels. Cross-page state injected via
+        │   │               #   Gallery.attach({...}). Exposes window.Gallery
         │   ├── qrcode.min.js # QR code generator library (vendored, used by receiver)
         │   └── jsqr.min.js # QR code scanner library (vendored, used by sender)
         │
@@ -551,11 +568,29 @@ Send {type:'transform-image',                ───────────�
 ```
 
 Transform ops: `rotateCW`, `flipH`, `bw` (Otsu binarization), `crop` (with normalized
-corner coordinates for perspective transform). The receiver stores `originalData` (the
+corner coordinates for perspective transform), all dispatched through the shared
+`ImageTransforms.applyOps` vocabulary. The receiver stores `originalData` (the
 as-first-received image) so transforms always replay from the pristine source. This is
 an alias of the live `data` buffer, not a copy: since `data` is only ever reassigned to
 a fresh buffer (never mutated in place), the two can share one allocation, avoiding a
 doubling of receiver resident memory per file.
+
+**Crop is the exception and is never sent as a `transform-image`.** Because the sender
+sends the cropped bytes first by design (a gallery crop, and the auto-crop applied on
+capture when document detection is on, both transmit the cropped page so the receiver
+gets the smaller, faster image), the receiver only ever holds the cropped pixels and
+cannot replay a re-crop from a fuller source. So a crop is **baked into the bytes and
+re-sent in full**: the sender keeps the pristine full image locally as the crop source
+(`originalBlob` in the gallery), and `applyCropResult` crops from it, bakes any
+post-crop `rotateCW`/`flipH`/`bw` back in, clears the photo's `transforms` array, and
+re-sends via `replace-image` (or swaps the still-queued bytes via
+`SenderSend.updateQueuedBlob`). The remembered handle position (`cropCorners` on the
+sender, `lastCropCorners` on the receiver) lets a re-crop reopen on the stored original
+(the sender's pristine full image; on the receiver, the as-first-received image, which
+is already the cropped page) with the handles where they last were, so a crop can be
+dragged back out to undo it. The receiver's own crop is therefore reversible only down
+to what it received, not the sender's full frame. A replayed rotate/flip/bw clears
+`lastCropCorners` since the remembered handles no longer match the new pixels.
 
 The happy path is fire-and-forget (no positive ack). On failure (unknown `oldHash`,
 missing `originalData`, or replay exception) the receiver sends `{type:'transform-nack',
