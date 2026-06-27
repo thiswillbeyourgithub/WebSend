@@ -103,6 +103,24 @@
         return true;
     }
 
+    /**
+     * Replace the blob of a still-queued (not-yet-sent) photo by gallery
+     * photoId. Used when the user crops a photo before its first send has
+     * started: the bytes captured at push time are stale, so swap in the
+     * freshly-cropped blob and drop any half-built SegmentSender so it is
+     * rebuilt from the new blob. No-op (returns false) if the item already
+     * left the queue.
+     * @returns {boolean} true if updated
+     */
+    function updateQueuedBlob(photoId, blob) {
+        const item = queue.find(it => it.photoId === photoId);
+        if (!item) return false;
+        item.blob = blob;
+        item._segmentSender = null;
+        updateBanner();
+        return true;
+    }
+
     /** Reset all queue state. Called on cleanup / new pairing. */
     function clear() {
         queue.length = 0;
@@ -482,6 +500,7 @@
         markBatchStartPending,
         markBatchEndPending,
         removePhotoById,
+        updateQueuedBlob,
         clear,
         resetForReconnect,
         size,

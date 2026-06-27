@@ -395,24 +395,56 @@
     function galleryOpenCrop() {
         if (galleryEditIndex < 0) return;
         const photo = galleryPhotos[galleryEditIndex];
-        _setCropContext(photo.blob, photo.originalBlob);
+        // Crop source is always the pristine full image (originalBlob), never
+        // the previous crop, so the handles can be dragged back out to undo.
+        // Restore the last crop handles if this photo was cropped before;
+        // otherwise the modal auto-detects the document edges.
+        _setCropContext(photo.blob, photo.originalBlob, photo.cropCorners || null);
         _openCropModal();
     }
 
-    function applyCropResult(editIdx, { blob, corners }) {
+    /**
+     * Apply a crop result from the modal. `blob` is crop(originalBlob, corners)
+     * and `corners` are normalized to the pristine full image.
+     *
+     * Unlike rotate/flip/bw (which the receiver replays from its baseline), a
+     * crop is baked into the bytes the receiver gets: it only ever holds the
+     * cropped pixels, so a re-crop from the full image cannot be expressed as a
+     * replay op. We therefore flatten any post-crop rotate/flip/bw into the new
+     * bytes, reset the replay list, and re-send the whole image via
+     * replace-image. originalBlob is left untouched so undo-to-full keeps
+     * working across repeated re-crops.
+     */
+    async function applyCropResult(editIdx, { blob, corners }) {
         if (editIdx < 0 || editIdx >= galleryPhotos.length) return;
         const photo = galleryPhotos[editIdx];
+
+        // Bake any rotate/flip/bw applied since the last crop into the cropped
+        // bytes so the displayed/sent image keeps them.
+        let finalBlob = blob;
+        if (photo.transforms.length > 0) {
+            finalBlob = window.ImageTransforms.toBlob(
+                await window.ImageTransforms.applyOps(blob, photo.transforms));
+        }
+
         if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
-        photo.blob = blob;
-        photo.originalBlob = blob;
-        photo.thumbUrl = URL.createObjectURL(blob);
-        photo.transforms.push({ op: 'crop', corners });
+        photo.blob = finalBlob;
+        photo.cropCorners = corners;   // remember handle positions for next re-crop
+        photo.transforms = [];         // crop is baked into the new baseline bytes
+        photo.thumbUrl = URL.createObjectURL(finalBlob);
         _invalidateBWUndo(photo);
+        // originalBlob (pristine full) intentionally NOT changed → undo stays possible.
 
         if (photo.sentHash) {
-            const oldHash = photo.sentHash;
-            _logger.info(`Sending transform commands for crop (replacing ${oldHash.substring(0, 8)}...)`);
-            _getRtc().sendMessage(Protocol.build.transformImage(oldHash, photo.transforms));
+            // The receiver only has the previous cropped baseline; re-send the
+            // new bytes in place rather than a (now invalid) transform-replay.
+            _logger.info(`Re-sending cropped image (replacing ${photo.sentHash.substring(0, 8)}...)`);
+            window.SenderSend.push({ blob: finalBlob, photoId: photo.id, replaceHash: photo.sentHash });
+            window.SenderSend.drain();
+        } else {
+            // Not sent yet: update the queued bytes so the first send carries
+            // the crop (no-op if it already left the queue).
+            window.SenderSend.updateQueuedBlob(photo.id, finalBlob);
         }
 
         openGalleryEdit(editIdx);

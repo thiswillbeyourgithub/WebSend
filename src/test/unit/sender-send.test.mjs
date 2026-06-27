@@ -349,3 +349,29 @@ test('batch-end stays pending when its send fails and goes out on the next drain
     assert.deepEqual(sentMessages.map(m => m.type), ['batch-end'],
         'the kept flag must close the batch on the next drain');
 });
+
+test('updateQueuedBlob swaps the bytes of a still-queued photo and drops its half-built sender', async () => {
+    const { win, sentFiles, created } = loadIntoJsdom({ verified: true });
+    const first = makeBlob(win);
+    const cropped = new win.Blob([new Uint8Array([9, 9])], { type: 'image/jpeg' });
+    win.SenderSend.push({ blob: first, photoId: 7 });
+
+    // A crop lands before the send started: the queued bytes are swapped.
+    assert.equal(win.SenderSend.updateQueuedBlob(7, cropped), true, 'reports the update happened');
+    assert.equal(win.SenderSend.updateQueuedBlob(999, cropped), false, 'unknown photoId is a no-op');
+
+    await win.SenderSend.drain();
+    assert.equal(sentFiles.length, 1, 'the photo is sent once');
+    assert.equal(created.length, 1, 'exactly one SegmentSender built (from the cropped bytes)');
+    assert.equal(created[0].blob, cropped, 'the cropped blob is what reaches SegmentStream, not the original');
+    assert.equal(created[0].metadata.mimeType, 'image/jpeg');
+});
+
+test('updateQueuedBlob is a no-op once the photo has left the queue', async () => {
+    const { win } = loadIntoJsdom({ verified: true });
+    win.SenderSend.push({ blob: makeBlob(win), photoId: 3 });
+    await win.SenderSend.drain();
+    assert.equal(win.SenderSend.size(), 0);
+    assert.equal(win.SenderSend.updateQueuedBlob(3, makeBlob(win)), false,
+        'nothing to update after the item was sent');
+});

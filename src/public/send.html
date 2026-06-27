@@ -301,11 +301,11 @@
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-uMrESk94t8vNbYOfNElA05X6xrtx22R84sVmUFOPMhOuJMf3kxW9EW+Ccpm/O4v0"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-LTPGF18+5jFBGR0I9E2w/S8qCTnPg31f9dtJwBFDrgGI1HalzQMpKf/9ZrcT9zM6"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
-    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-ClAPtOTtT4b9aA78xagaLgwb6HSPPQmkgJW69iyiI8OJpkgGY6JDQY9S84fyczKZ"></script>
+    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-7YZggx/rOg9RpaYC+gX3K7AVKaJJwdh9jlbm6W1AxufaCKwIKFKk3atWv0mZB/42"></script>
     <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-fk1Kyv/4We+VzeAPx0LuXxSrwnluxidKwdg4Ax5aao2CzguyKrgRIiiMjzH/4eKK"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-fcGrrLyX4p4ezy27wAN+wf7dd2a42zAkTHbILlB6rjauzOh70XuQJIrzWSHKlee2"></script>
     <script src="/js/qr-parse.js" crossorigin="anonymous" integrity="sha384-WAVjGaW7/8LbUYIxmiRgeQNvbiuRqzJmqEz4TwPFQQc5yyHWHgnCg8BqCO+9A+mM"></script>
-    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-FswQQCZnOdEDc4CTFf3AG/vBJEW6Hc+I5V6RjG/jRovXFiWTuMKtKFRpab/VEBMF"></script>
+    <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-OnClY34vNPr1NL7L6Q7TEDpRZ1UiJ+x/YPqx1Orw71ZT3CoobrFiwWoqe1XpmPDv"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
         i18n.init();
@@ -332,6 +332,9 @@
         let currentPhotoBlob = null;
         // Stores the original (pre-crop) blob so re-cropping uses the uncropped image
         let originalPhotoBlob = null;
+        // Crop handles to pre-position when the crop modal next opens (a gallery
+        // re-crop restores the photo's last crop). Consumed (cleared) on open.
+        let cropInitialCorners = null;
         let preBWBlob = null; // Stores pre-B&W blob for undo
         // Connection state (rtc, keyPair, sharedKey, fingerprint flags) lives in
         // window.SenderConnect (sender-connect.js).
@@ -509,7 +512,7 @@
                 onPhotoCaptured: (blob) => {
                     const thumbUrl = URL.createObjectURL(blob);
                     const photoId = Gallery.nextId();
-                    Gallery.addPhoto({ blob, thumbUrl, originalBlob: blob, id: photoId, sentHash: null, sendStatus: 'queuing', transforms: [] });
+                    Gallery.addPhoto({ blob, thumbUrl, originalBlob: blob, cropCorners: null, id: photoId, sentHash: null, sendStatus: 'queuing', transforms: [] });
                     SenderSend.push({ blob, photoId });
                     SenderSend.drain();
                     logger.info(`Photo added to gallery (${Gallery.size()} total)`);
@@ -528,7 +531,7 @@
                 openCropModal,
                 getFlashMode: SenderCamera.getFlashMode,
                 getCaptureStream: SenderCamera.getCaptureStream,
-                setCropContext: (blob, original) => { currentPhotoBlob = blob; originalPhotoBlob = original; },
+                setCropContext: (blob, original, corners) => { currentPhotoBlob = blob; originalPhotoBlob = original; cropInitialCorners = corners || null; },
                 removeQueuedPhotoById: SenderSend.removePhotoById,
             });
 
@@ -954,16 +957,23 @@
         /**
          * Open the crop modal for the current preview image.
          * Always crops from the original (pre-crop) image so re-cropping
-         * doesn't compound quality loss from previous crops.
+         * doesn't compound quality loss and can be dragged back out to undo.
          */
         function openCropModal() {
             if (!currentPhotoBlob) return;
             logger.info('Opening crop modal');
 
             const sourceBlob = originalPhotoBlob || currentPhotoBlob;
-            let initialCorners = SenderCamera.consumeDetectedCorners();
+            // Prefer the photo's remembered crop handles (set by a gallery
+            // re-crop), then the live camera-overlay corners; otherwise the
+            // modal's detectCorners fallback positions them on the document.
+            let initialCorners = cropInitialCorners;
+            cropInitialCorners = null;
             if (initialCorners) {
-                logger.info('Using live-detected corners for crop');
+                logger.info('Restoring previous crop handles');
+            } else {
+                initialCorners = SenderCamera.consumeDetectedCorners();
+                if (initialCorners) logger.info('Using live-detected corners for crop');
             }
 
             // Capture which gallery index (if any) this crop applies to, so
@@ -986,10 +996,11 @@
                         { type: 'image/jpeg' }
                     );
 
-                    // Gallery-edit path: update gallery entry, send transform-image if already sent
+                    // Gallery-edit path: bake the crop into the photo and
+                    // re-send it (crop changes the receiver's baseline).
                     if (editIdx >= 0 && editIdx < Gallery.size()) {
                         logger.success(`Cropped gallery image: ${dstW}x${dstH}px`);
-                        Gallery.applyCropResult(editIdx, { blob: currentPhotoBlob, corners: normalizedCorners });
+                        await Gallery.applyCropResult(editIdx, { blob: currentPhotoBlob, corners: normalizedCorners });
                         return;
                     }
 
