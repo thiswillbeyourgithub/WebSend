@@ -257,6 +257,7 @@ The protections listed in [Security Features](#security-features) below address 
 - **Connection type detection**: shows whether the connection is direct (local network or via STUN) or relayed (TURN/TURNS)
 - **Debug logging**: "Logs" button on both sender and receiver pages for troubleshooting, with optional verbose DEV mode. A vendored [eruda](https://github.com/liriliri/eruda) mobile devtools console can be opened on demand by appending `?debug=1` to any page URL or by 5-tapping the DEV badge in the sidebar. Once opened it stays on across reloads (sticky `eruda-persist` flag in localStorage); append `?debug=0` once to turn the auto-load back off
 - **Configurable file types**: `ALLOWED_FILE_TYPES` env var restricts uploads to images (`ONLY_IMAGES`), images + PDFs (`IMAGE_OR_PDF`), or anything (`ANY`, default)
+- **Custom branding**: `BRANDING` env var renames the instance across the landing page, browser tab, sidebar header and About modal, and as the default downloaded-file name prefix (default `WebSend`)
 - **Large button UI**: designed for usability by non-technical users
 - **No heavy frameworks**: vanilla HTML5 + CSS + JavaScript only
 
@@ -371,6 +372,7 @@ COMPOSE_PROFILES=auth-split       # receiver-only SSO (two hosts), external TURN
 | `UMAMI_DNT` | Respect browser Do Not Track setting (`true` or `false`) | `true` |
 | `RUN_NPM_AUDIT` | Run `npm audit --audit-level=high` during `docker build` (build arg) | `false` |
 | `ALLOWED_FILE_TYPES` | Restrict accepted uploads: `ONLY_IMAGES`, `IMAGE_OR_PDF`, or `ANY` | `ANY` |
+| `BRANDING` | Instance display name: landing-page heading, browser tab title, sidebar header, About title, and (lowercased) the default received-file name prefix. Must be 1-32 chars of letters/digits/spaces/`-`/`_`; an invalid value aborts startup | `WebSend` |
 | `OCR_LANGS` | Tesseract languages used by the receiver's OCR (comma-separated) | `eng,fra` |
 | `OCR_PSM` | Tesseract page-segmentation mode | `12` |
 | `TURN_TIMEOUT` | Seconds the client waits for the WebRTC connection to establish before giving up | `15` |

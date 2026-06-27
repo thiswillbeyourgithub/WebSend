@@ -33,7 +33,11 @@ transport: suppresses WebRTC ICE servers and disables the WS relay endpoint so o
 the long-poll path is exposed, default `false`), `WEBSEND_ROOM_TTL_MS` /
 `WEBSEND_ROOM_CLEANUP_INTERVAL_MS` (room TTL and cleanup-sweep interval in ms,
 defaults 10 min / 1 min; mainly a test escape hatch), `TEST_DISABLE_RATE_LIMIT`
-(test escape hatch), and the receiver-only-auth trio `AUTH_SCOPE`
+(test escape hatch), `BRANDING` (the instance display name shown on the landing
+page, browser tab title, sidebar header and About modal, and used lowercased as
+the default received-file name prefix; default `WebSend`, validated to 1-32 chars
+of `[A-Za-z0-9 _-]` and aborting startup otherwise), and the receiver-only-auth
+trio `AUTH_SCOPE`
 (`both` default / `receiver`), `SENDER_PUBLIC_ORIGIN` (the open sender host,
 surfaced to the receiver page as `senderOrigin`), and `AUTH_IDENTITY_HEADER`
 (the proxy header the room-creation gate checks; see
@@ -237,7 +241,12 @@ WebSend/
         │   │               #   Supports info/success/warn/error/debug levels.
         │   │               #   DEV mode (toggled via server config) enables verbose output
         │   ├── i18n.js     # Internationalization: English + French. Detects browser locale,
-        │   │               #   applies translations via data-i18n attributes on DOM elements
+        │   │               #   applies translations via data-i18n attributes on DOM elements.
+        │   │               #   Owns the instance brand: t() substitutes {brand} in every
+        │   │               #   string (default "WebSend"); setBrand() (called from
+        │   │               #   updateDevBadge after /api/config) re-renders the headings,
+        │   │               #   tab title and About title, toggles the #about-instance-line,
+        │   │               #   and exposes getBrandSlug() for the default filename prefix
         │   ├── crop-modal.js # Shared perspective-crop modal (injects its own DOM).
         │   │               #   Exposes window.CropModal.open({ sourceBlob, initialCorners,
         │   │               #   detectCorners, onApply, onCancel }); used by both send.html
@@ -385,7 +394,8 @@ WebSend/
         │   │               #   used by index/receive/send. Exposes buildSidebar(),
         │   │               #   initSidebar(), updateDevBadge() (also on window) so each
         │   │               #   page only wires once. updateDevBadge() accepts the full
-        │   │               #   /api/config object and also fills the sidebar version line.
+        │   │               #   /api/config object, fills the sidebar version line, and
+        │   │               #   applies the instance brand via i18n.setBrand(config.branding).
         │   │               #   In DEV mode it shows the maintenance banner, turning
         │   │               #   config.serverStartedAt into a "restarted X hours/days ago"
         │   │               #   notice (via formatStartAge) so users know the instance was
