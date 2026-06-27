@@ -52,6 +52,20 @@ const OCR_PSM = process.env.OCR_PSM || '12';
 // ANY = any file type (default)
 const ALLOWED_FILE_TYPES = (process.env.ALLOWED_FILE_TYPES || 'ANY').toUpperCase();
 
+// BRANDING: the display name for this instance. Surfaced to the client via
+// /api/config and used as: the landing-page heading, the browser tab title,
+// the sidebar header, the "About" modal title, and (lowercased) the default
+// filename prefix for received files. Validated strictly so it can never break
+// a filename or be used as an injection vector: 1-32 characters, only letters,
+// digits, spaces, "-" or "_". An UNSET var falls back to "WebSend"; a value
+// that is empty, too long, or contains other characters aborts startup.
+const BRANDING = process.env.BRANDING === undefined ? 'WebSend' : process.env.BRANDING;
+const BRANDING_RE = /^[A-Za-z0-9 _-]{1,32}$/;
+if (!BRANDING_RE.test(BRANDING)) {
+    console.error(`FATAL: BRANDING must be 1-32 characters of letters, digits, spaces, "-" or "_", got: ${JSON.stringify(BRANDING)}. Aborting startup.`);
+    process.exit(1);
+}
+
 // ============ ICE Server Configuration ============
 // STUN_SERVER: optional self-hosted STUN server (host:port)
 const STUN_SERVER = process.env.STUN_SERVER || '';
@@ -850,6 +864,9 @@ app.get('/api/config', (req, res) => {
         ocrLangs: OCR_LANGS.split(',').map(l => l.trim()),
         ocrPsm: OCR_PSM,
         allowedFileTypes: ALLOWED_FILE_TYPES,
+        // Instance display name (landing heading, tab title, sidebar header,
+        // About modal) and, lowercased, the default received-file name prefix.
+        branding: BRANDING,
         // Asymmetric auth: when AUTH_SCOPE=receiver, the receiver page builds
         // the sender invite URL (QR + link) against this open origin so the
         // unauthenticated sender is not bounced to SSO. null in the default
@@ -1886,6 +1903,7 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'UMAMI_DNT',             value: process.env.UMAMI_DNT,            used: UMAMI_DNT },
         { name: 'OCR_LANGS',             value: process.env.OCR_LANGS,            used: OCR_LANGS },
         { name: 'OCR_PSM',               value: process.env.OCR_PSM,              used: OCR_PSM },
+        { name: 'BRANDING',              value: process.env.BRANDING,             used: BRANDING },
         { name: 'AUTH_SCOPE',            value: process.env.AUTH_SCOPE,           used: AUTH_SCOPE },
         { name: 'SENDER_PUBLIC_ORIGIN',  value: process.env.SENDER_PUBLIC_ORIGIN, used: SENDER_PUBLIC_ORIGIN || '(none)' },
     ];
