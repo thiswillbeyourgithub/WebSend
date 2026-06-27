@@ -1,7 +1,7 @@
 {
   "name": "WebSend",
   "version": "4.10.0",
-  "description": "Secure photo sharing between devices using WebRTC",
+  "description": "Secure photo and file sharing between devices using WebRTC",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

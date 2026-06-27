@@ -1,7 +1,7 @@
 {
-  "name": "WebSend - Secure Photo Transfer",
+  "name": "WebSend - Secure Photo & files Transfer",
   "short_name": "WebSend",
-  "description": "End-to-end encrypted photo transfer between devices",
+  "description": "End-to-end encrypted photo and file transfer between devices",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#ffffff",

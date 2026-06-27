@@ -19,7 +19,7 @@ const i18n = (function() {
             // {brand} is substituted with the instance name (BRANDING env var,
             // default "WebSend") in t(); see setBrand().
             'app.name': '{brand}',
-            'app.subtitle': 'Secure Photo Transfer',
+            'app.subtitle': 'Secure Photo & files Transfer',
             'nav.back': '← Back',
             'common.close': 'Close',
 
@@ -37,7 +37,7 @@ const i18n = (function() {
             // Shown only on branded instances (brand !== "WebSend"): clarifies
             // that the renamed instance is still running the WebSend program.
             'about.instanceLine': '{brand} is an instance running a program called WebSend.',
-            'about.description': 'A secure, end-to-end encrypted photo transfer app designed for environments where data privacy is paramount. Photos never leave your device unencrypted, and only the intended recipient can decrypt them — no middleman, not even the server, ever has access.',
+            'about.description': 'A secure, end-to-end encrypted photo and file transfer app designed for environments where data privacy is paramount. Photos never leave your device unencrypted, and only the intended recipient can decrypt them, no middleman, not even the server, ever has access.',
             'about.techStack': 'Tech Stack',
             'about.techStack.frontend': 'Vanilla HTML, CSS, JavaScript (no frameworks)',
             'about.techStack.transport': 'WebRTC peer-to-peer data channels',
@@ -274,7 +274,7 @@ const i18n = (function() {
         fr: {
             // Common
             'app.name': '{brand}',
-            'app.subtitle': 'Transfert de Photos Sécurisé',
+            'app.subtitle': 'Transfert de Photos & fichiers Sécurisé',
             'nav.back': '← Retour',
             'common.close': 'Fermer',
 
@@ -290,7 +290,7 @@ const i18n = (function() {
             // About modal
             'about.title': 'À propos de {brand}',
             'about.instanceLine': '{brand} est une instance qui exécute un programme appelé WebSend.',
-            'about.description': 'Une application de transfert de photos sécurisée, chiffrée de bout en bout, conçue pour les environnements où la confidentialité des données est primordiale. Les photos ne quittent jamais votre appareil sans être chiffrées, et seul le destinataire peut les déchiffrer — aucun intermédiaire, pas même le serveur, n\'y a accès.',
+            'about.description': 'Une application de transfert de photos et fichiers sécurisée, chiffrée de bout en bout, conçue pour les environnements où la confidentialité des données est primordiale. Les photos ne quittent jamais votre appareil sans être chiffrées, et seul le destinataire peut les déchiffrer, aucun intermédiaire, pas même le serveur, n\'y a accès.',
             'about.techStack': 'Technologies',
             'about.techStack.frontend': 'HTML, CSS, JavaScript pur (sans framework)',
             'about.techStack.transport': 'Canaux de données WebRTC pair-à-pair',
