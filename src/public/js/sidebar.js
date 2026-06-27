@@ -234,10 +234,10 @@ function updateDevBadge(config) {
                 // as a real clickable link. Built via DOM (not innerHTML) so the
                 // translated text never passes through an HTML sink.
                 const issuesLink = document.createElement('a');
-                issuesLink.href = 'https://github.com/thiswillbeyourgithub/ImageSecureSend/issues';
+                issuesLink.href = 'https://github.com/thiswillbeyourgithub/WebSend/issues';
                 issuesLink.target = '_blank';
                 issuesLink.rel = 'noopener';
-                issuesLink.textContent = 'github.com/thiswillbeyourgithub/ImageSecureSend/issues';
+                issuesLink.textContent = 'github.com/thiswillbeyourgithub/WebSend/issues';
                 issuesLink.style.color = 'inherit';
                 issuesLink.style.fontWeight = '700';
                 issuesLink.style.textDecoration = 'underline';
