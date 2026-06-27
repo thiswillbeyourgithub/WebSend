@@ -9,6 +9,7 @@ node_modules/
 deploy.sh
 TODO.md
 PLAN.md
+CLAUDE.local.md
 
 # test artifacts
 src/test-results/
