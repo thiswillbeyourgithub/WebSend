@@ -145,7 +145,10 @@
         // photoCount is read here only to seed a fallback filename; the real
         // index is allocated below from receivedImages.length.
         const seq = receivedImages.length + 1;
-        const fileName = metadata.name || `websend_${_getConnectionTimestamp()}_${seq}.${ext}`;
+        // Default name prefix is the instance brand slug (BRANDING env var,
+        // lowercased); falls back to "websend" when i18n isn't wired (tests).
+        const brand = (_i18n && _i18n.getBrandSlug) ? _i18n.getBrandSlug() : 'websend';
+        const fileName = metadata.name || `${brand}_${_getConnectionTimestamp()}_${seq}.${ext}`;
 
         return { metadata, data, fileData, fileMimeType, fileBlob, fileType, fileName };
     }

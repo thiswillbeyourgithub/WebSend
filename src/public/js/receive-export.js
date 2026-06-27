@@ -91,7 +91,9 @@
                 return safeName || 'document';
             }
         }
-        return 'websend';
+        // Default export prefix is the instance brand slug (BRANDING env var,
+        // lowercased); falls back to "websend" when i18n isn't wired.
+        return (i18n && i18n.getBrandSlug) ? i18n.getBrandSlug() : 'websend';
     }
 
     function openExportModal() {

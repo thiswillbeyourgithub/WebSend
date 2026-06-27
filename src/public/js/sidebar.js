@@ -213,6 +213,14 @@ function updateDevBadge(config) {
     const version = typeof config === 'object' && config !== null ? config.version : null;
     const startedAt = typeof config === 'object' && config !== null ? config.serverStartedAt : null;
 
+    // Apply the instance brand (sidebar header, page heading, tab title, About
+    // modal). Folded in here because this is the one config-driven hook every
+    // page already calls after fetching /api/config.
+    if (typeof config === 'object' && config !== null && config.branding
+        && window.i18n && typeof i18n.setBrand === 'function') {
+        i18n.setBrand(config.branding);
+    }
+
     const badge = document.getElementById('sidebar-dev-badge');
     if (badge) {
         if (isDev) {

@@ -351,7 +351,10 @@
         }
 
         if (!item._segmentSender) {
-            const filename = blob.name || `websend_${Date.now()}.png`;
+            // Nameless blobs (camera captures) get a brand-slug default name,
+            // which becomes the receiver's download filename.
+            const brand = (_i18n && _i18n.getBrandSlug) ? _i18n.getBrandSlug() : 'websend';
+            const filename = blob.name || `${brand}_${Date.now()}.png`;
             // Camera/gallery blobs always carry an explicit image/* type (set
             // by canvas.toBlob). An empty blob.type only happens for a
             // file-picker pass-through of a type the browser does not

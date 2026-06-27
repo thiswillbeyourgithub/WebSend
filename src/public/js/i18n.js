@@ -16,7 +16,9 @@ const i18n = (function() {
     const translations = {
         en: {
             // Common
-            'app.name': 'WebSend',
+            // {brand} is substituted with the instance name (BRANDING env var,
+            // default "WebSend") in t(); see setBrand().
+            'app.name': '{brand}',
             'app.subtitle': 'Secure Photo Transfer',
             'nav.back': '← Back',
             'common.close': 'Close',
@@ -31,7 +33,10 @@ const i18n = (function() {
             'index.firefoxAndroidFlashWarning': 'Heads up: Firefox on Android does not support camera flash/torch. If you need flash while taking photos, use Chrome or another Chromium-based browser instead. Tap OK to continue anyway.',
 
             // About modal
-            'about.title': 'About WebSend',
+            'about.title': 'About {brand}',
+            // Shown only on branded instances (brand !== "WebSend"): clarifies
+            // that the renamed instance is still running the WebSend program.
+            'about.instanceLine': '{brand} is an instance running a program called WebSend.',
             'about.description': 'A secure, end-to-end encrypted photo transfer app designed for environments where data privacy is paramount. Photos never leave your device unencrypted, and only the intended recipient can decrypt them — no middleman, not even the server, ever has access.',
             'about.techStack': 'Tech Stack',
             'about.techStack.frontend': 'Vanilla HTML, CSS, JavaScript (no frameworks)',
@@ -55,6 +60,8 @@ const i18n = (function() {
 
             // Send page
             'send.title': 'Send Photos',
+            // Browser tab title (data-i18n-title on <html>); carries the brand.
+            'send.tabTitle': '{brand} - Send Photos',
             'send.scanSubtitle': 'Scan the QR code from the receiver\'s screen',
             'send.startCamera': 'Start Camera to Scan',
             'send.scanning': 'Scanning...',
@@ -129,6 +136,8 @@ const i18n = (function() {
 
             // Receive page
             'receive.title': 'Receive Photos',
+            // Browser tab title (data-i18n-title on <html>); carries the brand.
+            'receive.tabTitle': '{brand} - Receive Photos',
             'receive.scanSubtitle': 'Scan this QR code with your phone',
             'receive.generating': 'Generating secure connection...',
             'receive.waiting': 'Waiting for sender to scan...',
@@ -262,7 +271,7 @@ const i18n = (function() {
 
         fr: {
             // Common
-            'app.name': 'WebSend',
+            'app.name': '{brand}',
             'app.subtitle': 'Transfert de Photos Sécurisé',
             'nav.back': '← Retour',
             'common.close': 'Fermer',
@@ -277,7 +286,8 @@ const i18n = (function() {
             'index.firefoxAndroidFlashWarning': 'Attention : Firefox sur Android ne supporte pas le flash/torche de l\'appareil photo. Si vous avez besoin du flash pour prendre des photos, utilisez Chrome ou un autre navigateur basé sur Chromium. Appuyez sur OK pour continuer quand même.',
 
             // About modal
-            'about.title': 'À propos de WebSend',
+            'about.title': 'À propos de {brand}',
+            'about.instanceLine': '{brand} est une instance qui exécute un programme appelé WebSend.',
             'about.description': 'Une application de transfert de photos sécurisée, chiffrée de bout en bout, conçue pour les environnements où la confidentialité des données est primordiale. Les photos ne quittent jamais votre appareil sans être chiffrées, et seul le destinataire peut les déchiffrer — aucun intermédiaire, pas même le serveur, n\'y a accès.',
             'about.techStack': 'Technologies',
             'about.techStack.frontend': 'HTML, CSS, JavaScript pur (sans framework)',
@@ -301,6 +311,7 @@ const i18n = (function() {
 
             // Send page
             'send.title': 'Envoyer des Photos',
+            'send.tabTitle': '{brand} - Envoyer des Photos',
             'send.scanSubtitle': 'Scannez le QR code affiché sur l\'écran du destinataire',
             'send.startCamera': 'Activer la caméra pour scanner',
             'send.scanning': 'Scan en cours...',
@@ -375,6 +386,7 @@ const i18n = (function() {
 
             // Receive page
             'receive.title': 'Recevoir des Photos',
+            'receive.tabTitle': '{brand} - Recevoir des Photos',
             'receive.scanSubtitle': 'Scannez ce QR code avec votre téléphone',
             'receive.generating': 'Génération de la connexion sécurisée...',
             'receive.waiting': 'En attente du scan...',
@@ -508,6 +520,13 @@ const i18n = (function() {
     // Detect locale - use French if browser is French, otherwise English
     let currentLocale = 'en';
 
+    // Instance display name, substituted for {brand} in every translation.
+    // Defaults to "WebSend" so strings render correctly before /api/config is
+    // fetched; setBrand() updates it from config.branding. Kept here (not on
+    // window) so it stays the single source of truth shared by t(), the page
+    // headings/titles, and the default filename prefix (getBrandSlug).
+    let currentBrand = 'WebSend';
+
     // localStorage key for persisted language choice
     const STORAGE_KEY = 'imageSS_locale';
 
@@ -539,6 +558,10 @@ const i18n = (function() {
     function t(key, params = {}) {
         const dict = translations[currentLocale] || translations.en;
         let text = dict[key] || translations.en[key] || key;
+
+        // {brand} is always available so any string can embed the instance
+        // name; an explicit `brand` param (rare) still wins via the spread.
+        params = { brand: currentBrand, ...params };
 
         // Substitute parameters
         for (const [param, value] of Object.entries(params)) {
@@ -655,12 +678,51 @@ const i18n = (function() {
         }
     }
 
+    /**
+     * Set the instance brand (from /api/config.branding) and re-render every
+     * translated element so the heading, tab title, sidebar header, and About
+     * title pick it up. Ignores empty / non-string values, keeping the
+     * "WebSend" default. The server validates the value (1-32 chars of
+     * [A-Za-z0-9 _-]) before it ever reaches here.
+     *
+     * @param {string} brand - The instance display name.
+     */
+    function setBrand(brand) {
+        if (typeof brand !== 'string' || brand.trim() === '') return;
+        currentBrand = brand;
+        applyTranslations();
+        // The "is an instance running WebSend" line is meaningful only when the
+        // instance was actually renamed; hide it on the default-branded build.
+        const instanceLine = document.getElementById('about-instance-line');
+        if (instanceLine) instanceLine.classList.toggle('hidden', brand === 'WebSend');
+    }
+
+    /**
+     * @returns {string} The current instance brand (display form).
+     */
+    function getBrand() {
+        return currentBrand;
+    }
+
+    /**
+     * @returns {string} The brand as a filename-safe slug (lowercased, spaces
+     *   collapsed to underscores). Used as the default prefix for received-file
+     *   names. The server's validation guarantees only [A-Za-z0-9 _-], so this
+     *   slug needs no further sanitisation.
+     */
+    function getBrandSlug() {
+        return currentBrand.toLowerCase().replace(/\s+/g, '_');
+    }
+
     // Public API
     return {
         init,
         t,
         getLocale,
         setLocale,
+        setBrand,
+        getBrand,
+        getBrandSlug,
         detectLocale,
         applyTranslations
     };

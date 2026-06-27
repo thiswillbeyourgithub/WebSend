@@ -44,6 +44,11 @@
         <div style="background: white; border-radius: 15px; padding: 25px; max-width: 600px; width: 90vw; margin: 20px; max-height: 80vh; overflow-y: auto;">
             <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="about.title">About WebSend</h2>
 
+            <!-- Shown only on branded instances (revealed by i18n.setBrand when
+                 the brand differs from "WebSend"); explains the instance is
+                 still running the WebSend program. -->
+            <p id="about-instance-line" class="hidden" style="color: #555; font-size: 0.95rem; margin: -5px 0 15px 0;" data-i18n="about.instanceLine"></p>
+
             <p style="color: #555; font-size: 0.95rem; margin-bottom: 15px;" data-i18n="about.description">
                 A secure, end-to-end encrypted photo transfer app designed for environments where data privacy is paramount. Photos never leave your device unencrypted, and only the intended recipient can decrypt them — no middleman, not even the server, ever has access.
             </p>
@@ -93,8 +98,8 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-C6BlAtUy49n18WM2jSB7DgQ/NFjo6J+vB1ZJrMmwhzQFmhzwnkdgTqdPUKWWj5M0"></script>
-    <script src="/js/sidebar.js" integrity="sha384-fst2l+qnD3PVySYzIxn0U+k9Ro9avFWmm7PiCJ3vW8k724XkJ6ooz084uzoApo0k"></script>
+    <script src="/js/i18n.js" integrity="sha384-S4KvK2xuc/Su+Pm/Ff4zT5jLNVoux6j5J7duUA2Nr9BwxpV/At1h4b7KEsWnI6Ze"></script>
+    <script src="/js/sidebar.js" integrity="sha384-QVg0uYAdUkExAiSVxfYrBBTB2TXeLcEk0ZiMV/QCw5MKcK4Fazc8OcjwcTLpY5S1"></script>
     <script>
         // Initialize i18n (detect locale and apply translations), then build shared sidebar
         i18n.init();

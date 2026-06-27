@@ -496,6 +496,28 @@ test('generic mime is classified as fileType=other and a filename is synthesized
     assert.match(img.name, /^websend_1700000000_\d+\.zip$/);
 });
 
+test('synthesized filename prefix uses the instance brand slug when one is wired', async () => {
+    const images = [];
+    const fake = makeFakeReceiver({ segCount: 1 });
+    fake.finish = async () => ({
+        metadata: { name: '', mimeType: 'application/zip', originalSize: 1 },
+        blob: { size: 4, arrayBuffer: async () => new ArrayBuffer(4) },
+        compositeHashHex: COMPOSITE,
+    });
+    const { win } = setupV2(fake, {
+        receivedImages: images,
+        // A real i18n exposes getBrandSlug(); the default stub does not, which is
+        // why the test above still falls back to "websend".
+        optsExtra: { i18n: { t: (k) => k, getBrandSlug: () => 'acme_corp' } },
+    });
+    await win.ReceiveFlow.handleFileStart({ ...V2_START, segCount: 1 });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 1, ct: new ArrayBuffer(32) });
+    await win.ReceiveFlow.handleFileEnd({ type: 'file-end' });
+    assert.equal(images.length, 1);
+    assert.match(images[0].name, /^acme_corp_1700000000_\d+\.zip$/);
+});
+
 // ---- add-vs-replace routing at file-end ----
 
 async function runFullTransfer(win) {
