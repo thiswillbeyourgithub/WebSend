@@ -167,6 +167,9 @@
         // If you ever start writing into `data` byte-by-byte, copy here again.
         oldImg.originalData = fileData;
         oldImg.originalMimeType = fileMimeType;
+        // The pristine image just changed; any remembered crop-handle
+        // positions were relative to the old bytes and no longer apply.
+        oldImg.lastCropCorners = null;
 
         window.ReceiveCard.setCardImage(replaceIdx, fileBlob, { filename: fileName });
 

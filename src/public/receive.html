@@ -154,6 +154,7 @@
     <script src="/js/lp-transport.js" integrity="sha384-2NWvg+V4Q1oEb0QrjraiFzDKDUefi0pnj9+E7BYeh4pZnus9IKgDRJ1Yh2XV9SMF"></script>
     <script src="/js/transport.js" integrity="sha384-Ge3tX5fg7oGcICW5SUTvCo1gKPcnp2oYj83fAz0EsBYexK+vUxypRb4yA7MZhNKo"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-OB4QY3CCpEJiptMsiTcPnBGnoDm2iqtD5/EoKp6OeKJD0VOsSHt4bV+9OGFGEDfI"></script>
+    <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-uMrESk94t8vNbYOfNElA05X6xrtx22R84sVmUFOPMhOuJMf3kxW9EW+Ccpm/O4v0"></script>
     <script src="/js/ocr-rescale.js" crossorigin="anonymous" integrity="sha384-5M5fQCXV2I9KB8Vmt0xEBD8WrkfdHFsTzn2pPC3F1JDAOt8GEqiVTNWQyPLY7Tgn"></script>
     <script src="/js/scribe-handle.js" crossorigin="anonymous" integrity="sha384-7XsvlU+XY7iUhYR036TJxB75AOr924dzEMuRX1RxBqsrmNgsW2aakNjeGOnSlCBG"></script>
@@ -164,7 +165,7 @@
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-A0vvgdJ8ktmC65klkTfsPqjIHZXNroXsONfZzY7jVL0rVoRSdExtZid0K+ZXuRTw"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-NH+XRrtXv6xYSNjsbbaYzmJyXTVVdKmnIDrKgUvWXmwSVwnrJV5X5G8UcLvJs5xi"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-k/ah8ateHuYpet8W4GcGZ+A7kOq4oU5IyRquOUI/N4e6Nd2cC9sHdyuimkaOTN4g"></script>
-    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-ibr1472MItzRdV1jAs+IuPIEfhTHlGSbDsbqbZmrmi+lDCjCQreGtw70fuGeJkvf"></script>
+    <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-AL+F1hEUPPE9+udqJjOU6cdZCmEP/bjPwlbRE+q2AqXhFJ+m5RmOmoe4VrrfNGh5"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-qbpF8npqwS+Nl+YT3xMEQcJScijytkDWv5OxODlS5gubOl3nETag+wBkO1GzCDlO"></script>
     <script>
         // Initialize i18n first, then build the shared sidebar
@@ -1611,22 +1612,40 @@
             logger.info(`Opening crop modal for image ${imageIndex}`);
             const imgData = receivedImages[imageIndex];
             if (!imgData) return;
+            // Crop from the pristine as-received bytes (originalData), not the
+            // currently displayed crop, so re-cropping is non-destructive: the
+            // handles can be dragged back out to undo a previous crop. Falls
+            // back to the live data if a large/blob-only file has no
+            // materialized originalData.
+            const srcData = imgData.originalData || imgData.data;
             // Force application/octet-stream so the crop modal's blob: URL
             // cannot render peer-controlled HTML/SVG when navigated to via
             // context-menu "Open Image in New Tab". <img> tags content-sniff
             // so the displayed crop preview still renders.
-            const sourceBlob = new Blob([imgData.data], { type: ReceiveCard.SAFE_BLOB_TYPE });
+            const sourceBlob = new Blob([srcData], { type: ReceiveCard.SAFE_BLOB_TYPE });
 
             CropModal.open({
                 sourceBlob,
+                // Restore the handles where they were the last time this image
+                // was cropped here; otherwise auto-detect the document edges so
+                // the handles start on the page instead of a default box.
+                initialCorners: imgData.lastCropCorners || null,
+                detectCorners: (cropImg) => {
+                    const detected = window.DocDetect ? window.DocDetect.detectFromImage(cropImg) : null;
+                    if (detected) logger.info('Auto-detected document edges for crop');
+                    return detected;
+                },
                 onCancel: () => logger.info('Crop cancelled'),
-                onApply: async (resultBlob, _corners, { dstW, dstH }) => {
+                onApply: async (resultBlob, corners, { dstW, dstH }) => {
                     const resultData = new Uint8Array(await resultBlob.arrayBuffer());
 
-                    // Update receivedImages in place to preserve hash, fileType, collection refs, etc.
+                    // Update receivedImages in place to preserve hash, fileType,
+                    // collection refs, etc. originalData stays untouched so the
+                    // next crop can still undo back to the full received image.
                     imgData.data = resultData;
                     imgData.mimeType = 'image/jpeg';
                     imgData.ocrPageData = null;
+                    imgData.lastCropCorners = corners;
 
                     ReceiveCard.setCardImage(imageIndex, resultBlob);
 

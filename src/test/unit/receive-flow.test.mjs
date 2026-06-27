@@ -507,7 +507,8 @@ async function runFullTransfer(win) {
 }
 
 test('file-end with matching pending replace hash replaces the image in place', async () => {
-    const received = [{ hash: 'oldhash', data: new Uint8Array([1]), name: 'old.jpg', mimeType: 'image/jpeg', fileType: 'image' }];
+    const received = [{ hash: 'oldhash', data: new Uint8Array([1]), name: 'old.jpg', mimeType: 'image/jpeg', fileType: 'image',
+        lastCropCorners: { tl: { x: 0, y: 0 }, tr: { x: 1, y: 0 }, br: { x: 1, y: 1 }, bl: { x: 0, y: 1 } } }];
     let pending = 'oldhash';
     const { win, deps } = setupV2(makeFakeReceiver({ segCount: 2 }), {
         receivedImages: received,
@@ -517,6 +518,7 @@ test('file-end with matching pending replace hash replaces the image in place', 
     await runFullTransfer(win);
     assert.equal(received.length, 1, 'no new image added');
     assert.equal(received[0].hash, COMPOSITE, 'replaced in place with the new composite hash');
+    assert.equal(received[0].lastCropCorners, null, 'remembered crop handles cleared on replace');
     assert.equal(pending, null, 'pending hash cleared');
     const ack = deps.sent.find(m => m.type === 'file-ack');
     assert.equal(ack.hash, COMPOSITE);
