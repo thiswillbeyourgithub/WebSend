@@ -230,8 +230,23 @@ function updateDevBadge(config) {
             const banner = document.getElementById('maintenance-banner');
             if (banner) {
                 banner.textContent = i18n.t('maintenance.banner', { age: formatStartAge(startedAt) });
+                // The banner sentence ends right before the issues URL; append it
+                // as a real clickable link. Built via DOM (not innerHTML) so the
+                // translated text never passes through an HTML sink.
+                const issuesLink = document.createElement('a');
+                issuesLink.href = 'https://github.com/thiswillbeyourgithub/ImageSecureSend/issues';
+                issuesLink.target = '_blank';
+                issuesLink.rel = 'noopener';
+                issuesLink.textContent = 'github.com/thiswillbeyourgithub/ImageSecureSend/issues';
+                issuesLink.style.color = 'inherit';
+                issuesLink.style.fontWeight = '700';
+                issuesLink.style.textDecoration = 'underline';
+                banner.appendChild(issuesLink);
                 banner.classList.add('visible');
-                banner.addEventListener('click', () => {
+                banner.addEventListener('click', (e) => {
+                    // Clicking the link should open the issue tracker, not dismiss
+                    // the banner.
+                    if (e.target.closest('a')) return;
                     banner.style.opacity = '0';
                     setTimeout(() => banner.classList.remove('visible'), 300);
                 });

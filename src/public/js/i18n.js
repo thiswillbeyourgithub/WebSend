@@ -238,7 +238,9 @@ const i18n = (function() {
             'menu.connection': 'Connection',
             'menu.devMode': 'DEV mode enabled',
             'menu.prodMode': 'Production mode',
-            'maintenance.banner': '\u26a0\ufe0f Developer instance, restarted {age}. It is being actively modified and may be temporarily broken. If something seems off, please come back in a few hours. If the problem persists, open an issue at github.com/thiswillbeyourgithub/ImageSecureSend/issues',
+            // The issues URL is appended as a real <a> by sidebar.js, so this
+            // string ends right where the link begins (note the trailing space).
+            'maintenance.banner': '\u26a0\ufe0f Developer instance, restarted {age}. It is being actively modified and may be temporarily broken. If something seems off, please come back in a few hours. If the problem persists, open an issue at ',
             'maintenance.ageJustNow': 'just now',
             'maintenance.ageMinute': '1 minute ago',
             'maintenance.ageMinutes': '{n} minutes ago',
@@ -485,7 +487,7 @@ const i18n = (function() {
             'menu.connection': 'Connexion',
             'menu.devMode': 'Mode DEV activé',
             'menu.prodMode': 'Mode production',
-            'maintenance.banner': '\u26a0\ufe0f Instance de développement, redémarrée {age}. Elle est en cours de modification et peut être temporairement cassée. Si quelque chose ne va pas, revenez dans quelques heures. Si le problème persiste, ouvrez un ticket sur github.com/thiswillbeyourgithub/ImageSecureSend/issues',
+            'maintenance.banner': '\u26a0\ufe0f Instance de développement, redémarrée {age}. Elle est en cours de modification et peut être temporairement cassée. Si quelque chose ne va pas, revenez dans quelques heures. Si le problème persiste, ouvrez un ticket sur ',
             'maintenance.ageJustNow': 'à l\'instant',
             'maintenance.ageMinute': 'il y a 1 minute',
             'maintenance.ageMinutes': 'il y a {n} minutes',
