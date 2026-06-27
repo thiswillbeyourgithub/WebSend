@@ -10,6 +10,7 @@ deploy.sh
 TODO.md
 PLAN.md
 CLAUDE.local.md
+remotes/
 
 # test artifacts
 src/test-results/
