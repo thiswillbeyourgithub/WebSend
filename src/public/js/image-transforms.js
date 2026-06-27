@@ -372,6 +372,44 @@ async function cropPerspective(input, opts) {
 }
 
 /**
+ * Apply a single transform op (the wire vocabulary shared by the sender
+ * gallery and the receiver transform-replay) to an image.
+ * @param {Blob|{data,mimeType}} input
+ * @param {{op: string, corners?: object}} transform
+ * @returns {Promise<{data: Uint8Array, mimeType: string}>}
+ */
+function applyOp(input, transform) {
+    switch (transform.op) {
+        case 'rotateCW': return rotateImage(input, { degrees: 90 });
+        case 'flipH':    return flipImage(input, { axis: 'h' });
+        case 'bw':       return binarize(input);
+        case 'crop':     return cropPerspective(input, { corners: transform.corners });
+        default: throw new Error(`Unknown transform op: ${transform.op}`);
+    }
+}
+
+/**
+ * Apply an ordered list of transform ops, threading each result into the
+ * next. Single source of truth for both the sender (baking edits into the
+ * bytes it re-sends after a crop) and the receiver (replaying a sender's
+ * transform list against the pristine originalData).
+ * @param {Blob|{data,mimeType}} input
+ * @param {Array<{op: string, corners?: object}>} ops
+ * @returns {Promise<{data: Uint8Array, mimeType: string}>}
+ */
+async function applyOps(input, ops) {
+    // Duck-type the Blob case (it exposes arrayBuffer()) so this helper does
+    // not depend on the Blob global being present (e.g. in unit-test VMs).
+    let cur = (input && typeof input.arrayBuffer === 'function')
+        ? { data: new Uint8Array(await input.arrayBuffer()), mimeType: input.type || 'image/jpeg' }
+        : input;
+    for (const t of (ops || [])) {
+        cur = await applyOp(cur, t);
+    }
+    return cur;
+}
+
+/**
  * Normalize a transform result to a Blob.
  * rotateImage/flipImage return a Blob; binarize/cropPerspective return
  * {data: Uint8Array, mimeType: string}. Callers that just want a Blob
@@ -385,7 +423,7 @@ function toBlob(result, fallbackMime = 'image/jpeg') {
 
 window.ImageTransforms = {
     applyOtsu, perspectiveTransform, distance,
-    rotateImage, flipImage, binarize, cropPerspective, toBlob,
+    rotateImage, flipImage, binarize, cropPerspective, applyOp, applyOps, toBlob,
     CROP_MAX_DIM,
     MAX_TRANSFORM_PIXELS,
 };

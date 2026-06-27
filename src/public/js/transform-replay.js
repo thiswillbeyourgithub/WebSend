@@ -9,7 +9,7 @@
  * On failure (unknown hash, missing original, transform error), we send a
  * `transform-nack` so the sender can fall back to a full re-send.
  *
- * Depends on globals: rotateImage, flipImage, binarize, cropPerspective
+ * Depends on globals: window.ImageTransforms.applyOp/applyOps
  * (js/image-transforms.js); rtc, logger, i18n, showToast; window.BgOcr.
  *
  * State injected via attach(): receivedImages, preBWData.
@@ -26,21 +26,16 @@
     }
 
     /**
-     * Apply a single transform operation to image data.
+     * Apply a single transform operation to image data. Thin wrapper kept for
+     * callers/tests; the op vocabulary itself lives in ImageTransforms.applyOp
+     * so the sender and receiver share one implementation.
      * @param {Uint8Array} inputData
      * @param {string} inputMimeType
      * @param {Object} transform - { op, corners? }
      * @returns {Promise<{data: Uint8Array, mimeType: string}>}
      */
     async function applyTransformToData(inputData, inputMimeType, transform) {
-        const input = { data: inputData, mimeType: inputMimeType };
-        switch (transform.op) {
-            case 'rotateCW': return rotateImage(input, { degrees: 90 });
-            case 'flipH':    return flipImage(input, { axis: 'h' });
-            case 'bw':       return binarize(input);
-            case 'crop':     return cropPerspective(input, { corners: transform.corners });
-            default: throw new Error(`Unknown transform op: ${transform.op}`);
-        }
+        return window.ImageTransforms.applyOp({ data: inputData, mimeType: inputMimeType }, transform);
     }
 
     function sendNack(oldHash, reason) {
@@ -67,18 +62,17 @@
         }
 
         try {
-            let currentData = imgObj.originalData;
-            let currentMimeType = imgObj.originalMimeType;
+            const result = await window.ImageTransforms.applyOps(
+                { data: imgObj.originalData, mimeType: imgObj.originalMimeType },
+                transforms
+            );
 
-            for (const t of transforms) {
-                const result = await applyTransformToData(currentData, currentMimeType, t);
-                currentData = result.data;
-                currentMimeType = result.mimeType;
-            }
-
-            imgObj.data = currentData;
-            imgObj.mimeType = currentMimeType;
+            imgObj.data = result.data;
+            imgObj.mimeType = result.mimeType;
             imgObj.ocrPageData = null;
+            // The sender just redefined this image; any handle positions the
+            // receiver remembered from a local crop no longer correspond.
+            imgObj.lastCropCorners = null;
 
             if (preBWData[replaceIdx]) {
                 delete preBWData[replaceIdx];

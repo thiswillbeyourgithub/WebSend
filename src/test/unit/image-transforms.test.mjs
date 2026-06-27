@@ -173,3 +173,30 @@ test('rotateImage accepts a bitmap at the cap boundary', async () => {
         );
     });
 });
+
+// ---- applyOp / applyOps (op dispatch; canvas-heavy ops covered in E2E) ----
+
+test('applyOps with no ops returns the input object unchanged', async () => {
+    const input = { data: new Uint8Array([1, 2, 3]), mimeType: 'image/png' };
+    const out = await win.ImageTransforms.applyOps(input, []);
+    assert.equal(out, input, 'empty op list is an identity passthrough');
+    const out2 = await win.ImageTransforms.applyOps(input, undefined);
+    assert.equal(out2, input, 'missing op list is also a passthrough');
+});
+
+test('applyOp throws on an unknown op', () => {
+    assert.throws(
+        () => win.ImageTransforms.applyOp({ data: new Uint8Array([0]), mimeType: 'image/jpeg' }, { op: 'frobnicate' }),
+        /Unknown transform op: frobnicate/
+    );
+});
+
+test('applyOps surfaces an unknown op from the middle of the list', async () => {
+    await assert.rejects(
+        () => win.ImageTransforms.applyOps(
+            { data: new Uint8Array([0]), mimeType: 'image/jpeg' },
+            [{ op: 'bogus' }]
+        ),
+        /Unknown transform op: bogus/
+    );
+});
