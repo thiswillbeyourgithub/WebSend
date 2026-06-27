@@ -511,6 +511,7 @@
         cleanup,
         getFlashMode: () => flashMode,
         getCaptureStream: () => captureStream,
+        isDetectEnabled: () => detectEnabled,
         consumeDetectedCorners,
     };
 })();
