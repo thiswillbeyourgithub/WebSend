@@ -65,6 +65,9 @@ x-websend-env: &websend-env
   OCR_LANGS: "${OCR_LANGS:-eng,fra}"
   OCR_PSM: "${OCR_PSM:-12}"
   ALLOWED_FILE_TYPES: "${ALLOWED_FILE_TYPES:-ANY}"
+  BRANDING: "${BRANDING:-WebSend}"
+  HSTS_MAX_AGE: "${HSTS_MAX_AGE:-}"
+  RELAY_LP_ONLY: "${RELAY_LP_ONLY:-false}"
   # TRUST_PROXY is NOT in this shared map: each variant sets its own
   # default (loopback for direct, loopback+linklocal+uniquelocal for
   # auth) so the right value ships without users having to override it.
