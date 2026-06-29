@@ -1893,6 +1893,8 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'TURN_CREDENTIAL_TTL',   value: process.env.TURN_CREDENTIAL_TTL,  used: String(TURN_CREDENTIAL_TTL) },
         { name: 'TURN_TIMEOUT',          value: process.env.TURN_TIMEOUT,         used: String(TURN_TIMEOUT) },
         { name: 'ALLOWED_ORIGINS',       value: process.env.ALLOWED_ORIGINS,      used: ALLOWED_ORIGINS.join(', ') },
+        { name: 'ALLOWED_FILE_TYPES',    value: process.env.ALLOWED_FILE_TYPES,   used: ALLOWED_FILE_TYPES },
+        { name: 'TRUST_PROXY',           value: process.env.TRUST_PROXY,          used: Array.isArray(TRUST_PROXY) ? TRUST_PROXY.join(', ') : TRUST_PROXY },
         { name: 'HSTS_MAX_AGE',          value: process.env.HSTS_MAX_AGE,         used: HSTS_MAX_AGE > 0 ? `${HSTS_MAX_AGE}s` : '(disabled)' },
         { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
         { name: 'RELAY_ENABLE',          value: process.env.RELAY_ENABLE,         used: String(RELAY_ENABLE) },
@@ -1905,6 +1907,7 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'OCR_PSM',               value: process.env.OCR_PSM,              used: OCR_PSM },
         { name: 'BRANDING',              value: process.env.BRANDING,             used: BRANDING },
         { name: 'AUTH_SCOPE',            value: process.env.AUTH_SCOPE,           used: AUTH_SCOPE },
+        { name: 'AUTH_IDENTITY_HEADER',  value: process.env.AUTH_IDENTITY_HEADER, used: AUTH_IDENTITY_HEADER },
         { name: 'SENDER_PUBLIC_ORIGIN',  value: process.env.SENDER_PUBLIC_ORIGIN, used: SENDER_PUBLIC_ORIGIN || '(none)' },
     ];
 
