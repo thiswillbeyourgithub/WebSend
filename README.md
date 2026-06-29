@@ -295,6 +295,8 @@ SENDER   ──▶ open host (no SSO) ──────────────
 - On **both** hostnames, never let a client set the identity header; only oauth2-proxy may. The `auth-split` proxy sets `OAUTH2_PROXY_SET_XAUTHREQUEST=true` so it emits `X-Auth-Request-User`.
 - Set `SENDER_PUBLIC_ORIGIN` to the open hostname's origin and add it to `ALLOWED_ORIGINS`. The receiver's QR/invite link is built against it (so the sender lands on the open host, not the SSO login), and the server aborts at boot if it is missing or not whitelisted. The link stays same-origin from the sender's perspective, so the QR phishing defense is unaffected.
 
+On the open sender host the landing page hides the **Receive** button (receiving needs the SSO gate, so it would only lead to a 403) and offers **Send** only. The gated host still shows both. This is cosmetic; the `POST /api/rooms` gate above is the real control.
+
 This feature was added with assistance from [Claude Code](https://claude.ai/claude-code).
 
 ## Requirements

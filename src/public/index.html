@@ -147,6 +147,15 @@
         // Fetch server config to update DEV badge and sidebar version
         fetch('/api/config').then(r => r.json()).then(config => {
             updateDevBadge(config); // defined in sidebar.js — also fills version
+            // Split auth (AUTH_SCOPE=receiver): the OPEN sender host cannot
+            // create a room (receiving requires the SSO gate's identity header),
+            // so the Receive button is a dead end there. Hide it when we are on
+            // that host. config.senderOrigin is the open host's origin, and is
+            // null in the default 'both' mode (so both buttons stay shown).
+            if (config.senderOrigin && window.location.origin === config.senderOrigin) {
+                const receiveLink = document.querySelector('a[href="/receive.html"]');
+                if (receiveLink) receiveLink.remove();
+            }
         }).catch(() => {}); // Non-fatal
 
         // Open about modal if URL has #about (from sidebar on other pages)

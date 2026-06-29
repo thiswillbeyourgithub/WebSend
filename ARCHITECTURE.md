@@ -1216,6 +1216,12 @@ SENDER   ──▶ open host  ────────────────�
   instead of the gated one. It remains same-origin from the sender's point of
   view, so `qr-parse.js`'s foreign-origin (phishing) defense is unaffected. In
   `both` mode `senderOrigin` is `null` and the page uses its own origin.
+- **Sender-host UI.** On the open sender host the Receive button is a dead end
+  (receiving needs the SSO gate), so `index.html` removes it after `/api/config`
+  returns, comparing `window.location.origin` against `senderOrigin`. Only Send
+  is offered there. On the gated host, and in `both` mode (where `senderOrigin`
+  is `null`), both buttons stay. The server-side `POST /api/rooms` gate is the
+  real control; this is just UX so senders are not led to a 403.
 
 This feature is experimental and was added with assistance from
 [Claude Code](https://claude.ai/claude-code).
