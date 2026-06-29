@@ -277,7 +277,11 @@ services:
       # DNS name is the compose service name, NOT container_name. The gated
       # websend service is named "websend-gated" on the bridge network even
       # though its container is named "websend".
-      OAUTH2_PROXY_UPSTREAM: "http://websend-gated:8080"
+      # The var is OAUTH2_PROXY_UPSTREAMS (PLURAL): oauth2-proxy derives env
+      # names from its `cfg:"upstreams"` struct tag, not the `--upstream` flag,
+      # so the singular OAUTH2_PROXY_UPSTREAM is silently ignored -> no upstream
+      # registered -> the gate authenticates the user then 404s every path.
+      OAUTH2_PROXY_UPSTREAMS: "http://websend-gated:8080"
 
   # ── oauth2-proxy-split (receiver-only SSO gate) ─────────────────────
   # Activated by: COMPOSE_PROFILES=auth-split
@@ -294,7 +298,9 @@ services:
       - websend-split
     environment:
       <<: *oauth2-env
-      OAUTH2_PROXY_UPSTREAM: "http://websend-split:8080"
+      # PLURAL (see the note on oauth2-proxy's OAUTH2_PROXY_UPSTREAMS above):
+      # the singular form is silently ignored and the gate 404s every path.
+      OAUTH2_PROXY_UPSTREAMS: "http://websend-split:8080"
       # Inject X-Auth-Request-User (the X-Auth-Request-* family) into the
       # upstream request so websend-split's AUTH_SCOPE=receiver room-creation
       # gate can confirm the receiver authenticated. If you change
