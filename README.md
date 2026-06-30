@@ -286,13 +286,13 @@ RECEIVER ──▶ gated host (SSO) ──▶ oauth2-proxy :4180 ──▶ webse
 SENDER   ──▶ open host (no SSO) ─────────────────────▶ websend :7395
 ```
 
-**Why "only staff may receive" holds.** Creating a room is what makes you a receiver, and `POST /api/rooms` is the only endpoint that mints one. In receiver mode the app **refuses room creation** unless the request carries the identity header oauth2-proxy injects after login (`AUTH_IDENTITY_HEADER`, default `x-auth-request-user`). So an unauthenticated sender cannot become a receiver. The actual file transfer (WebRTC/relay) is shared between the two peers and stays open, protected by the per-room 128-bit secret exactly as in the non-SSO `direct` profile, so a transfer is no less private than a `direct` deploy; only *who may start one as the receiver* is restricted.
+**Why "only staff may receive" holds.** Creating a room is what makes you a receiver, and `POST /api/rooms` is the only endpoint that mints one. In receiver mode the app **refuses room creation** unless the request carries the identity header oauth2-proxy injects into the upstream request after login (`AUTH_IDENTITY_HEADER`, default `x-forwarded-user`). So an unauthenticated sender cannot become a receiver. The actual file transfer (WebRTC/relay) is shared between the two peers and stays open, protected by the per-room 128-bit secret exactly as in the non-SSO `direct` profile, so a transfer is no less private than a `direct` deploy; only *who may start one as the receiver* is restricted.
 
 **You MUST configure the reverse proxy, or the guarantee is void.** The app-side header check is defense in depth; the non-forgeable gate is the network path you control:
 
 - Route the **receiver** (gated) hostname to `127.0.0.1:4180` (oauth2-proxy), as with the `auth` profile.
 - Route the **sender** (open) hostname to `127.0.0.1:7395` (websend) and, on that host, **(a)** return `403` for `POST /api/rooms` (senders never create rooms), and **(b)** strip any client-supplied `AUTH_IDENTITY_HEADER`.
-- On **both** hostnames, never let a client set the identity header; only oauth2-proxy may. The `auth-split` proxy sets `OAUTH2_PROXY_SET_XAUTHREQUEST=true` so it emits `X-Auth-Request-User`.
+- On **both** hostnames, never let a client set the identity header; only oauth2-proxy may. The `auth-split` proxy injects `X-Forwarded-User` into the upstream request via `pass-user-headers` (on by default), so no extra flag is needed. (Do **not** rely on `--set-xauthrequest`/`OAUTH2_PROXY_SET_XAUTHREQUEST`: it only sets `X-Auth-Request-*` on the *response*, for nginx `auth_request` subrequest mode, never on this upstream request, so the gate would 401 every call.)
 - Set `SENDER_PUBLIC_ORIGIN` to the open hostname's origin and add it to `ALLOWED_ORIGINS`. The receiver's QR/invite link is built against it (so the sender lands on the open host, not the SSO login), and the server aborts at boot if it is missing or not whitelisted. The link stays same-origin from the sender's perspective, so the QR phishing defense is unaffected.
 
 On the open sender host the landing page hides the **Receive** button (receiving needs the SSO gate, so it would only lead to a 403) and offers **Send** only. The gated host still shows both. This is cosmetic; the `POST /api/rooms` gate above is the real control.
@@ -385,7 +385,7 @@ COMPOSE_PROFILES=auth-split       # receiver-only SSO (two hosts), external TURN
 | `TRUST_PROXY` | Comma-separated [Express trust-proxy](https://expressjs.com/en/guide/behind-proxies.html) specifiers. Automatically set to `loopback,linklocal,uniquelocal` by the `auth` compose profile; only override if you have extra proxy hops upstream of Caddy | `loopback` (`direct`) / `loopback,linklocal,uniquelocal` (`auth`) |
 | `AUTH_SCOPE` | `both` gates every peer behind SSO; `receiver` gates only the room creator and leaves the sender on an open host. See [Receiver-only authentication](#receiver-only-authentication-experimental) | `both` |
 | `SENDER_PUBLIC_ORIGIN` | Required when `AUTH_SCOPE=receiver`: the open sender host's origin (`scheme://host[:port]`) the receiver's QR/invite link targets. Must also be in `ALLOWED_ORIGINS` (server aborts at boot otherwise) | _(empty)_ |
-| `AUTH_IDENTITY_HEADER` | The proxy-injected identity header the room-creation gate checks when `AUTH_SCOPE=receiver` | `x-auth-request-user` |
+| `AUTH_IDENTITY_HEADER` | The proxy-injected identity header the room-creation gate checks when `AUTH_SCOPE=receiver` (oauth2-proxy injects this upstream via `pass-user-headers`) | `x-forwarded-user` |
 | `TEST_DISABLE_RATE_LIMIT` | Disable per-IP rate limiting (test escape hatch only) | _(unset)_ |
 
 ## Firewall (UFW)

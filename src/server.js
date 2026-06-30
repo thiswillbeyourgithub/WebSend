@@ -184,8 +184,9 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 //            "only authenticated staff may receive" guarantee, room creation
 //            (POST /api/rooms) is the load-bearing boundary: it is refused
 //            unless the request carries the trusted identity header that the
-//            auth proxy injects after a successful login (AUTH_IDENTITY_HEADER,
-//            e.g. oauth2-proxy's X-Auth-Request-User).
+//            auth proxy injects into the UPSTREAM request after a successful
+//            login (AUTH_IDENTITY_HEADER, default x-forwarded-user, which
+//            oauth2-proxy sets via pass-user-headers when it reverse-proxies us).
 //
 // SECURITY: the in-app header check is DEFENSE-IN-DEPTH, and is only sound
 // because the deployment guarantees that (a) the open sender host's proxy
@@ -193,7 +194,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 // identity) and ideally (b) the open host returns 403 for POST /api/rooms
 // outright. The non-forgeable gate is the proxy network path; this header
 // check is the second layer that fails CLOSED (refuses room creation) if the
-// proxy is misrouted or forgets --set-xauthrequest. See ARCHITECTURE.md
+// proxy is misrouted or stops injecting the identity header. See ARCHITECTURE.md
 // "SSO (Experimental)" / README "Receiver-only authentication".
 const AUTH_SCOPE = (process.env.AUTH_SCOPE || 'both').toLowerCase();
 if (!['both', 'receiver'].includes(AUTH_SCOPE)) {
@@ -208,10 +209,16 @@ if (!['both', 'receiver'].includes(AUTH_SCOPE)) {
 // origin. Trailing slashes trimmed so it concatenates cleanly with /send/...
 const SENDER_PUBLIC_ORIGIN = (process.env.SENDER_PUBLIC_ORIGIN || '').replace(/\/+$/, '');
 // AUTH_IDENTITY_HEADER: the request header the auth proxy injects carrying the
-// authenticated user id. oauth2-proxy sets X-Auth-Request-User when started
-// with --set-xauthrequest. Lower-cased because Express header keys are
-// lower-cased; only its PRESENCE is checked (we do no user/group mapping).
-const AUTH_IDENTITY_HEADER = (process.env.AUTH_IDENTITY_HEADER || 'x-auth-request-user').toLowerCase();
+// authenticated user id. Default x-forwarded-user: when oauth2-proxy
+// reverse-proxies us (the shipped `auth-split` topology), pass-user-headers
+// (on by default) injects X-Forwarded-User into the UPSTREAM request. Note
+// --set-xauthrequest does NOT help here: it sets X-Auth-Request-* on the
+// RESPONSE only (for nginx auth_request *subrequest* mode), never on the
+// upstream request, so the app would never see it. Lower-cased because Express
+// header keys are lower-cased; only its PRESENCE is checked (no user/group
+// mapping). Override it to match whatever identity header your proxy actually
+// injects upstream (e.g. x-auth-request-user if nginx auth_request re-injects it).
+const AUTH_IDENTITY_HEADER = (process.env.AUTH_IDENTITY_HEADER || 'x-forwarded-user').toLowerCase();
 
 if (AUTH_SCOPE === 'receiver') {
     if (!SENDER_PUBLIC_ORIGIN) {
@@ -1936,8 +1943,9 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         console.log(`    Sender invite origin (open host): ${SENDER_PUBLIC_ORIGIN}`);
         console.log(`    Room creation requires the "${AUTH_IDENTITY_HEADER}" header from the auth proxy.`);
         console.log('    DEPLOYMENT MUST, or the guarantee is void:');
-        console.log('      1. gate the receiver host via oauth2-proxy with --set-xauthrequest');
-        console.log(`         (OAUTH2_PROXY_SET_XAUTHREQUEST=true) so it injects ${AUTH_IDENTITY_HEADER};`);
+        console.log('      1. gate the receiver host via oauth2-proxy so it injects');
+        console.log(`         "${AUTH_IDENTITY_HEADER}" into the upstream request (pass-user-headers,`);
+        console.log('         on by default, sets X-Forwarded-User; adjust if you changed the header);');
         console.log(`      2. on the OPEN sender host: STRIP any client-sent ${AUTH_IDENTITY_HEADER}`);
         console.log('         header AND return 403 for POST /api/rooms.');
     }

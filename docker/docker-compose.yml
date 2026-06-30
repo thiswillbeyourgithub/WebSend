@@ -222,7 +222,7 @@ services:
   # Reverse proxy (you provide it; not shipped here) MUST, or the guarantee
   # is void:
   #   - on the OPEN sender host: return 403 for POST /api/rooms AND strip any
-  #     client-sent ${AUTH_IDENTITY_HEADER} (default X-Auth-Request-User);
+  #     client-sent ${AUTH_IDENTITY_HEADER} (default X-Forwarded-User);
   #   - on BOTH hosts: never let a client set that header.
   # SENDER_PUBLIC_ORIGIN must be the open host's origin and must appear in
   # ALLOWED_ORIGINS (server.js aborts at boot otherwise).
@@ -236,7 +236,13 @@ services:
       <<: *websend-env
       AUTH_SCOPE: "receiver"
       SENDER_PUBLIC_ORIGIN: "${SENDER_PUBLIC_ORIGIN:-}"
-      AUTH_IDENTITY_HEADER: "${AUTH_IDENTITY_HEADER:-x-auth-request-user}"
+      # Default x-forwarded-user: that is the identity header oauth2-proxy-split
+      # actually injects into THIS upstream request (pass-user-headers, on by
+      # default). Do NOT use x-auth-request-user here: oauth2-proxy's
+      # --set-xauthrequest sets X-Auth-Request-* on the RESPONSE only (nginx
+      # auth_request mode), never on the upstream request, so the gate would
+      # never see it and every POST /api/rooms would 401.
+      AUTH_IDENTITY_HEADER: "${AUTH_IDENTITY_HEADER:-x-forwarded-user}"
       # Both the open-host proxy and oauth2-proxy sit in front, so trust the
       # RFC1918 bridge peer for X-Forwarded-For like the gated variant (see
       # its TRUST_PROXY note above) or the rate limiter collapses every caller
@@ -285,9 +291,12 @@ services:
 
   # ── oauth2-proxy-split (receiver-only SSO gate) ─────────────────────
   # Activated by: COMPOSE_PROFILES=auth-split
-  # Same Keycloak gate as oauth2-proxy, but it fronts websend-split and,
-  # crucially, injects the identity header (OAUTH2_PROXY_SET_XAUTHREQUEST=true
-  # -> X-Auth-Request-User) that websend-split's room-creation gate checks.
+  # Same Keycloak gate as oauth2-proxy, but it fronts websend-split. The
+  # identity header websend-split's room-creation gate checks (X-Forwarded-User)
+  # is injected into the upstream request automatically by pass-user-headers
+  # (on by default), so no extra flag is needed here. Do NOT reach for
+  # --set-xauthrequest: it only sets X-Auth-Request-* on the RESPONSE (for nginx
+  # auth_request subrequest mode), never on this upstream request.
   # Shares container_name "oauth2-proxy" with the variant above, so `auth` and
   # `auth-split` cannot run together. The RECEIVER's reverse-proxy host points
   # here (127.0.0.1:4180); the sender's open host does NOT.
@@ -301,11 +310,12 @@ services:
       # PLURAL (see the note on oauth2-proxy's OAUTH2_PROXY_UPSTREAMS above):
       # the singular form is silently ignored and the gate 404s every path.
       OAUTH2_PROXY_UPSTREAMS: "http://websend-split:8080"
-      # Inject X-Auth-Request-User (the X-Auth-Request-* family) into the
-      # upstream request so websend-split's AUTH_SCOPE=receiver room-creation
-      # gate can confirm the receiver authenticated. If you change
-      # AUTH_IDENTITY_HEADER, make sure the proxy still sets that exact header.
-      OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
+      # No header flag needed: pass-user-headers (on by default) already injects
+      # X-Forwarded-User into the upstream request, which is what websend-split's
+      # AUTH_SCOPE=receiver room-creation gate checks (AUTH_IDENTITY_HEADER
+      # default x-forwarded-user). If you change AUTH_IDENTITY_HEADER to a header
+      # oauth2-proxy does NOT inject upstream by default (e.g. x-auth-request-user),
+      # the gate will 401 every request: keep the two in sync.
 
   # ── coturn TURN relay server ────────────────────────────────────────
   # Activated by: COMPOSE_PROFILES=turn

@@ -70,11 +70,16 @@ test('receiver mode: POST /api/rooms without an identity header is refused (401)
     }
 });
 
-test('receiver mode: POST /api/rooms with the proxy identity header succeeds', async () => {
+// Regression test for the auth-split 401 bug: the default identity header is
+// x-forwarded-user, the one oauth2-proxy actually injects upstream via
+// pass-user-headers. (Before the fix the default was x-auth-request-user, which
+// oauth2-proxy only sets on the RESPONSE under --set-xauthrequest, so this POST
+// 401'd in real deployments.)
+test('receiver mode: POST /api/rooms with the default X-Forwarded-User header succeeds', async () => {
     const srv = await startServer(RECEIVER_ENV);
     try {
-        const res = await postRoom(srv.baseUrl, { 'X-Auth-Request-User': 'alice@example.com' });
-        assert.equal(res.status, 200, 'a request carrying the identity header is the authenticated path');
+        const res = await postRoom(srv.baseUrl, { 'X-Forwarded-User': 'alice@example.com' });
+        assert.equal(res.status, 200, 'a request carrying the default identity header is the authenticated path');
         const body = await res.json();
         assert.ok(typeof body.roomId === 'string' && body.roomId.length === 6, `Bad roomId: ${body.roomId}`);
     } finally {
@@ -85,7 +90,7 @@ test('receiver mode: POST /api/rooms with the proxy identity header succeeds', a
 test('receiver mode: a blank identity header does not satisfy the gate', async () => {
     const srv = await startServer(RECEIVER_ENV);
     try {
-        const res = await postRoom(srv.baseUrl, { 'X-Auth-Request-User': '   ' });
+        const res = await postRoom(srv.baseUrl, { 'X-Forwarded-User': '   ' });
         assert.equal(res.status, 401, 'whitespace-only identity must fail closed');
     } finally {
         await stopServer(srv.proc);
@@ -93,13 +98,13 @@ test('receiver mode: a blank identity header does not satisfy the gate', async (
 });
 
 test('receiver mode: AUTH_IDENTITY_HEADER is configurable', async () => {
-    const srv = await startServer({ ...RECEIVER_ENV, AUTH_IDENTITY_HEADER: 'X-Forwarded-User' });
+    const srv = await startServer({ ...RECEIVER_ENV, AUTH_IDENTITY_HEADER: 'X-Auth-Request-User' });
     try {
         // The default header is now ignored; only the configured one counts.
-        const ignored = await postRoom(srv.baseUrl, { 'X-Auth-Request-User': 'alice@example.com' });
+        const ignored = await postRoom(srv.baseUrl, { 'X-Forwarded-User': 'alice@example.com' });
         assert.equal(ignored.status, 401, 'default header must not satisfy a custom AUTH_IDENTITY_HEADER');
 
-        const accepted = await postRoom(srv.baseUrl, { 'X-Forwarded-User': 'alice@example.com' });
+        const accepted = await postRoom(srv.baseUrl, { 'X-Auth-Request-User': 'alice@example.com' });
         assert.equal(accepted.status, 200, 'the configured header must be honored');
     } finally {
         await stopServer(srv.proc);

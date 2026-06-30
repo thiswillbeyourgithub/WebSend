@@ -1190,9 +1190,13 @@ SENDER   ──▶ open host  ────────────────�
 - **Why this is sound.** Creating a room is what makes you a receiver, and
   `POST /api/rooms` is the only room-minting endpoint. In receiver mode the app
   refuses room creation (HTTP 401) unless the request carries the trusted
-  identity header `AUTH_IDENTITY_HEADER` (default `x-auth-request-user`) that
-  oauth2-proxy injects after login (`OAUTH2_PROXY_SET_XAUTHREQUEST=true` on
-  `oauth2-proxy-split`). So an unauthenticated sender cannot become a receiver.
+  identity header `AUTH_IDENTITY_HEADER` (default `x-forwarded-user`) that
+  oauth2-proxy injects into the upstream request after login. (`pass-user-headers`
+  is on by default, so `oauth2-proxy-split` sets `X-Forwarded-User` with no extra
+  flag. NOTE: `--set-xauthrequest`/`OAUTH2_PROXY_SET_XAUTHREQUEST` does NOT work
+  for this: it sets `X-Auth-Request-*` on the *response* only, for nginx
+  `auth_request` subrequest mode, never on the upstream request the app reads.)
+  So an unauthenticated sender cannot become a receiver.
   The data plane (WebRTC/relay) is shared and symmetric between the two peers
   and stays open, protected by the per-room 128-bit secret exactly as in the
   non-SSO `direct` profile, so the security posture for the *transfer* is
@@ -1207,7 +1211,7 @@ SENDER   ──▶ open host  ────────────────�
   rooms) and (b) strips any client-supplied `AUTH_IDENTITY_HEADER`, on both
   hosts, so only the auth proxy can ever set it. The network path (proxy) is
   the non-forgeable gate; the app check fails **closed** (refuses room creation)
-  if the proxy is misconfigured or forgets `--set-xauthrequest`. Startup aborts
+  if the proxy is misconfigured or stops injecting the identity header. Startup aborts
   if `AUTH_SCOPE=receiver` and `SENDER_PUBLIC_ORIGIN` is unset, not a bare
   origin, or not present in `ALLOWED_ORIGINS`.
 - **Sender invite URL.** `/api/config` surfaces `senderOrigin`
