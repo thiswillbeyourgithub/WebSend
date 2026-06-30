@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
@@ -77,4 +77,74 @@ test('about-instance-line is shown only when the brand differs from WebSend', ()
 
     i18n.setBrand('WebSend');
     assert.equal(line.classList.contains('hidden'), true, 'hidden on the default-branded build');
+});
+
+// --- Key coverage / locale parity ------------------------------------------
+// t() returns the key itself when a key is missing (dict[key] ||
+// translations.en[key] || key), so a never-defined key (e.g. a typo, or one
+// only ever written as `i18n.t('x') || 'fallback'`) silently renders the raw
+// key string to the user: the `|| 'fallback'` is dead because t() never
+// returns a falsy value. These tests extract the en/fr dictionaries and every
+// key referenced in the HTML/JS, then assert the two locales define the same
+// keys and that every referenced key is defined in both.
+
+// Parse one locale block out of the i18n.js source. The dictionaries are flat
+// (no nested objects), so the block ends at the first line that is just a
+// closing brace at the object's own indentation.
+function extractLocaleKeys(source, locale) {
+    const lines = source.split('\n');
+    const start = lines.findIndex(l => new RegExp(`^\\s*${locale}:\\s*\\{`).test(l));
+    assert.ok(start !== -1, `${locale} block not found in i18n.js`);
+    const keys = new Set();
+    const keyRe = /^\s*(['"])((?:[^'"\\]|\\.)*?)\1\s*:/;
+    for (let i = start + 1; i < lines.length; i++) {
+        if (/^\s*\},?;?\s*$/.test(lines[i])) break; // end of this locale block
+        const m = lines[i].match(keyRe);
+        if (m) keys.add(m[2]);
+    }
+    return keys;
+}
+
+// Every i18n key referenced from markup (data-i18n / -placeholder / -title /
+// -aria-label / -alt) or from JS (i18n.t / _i18n.t / i18nRef.t).
+function collectReferencedKeys() {
+    const publicDir = path.resolve(__dirname, '../../public');
+    const refs = new Set();
+    const tagRe = /data-i18n(?:-placeholder|-title|-aria-label|-alt)?\s*=\s*"([^"]+)"/g;
+    const tRe = /i18n(?:Ref)?\.t\(\s*(['"])((?:[^'"\\]|\\.)*?)\1/g;
+    const scan = (txt, { tags = false, file = '' } = {}) => {
+        let m;
+        if (tags) { while ((m = tagRe.exec(txt))) refs.add(m[1]); }
+        while ((m = tRe.exec(txt))) {
+            // i18n.js's own doc comment uses i18n.t('key') as an example.
+            if (file === 'i18n.js' && m[2] === 'key') continue;
+            refs.add(m[2]);
+        }
+    };
+    for (const f of ['index.html', 'send.html', 'receive.html']) {
+        scan(readFileSync(path.join(publicDir, f), 'utf8'), { tags: true });
+    }
+    const jsDir = path.join(publicDir, 'js');
+    for (const f of readdirSync(jsDir)) {
+        if (f.endsWith('.js')) scan(readFileSync(path.join(jsDir, f), 'utf8'), { file: f });
+    }
+    return refs;
+}
+
+test('en and fr define exactly the same set of i18n keys', () => {
+    const en = extractLocaleKeys(moduleSource, 'en');
+    const fr = extractLocaleKeys(moduleSource, 'fr');
+    assert.ok(en.size > 100, `sanity: expected many en keys, parsed ${en.size}`);
+    const onlyEn = [...en].filter(k => !fr.has(k));
+    const onlyFr = [...fr].filter(k => !en.has(k));
+    assert.deepEqual(onlyEn, [], `keys defined in en but missing from fr: ${onlyEn.join(', ')}`);
+    assert.deepEqual(onlyFr, [], `keys defined in fr but missing from en: ${onlyFr.join(', ')}`);
+});
+
+test('every i18n key referenced in HTML/JS is defined in both locales', () => {
+    const en = extractLocaleKeys(moduleSource, 'en');
+    const fr = extractLocaleKeys(moduleSource, 'fr');
+    const missing = [...collectReferencedKeys()].filter(k => !en.has(k) || !fr.has(k)).sort();
+    assert.deepEqual(missing, [],
+        `referenced i18n keys not defined in both locales: ${missing.join(', ')}`);
 });

@@ -81,7 +81,7 @@
             window.ReceiveCard.setCardImage(replaceIdx, new Blob([currentData], { type: currentMimeType }));
 
             logger.success(`Transform applied locally (${transforms.length} ops)`);
-            showToast(i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
+            showToast(i18n.t('receive.imageReplaced'), { type: 'success' });
 
             BgOcr.cancel(replaceIdx);
             BgOcr.queue(replaceIdx);

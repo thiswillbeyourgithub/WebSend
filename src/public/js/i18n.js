@@ -191,6 +191,10 @@ const i18n = (function() {
             'receive.orCopyLink': 'Or copy this link:',
             'receive.disconnected': 'Disconnected',
             'receive.qrFailed': 'QR code failed. Share this URL:',
+            // Transfer / replacement status toasts (receive-flow, transform-replay)
+            'receive.ackLost': 'Connection lost before ack, sender may retry',
+            'receive.imageReplaced': 'Image updated by sender',
+            'receive.ocrAlreadyRunning': 'Export already in progress',
 
             // Crop modal
             'crop.title': 'Crop Document',
@@ -442,6 +446,10 @@ const i18n = (function() {
             'receive.orCopyLink': 'Ou copiez ce lien :',
             'receive.disconnected': 'Déconnecté',
             'receive.qrFailed': 'Échec du QR code. Partagez cette URL :',
+            // Transfer / replacement status toasts (receive-flow, transform-replay)
+            'receive.ackLost': "Connexion perdue avant confirmation, l'expéditeur peut réessayer",
+            'receive.imageReplaced': "Image mise à jour par l'expéditeur",
+            'receive.ocrAlreadyRunning': 'Export déjà en cours',
 
             // Crop modal
             'crop.title': 'Recadrer le document',

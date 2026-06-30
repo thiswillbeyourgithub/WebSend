@@ -530,7 +530,7 @@
     async function generateOcrPdf() {
         if (ocrExportInFlight) {
             logger.warn('OCR PDF export already in progress — ignoring duplicate trigger');
-            window.showToast(i18n.t('receive.ocrAlreadyRunning') || 'Export already in progress', { type: 'warn' });
+            window.showToast(i18n.t('receive.ocrAlreadyRunning'), { type: 'warn' });
             return;
         }
 

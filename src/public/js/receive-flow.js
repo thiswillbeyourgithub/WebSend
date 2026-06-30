@@ -183,11 +183,11 @@
         _logger.info(`Replacement SHA-256: ${decryptedHash}`);
         if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
             _logger.warn('Replacement ack could not be sent (channel closed) — sender will treat transfer as failed');
-            _showToast(_i18n.t('receive.ackLost') || 'Connection lost before ack — sender may retry', { type: 'warn' });
+            _showToast(_i18n.t('receive.ackLost'), { type: 'warn' });
             return;
         }
         _logger.success(`Image replaced (index ${replaceIdx}) and ack sent`);
-        _showToast(_i18n.t('receive.imageReplaced') || 'Image updated by sender', { type: 'success' });
+        _showToast(_i18n.t('receive.imageReplaced'), { type: 'success' });
 
         window.BgOcr.cancel(replaceIdx);
         window.BgOcr.queue(replaceIdx);
@@ -245,7 +245,7 @@
         _logger.info(`Decrypted SHA-256: ${decryptedHash}`);
         if (!_getRtc().sendMessage(window.Protocol.build.fileAck(decryptedHash))) {
             _logger.warn('Ack could not be sent (channel closed) — sender will treat transfer as failed');
-            _showToast(_i18n.t('receive.ackLost') || 'Connection lost before ack — sender may retry', { type: 'warn' });
+            _showToast(_i18n.t('receive.ackLost'), { type: 'warn' });
             return;
         }
         _logger.success('File decrypted, displayed, and ack sent');
