@@ -763,3 +763,13 @@ const i18n = (function() {
         applyTranslations
     };
 })();
+
+// Expose the module on window. A top-level `const` lives in the global lexical
+// scope but is NOT a property of window, so callers that defensively gate on
+// `window.i18n` (crop-modal.js, sidebar.js) would otherwise never find it: the
+// BRANDING-to-UI hook (setBrand) and the crop-modal label re-translation
+// silently no-op. Bare `i18n` keeps working for the modules that use it
+// directly.
+if (typeof window !== 'undefined') {
+    window.i18n = i18n;
+}

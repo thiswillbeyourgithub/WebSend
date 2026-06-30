@@ -131,6 +131,24 @@ function collectReferencedKeys() {
     return refs;
 }
 
+test('exposes itself on window so window.i18n-guarded callers work', () => {
+    // crop-modal.js and sidebar.js gate applyTranslations() / setBrand() behind
+    // `window.i18n`. A top-level `const i18n` is NOT a window property, so
+    // without an explicit window.i18n assignment those hooks silently no-op:
+    // BRANDING never reaches the UI and the crop modal stays in English.
+    // Loads via a real <script> (not eval) so const-vs-window scoping matches
+    // the browser.
+    const dom = new JSDOM('<!doctype html><html><body></body></html>', {
+        runScripts: 'dangerously',
+    });
+    const script = dom.window.document.createElement('script');
+    script.textContent = moduleSource;
+    dom.window.document.body.appendChild(script);
+    assert.equal(typeof dom.window.i18n, 'object', 'window.i18n must be defined');
+    assert.equal(typeof dom.window.i18n.t, 'function');
+    assert.equal(dom.window.i18n.t('app.name'), 'WebSend');
+});
+
 test('en and fr define exactly the same set of i18n keys', () => {
     const en = extractLocaleKeys(moduleSource, 'en');
     const fr = extractLocaleKeys(moduleSource, 'fr');

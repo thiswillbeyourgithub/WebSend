@@ -264,7 +264,12 @@
         } catch (e) {
             hide();
             if (window.logger) window.logger.error('Crop failed: ' + e.message);
-            if (typeof window.showToast === 'function') window.showToast('Crop failed: ' + e.message);
+            if (typeof window.showToast === 'function') {
+                const msg = (window.i18n && typeof window.i18n.t === 'function')
+                    ? window.i18n.t('crop.failed', { error: e.message })
+                    : 'Crop failed: ' + e.message;
+                window.showToast(msg);
+            }
         }
     }
 
