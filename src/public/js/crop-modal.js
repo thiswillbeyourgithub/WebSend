@@ -37,7 +37,7 @@
                 <p data-i18n="crop.instructions">Drag the corners to mark the document edges</p>
             </div>
             <div class="crop-canvas-container" id="crop-container">
-                <img id="crop-image" alt="Image to crop">
+                <img id="crop-image" alt="Image to crop" data-i18n-alt="crop.imageAlt">
                 <svg class="crop-overlay" id="crop-overlay">
                     <polygon id="crop-polygon" points="0,0 0,0 0,0 0,0"/>
                 </svg>

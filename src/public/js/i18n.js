@@ -140,6 +140,9 @@ const i18n = (function() {
             'send.flashMode': 'Flash mode',
             'send.documentDetection': 'Document detection',
             'send.doneTitle': 'Done',
+            'send.photoAlt': 'Photo {n}',
+            'send.editPreviewAlt': 'Edit preview',
+            'send.photoPreviewAlt': 'Photo preview',
 
             // Receive page
             'receive.title': 'Receive Photos',
@@ -216,6 +219,8 @@ const i18n = (function() {
             'receive.copy': 'Copy',
             'receive.dragToReorder': 'Drag to reorder',
             'receive.actions': 'Actions',
+            'receive.receivedPhotoAlt': 'Received photo',
+            'receive.previewAlt': 'Preview',
 
             // Crop modal
             'crop.title': 'Crop Document',
@@ -223,6 +228,7 @@ const i18n = (function() {
             'crop.cancel': 'Cancel',
             'crop.apply': 'Apply Crop',
             'crop.failed': 'Crop failed: {error}',
+            'crop.imageAlt': 'Image to crop',
 
             // Verification modal
             'verify.title': '🔒 Verify Connection',
@@ -262,6 +268,7 @@ const i18n = (function() {
             'menu.about': 'About',
             'menu.language': 'Language',
             'menu.connection': 'Connection',
+            'menu.settings': 'Settings',
             'menu.devMode': 'DEV mode enabled',
             'menu.prodMode': 'Production mode',
             // The issues URL is appended as a real <a> by sidebar.js, so this
@@ -418,6 +425,9 @@ const i18n = (function() {
             'send.flashMode': 'Mode flash',
             'send.documentDetection': 'Détection de document',
             'send.doneTitle': 'Terminé',
+            'send.photoAlt': 'Photo {n}',
+            'send.editPreviewAlt': "Aperçu de l'édition",
+            'send.photoPreviewAlt': 'Aperçu de la photo',
 
             // Receive page
             'receive.title': 'Recevoir des Photos',
@@ -493,6 +503,8 @@ const i18n = (function() {
             'receive.copy': 'Copier',
             'receive.dragToReorder': 'Glisser pour réorganiser',
             'receive.actions': 'Actions',
+            'receive.receivedPhotoAlt': 'Photo reçue',
+            'receive.previewAlt': 'Aperçu',
 
             // Crop modal
             'crop.title': 'Recadrer le document',
@@ -500,6 +512,7 @@ const i18n = (function() {
             'crop.cancel': 'Annuler',
             'crop.apply': 'Appliquer',
             'crop.failed': 'Échec du recadrage : {error}',
+            'crop.imageAlt': 'Image à recadrer',
 
             // Verification modal
             'verify.title': '🔒 Vérifier la connexion',
@@ -537,6 +550,7 @@ const i18n = (function() {
             'menu.about': 'À propos',
             'menu.language': 'Langue',
             'menu.connection': 'Connexion',
+            'menu.settings': 'Paramètres',
             'menu.devMode': 'Mode DEV activé',
             'menu.prodMode': 'Mode production',
             'maintenance.banner': '\u26a0\ufe0f Instance de développement, redémarrée {age}. Elle est en cours de modification et peut être temporairement cassée. Si quelque chose ne va pas, revenez dans quelques heures. Si le problème persiste, ouvrez un ticket sur ',
@@ -689,6 +703,18 @@ const i18n = (function() {
             if (el === document.documentElement) return;
             const key = el.getAttribute('data-i18n-title');
             el.title = t(key);
+        });
+
+        // Apply to elements with data-i18n-aria-label for the aria-label attr
+        // (screen-reader labels; e.g. icon-only buttons).
+        document.querySelectorAll('[data-i18n-aria-label]').forEach(el => {
+            el.setAttribute('aria-label', t(el.getAttribute('data-i18n-aria-label')));
+        });
+
+        // Apply to elements with data-i18n-alt for the alt attribute (images:
+        // screen-reader text and the broken-image fallback).
+        document.querySelectorAll('[data-i18n-alt]').forEach(el => {
+            el.setAttribute('alt', t(el.getAttribute('data-i18n-alt')));
         });
 
         // Update document title if there's a matching key

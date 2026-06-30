@@ -131,6 +131,16 @@ function collectReferencedKeys() {
     return refs;
 }
 
+test('applyTranslations sets aria-label and alt from data-i18n-* attributes', () => {
+    const win = loadI18n(
+        '<button data-i18n-aria-label="menu.settings"></button>' +
+        '<img data-i18n-alt="receive.previewAlt">'
+    );
+    win.__i18n.applyTranslations();
+    assert.equal(win.document.querySelector('button').getAttribute('aria-label'), 'Settings');
+    assert.equal(win.document.querySelector('img').getAttribute('alt'), 'Preview');
+});
+
 test('exposes itself on window so window.i18n-guarded callers work', () => {
     // crop-modal.js and sidebar.js gate applyTranslations() / setBrand() behind
     // `window.i18n`. A top-level `const i18n` is NOT a window property, so

@@ -164,7 +164,7 @@
 
             const img = document.createElement('img');
             img.src = url;
-            img.alt = 'Received photo';
+            img.alt = i18n.t('receive.receivedPhotoAlt');
             trackId(img, 'img-', imageIndex);
             img.addEventListener('click', (event) => {
                 if (event.shiftKey) handlers.onToggleSelectFromMenu(getIdx());

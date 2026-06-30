@@ -134,7 +134,7 @@
 
             const img = document.createElement('img');
             img.src = photo.thumbUrl;
-            img.alt = `Photo ${idx + 1}`;
+            img.alt = _i18n.t('send.photoAlt', { n: idx + 1 });
 
             const indexBadge = document.createElement('span');
             indexBadge.className = 'gallery-thumb-index';
