@@ -133,6 +133,10 @@ const i18n = (function() {
             'send.editPhoto': 'Edit',
             'send.noPhotos': 'No photos yet. Take some photos first!',
             'send.galleryEmpty': 'Gallery is empty',
+            'send.fileQueued': '{name} queued for sending',
+            'send.tooManyFiles': 'Too many files ({count}). Please select {max} or fewer at a time.',
+            'send.imagesFailed': '{count} image(s) could not be processed',
+            'send.photosQueued': '{count} photo(s) queued for sending',
 
             // Receive page
             'receive.title': 'Receive Photos',
@@ -195,12 +199,21 @@ const i18n = (function() {
             'receive.ackLost': 'Connection lost before ack, sender may retry',
             'receive.imageReplaced': 'Image updated by sender',
             'receive.ocrAlreadyRunning': 'Export already in progress',
+            // Export status toasts (receive-export.js)
+            'receive.exportZipFailed': 'Failed to generate ZIP: {error}',
+            'receive.exportNoImagesPdf': 'No images selected for PDF export',
+            'receive.exportPdfFailed': 'Failed to generate PDF: {error}',
+            'receive.exportNoImagesOcrPdf': 'No images selected for OCR PDF export',
+            'receive.ocrCacheFailed': 'Cached OCR failed, running full OCR...',
+            'receive.exportFailed': 'Export failed: {error}',
+            'receive.ocrExportFailed': 'OCR export failed: {error}',
 
             // Crop modal
             'crop.title': 'Crop Document',
             'crop.instructions': 'Drag the corners to mark the document edges',
             'crop.cancel': 'Cancel',
             'crop.apply': 'Apply Crop',
+            'crop.failed': 'Crop failed: {error}',
 
             // Verification modal
             'verify.title': '🔒 Verify Connection',
@@ -389,6 +402,10 @@ const i18n = (function() {
             'send.editPhoto': 'Modifier',
             'send.noPhotos': 'Aucune photo. Prenez des photos d\'abord !',
             'send.galleryEmpty': 'La galerie est vide',
+            'send.fileQueued': "{name} en attente d'envoi",
+            'send.tooManyFiles': 'Trop de fichiers ({count}). Veuillez en sélectionner {max} ou moins à la fois.',
+            'send.imagesFailed': "{count} image(s) n'ont pas pu être traitées",
+            'send.photosQueued': "{count} photo(s) en attente d'envoi",
 
             // Receive page
             'receive.title': 'Recevoir des Photos',
@@ -450,12 +467,21 @@ const i18n = (function() {
             'receive.ackLost': "Connexion perdue avant confirmation, l'expéditeur peut réessayer",
             'receive.imageReplaced': "Image mise à jour par l'expéditeur",
             'receive.ocrAlreadyRunning': 'Export déjà en cours',
+            // Export status toasts (receive-export.js)
+            'receive.exportZipFailed': 'Échec de la génération du ZIP : {error}',
+            'receive.exportNoImagesPdf': "Aucune image sélectionnée pour l'export PDF",
+            'receive.exportPdfFailed': 'Échec de la génération du PDF : {error}',
+            'receive.exportNoImagesOcrPdf': "Aucune image sélectionnée pour l'export PDF OCR",
+            'receive.ocrCacheFailed': "Échec de l'OCR en cache, lancement de l'OCR complet...",
+            'receive.exportFailed': "Échec de l'export : {error}",
+            'receive.ocrExportFailed': "Échec de l'export OCR : {error}",
 
             // Crop modal
             'crop.title': 'Recadrer le document',
             'crop.instructions': 'Faites glisser les coins pour marquer les bords du document',
             'crop.cancel': 'Annuler',
             'crop.apply': 'Appliquer',
+            'crop.failed': 'Échec du recadrage : {error}',
 
             // Verification modal
             'verify.title': '🔒 Vérifier la connexion',

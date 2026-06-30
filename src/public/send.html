@@ -284,7 +284,7 @@
 
     <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-whDXFzoSnov0ydxfR0pd8EgNWKISDLLfChP5xUHjMLhgCh5QqOtRzf1I3na/F3/V"></script>
+    <script src="/js/i18n.js" integrity="sha384-GgezjrbWdMGnuPixIuhe9rIDL6FUiLPAajTAdDBfNfrF2aIFEtOgOxLTJ+/+1IrG"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-OmJ5UBpQ6mIFx61WdSne5inVPq7987H510p2r1cRUBJTp/N28iFU6mzFPGJGdYBf"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>
@@ -803,7 +803,7 @@
                     SenderSend.markBatchStartPending();
                     SenderSend.markBatchEndPending();
                     if (SenderConnect.isVerified()) {
-                        showToast(`${processed.name} queued for sending`, { type: 'success' });
+                        showToast(i18n.t('send.fileQueued', { name: processed.name }), { type: 'success' });
                     } else {
                         showToast(i18n.t('send.queuedAwaitingReconnect'), { type: 'warn', duration: 6000 });
                     }
@@ -830,7 +830,7 @@
             const MAX_FILES = 50;
             if (files.length > MAX_FILES) {
                 logger.warn(`Selection of ${files.length} files exceeds cap of ${MAX_FILES}; rejecting`);
-                showToast(`Too many files (${files.length}). Please select ${MAX_FILES} or fewer at a time.`, { type: 'warn' });
+                showToast(i18n.t('send.tooManyFiles', { count: files.length, max: MAX_FILES }), { type: 'warn' });
                 event.target.value = '';
                 return;
             }
@@ -859,11 +859,11 @@
 
             logger.info(`Queued ${queued} photos${failed ? `, ${failed} failed` : ''}`);
             if (failed > 0) {
-                showToast(`${failed} image(s) could not be processed`, { type: 'warn' });
+                showToast(i18n.t('send.imagesFailed', { count: failed }), { type: 'warn' });
             }
             if (queued > 0) {
                 if (SenderConnect.isVerified()) {
-                    showToast(`${queued} photo(s) queued for sending`, { type: 'success' });
+                    showToast(i18n.t('send.photosQueued', { count: queued }), { type: 'success' });
                 } else {
                     showToast(i18n.t('send.queuedAwaitingReconnect'), { type: 'warn', duration: 6000 });
                 }

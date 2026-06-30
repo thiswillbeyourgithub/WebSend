@@ -332,7 +332,7 @@
             logger.success('ZIP downloaded');
         } catch (e) {
             logger.error('ZIP generation failed: ' + e.message);
-            window.showToast('Failed to generate ZIP: ' + e.message);
+            window.showToast(i18n.t('receive.exportZipFailed', { error: e.message }));
         } finally {
             btn.disabled = false;
             _updateExportBtn();
@@ -367,7 +367,7 @@
             const selectedIndices = _getSelectedIndices(exportCollectionId !== null ? exportCollectionId : undefined);
             const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
             if (activeImages.length === 0) {
-                window.showToast('No images selected for PDF export', { type: 'warn' });
+                window.showToast(i18n.t('receive.exportNoImagesPdf'), { type: 'warn' });
                 return;
             }
             const jpegs = await Promise.all(activeImages.map(img => toJpegData(img.data, img.mimeType, { bw })));
@@ -385,7 +385,7 @@
             logger.success('PDF downloaded');
         } catch (e) {
             logger.error('PDF generation failed: ' + e.message);
-            window.showToast('Failed to generate PDF: ' + e.message);
+            window.showToast(i18n.t('receive.exportPdfFailed', { error: e.message }));
         } finally {
             btn.disabled = false;
             _updateExportBtn();
@@ -539,7 +539,7 @@
         const activeImages = selectedIndices.map(i => receivedImages[i]).filter(img => img.fileType === 'image');
         if (activeImages.length === 0) {
             logger.warn('No images selected for OCR PDF export');
-            window.showToast('No images selected for OCR PDF export', { type: 'warn' });
+            window.showToast(i18n.t('receive.exportNoImagesOcrPdf'), { type: 'warn' });
             btn.disabled = false;
             _updateExportBtn();
             return;
@@ -696,7 +696,7 @@
         } catch (cacheErr) {
             if (cacheErr.name === 'AbortError') throw cacheErr;
             logger.warn('Cached OCR assembly failed: ' + cacheErr.message + ' — falling back to full on-demand OCR');
-            window.showToast('Cached OCR failed, running full OCR...', { type: 'warn' });
+            window.showToast(i18n.t('receive.ocrCacheFailed'), { type: 'warn' });
 
             try {
                 const stillAlive = await scribe.reset();
@@ -797,7 +797,7 @@
             logger.success(`Exported ${pages.length} pages as ZIP`);
         } catch (e) {
             logger.error('PDF to images export failed: ' + e.message);
-            window.showToast('Export failed: ' + e.message, { type: 'error' });
+            window.showToast(i18n.t('receive.exportFailed', { error: e.message }), { type: 'error' });
         } finally {
             btn.disabled = false;
             btn.textContent = origText;
@@ -861,7 +861,7 @@
             }
         } catch (e) {
             logger.error('PDF OCR export failed: ' + e.message);
-            window.showToast('OCR export failed: ' + e.message, { type: 'error' });
+            window.showToast(i18n.t('receive.ocrExportFailed', { error: e.message }), { type: 'error' });
         } finally {
             btn.disabled = false;
             btn.textContent = origText;
