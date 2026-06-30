@@ -141,7 +141,7 @@
             zone = document.createElement('div');
             zone.id = 'new-document-drop-zone';
             zone.className = 'new-document-drop-zone';
-            zone.textContent = '＋ New Document';
+            zone.textContent = '＋ ' + ((i18nRef && i18nRef.t('receive.newDocument')) || 'New Document');
             zone.addEventListener('dragover', (e) => {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = 'move';
@@ -345,7 +345,7 @@
 
         const collapseBtn = document.createElement('button');
         collapseBtn.className = 'collection-collapse-btn';
-        collapseBtn.title = 'Collapse/Expand';
+        collapseBtn.title = (i18nRef && i18nRef.t('receive.collapseExpand')) || 'Collapse/Expand';
         collapseBtn.textContent = '▼';
         collapseBtn.addEventListener('click', () => toggleCollapse(collectionId));
 
@@ -382,8 +382,8 @@
 
         const exportBtn = document.createElement('button');
         exportBtn.className = 'btn btn-action collection-export-btn';
-        exportBtn.title = 'Export';
-        exportBtn.textContent = '📦 Export';
+        exportBtn.title = (i18nRef && i18nRef.t('receive.exportTitle')) || 'Export';
+        exportBtn.textContent = '📦 ' + ((i18nRef && i18nRef.t('receive.exportTitle')) || 'Export');
         exportBtn.addEventListener('click', () => onOpenExportModal(collectionId));
 
         headerRight.append(selectAllBtn, exportBtn);
@@ -450,7 +450,7 @@
         const pad = n => String(n).padStart(2, '0');
         const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
         const id = nextCollectionId++;
-        const name = `Document ${id + 1}`;
+        const name = `${(i18nRef && i18nRef.t('receive.document')) || 'Document'} ${id + 1}`;
         collections.push({ id, name, timeStr, images: [] });
         activeCollectionId = id;
         renderCollectionHeader(id, name, timeStr);

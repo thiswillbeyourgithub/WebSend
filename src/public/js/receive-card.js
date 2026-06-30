@@ -67,7 +67,7 @@
 
         const dragHandle = document.createElement('div');
         dragHandle.className = 'drag-handle';
-        dragHandle.title = 'Drag to reorder';
+        dragHandle.title = i18n.t('receive.dragToReorder');
         dragHandle.textContent = '☰';
         item.appendChild(dragHandle);
 
@@ -102,7 +102,7 @@
         // Kebab button (shared)
         const kebabBtn = document.createElement('button');
         kebabBtn.className = 'card-kebab-btn';
-        kebabBtn.title = 'Actions';
+        kebabBtn.title = i18n.t('receive.actions');
         kebabBtn.textContent = '⋮';
         kebabBtn.addEventListener('click', (e) => handlers.onToggleCardMenu(e, getIdx()));
 

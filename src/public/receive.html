@@ -140,7 +140,7 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-jYSH1QVNFIehV9CEW7dcQ6dkQ1NPPywO3DZgDjEI+0Ep/QeAGz0ZyAyEWVjN25x1"></script>
+    <script src="/js/i18n.js" integrity="sha384-DHxw/fEEMFjHUJE2NKIiKVKMjYk5pmcyt5bzFWw3Ba6A3+8Rxuw2c2tHig/Gjyf8"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-OmJ5UBpQ6mIFx61WdSne5inVPq7987H510p2r1cRUBJTp/N28iFU6mzFPGJGdYBf"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>
@@ -161,8 +161,8 @@
     <script src="/js/pdf-builder.js" crossorigin="anonymous" integrity="sha384-CyO5TKKXJdtZTcfcXkZwriItvfC60Mzed8gPtfCKnVZmwqToTUjVl6/w1Biwh0b/"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-LTPGF18+5jFBGR0I9E2w/S8qCTnPg31f9dtJwBFDrgGI1HalzQMpKf/9ZrcT9zM6"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
-    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-r9ZhZZGoBjGXrxfB2k8TfZD8BTEOLdE/KsZ7ZN6mg8VqP0Rq8LriAXUDOF+vyjqA"></script>
-    <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-A0vvgdJ8ktmC65klkTfsPqjIHZXNroXsONfZzY7jVL0rVoRSdExtZid0K+ZXuRTw"></script>
+    <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-T33d+yoV7YKwO66VzTB0jGI4BgjZFrMuL39pE+0NJncBV6G9IUd1I+eJiSr4THm0"></script>
+    <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-jT/qyuV/2VKA8C4pGdZHuAiH/p2L34W3/nONAQfo0nJneTmi9ePGrU076mzSL1sm"></script>
     <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-NH+XRrtXv6xYSNjsbbaYzmJyXTVVdKmnIDrKgUvWXmwSVwnrJV5X5G8UcLvJs5xi"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-cOB1utZnbmqTkePvvwaY7I6Pi2BDXJFIlTWMJksTluQetkflePyFP0lh/l6WoR76"></script>
     <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-XqLlXVhq8j3AkhaaBoaQ+ehyxR5La/NWkQZG+31wAE/ND+h0x/97unk91t/wbHoC"></script>
@@ -443,7 +443,7 @@
 
                 const copyBtn = document.createElement('button');
                 copyBtn.style.cssText = 'padding: 8px 12px; border: 1px solid #ccc; border-radius: 5px; background: #fff; cursor: pointer; font-size: 0.85rem;';
-                copyBtn.title = 'Copy';
+                copyBtn.title = i18n.t('receive.copy');
                 copyBtn.textContent = '📋';
                 copyBtn.addEventListener('click', () => {
                     navigator.clipboard.writeText(url)

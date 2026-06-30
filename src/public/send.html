@@ -139,12 +139,12 @@
             <div class="camera-container" id="capture-camera-container">
                 <video id="capture-video" autoplay playsinline></video>
                 <!-- Flash mode toggle: top-left -->
-                <button class="flash-toggle-btn hidden" id="flash-toggle-btn" title="Flash mode">
+                <button class="flash-toggle-btn hidden" id="flash-toggle-btn" title="Flash mode" data-i18n-title="send.flashMode">
                     <span id="flash-icon">⚡</span>
                     <span id="flash-label" data-i18n="send.flashOff">Off</span>
                 </button>
                 <!-- Document detection toggle: top-right -->
-                <button class="detect-toggle-btn" id="detect-toggle-btn" title="Document detection">
+                <button class="detect-toggle-btn" id="detect-toggle-btn" title="Document detection" data-i18n-title="send.documentDetection">
                     <span id="detect-icon">📐</span>
                     <span id="detect-label" data-i18n="send.detectOff">Detect</span>
                 </button>
@@ -154,14 +154,14 @@
                 </svg>
                 <!-- Bottom bar: gallery (left), capture (center), done (right) -->
                 <div class="camera-bottom-bar">
-                    <button class="camera-bar-btn" id="gallery-btn" title="Gallery">
+                    <button class="camera-bar-btn" id="gallery-btn" title="Gallery" data-i18n-title="send.gallery">
                         <span>🖼️</span>
                         <span class="gallery-badge hidden" id="gallery-badge">0</span>
                     </button>
                     <button class="btn btn-action btn-danger capture-btn-floating" id="capture-btn" data-i18n="send.capture">
                         📸
                     </button>
-                    <button class="camera-bar-btn camera-done-btn" id="camera-done-btn" title="Done" data-i18n="send.done">
+                    <button class="camera-bar-btn camera-done-btn" id="camera-done-btn" title="Done" data-i18n="send.done" data-i18n-title="send.doneTitle">
                         ✓
                     </button>
                 </div>
@@ -284,7 +284,7 @@
 
     <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-jYSH1QVNFIehV9CEW7dcQ6dkQ1NPPywO3DZgDjEI+0Ep/QeAGz0ZyAyEWVjN25x1"></script>
+    <script src="/js/i18n.js" integrity="sha384-DHxw/fEEMFjHUJE2NKIiKVKMjYk5pmcyt5bzFWw3Ba6A3+8Rxuw2c2tHig/Gjyf8"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-OmJ5UBpQ6mIFx61WdSne5inVPq7987H510p2r1cRUBJTp/N28iFU6mzFPGJGdYBf"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>

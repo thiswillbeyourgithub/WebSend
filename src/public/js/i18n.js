@@ -137,6 +137,9 @@ const i18n = (function() {
             'send.tooManyFiles': 'Too many files ({count}). Please select {max} or fewer at a time.',
             'send.imagesFailed': '{count} image(s) could not be processed',
             'send.photosQueued': '{count} photo(s) queued for sending',
+            'send.flashMode': 'Flash mode',
+            'send.documentDetection': 'Document detection',
+            'send.doneTitle': 'Done',
 
             // Receive page
             'receive.title': 'Receive Photos',
@@ -207,6 +210,12 @@ const i18n = (function() {
             'receive.ocrCacheFailed': 'Cached OCR failed, running full OCR...',
             'receive.exportFailed': 'Export failed: {error}',
             'receive.ocrExportFailed': 'OCR export failed: {error}',
+            // Collection header / card tooltips
+            'receive.newDocument': 'New Document',
+            'receive.collapseExpand': 'Collapse/Expand',
+            'receive.copy': 'Copy',
+            'receive.dragToReorder': 'Drag to reorder',
+            'receive.actions': 'Actions',
 
             // Crop modal
             'crop.title': 'Crop Document',
@@ -406,6 +415,9 @@ const i18n = (function() {
             'send.tooManyFiles': 'Trop de fichiers ({count}). Veuillez en sélectionner {max} ou moins à la fois.',
             'send.imagesFailed': "{count} image(s) n'ont pas pu être traitées",
             'send.photosQueued': "{count} photo(s) en attente d'envoi",
+            'send.flashMode': 'Mode flash',
+            'send.documentDetection': 'Détection de document',
+            'send.doneTitle': 'Terminé',
 
             // Receive page
             'receive.title': 'Recevoir des Photos',
@@ -475,6 +487,12 @@ const i18n = (function() {
             'receive.ocrCacheFailed': "Échec de l'OCR en cache, lancement de l'OCR complet...",
             'receive.exportFailed': "Échec de l'export : {error}",
             'receive.ocrExportFailed': "Échec de l'export OCR : {error}",
+            // Collection header / card tooltips
+            'receive.newDocument': 'Nouveau document',
+            'receive.collapseExpand': 'Réduire/Développer',
+            'receive.copy': 'Copier',
+            'receive.dragToReorder': 'Glisser pour réorganiser',
+            'receive.actions': 'Actions',
 
             // Crop modal
             'crop.title': 'Recadrer le document',
