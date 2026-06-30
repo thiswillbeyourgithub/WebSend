@@ -180,7 +180,7 @@
             if (!document.getElementById('error-retry-btn')) {
                 const retryBtn = document.createElement('button');
                 retryBtn.id = 'error-retry-btn';
-                retryBtn.textContent = _i18n.t('send.backToScan') || 'Back to scan';
+                retryBtn.textContent = _i18n.t('send.backToScan');
                 retryBtn.className = 'btn btn-action retry-btn';
                 retryBtn.addEventListener('click', () => {
                     retryBtn.remove();
@@ -212,7 +212,7 @@
         _logger.warn(`Relay reconnect attempt ${attempt}`);
         const statusEl = document.getElementById('connection-status');
         if (statusEl) {
-            statusEl.textContent = (_i18n.t('send.reconnecting') || 'Reconnecting...') +
+            statusEl.textContent = _i18n.t('send.reconnecting') +
                 (attempt > 1 ? ` (${attempt})` : '');
             statusEl.className = 'status status-info';
         }
@@ -302,7 +302,7 @@
                 // rotate the encryption key under fingerprint state the user
                 // has already confirmed.
                 _logger.warn('Ignoring unexpected public-key after key exchange already completed');
-                _showToast(_i18n.t('send.unexpectedRekey') || 'Unexpected re-key attempt blocked', { type: 'error', duration: 5000 });
+                _showToast(_i18n.t('send.unexpectedRekey'), { type: 'error', duration: 5000 });
                 return;
             }
             try {
@@ -314,8 +314,7 @@
                     // and force the user back to scan so they see a fresh
                     // verification ceremony.
                     _logger.error(`Peer fingerprint changed during reconnect: cached ${cachedTheirFingerprint} vs new ${newTheirFingerprint}`);
-                    _showToast(_i18n.t('send.peerChangedOnReconnect') ||
-                        'Peer key changed during reconnect, please rescan', { type: 'error', duration: 0 });
+                    _showToast(_i18n.t('send.peerChangedOnReconnect'), { type: 'error', duration: 0 });
                     sharedKey = null;
                     sessionKeys = null;
                     weConfirmed = false;

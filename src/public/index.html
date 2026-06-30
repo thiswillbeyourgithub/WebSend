@@ -56,12 +56,12 @@
 
                 <h3 data-i18n="about.techStack">Tech Stack</h3>
                 <ul>
-                    <li><strong>Frontend:</strong> <span data-i18n="about.techStack.frontend">Vanilla HTML, CSS, JavaScript (no frameworks)</span></li>
-                    <li><strong>Transport:</strong> <span data-i18n="about.techStack.transport">WebRTC peer-to-peer data channels</span></li>
-                    <li><strong>Encryption:</strong> <span data-i18n="about.techStack.encryption">ECDH key exchange + AES-GCM (Web Crypto API)</span></li>
-                    <li><strong>Signaling:</strong> <span data-i18n="about.techStack.signaling">Express.js server (SDP relay only)</span></li>
-                    <li><strong>QR Codes:</strong> <span data-i18n="about.techStack.qr">qrcode.js / jsQR</span></li>
-                    <li><strong>TURN Relay:</strong> <span data-i18n="about.techStack.turn"><a href="https://github.com/coturn/coturn" target="_blank" rel="noopener">coturn</a> (fallback when direct P2P fails)</span></li>
+                    <li><strong data-i18n="about.label.frontend">Frontend:</strong> <span data-i18n="about.techStack.frontend">Vanilla HTML, CSS, JavaScript (no frameworks)</span></li>
+                    <li><strong data-i18n="about.label.transport">Transport:</strong> <span data-i18n="about.techStack.transport">WebRTC peer-to-peer data channels</span></li>
+                    <li><strong data-i18n="about.label.encryption">Encryption:</strong> <span data-i18n="about.techStack.encryption">ECDH key exchange + AES-GCM (Web Crypto API)</span></li>
+                    <li><strong data-i18n="about.label.signaling">Signaling:</strong> <span data-i18n="about.techStack.signaling">Express.js server (SDP relay only)</span></li>
+                    <li><strong data-i18n="about.label.qr">QR Codes:</strong> <span data-i18n="about.techStack.qr">qrcode.js / jsQR</span></li>
+                    <li><strong data-i18n="about.label.turn">TURN Relay:</strong> <span data-i18n="about.techStack.turn"><a href="https://github.com/coturn/coturn" target="_blank" rel="noopener">coturn</a> (fallback when direct P2P fails)</span></li>
                 </ul>
 
                 <h3 data-i18n="about.security">Security</h3>
@@ -82,11 +82,11 @@
 
                 <h3 data-i18n="about.thirdParty">Third-Party Libraries</h3>
                 <ul>
-                    <li><a href="https://github.com/soldair/node-qrcode" target="_blank" rel="noopener">qrcode.js</a> v1.5.1, QR code generation (MIT)</li>
-                    <li><a href="https://github.com/cozmo/jsQR" target="_blank" rel="noopener">jsQR</a> v1.4.0, QR code scanning (Apache-2.0)</li>
-                    <li><a href="https://github.com/Touffy/client-zip" target="_blank" rel="noopener">client-zip</a>, ZIP export (MIT)</li>
-                    <li><a href="https://github.com/scribeocr/scribe.js" target="_blank" rel="noopener">scribe.js-ocr</a> v0.10.1, OCR engine (AGPL-3.0)</li>
-                    <li><a href="https://expressjs.com" target="_blank" rel="noopener">Express.js</a>, server-side HTTP framework (MIT)</li>
+                    <li><a href="https://github.com/soldair/node-qrcode" target="_blank" rel="noopener">qrcode.js</a> v1.5.1, <span data-i18n="about.lib.qrGen">QR code generation</span> (MIT)</li>
+                    <li><a href="https://github.com/cozmo/jsQR" target="_blank" rel="noopener">jsQR</a> v1.4.0, <span data-i18n="about.lib.qrScan">QR code scanning</span> (Apache-2.0)</li>
+                    <li><a href="https://github.com/Touffy/client-zip" target="_blank" rel="noopener">client-zip</a>, <span data-i18n="about.lib.zipExport">ZIP export</span> (MIT)</li>
+                    <li><a href="https://github.com/scribeocr/scribe.js" target="_blank" rel="noopener">scribe.js-ocr</a> v0.10.1, <span data-i18n="about.lib.ocrEngine">OCR engine</span> (AGPL-3.0)</li>
+                    <li><a href="https://expressjs.com" target="_blank" rel="noopener">Express.js</a>, <span data-i18n="about.lib.httpFramework">server-side HTTP framework</span> (MIT)</li>
                 </ul>
                 <p class="about-thirdparty-note" data-i18n="about.thirdParty.note">
                     All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.
@@ -100,7 +100,7 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-I2vhu9LlMYTz5fO7ltIdh96iwrKyycqAXvbcLdt5LhCXleA3hpcub/IN5FTKS2vA"></script>
+    <script src="/js/i18n.js" integrity="sha384-ULZ7z0OKffzR8JrV1YFACcEJiwkfT9D7jkXXVGWTGl8OqKoSRWq7tzcTuK+01E5D"></script>
     <script src="/js/sidebar.js" integrity="sha384-3vgTf0Magm+fA0KqcJhC/YZrHwHI7ElLW/01Pun4YR4xCd/D4yGF1yNFNspG2CO0"></script>
     <script>
         // Initialize i18n (detect locale and apply translations), then build shared sidebar

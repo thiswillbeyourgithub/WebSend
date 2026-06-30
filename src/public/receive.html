@@ -140,7 +140,7 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-I2vhu9LlMYTz5fO7ltIdh96iwrKyycqAXvbcLdt5LhCXleA3hpcub/IN5FTKS2vA"></script>
+    <script src="/js/i18n.js" integrity="sha384-ULZ7z0OKffzR8JrV1YFACcEJiwkfT9D7jkXXVGWTGl8OqKoSRWq7tzcTuK+01E5D"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-3vgTf0Magm+fA0KqcJhC/YZrHwHI7ElLW/01Pun4YR4xCd/D4yGF1yNFNspG2CO0"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>
@@ -163,7 +163,7 @@
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
     <script src="/js/receive-card.js" crossorigin="anonymous" integrity="sha384-x8vMzZZDAgweK87uBvoorsKvW1eMvmTVkFvr3HY7GtE2q3/0nRIdmOhxkAhfa92X"></script>
     <script src="/js/collections.js" crossorigin="anonymous" integrity="sha384-jT/qyuV/2VKA8C4pGdZHuAiH/p2L34W3/nONAQfo0nJneTmi9ePGrU076mzSL1sm"></script>
-    <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-NH+XRrtXv6xYSNjsbbaYzmJyXTVVdKmnIDrKgUvWXmwSVwnrJV5X5G8UcLvJs5xi"></script>
+    <script src="/js/bg-ocr.js" crossorigin="anonymous" integrity="sha384-ahcIp/mB7auJhDgBewk9B7jqYC4LiNMVH54CjfBWJN9WluSf8AdN0sn6/jA7AGKg"></script>
     <script src="/js/receive-export.js" crossorigin="anonymous" integrity="sha384-cOB1utZnbmqTkePvvwaY7I6Pi2BDXJFIlTWMJksTluQetkflePyFP0lh/l6WoR76"></script>
     <script src="/js/receive-flow.js" crossorigin="anonymous" integrity="sha384-XqLlXVhq8j3AkhaaBoaQ+ehyxR5La/NWkQZG+31wAE/ND+h0x/97unk91t/wbHoC"></script>
     <script src="/js/transform-replay.js" crossorigin="anonymous" integrity="sha384-llBFmPHoa+WfUQFqdwis+ar1UdQ2mKlEBmKx1qu2LaaW0i70LZc9GG8byEYOF00N"></script>
@@ -670,7 +670,7 @@
             const statusEl = document.querySelector('#step-connected .status') ||
                              document.getElementById('status-waiting');
             if (statusEl) {
-                statusEl.textContent = (i18n.t('receive.reconnecting') || 'Reconnecting...') +
+                statusEl.textContent = i18n.t('receive.reconnecting') +
                     (attempt > 1 ? ` (${attempt})` : '');
                 statusEl.className = 'status status-info';
             }
@@ -1075,8 +1075,7 @@
                         return;
                     }
                     logger.error(`Sender fingerprint changed during reconnect: cached ${cachedSenderFingerprint} vs new ${fp}; forcing re-verification`);
-                    showToast(i18n.t('receive.peerChangedOnReconnect') ||
-                        'Peer key changed during reconnect, please re-verify', { type: 'error', duration: 0 });
+                    showToast(i18n.t('receive.peerChangedOnReconnect'), { type: 'error', duration: 0 });
                     // Fall through into the normal rekey path which
                     // tears down verification state and reshows the modal.
                 } catch (e) {

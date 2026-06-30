@@ -241,7 +241,10 @@ WebSend/
         │   │               #   Supports info/success/warn/error/debug levels.
         │   │               #   DEV mode (toggled via server config) enables verbose output
         │   ├── i18n.js     # Internationalization: English + French. Detects browser locale,
-        │   │               #   applies translations via data-i18n attributes on DOM elements.
+        │   │               #   applies translations via data-i18n (textContent) plus
+        │   │               #   data-i18n-placeholder / -title / -aria-label / -alt attributes.
+        │   │               #   Assigns window.i18n so window.i18n-guarded callers
+        │   │               #   (crop-modal.js, sidebar.js) can re-apply translations / set brand.
         │   │               #   Owns the instance brand: t() substitutes {brand} in every
         │   │               #   string (default "WebSend"); setBrand() (called from
         │   │               #   updateDevBadge after /api/config) re-renders the headings,
@@ -1241,7 +1244,7 @@ Three tiers, layered from fast/cheap to slow/realistic:
 A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and aborts the push on failure. The hook is auto-wired by the `prepare` script in `src/package.json` (sets `core.hooksPath=.githooks` on `npm install`).
 
 **Not yet covered** (intentional gaps — documented so the picture is honest):
-- Frontend modules with no unit tests: `webrtc.js` (peer-connection state machine, chunked transfer, connection-type detection), `logger.js`, `i18n.js` — tightly coupled to real `RTCPeerConnection` / DOM, so the E2E tier exercises them instead.
+- Frontend modules with no unit tests: `webrtc.js` (peer-connection state machine, chunked transfer, connection-type detection), `logger.js` — tightly coupled to real `RTCPeerConnection` / DOM, so the E2E tier exercises them instead. (`i18n.js` is covered by `test/unit/i18n.test.mjs`: brand substitution, en/fr key parity, referenced-key coverage, the window.i18n exposure, and the aria-label/alt attribute handlers.)
 - Receiver UI logic: the perspective-crop tool and the **transform-replay protocol** (`transform-image` messages for `rotateCW` / `flipH` / `bw` / `crop`); the receiver-side replay handler lives in `js/transform-replay.js` (`window.TransformReplay`) and dispatches into `js/image-transforms.js`. The export modal (PDF / ZIP / B&W Otsu / scribe.js OCR / per-PDF actions) lives in `js/receive-export.js`; the hand-crafted minimal PDF generator lives in `js/pdf-builder.js` and has unit tests covering xref offsets, trailer size, and multi-image structure.
 - Protocol edge paths: fingerprint **mismatch / abort**, `file-ack` integrity **mismatch or timeout → retry**, SRI-mismatch failure mode. E2E only drives the happy path. (The segment-nack/rewind retry and resume paths ARE unit-covered — `segment-stream.test.mjs`, `receive-flow.test.mjs`, `v2-retry-integration.test.mjs`, `webrtc-send-resume.test.mjs` — and room TTL expiry/refresh is HTTP-covered by `room-ttl.test.mjs`.)
 - PWA service-worker caching + `controllerchange` auto-reload.

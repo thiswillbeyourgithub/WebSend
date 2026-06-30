@@ -157,14 +157,16 @@
             const thumbContainer = card.querySelector('.image-thumb-container');
             if (thumbContainer) thumbContainer.appendChild(badge);
         }
+        const badgeText = (key, fallback) =>
+            (window.i18n && window.i18n.t(key)) || fallback;
         if (img.ocrPageData) {
-            badge.textContent = 'OCR ✓';
+            badge.textContent = badgeText('receive.ocrBadgeDone', 'OCR ✓');
             badge.style.background = 'rgba(46,125,50,0.75)';
         } else if (currentOcrIndex === imageIndex) {
-            badge.textContent = 'OCR…';
+            badge.textContent = badgeText('receive.ocrBadgeRunning', 'OCR…');
             badge.style.background = 'rgba(21,101,192,0.75)';
         } else if (ocrQueueSet.has(imageIndex)) {
-            badge.textContent = 'OCR ⏳';
+            badge.textContent = badgeText('receive.ocrBadgePending', 'OCR ⏳');
             badge.style.background = 'rgba(0,0,0,0.6)';
         } else {
             badge.remove();

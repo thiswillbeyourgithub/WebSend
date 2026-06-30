@@ -57,6 +57,19 @@ const i18n = (function() {
             'about.credits.repo': 'Source code on GitHub (AGPLv3)',
             'about.thirdParty': 'Third-Party Libraries',
             'about.thirdParty.note': 'All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.',
+            // About modal: tech-stack labels (French puts a space before ':')
+            'about.label.frontend': 'Frontend:',
+            'about.label.transport': 'Transport:',
+            'about.label.encryption': 'Encryption:',
+            'about.label.signaling': 'Signaling:',
+            'about.label.qr': 'QR Codes:',
+            'about.label.turn': 'TURN Relay:',
+            // About modal: third-party library descriptions
+            'about.lib.qrGen': 'QR code generation',
+            'about.lib.qrScan': 'QR code scanning',
+            'about.lib.zipExport': 'ZIP export',
+            'about.lib.ocrEngine': 'OCR engine',
+            'about.lib.httpFramework': 'server-side HTTP framework',
 
             // Send page
             'send.title': 'Send Photos',
@@ -221,6 +234,11 @@ const i18n = (function() {
             'receive.actions': 'Actions',
             'receive.receivedPhotoAlt': 'Received photo',
             'receive.previewAlt': 'Preview',
+            // Background-OCR status badge: "OCR" is a universal acronym and the
+            // symbol carries the state, so the fr values intentionally match en.
+            'receive.ocrBadgeDone': 'OCR ✓',
+            'receive.ocrBadgeRunning': 'OCR…',
+            'receive.ocrBadgePending': 'OCR ⏳',
 
             // Crop modal
             'crop.title': 'Crop Document',
@@ -343,6 +361,19 @@ const i18n = (function() {
             'about.credits.repo': 'Code source sur GitHub (AGPLv3)',
             'about.thirdParty': 'Bibliothèques tierces',
             'about.thirdParty.note': 'Toutes les bibliothèques côté client sont incluses directement dans le dépôt (pas de CDN à l\'exécution). Toutes les licences sont compatibles avec l\'AGPL-3.0.',
+            // About modal: tech-stack labels (French puts a space before ':')
+            'about.label.frontend': 'Frontend :',
+            'about.label.transport': 'Transport :',
+            'about.label.encryption': 'Chiffrement :',
+            'about.label.signaling': 'Signalisation :',
+            'about.label.qr': 'Codes QR :',
+            'about.label.turn': 'Relais TURN :',
+            // About modal: third-party library descriptions
+            'about.lib.qrGen': 'Génération de QR codes',
+            'about.lib.qrScan': 'Scan de QR codes',
+            'about.lib.zipExport': 'Export ZIP',
+            'about.lib.ocrEngine': 'Moteur OCR',
+            'about.lib.httpFramework': 'framework HTTP côté serveur',
 
             // Send page
             'send.title': 'Envoyer des Photos',
@@ -505,6 +536,11 @@ const i18n = (function() {
             'receive.actions': 'Actions',
             'receive.receivedPhotoAlt': 'Photo reçue',
             'receive.previewAlt': 'Aperçu',
+            // Background-OCR status badge: "OCR" is a universal acronym and the
+            // symbol carries the state, so the fr values intentionally match en.
+            'receive.ocrBadgeDone': 'OCR ✓',
+            'receive.ocrBadgeRunning': 'OCR…',
+            'receive.ocrBadgePending': 'OCR ⏳',
 
             // Crop modal
             'crop.title': 'Recadrer le document',
