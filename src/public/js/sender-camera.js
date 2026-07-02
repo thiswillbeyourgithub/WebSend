@@ -26,6 +26,11 @@
     let fillLightSupported = false;
     let cachedImageCapture = null;
 
+    // True while a capture (including its full-res JPEG encode) is in flight, so
+    // repeated taps during that window are ignored instead of each grabbing a
+    // fresh frame and silently producing duplicate photos.
+    let capturing = false;
+
     // Document detection state
     let detectEnabled = localStorage.getItem('docDetectEnabled') === 'true';
     let detectInterval = null;
@@ -155,8 +160,12 @@
             captureStream = await navigator.mediaDevices.getUserMedia({
                 video: {
                     facingMode: 'environment',
-                    width: { ideal: 3840 },
-                    height: { ideal: 2160 },
+                    // QHD, not 4K: a full-page A4 across 2560px is ~309 DPI (the
+                    // 300 DPI OCR sweet spot), while ~2.25x fewer pixels than
+                    // 3840x2160 means far cheaper per-frame draw + JPEG encode on
+                    // the capture tap, so the shutter feels responsive not laggy.
+                    width: { ideal: 2560 },
+                    height: { ideal: 1440 },
                 }
             });
             video.srcObject = captureStream;
@@ -368,54 +377,77 @@
         cachedImageCapture = null;
     }
 
+    // Resolve after the browser has had a chance to paint: two rAFs guarantee a
+    // style set just before this is actually on screen before we hand the main
+    // thread to the synchronous frame draw + encode below.
+    function nextFramePaint() {
+        return new Promise(resolve =>
+            requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
+
     async function capturePhoto() {
-        const video = document.getElementById('capture-video');
-        const canvas = document.getElementById('capture-canvas');
-        const track = captureStream ? captureStream.getVideoTracks()[0] : null;
+        // Debounce: a full-res JPEG encode takes hundreds of ms on a phone, and
+        // without immediate feedback users tap again thinking it didn't register,
+        // each tap capturing a duplicate. Ignore re-entrant taps until the whole
+        // capture (encode included) has been handed off.
+        if (capturing) return;
+        capturing = true;
 
-        let capturedBlob = null;
-        if (flashMode === 'flash' && track) {
-            if (torchSupported) {
-                try {
-                    await track.applyConstraints({ advanced: [{ torch: true }] });
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                } catch (e) {
-                    _logger.warn('Flash fire failed: ' + e.message);
-                    _showToast(_i18n.t('send.flashFallbackNoFlash'), { duration: 3000 });
-                }
-            } else if (fillLightSupported && cachedImageCapture) {
-                try {
-                    capturedBlob = await cachedImageCapture.takePhoto({ fillLightMode: 'flash' });
-                    _logger.info(`Captured photo via ImageCapture with flash, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
-                } catch (e) {
-                    _logger.warn('ImageCapture flash failed, falling back to canvas: ' + e.message);
-                    _showToast(_i18n.t('send.flashFallbackNoFlash'), { duration: 3000 });
-                }
-            }
-        }
-
-        if (!capturedBlob) {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0);
-
-            if (flashMode === 'flash' && track && torchSupported) {
-                track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {});
-            }
-
-            capturedBlob = await new Promise(resolve =>
-                canvas.toBlob(resolve, 'image/jpeg', 0.95)
-            );
-            _logger.info(`Captured photo: ${video.videoWidth}x${video.videoHeight}, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
-        }
-
-        // Brief visual feedback: flash the screen white
+        // Fire the shutter flash FIRST and yield a frame so it actually paints
+        // before the blocking drawImage/encode runs. This is the tap's immediate
+        // acknowledgement; previously the only feedback came after the encode,
+        // leaving a multi-hundred-ms dead zone that read as an unresponsive button.
         const container = document.getElementById('capture-camera-container');
         container.style.boxShadow = 'inset 0 0 0 1000px rgba(255,255,255,0.5)';
         setTimeout(() => { container.style.boxShadow = ''; }, 120);
+        await nextFramePaint();
 
-        if (_onPhotoCaptured) _onPhotoCaptured(capturedBlob);
+        try {
+            const video = document.getElementById('capture-video');
+            const canvas = document.getElementById('capture-canvas');
+            const track = captureStream ? captureStream.getVideoTracks()[0] : null;
+
+            let capturedBlob = null;
+            if (flashMode === 'flash' && track) {
+                if (torchSupported) {
+                    try {
+                        await track.applyConstraints({ advanced: [{ torch: true }] });
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    } catch (e) {
+                        _logger.warn('Flash fire failed: ' + e.message);
+                        _showToast(_i18n.t('send.flashFallbackNoFlash'), { duration: 3000 });
+                    }
+                } else if (fillLightSupported && cachedImageCapture) {
+                    try {
+                        capturedBlob = await cachedImageCapture.takePhoto({ fillLightMode: 'flash' });
+                        _logger.info(`Captured photo via ImageCapture with flash, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
+                    } catch (e) {
+                        _logger.warn('ImageCapture flash failed, falling back to canvas: ' + e.message);
+                        _showToast(_i18n.t('send.flashFallbackNoFlash'), { duration: 3000 });
+                    }
+                }
+            }
+
+            if (!capturedBlob) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0);
+
+                if (flashMode === 'flash' && track && torchSupported) {
+                    track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {});
+                }
+
+                capturedBlob = await new Promise(resolve =>
+                    canvas.toBlob(resolve, 'image/jpeg', 0.9)
+                );
+                _logger.info(`Captured photo: ${video.videoWidth}x${video.videoHeight}, ${(capturedBlob.size / 1024).toFixed(0)} KB`);
+            }
+
+            if (_onPhotoCaptured) _onPhotoCaptured(capturedBlob);
+        } finally {
+            capturing = false;
+        }
     }
 
     // ============ Pinch to Zoom ============

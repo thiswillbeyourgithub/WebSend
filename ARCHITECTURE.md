@@ -368,7 +368,14 @@ WebSend/
         │   ├── sender-camera.js # Sender camera concerns: QR scanner, photo-capture
         │   │               #   camera, flash/torch + ImageCapture fallback, live
         │   │               #   document-corner detection overlay, pinch-to-zoom,
-        │   │               #   per-frame capture. isDetectEnabled() lets send.html
+        │   │               #   per-frame capture. Capture stream is QHD (2560x1440
+        │   │               #   ideal, ~309 DPI on a full A4, the OCR sweet spot) not
+        │   │               #   4K, so the per-tap draw+JPEG encode stays cheap.
+        │   │               #   capturePhoto() paints the shutter flash before the
+        │   │               #   encode (immediate tap feedback) and self-debounces via
+        │   │               #   a `capturing` flag so a laggy encode can't be turned
+        │   │               #   into duplicate photos by impatient re-taps.
+        │   │               #   isDetectEnabled() lets send.html
         │   │               #   decide whether to auto-crop a capture, and
         │   │               #   consumeDetectedCorners() hands off the last live
         │   │               #   overlay quad as a fallback. Exposes window.SenderCamera
