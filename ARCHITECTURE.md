@@ -10,7 +10,7 @@
 - [Server API Endpoints](#server-api-endpoints)
 - [Threat Model](#threat-model)
 - [Security Layers](#security-layers)
-- [SSO (Experimental)](#sso-experimental)
+- [SSO](#sso)
 - [Testing](#testing)
 - [Deployment](#deployment)
 
@@ -41,7 +41,7 @@ trio `AUTH_SCOPE`
 (`both` default / `receiver`), `SENDER_PUBLIC_ORIGIN` (the open sender host,
 surfaced to the receiver page as `senderOrigin`), and `AUTH_IDENTITY_HEADER`
 (the proxy header the room-creation gate checks; see
-[SSO (Experimental)](#sso-experimental)).
+[SSO](#sso)).
 
 ## Directory Structure
 
@@ -1141,7 +1141,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     keeps the queue intact without entering the resume-wait pause, and
     the head restarts from scratch on the post-reconnect drain.
 
-## SSO (Experimental)
+## SSO
 
 WebSend can optionally be gated behind **Keycloak** SSO using **oauth2-proxy** as a
 reverse authentication proxy. SSO is enabled by selecting the `auth` compose profile
@@ -1237,7 +1237,7 @@ SENDER   ──▶ open host  ────────────────�
   is `null`), both buttons stay. The server-side `POST /api/rooms` gate is the
   real control; this is just UX so senders are not led to a 403.
 
-This feature is experimental and was added with assistance from
+This feature was added with assistance from
 [Claude Code](https://claude.ai/claude-code).
 
 ## Testing

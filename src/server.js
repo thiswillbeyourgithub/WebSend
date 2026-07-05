@@ -195,7 +195,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 // outright. The non-forgeable gate is the proxy network path; this header
 // check is the second layer that fails CLOSED (refuses room creation) if the
 // proxy is misrouted or stops injecting the identity header. See ARCHITECTURE.md
-// "SSO (Experimental)" / README "Receiver-only authentication".
+// "SSO" / README "Receiver-only authentication".
 const AUTH_SCOPE = (process.env.AUTH_SCOPE || 'both').toLowerCase();
 if (!['both', 'receiver'].includes(AUTH_SCOPE)) {
     console.error(`FATAL: AUTH_SCOPE must be 'both' or 'receiver', got "${AUTH_SCOPE}". Aborting startup.`);
