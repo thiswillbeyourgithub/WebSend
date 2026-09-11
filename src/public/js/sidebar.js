@@ -178,6 +178,14 @@ function initSidebar() {
 }
 
 /**
+ * How recent a server restart has to be for the DEV maintenance banner to show.
+ * The banner warns that the instance may have just been modified and broken, so
+ * it is only useful right after a restart; on a DEV instance that has been up
+ * for a long time it is stale noise and gets suppressed.
+ */
+const MAINTENANCE_BANNER_MAX_AGE_MS = 5 * 24 * 60 * 60 * 1000; // 5 days
+
+/**
  * Turn a server start timestamp (epoch ms, from /api/config.serverStartedAt)
  * into a localized "restarted X ago" phrase for the DEV maintenance banner.
  * Picks the coarsest sensible unit (days > hours > minutes) so users can tell
@@ -197,6 +205,20 @@ function formatStartAge(startedAt) {
     if (hours >= 1)   return i18n.t(hours   === 1 ? 'maintenance.ageHour'   : 'maintenance.ageHours',   { n: hours });
     if (minutes >= 1) return i18n.t(minutes === 1 ? 'maintenance.ageMinute' : 'maintenance.ageMinutes', { n: minutes });
     return i18n.t('maintenance.ageJustNow');
+}
+
+/**
+ * Whether the DEV maintenance banner should be shown for a given server start
+ * timestamp. Only recent restarts qualify (see MAINTENANCE_BANNER_MAX_AGE_MS).
+ * An unknown or malformed timestamp fails open (banner shown), since that is
+ * how older servers that do not report serverStartedAt behaved.
+ *
+ * @param {number|null} startedAt - Epoch ms the server process started.
+ * @returns {boolean} True if the banner should be displayed.
+ */
+function shouldShowMaintenanceBanner(startedAt) {
+    if (!startedAt || typeof startedAt !== 'number') return true;
+    return (Date.now() - startedAt) < MAINTENANCE_BANNER_MAX_AGE_MS;
 }
 
 /**
@@ -228,7 +250,7 @@ function updateDevBadge(config) {
             badge.setAttribute('data-i18n', 'menu.devMode');
             badge.classList.add('dev-active');
             const banner = document.getElementById('maintenance-banner');
-            if (banner) {
+            if (banner && shouldShowMaintenanceBanner(startedAt)) {
                 banner.textContent = i18n.t('maintenance.banner', { age: formatStartAge(startedAt) });
                 // The banner sentence ends right before the issues URL; append it
                 // as a real clickable link. Built via DOM (not innerHTML) so the
