@@ -368,7 +368,8 @@ services:
       - --fingerprint
       - --no-multicast-peers
       - --no-cli
-      - --no-dtls
+      # NOTE: --no-dtls was removed in coturn 4.17.0: DTLS listeners are now
+      # opt-in via --dtls, so not passing anything keeps DTLS off (what we want).
       - --no-tls
       - --realm=websend
       - --min-port=49152
