@@ -18,7 +18,7 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
-    "@playwright/test": "^1.59.1",
+    "@playwright/test": "^1.64.0",
     "canvas": "^3.2.3",
     "jsdom": "^29.0.2"
   }
