@@ -1,7 +1,9 @@
 version: 2
 updates:
   - package-ecosystem: npm
-    directory: /src
+    directories:
+      - /src
+      - /src/vendor-pins
     schedule:
       interval: weekly
 

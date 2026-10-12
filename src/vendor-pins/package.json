@@ -1,0 +1,12 @@
+{
+  "name": "websend-vendored",
+  "private": true,
+  "description": "Pins of the npm packages vendored under public/ (see README Third-Party Libraries). Not installed: it exists so Dependabot alerts on them. Must match the vendored files (checked by test/unit/vendor-pins.test.mjs), so a Dependabot bump is not done until the files are re-vendored.",
+  "dependencies": {
+    "client-zip": "2.4.5",
+    "eruda": "3.4.3",
+    "jsqr": "1.4.0",
+    "qrcode": "1.5.1",
+    "scribe.js-ocr": "0.10.1"
+  }
+}

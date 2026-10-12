@@ -474,16 +474,16 @@ A minimal Node script `src/cli/receive.js` pairs as a receiver from a terminal �
 
 ## Third-Party Libraries
 
-All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0.
+All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0. The npm-published ones are also pinned in [`src/vendor-pins/package.json`](src/vendor-pins/package.json) so Dependabot raises CVE alerts for them; when bumping one, re-vendor its files and update this table (`test/unit/vendor-pins.test.mjs` checks all three agree).
 
 | Library | Version | License | Source |
 |---------|---------|---------|--------|
 | [qrcode.js](https://github.com/soldair/node-qrcode) | 1.5.1 | MIT | QR code generation |
 | [jsQR](https://github.com/cozmo/jsQR) | 1.4.0 | Apache-2.0 | QR code scanning |
-| [client-zip](https://github.com/Touffy/client-zip) | — | MIT | ZIP export |
+| [client-zip](https://github.com/Touffy/client-zip) | 2.4.5 | MIT | ZIP export |
 | [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (preloaded in background; bundles Tesseract WASM and MuPDF) |
 | [Tesseract trained data](https://github.com/tesseract-ocr/tessdata) | — | Apache-2.0 | `eng` + `fra` language models, served locally |
-| [eruda](https://github.com/liriliri/eruda) | — | MIT | Mobile devtools console (on-demand) |
+| [eruda](https://github.com/liriliri/eruda) | 3.4.3 | MIT | Mobile devtools console (on-demand) |
 | [Express.js](https://expressjs.com) | ^5.0.0 | MIT | Server-side HTTP framework |
 
 ## License
