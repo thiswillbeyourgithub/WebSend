@@ -139,18 +139,13 @@ async function installSenderHooks(page) {
 
         // Wrap SenderSend (Object.freeze'd, but the window property itself is writable;
         // delegating wrapper is enough because internal state lives in the IIFE closure
-        // and methods don't depend on `this`).
+        // and methods don't depend on `this`). Spread the original so methods
+        // added to SenderSend later are forwarded too: a hand-listed copy once
+        // missed markBatchStartPending and made the picker throw.
         const orig = window.SenderSend;
         window.SenderSend = {
-            attach: orig.attach,
+            ...orig,
             push: (item) => { window.__pushCount += 1; return orig.push(item); },
-            markBatchEndPending: orig.markBatchEndPending,
-            removePhotoById: orig.removePhotoById,
-            clear: orig.clear,
-            size: orig.size,
-            isActive: orig.isActive,
-            drain: orig.drain,
-            updateBanner: orig.updateBanner,
         };
 
         // Wrap the live RtcConnection instance methods. Done at hook-install
