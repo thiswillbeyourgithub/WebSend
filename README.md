@@ -462,7 +462,7 @@ The project uses a three-tier test suite:
 |------|---------|----------------|-------|
 | Unit | `npm run test:unit` | Pure JS modules: crypto, image transforms, server helpers, transfer stats, SRI updater, hand-rolled PDF builder, and a real-photo regression suite for the document-edge detector (`doc-detect-samples.test.mjs`, gated on the optional `canvas` devDep) | ~0.5s |
 | HTTP integration | `npm run test:http` | Real `server.js` spawned per file via child_process — config, origin validation, rate limiting, room/ICE/SDP signaling, long-poll edge cases, static asset mounts, env-var propagation | ~2s |
-| End-to-end | `npm run test:e2e` | Two real browsers via Playwright (sender + receiver round-trip) | ~30s |
+| End-to-end | `npm run test:e2e` | Two real browsers via Playwright (sender + receiver round-trip, OCR searchable-PDF export; the OCR spec needs `pdftotext` from poppler-utils and is skipped without it) | ~30s |
 
 Run `npm test` (= unit + HTTP) for the fast inner loop, or `npm run test:all` for everything. A pre-push git hook (in `.githooks/pre-push`, auto-wired by `npm install` via the `prepare` script) runs `npm test` before every push.
 
