@@ -21,6 +21,7 @@ const read = (rel) => readFileSync(path.join(SRC, rel), 'utf8');
 // sha256 of the npm tarball's index.js. Add the new hash when re-vendoring.
 const CLIENT_ZIP_SHA256 = {
   '2.4.5': '779bd285f37baad3a84732579181ddd5611de562dafced6e573bca7efa476a44',
+  '2.5.1': '28c957c53d8e5290951d4b45ccff8ab8c9c37219da08b9d537bbdd595a75706d',
 };
 
 // Per npm package: its name in the README table, and the version actually
