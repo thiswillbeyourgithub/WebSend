@@ -22,7 +22,7 @@ transfer and ECDH + AES-GCM for end-to-end encryption. The server's only role is
 signaling (SDP relay) and serving static files — it never sees file data or encryption
 keys. The `ALLOWED_FILE_TYPES` env var controls which file types are accepted
 (`ONLY_IMAGES`, `IMAGE_OR_PDF`, or `ANY` — default: `ANY`). PDFs can be exported as
-a ZIP of page images or as a searchable OCR PDF using the bundled scribe.js/MuPDF engine.
+a ZIP of page images or as a searchable OCR PDF using the bundled scribe.js engine (its own PDF renderer + Tesseract WASM).
 Other server-tunable knobs surfaced via `/api/config` and the startup env-var dump:
 `PORT` (HTTP listen port, default `8080`), `OCR_LANGS` (Tesseract languages, default
 `eng,fra`), `OCR_PSM` (page-segmentation mode, default `12`), `TURN_TIMEOUT` (WebRTC
@@ -291,11 +291,14 @@ WebSend/
         │   │               #   window.PdfBuilder.buildPdf(images) — one page per JPEG,
         │   │               #   page sized exactly to the image. Extracted from receive.html
         │   │               #   so the byte-level xref/trailer logic can be unit-tested
-        │   ├── scribe-handle.js # ScribeHandle class: owns one scribe.js instance and
-        │   │               #   exposes init/import/recognize/export plus reset()/dispose()
-        │   │               #   that hide the clear-vs-terminate API fork. Receive.html
-        │   │               #   uses it for preloaded, background-queue, and per-export
-        │   │               #   scribe lifecycles
+        │   ├── scribe-handle.js # Single owner of the scribe.js API. Loads and configures
+        │   │               #   the module once (self-hosted /tessdata langPath, invisible
+        │   │               #   text layer). A ScribeHandle wraps one ScribeDoc: import /
+        │   │               #   recognize / export, `doc` for per-page OCR state,
+        │   │               #   setPageImage() (swap in the original-quality image),
+        │   │               #   reset()/dispose(). Static renderPdfPages() rasterizes a
+        │   │               #   PDF with a throwaway ScribeDoc. Used for preloaded,
+        │   │               #   background-queue, per-export and per-PDF scribe lifecycles
         │   ├── segment-stream.js # v2 chunked-file streaming, loaded on both
         │   │               #   pages. createSender turns a Blob into sealed wire
         │   │               #   records one segment at a time (blob.slice, constant
@@ -322,7 +325,7 @@ WebSend/
         │   ├── receive-export.js # Export pipeline for the receive page: ZIP,
         │   │               #   plain PDF (via pdf-builder.js), OCR PDF (scribe.js
         │   │               #   with cached/fallback paths), and the per-card
-        │   │               #   PDF→images / PDF→OCR actions (MuPDF). Owns the
+        │   │               #   PDF→images / PDF→OCR actions (scribe PDF renderer). Owns the
         │   │               #   export modal wiring and the preloaded client-zip
         │   │               #   and scribe handles; bridges scribePreloaded to
         │   │               #   bg-ocr.js. Exposes window.ReceiveExport
@@ -460,7 +463,7 @@ WebSend/
         ├── vendor/             # Vendored third-party libraries (committed to repo)
         │   ├── client-zip.js   # ZIP generator (ESM, ~6KB, preloaded in background)
         │   ├── scribe.js-ocr/  # OCR engine (AGPL-3.0): scribe.js + Tesseract WASM,
-        │   │                   #   fonts, and mupdf — preloaded in background
+        │   │                   #   fonts, own PDF parser/renderer; preloaded in background
         │   ├── tessdata/       # Tesseract language models (eng + fra .traineddata),
         │   │                   #   served locally to avoid CDN dependency
         │   └── eruda/          # Mobile devtools console (loaded in DEV mode, via
@@ -952,10 +955,13 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 28. **PDF page-render cap**: `receive-export.renderPdfPages` refuses
     to render more than `MAX_PDF_RENDER_PAGES` (1000) pages from any
     peer-supplied PDF. The "Export as images" and "Export as OCR PDF"
-    per-card actions feed `file.data` directly into MuPDF; a malicious
-    PDF can declare millions of pages, and rendering each one at 150
-    or 300 DPI to a PNG chains large allocations on the main thread
-    until the tab OOMs. We free the MuPDF document and throw with a
+    per-card actions feed `file.data` directly into scribe.js's PDF
+    renderer (`ScribeHandle.renderPdfPages`); a malicious PDF can declare
+    millions of pages, and rendering each one at 150 or 300 DPI to a PNG
+    chains large allocations until the tab OOMs. The page count is only
+    known once scribe has opened the document, so the per-page metadata
+    is still parsed, but no page is rasterized. We close the scribe
+    document and throw with a
     clear "PDF has N pages, refusing to render more than 1000" error
     that surfaces as a user-visible toast.
 29. **Image-transform pixel cap**: `image-transforms._loadBitmap` now
@@ -1250,7 +1256,7 @@ Three tiers, layered from fast/cheap to slow/realistic:
 
 - **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed. `doc-detect-samples.test.mjs` runs the document-edge detector against real camera shots in `test/fixtures/doc-samples/`, warps the detected quad to the ground-truth dimensions in `test/fixtures/doc-target-result/` via `ImageTransforms.perspectiveTransform`, and asserts both mean luminance and mean Sobel edge density of the crop match the target within 1% of 0..255 (BW + math, no colour classifier). It also applies a per-corner **geometry guard** (`EXPECTED_CORNERS`, tolerance 0.06 normalized) because the content metrics stay green even when a corner collapses inward over a uniform page; the guard catches that class of failure. Skips automatically when the optional `canvas` devDep is not installed. `maintenance-banner.test.mjs` loads `sidebar.js` in JSDOM and asserts the DEV maintenance banner's 5-day age gate (shown under 5 days, suppressed over it, DEV badge unaffected, missing `serverStartedAt` fails open).
 - **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, the `/vendor` `/scribe` `/tessdata` static mounts, and the receiver-only-auth gate (`auth-scope.test.mjs`: `AUTH_SCOPE=receiver` refuses `POST /api/rooms` without the proxy identity header, honors a custom `AUTH_IDENTITY_HEADER`, surfaces `senderOrigin`, and aborts startup on the misconfiguration cases). A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
-- **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer. The receiver/sender pairing and fingerprint verification dance lives once in `src/test/e2e/helpers.js` (`pairAndVerify`), shared by every spec that needs a paired session. `ocr-export.spec.js` is the only test that runs the vendored scribe.js for real: it sends a 2400 px wide text image rendered in the browser (above the 2000 px OCR input cap) and exports a searchable PDF through both `generateOcrPdf` paths (cached background-OCR splice, and on-demand fallback forced by corrupting `receivedImages[0].ocrPageData`), then checks the text layer and word geometry with `pdftotext -bbox` (spec skipped when poppler-utils is missing). It is the regression net for scribe.js upgrades, since our code reaches into scribe's per-page OCR objects, page metrics and native image slots.
+- **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer. The receiver/sender pairing and fingerprint verification dance lives once in `src/test/e2e/helpers.js` (`pairAndVerify`), shared by every spec that needs a paired session. `ocr-export.spec.js` is the only test that runs the vendored scribe.js for real: it sends a 2400 px wide text image rendered in the browser (above the 2000 px OCR input cap) and exports a searchable PDF through both `generateOcrPdf` paths (cached background-OCR splice, and on-demand fallback forced by corrupting `receivedImages[0].ocrPageData`), then checks the text layer and word geometry with `pdftotext -bbox` (spec skipped when poppler-utils is missing). It is the regression net for scribe.js upgrades, since our code reaches into scribe's per-page OCR objects, page metrics and native image slots (confined to `js/scribe-handle.js` plus the splice code in `receive-export.js`).
 
 A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and aborts the push on failure. The hook is auto-wired by the `prepare` script in `src/package.json` (sets `core.hooksPath=.githooks` on `npm install`).
 

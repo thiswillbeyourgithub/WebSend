@@ -1,0 +1,1151 @@
+import scribe from '../../scribe.js';
+import { nativeTextForPage } from '../../js/textEdits.js';
+import { resolveReplacementChar } from '../../js/pdf/glyphResolve.js';
+// eslint-disable-next-line import/no-cycle
+import { ScribeViewer } from '../viewer.js';
+// eslint-disable-next-line import/no-cycle
+import { readingsListSync } from './viewerReadings.js';
+
+/**
+ * Resolve the viewer associated with a UiText/UiOcrWord.
+ * Falls back to the default viewer when none was explicitly attached (backward-compat for single-viewer apps).
+ * @param {UiText} itext
+ */
+function getViewer(itext) {
+  return itext.viewer || ScribeViewer.getDefault();
+}
+
+/**
+ * The ascent and descent, in px, this browser lays each face out with at each size, keyed by CSS font shorthand.
+ * @type {Map<string, {asc: number, desc: number}>}
+ */
+const faceMetricsCache = new Map();
+/** @type {?CanvasRenderingContext2D} */
+let faceMeasureCtx = null;
+
+/**
+ * The ascent and descent, in px, this browser lays a face out with at `sizePx`.
+ * Which table those come from varies by platform (hhea on Linux and macOS, OS/2 win on Windows, OS/2 typo when `USE_TYPO_METRICS` is set), so a font program's own tables are not a substitute.
+ * @param {string} faceName - CSS family name the face is registered under.
+ * @param {string} style - CSS font-style.
+ * @param {string} weight - CSS font-weight.
+ * @param {number} sizePx - Font size, in px.
+ * @returns {?{asc: number, desc: number}}
+ */
+function measureFace(faceName, style, weight, sizePx) {
+  if (typeof document === 'undefined') return null;
+  // Chromium rounds the ascent and descent to whole pixels per size and floors the half-leading, so metrics scaled from a single em measurement miss the baseline by up to a pixel.
+  const spec = `${style} ${weight} ${sizePx}px "${faceName}"`;
+  const cached = faceMetricsCache.get(spec);
+  if (cached) return cached;
+  // An unloaded face measures as the fallback font, so its metrics must not be taken or cached.
+  if (document.fonts && !document.fonts.check(spec)) return null;
+  if (!faceMeasureCtx) faceMeasureCtx = document.createElement('canvas').getContext('2d');
+  const ctx = /** @type {CanvasRenderingContext2D} */ (faceMeasureCtx);
+  ctx.font = spec;
+  const m = ctx.measureText('Hg');
+  if (!(m.fontBoundingBoxAscent > 0)) return null;
+  const fm = { asc: m.fontBoundingBoxAscent, desc: m.fontBoundingBoxDescent || 0 };
+  faceMetricsCache.set(spec, fm);
+  return fm;
+}
+
+let wordStyleSheetInjected = false;
+
+/**
+ * Inject, once, the static styles shared by every `.scribe-word` span (see `_styleElem`),
+ * as one stylesheet rule rather than inline on each of thousands of words.
+ */
+function ensureWordStyleSheet() {
+  if (wordStyleSheetInjected || typeof document === 'undefined') return;
+  wordStyleSheetInjected = true;
+  const styleEl = document.createElement('style');
+  // `.scribe-fill` = selection dead-space fillers built alongside the words (see `_renderCanvasWords`).
+  // z-index 0 sits them under the words (z-index 1) so a pointer over a glyph hit-tests the word, not the filler.
+  // color:transparent and the ::selection rule keep the filler unpainted, including the selection sliver the browser would otherwise paint over its character.
+  // No overflow:hidden by design: there is nothing to clip, and a clip node per filler across thousands of them taxes paint and compositing every frame.
+  styleEl.textContent = '.scribe-word{position:absolute;z-index:1;white-space:nowrap;font-kerning:normal;pointer-events:auto;padding:0}'
+    + '.scribe-fill{position:absolute;z-index:0;pointer-events:auto;width:0;white-space:pre;font-size:2px;color:transparent}'
+    + '.scribe-fill::selection{background:transparent;color:transparent}'
+    + '.scribe-word>.scribe-word-readings{position:absolute;left:0;right:0;height:0;border-bottom:calc(2px / var(--scribe-zoom,1)) dotted rgba(31,37,48,.72);pointer-events:none}';
+  document.head.appendChild(styleEl);
+}
+
+/**
+ * A word rendered as an absolutely-positioned `<span>` in page (content) space.
+ * While it uses an `OcrWord` for layout, it is not tied to OCR and works with any dummy `OcrWord`.
+ */
+export class UiText {
+  /** @type {?HTMLSpanElement} */
+  static input = null;
+
+  /**
+   * innerHTML of the input element before the current edit, used to restore it within a callback when the new value is invalid.
+   */
+  static inputInnerHTMLLast = '';
+
+  static inputCursorLast = 0;
+
+  /** @type {?UiText} */
+  static inputWord = null;
+
+  /** @type {?Function} */
+  static inputRemove = null;
+
+  static enableEditing = false;
+
+  static smartQuotes = true;
+
+  /** Client coordinates of the pointer at the last edit-triggering double-click, read by `getCursorIndex`. */
+  static _lastPointerClient = { x: 0, y: 0 };
+
+  /**
+   * @param {Object} options
+   * @param {number} options.x
+   * @param {number} options.yActual
+   * @param {InstanceType<typeof scribe.utils.ocr.OcrWord>} options.word
+   * @param {number} [options.rotation=0]
+   * @param {boolean} [options.outline=false]
+   * @param {boolean} [options.selected=false]
+   * @param {boolean} [options.fillBox=false]
+   * @param {boolean} [options.activeMatch=false]
+   * @param {number} [options.opacity=1]
+   * @param {string} [options.fill='black']
+   * @param {boolean} [options.dynamicWidth=false] - If `true`, the width is computed from the text content rather than the bounding box.
+   *    Used for dummy text boxes not tied to OCR; should be `false` for OCR text boxes.
+   * @param {Function} [options.changeTextCallback] - Called when the text is edited and the input loses focus.
+   * @param {Function} [options.inputTextCallback] - Called when a keystroke modifies the value of the text input.
+   * @param {?string} [options.highlightColor=null] - Highlight background color (hex string like '#ffff00'), or null for no highlight.
+   * @param {number} [options.highlightOpacity=1] - Opacity for the highlight background (0-1).
+   * @param {?string} [options.highlightGroupId=null] - Group ID linking annotations in the same highlight group.
+   * @param {string} [options.highlightComment=''] - Comment text attached to this highlight group.
+   * @param {?('underline'|'strikeout')} [options.markupType=null] - Line-markup kind on this word, or null for none.
+   * @param {?string} [options.markupColor=null] - Line-markup color (hex string), or null for none.
+   * @param {number} [options.markupOpacity=1] - Opacity for the line markup (0-1).
+   * @param {?string} [options.markupGroupId=null] - Group ID linking annotations in the same line-markup group.
+   * @param {string} [options.markupComment=''] - Comment text attached to this line-markup group.
+   * @param {import('../viewer.js').ScribeViewer} [options.viewer] - The viewer this word belongs to; falls back to the default viewer.
+   * @param {boolean} [options.dom=true] - Build the word's `<span>`; false under the custom selection engine, which needs the word's geometry and highlight/search state but no element.
+   */
+  constructor({
+    x, yActual, word, rotation = 0,
+    outline = false, selected = false, fillBox = false, activeMatch = false, opacity = 1, fill = 'black', dynamicWidth = false, changeTextCallback, inputTextCallback,
+    highlightColor = null, highlightOpacity = 1, highlightGroupId = null, highlightComment = '',
+    markupType = null, markupColor = null, markupOpacity = 1, markupGroupId = null, markupComment = '',
+    viewer, dom = true,
+  }) {
+    const _viewer = viewer || ScribeViewer.getDefault();
+    ensureWordStyleSheet();
+
+    // In the table preview a word draws with the document's own embedded font once its program has settled and covers the text.
+    // Style runs and small caps keep the substitute path, whose mechanics they need.
+    /** @type {?FontContainerFont} */
+    let fontNative = null;
+    /** Faux-bold stroke the document draws the word with over its fill, in page px. */
+    let strokeWidthPx = 0;
+    /** @type {?string} */
+    let strokeColor = null;
+    /** Horizontal scale the document draws the word at, from its text matrix. */
+    let stretch = 1;
+    if (_viewer.state.tablePreview && !word.styleRuns && !word.style.smallCaps && word.line) {
+      const ntw = nativeTextForPage(_viewer.doc, word.line.page)[word.id];
+      // One span scales as a whole, so a word whose glyphs disagree stays unscaled.
+      if (ntw?.stretch) {
+        const scales = ntw.stretch.map((v) => v || 1);
+        if (Math.max(...scales) - Math.min(...scales) < 0.01) stretch = scales[0];
+      }
+      const f = ntw?.fontObjNum;
+      const strokeOnly = !!(ntw && ntw.renderMode === 1 && ntw.strokeWidthPx);
+      if (typeof f === 'number' && Number.isFinite(f) && !strokeOnly) {
+        const ef = _viewer.doc.images.getEditFontSync(word.line.page.n, f);
+        // A subset face has only the glyphs this document drew with it, so a word it cannot fully cover falls back.
+        if (ef?.faceName && ef.program?.font
+          && [...word.text].every((ch) => resolveReplacementChar(ch, ef.program, word.style).kind === 'orig')) {
+          // An unmeasurable face has no reliable baseline, so the word keeps the substitute font instead.
+          if (measureFace(ef.faceName, 'normal', 'normal', 1000)) {
+            // The style keywords stay 'normal' because an embedded face carries its style in its glyphs.
+            fontNative = /** @type {FontContainerFont} */ ({
+              opentype: ef.program.font,
+              fontFaceName: ef.faceName,
+              fontFaceStyle: 'normal',
+              fontFaceWeight: 'normal',
+              smallCapsMult: 0.75,
+              family: ef.program.familyName || ef.program.baseName,
+              src: ef.bytes,
+            });
+            // The substitute path stands a bold face in for the stroke, so the stroke is only carried with the document face.
+            if (ntw.renderMode === 2 && ntw.strokeWidthPx) {
+              strokeWidthPx = ntw.strokeWidthPx;
+              strokeColor = ntw.strokeColor || null;
+            }
+          }
+        }
+      }
+    }
+
+    const {
+      charSpacing, leftSideBearing, rightSideBearing, fontSize, charArr, advanceArr, kerningArr, font,
+    } = scribe.utils.calcWordMetrics(word, _viewer.doc.fonts, 0, fontNative || stretch !== 1 ? { font: fontNative || undefined, stretch } : undefined);
+
+    const fm = measureFace(font.fontFaceName, font.fontFaceStyle, font.fontFaceWeight, fontSize);
+
+    const charSpacingFinal = !dynamicWidth ? charSpacing : 0;
+
+    // The metrics come back in the span's unscaled space, and the CSS transform scales what it draws.
+    // Hit-testing measures against the stored advances and bearings instead, so those are scaled here.
+    const advanceArrTotal = [];
+    for (let i = 0; i < advanceArr.length; i++) {
+      let leftI = 0;
+      leftI += advanceArr[i] || 0;
+      leftI += kerningArr[i] || 0;
+      leftI += charSpacingFinal || 0;
+      advanceArrTotal.push(leftI * stretch);
+    }
+
+    // The `dynamicWidth` option is useful for dummy text boxes that are not tied to OCR, however should be `false` for OCR text boxes.
+    // Setting to `true` for OCR text results in no change for most words, however can cause fringe issues with some words.
+    // For example, in some cases Tesseract will misidentify a single character as a multi-character word.
+    // In this case, the total advance may be negative, making this method of calculating the width incorrect.
+    let width = dynamicWidth ? advanceArrTotal.reduce((a, b) => a + b, 0) : word.bbox.right - word.bbox.left;
+
+    // Subtract the side bearings from the width if they are not excluded from the `ocrWord` coordinates.
+    if (!dynamicWidth && !word.visualCoords) {
+      width -= (leftSideBearing + rightSideBearing) * stretch;
+      width = Math.max(width, 7);
+    }
+
+    let y = yActual - fontSize * 0.6;
+    if (!word.visualCoords && (word.style.sup || word.style.dropcap)) {
+      const fontDesc = fm ? -fm.desc : font.opentype.descender / font.opentype.unitsPerEm * fontSize;
+      y = yActual - fontSize * 0.6 + fontDesc;
+    }
+
+    /** @type {import('../viewer.js').ScribeViewer} */
+    this.viewer = _viewer;
+    this.word = word;
+    this.charArr = charArr;
+    this.charSpacing = charSpacingFinal;
+    this.advanceArrTotal = advanceArrTotal;
+    this.leftSideBearing = leftSideBearing * stretch;
+    this.fontSize = fontSize;
+    this.smallCapsMult = font.smallCapsMult;
+    // The span's top and line-height are set from these, so they must be the metrics the browser builds the line box from or the glyph baseline misses `yActual`.
+    this.fontAscentPx = fm ? fm.asc : font.opentype.ascender / font.opentype.unitsPerEm * fontSize;
+    this.fontDescentPx = fm ? fm.desc : -font.opentype.descender / font.opentype.unitsPerEm * fontSize;
+    // `yActual` is the y value we want to draw the text at, which is usually the baseline.
+    this.yActual = yActual;
+    // Baseline used to re-derive `yActual` on edit; `UiOcrWord` overrides it with its measured line baseline.
+    this.topBaseline = yActual;
+    this.fontFaceStyle = font.fontFaceStyle;
+    this.fontFaceWeight = font.fontFaceWeight;
+    this.fontFaceName = font.fontFaceName;
+    this.fontFamilyLookup = font.family;
+    this.strokeWidthPx = strokeWidthPx;
+    this.strokeColor = strokeColor;
+    this.rotation = rotation;
+    this.dynamicWidth = dynamicWidth;
+    this.changeTextCallback = changeTextCallback;
+    this.inputTextCallback = inputTextCallback;
+
+    // Geometry, in page (content) space. `x`/`y` are the top-left of the interactive box; `width`/`height` its size.
+    this._x = x;
+    this._y = y;
+    this._width = width;
+    this._height = fontSize * 0.6;
+    this._scaleX = stretch;
+    this._fill = fill;
+    this._opacity = opacity;
+    this._listening = true;
+    this._visible = true;
+
+    // Visual-state flags whose setters restyle the element, so external assignments (search/highlight) repaint with no redraw call.
+    this._outline = outline;
+    this._selected = selected;
+    this._fillBox = fillBox;
+    this._activeMatch = activeMatch;
+    this._highlightColor = highlightColor;
+    this._highlightOpacity = highlightOpacity;
+    this.highlightGroupId = highlightGroupId;
+    this.highlightComment = highlightComment;
+    this.highlightGapLeft = 0;
+    this.highlightGapRight = 0;
+    /**
+     * The fill rect this word's highlight run rendered into (set by `renderHighlights`, null when unhighlighted).
+     * Hover feedback lifts this band directly when the highlight has no group id.
+     * @type {?HTMLDivElement}
+     */
+    this.highlightRectElem = null;
+
+    // The line-markup slot, mirrored separately from the highlight fill so both can render on one word.
+    // Two markups on one word are first-wins in the view only; the model and export keep both.
+    /** @type {?('underline'|'strikeout')} */
+    this.markupType = markupType;
+    /** @type {?string} */
+    this.markupColor = markupColor;
+    this.markupOpacity = markupOpacity;
+    /** @type {?string} */
+    this.markupGroupId = markupGroupId;
+    this.markupComment = markupComment;
+    /**
+     * The bar this word's line-markup run rendered into (set by `renderHighlights`, null when unmarked).
+     * @type {?HTMLDivElement}
+     */
+    this.markupRectElem = null;
+
+    this.lastWidth = width;
+
+    /** Set by `destroy`, so a word evicted mid-pass is skipped rather than dereferenced. */
+    this._destroyed = false;
+
+    /**
+     * The word's `<span>`, or null when the custom selection engine owns text interaction.
+     * @type {?HTMLSpanElement}
+     */
+    this.el = dom ? this._styleElem(document.createElement('span'), { fresh: true }) : null;
+    if (this.el) {
+      // Back-reference for hit-testing: `event.target.closest('.scribe-word')._scribeObj` resolves to this object.
+      /** @type {any} */ (this.el)._scribeObj = this;
+
+      this.el.addEventListener('dblclick', (event) => {
+        if (!UiText.enableEditing) return;
+        if (event.button !== 0) return;
+        UiText._lastPointerClient = { x: event.clientX, y: event.clientY };
+        UiText.addTextInput(this);
+      });
+    }
+
+    this.select = () => { this.selected = true; };
+    this.deselect = () => { this.selected = false; };
+  }
+
+  /** @param {number} [v] @returns {number} */
+  x(v) { if (v === undefined) return this._x; this._x = v; if (this.el) this._position(); return this._x; }
+
+  /** @param {number} [v] @returns {number} */
+  y(v) { if (v === undefined) return this._y; this._y = v; if (this.el) this._position(); return this._y; }
+
+  /** @param {number} [v] @returns {number} */
+  width(v) { if (v === undefined) return this._width; this._width = v; return this._width; }
+
+  /** @param {number} [v] @returns {number} */
+  height(v) { if (v === undefined) return this._height; this._height = v; return this._height; }
+
+  /** @param {number} [v] @returns {number} */
+  scaleX(v) { if (v === undefined) return this._scaleX; this._scaleX = v; if (this.el) this._position(); return this._scaleX; }
+
+  /** @param {string} [v] @returns {string} */
+  fill(v) { if (v === undefined) return this._fill; this._fill = v; if (this.el) this._styleElem(this.el); return this._fill; }
+
+  /** @param {number} [v] @returns {number} */
+  opacity(v) { if (v === undefined) return this._opacity; this._opacity = v; if (this.el) this._styleElem(this.el); return this._opacity; }
+
+  /** @param {boolean} [v] @returns {boolean} */
+  listening(v) {
+    if (v === undefined) return this._listening;
+    this._listening = v;
+    if (this.el) this.el.style.pointerEvents = v ? 'auto' : 'none';
+    return this._listening;
+  }
+
+  /** @param {boolean} [v] @returns {boolean} */
+  visible(v) { if (v === undefined) return this._visible; this._visible = v; if (this.el) this.el.style.display = v ? '' : 'none'; return this._visible; }
+
+  show() { this.visible(true); }
+
+  hide() { this.visible(false); }
+
+  /** Re-apply style to the element after field changes. */
+  draw() { if (this.el) this._styleElem(this.el); }
+
+  get outline() { return this._outline; }
+
+  set outline(v) { this._outline = v; this._applyStateStyle(); }
+
+  get selected() { return this._selected; }
+
+  set selected(v) { this._selected = v; this._applyStateStyle(); readingsListSync(getViewer(this)); }
+
+  get fillBox() { return this._fillBox; }
+
+  set fillBox(v) { this._fillBox = v; this._applyStateStyle(); }
+
+  get activeMatch() { return this._activeMatch; }
+
+  set activeMatch(v) { this._activeMatch = v; this._applyStateStyle(); }
+
+  get highlightColor() { return this._highlightColor; }
+
+  // The fill is drawn by the viewer's highlight layer (`renderHighlights`), not the word span, so setting the colour only updates state.
+  set highlightColor(v) { this._highlightColor = v; }
+
+  get highlightOpacity() { return this._highlightOpacity; }
+
+  set highlightOpacity(v) { this._highlightOpacity = v; }
+
+  /** Remove the element from the DOM and drop this word from the viewer's per-page registry. */
+  destroy() {
+    // The registry that `getUiWords` reads must never hold a destroyed word.
+    // A lingering entry whose element is now null crashes any later pass that calls `getClientRect` on it.
+    // Doing this here covers every delete path, not just one caller.
+    const n = this.word?.line?.page?.n;
+    const pageWords = (n !== undefined && this.viewer) ? this.viewer._wordObjs[n] : undefined;
+    if (pageWords) {
+      const i = pageWords.findIndex((w) => w === this);
+      if (i >= 0) pageWords.splice(i, 1);
+    }
+    if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
+    this.el = /** @type {any} */ (null);
+    this._destroyed = true;
+  }
+
+  /** The element's parent (the per-line wrapper), used when attaching edit controls. */
+  getParent() { return this.el ? this.el.parentNode : null; }
+
+  /**
+   * Content-space axis-aligned bounding box of the word (handles zoom/rotation).
+   * @returns {{x: number, y: number, width: number, height: number}}
+   */
+  getClientRect() {
+    const v = getViewer(this);
+    if (!this.el) {
+      // Under rotation the transformed rectangle is not axis-aligned, so the box hulls all four corners.
+      const n = this.word.line.page.n;
+      const { orientation } = this.word.line;
+      const left = this._x - (this.word.visualCoords ? this.leftSideBearing : 0);
+      const corners = [
+        v.localToContent(n, orientation, left, this._y),
+        v.localToContent(n, orientation, left + this._width, this._y),
+        v.localToContent(n, orientation, left, this._y + this._height),
+        v.localToContent(n, orientation, left + this._width, this._y + this._height),
+      ];
+      const xs = corners.map((c) => c.x);
+      const ys = corners.map((c) => c.y);
+      const x = Math.min(...xs);
+      const y = Math.min(...ys);
+      return {
+        x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y,
+      };
+    }
+    const r = this.el.getBoundingClientRect();
+    const tl = v.clientToContent(r.left, r.top);
+    const br = v.clientToContent(r.right, r.bottom);
+    return {
+      x: tl.x, y: tl.y, width: br.x - tl.x, height: br.y - tl.y,
+    };
+  }
+
+  /** Update only the absolute position of the element from the current `x`/`y` (cheap; no text re-measure). */
+  _position() {
+    if (!this.el) return;
+    const scale = 1;
+    let x1 = this._x;
+    if (this.word.visualCoords) x1 -= this.leftSideBearing * scale;
+
+    const fontSizeHTML = this.fontSize * scale;
+    const topHTML = this._y - this.fontAscentPx * scale + fontSizeHTML * 0.6;
+
+    this.el.style.left = `${x1}px`;
+    this.el.style.top = `${topHTML}px`;
+  }
+
+  /** Apply the search-match fill and selection/outline decorations from the current flags. */
+  _applyStateStyle() {
+    if (!this.el) {
+      // With no span, the match fill is a rectangle in the select layer, so repaint that layer instead of restyling an element.
+      this.viewer?.scheduleMarkRepaint(this.word.line.page.n);
+      return;
+    }
+    if (this._activeMatch) this.el.style.backgroundColor = 'var(--scribe-match-active)';
+    else if (this._fillBox) this.el.style.backgroundColor = 'var(--scribe-match)';
+    else this.el.style.backgroundColor = '';
+    // Multiplied like the custom engine's mark layer, so in invis mode the wash sits behind the raster's ink.
+    this.el.style.mixBlendMode = this._activeMatch || this._fillBox ? 'multiply' : '';
+
+    if (this._selected) this.el.style.outline = 'calc(2px / var(--scribe-zoom, 1)) solid rgba(40,123,181,1)';
+    else if (this._outline) this.el.style.outline = 'calc(2px / var(--scribe-zoom, 1)) solid black';
+    else this.el.style.outline = 'none';
+  }
+
+  /**
+   * Apply all content, font, position, opacity, underline, small-caps, and highlight styling to `elem` from the current fields.
+   * Used both to build `this.el` and to rebuild the editable input.
+   * @param {HTMLSpanElement} elem
+   * @param {object} [opts]
+   * @param {boolean} [opts.pad=false] - Add horizontal padding so an edit cursor is visible before the first / after the last letter.
+   *   Pass false for the read-only word, where padding only makes adjacent word boxes overlap and corrupt selection.
+   * @param {boolean} [opts.fresh=false] - True when styling a brand-new element (no stale inline style to clear).
+   * @returns {HTMLSpanElement}
+   */
+  _styleElem(elem, { pad = false, fresh = false } = {}) {
+    const scale = 1;
+    const wordStr = this.charArr.join('');
+
+    const charSpacingHTML = this.charSpacing * scale;
+
+    let x1 = this._x;
+    if (this.word.visualCoords) x1 -= this.leftSideBearing * scale;
+
+    const fontSizeHTML = this.fontSize * scale;
+
+    const fontSizeHTMLSmallCaps = this.fontSize * scale * this.smallCapsMult;
+
+    // Align with baseline.
+    const topHTML = this._y - this.fontAscentPx * scale + fontSizeHTML * 0.6;
+
+    const angle = this.rotation;
+
+    const padPx = pad ? 5 : 0;
+    const topPadOffset = padPx * Math.sin(angle * (Math.PI / 180));
+    const leftPadOffset = padPx * Math.cos(angle * (Math.PI / 180));
+    const opacity = this._opacity;
+    // A fresh element has no inline style to clear, so absent features are simply omitted.
+    // Restyling an existing element must instead write a feature's default back, to clear a value a previous styling left behind.
+    const restyle = !fresh;
+
+    // Per-word dynamic styles, always written.
+    // The static styles shared by every word live in the injected `.scribe-word` rule (see `ensureWordStyleSheet`), so they are not re-written per word.
+    elem.style.left = `${x1 - leftPadOffset}px`;
+    elem.style.top = `${topHTML - topPadOffset}px`;
+    elem.style.fontSize = `${fontSizeHTML}px`;
+    elem.style.fontFamily = this.fontFaceName;
+    elem.style.fontStyle = this.fontFaceStyle;
+    elem.style.fontWeight = this.fontFaceWeight;
+    elem.style.letterSpacing = `${charSpacingHTML}px`;
+    // Line height must match the height of the font bounding box for the font metrics to be accurate.
+    elem.style.lineHeight = `${(this.fontAscentPx + this.fontDescentPx) * scale}px`;
+    // Text with opacity 0 is not selectable, so we make it transparent instead.
+    if (opacity === 0) {
+      elem.style.color = 'transparent';
+      elem.style.opacity = '1';
+    } else {
+      elem.style.color = this._fill;
+      elem.style.opacity = String(opacity);
+    }
+
+    // The stroke keeps the document's own stroke color while the word draws in its own ink.
+    // A preview recolor (ghost grey, plain black) takes the stroke with it.
+    if (this.strokeWidthPx > 0 && opacity !== 0) {
+      const ownInk = this.word.style.color || 'black';
+      elem.style.setProperty('-webkit-text-stroke', `${this.strokeWidthPx}px ${this._fill === ownInk && this.strokeColor ? this.strokeColor : this._fill}`);
+    } else if (restyle) {
+      elem.style.removeProperty('-webkit-text-stroke');
+    }
+
+    // Glyph selection is wanted only in `invis` mode, where the transparent text layer is the searchable/copyable overlay.
+    // In the visible modes the word box is the interactive unit, so selecting the letters too would only be noise.
+    const selectText = this.viewer.state.displayMode === 'invis';
+    elem.style.userSelect = selectText ? 'text' : 'none';
+    elem.style.setProperty('-webkit-user-select', selectText ? 'text' : 'none');
+
+    // Exceptions to the `.scribe-word` defaults: written only when they differ,
+    // and cleared on a restyle so a stale value does not linger.
+    if (padPx) {
+      elem.style.paddingLeft = `${padPx}px`;
+      elem.style.paddingRight = `${padPx}px`;
+    } else if (restyle) {
+      elem.style.paddingLeft = '';
+      elem.style.paddingRight = '';
+    }
+    if (!scribe.ScribeDoc.defaults.kerning) elem.style.fontKerning = 'none';
+    else if (restyle) elem.style.fontKerning = '';
+    if (!this._listening) elem.style.pointerEvents = 'none';
+    else if (restyle) elem.style.pointerEvents = '';
+    if (!this._visible) elem.style.display = 'none';
+    else if (restyle) elem.style.display = '';
+
+    const transforms = [];
+    if (Math.abs(angle ?? 0) > 0.05) transforms.push(`rotate(${angle}deg)`);
+    if (this._scaleX !== 1) transforms.push(`scaleX(${this._scaleX})`);
+    if (transforms.length) {
+      // A centered origin would move the word's left edge under the scale, so both transforms anchor at the left.
+      elem.style.transformOrigin = `left ${this._y - topHTML}px`;
+      elem.style.transform = transforms.join(' ');
+    } else if (restyle) {
+      elem.style.transformOrigin = '';
+      elem.style.transform = '';
+    }
+
+    // For small caps, real uppercasing would persist into the saved text, and the CSS small-caps property cannot size the caps.
+    // So render them with `text-transform: uppercase` (display-only) plus each letter in a span at a smaller font size.
+    if (this.word.style.smallCaps) {
+      elem.style.textTransform = 'uppercase';
+      elem.innerHTML = UiText.makeSmallCapsDivs(wordStr, fontSizeHTMLSmallCaps);
+    } else {
+      if (restyle) elem.style.textTransform = '';
+      const styleSegments = scribe.utils.ocr.getWordStyleSegments(this.word);
+      if (styleSegments) {
+        // Each style-run segment renders in its own span with the segment's face (e.g. an italic word's non-italic comma).
+        elem.innerHTML = styleSegments.map((segment) => {
+          const fontSegment = this.viewer.doc.fonts.getFont(segment.style, this.word.lang);
+          return `<span style="font-style:${fontSegment.fontFaceStyle};font-weight:${fontSegment.fontFaceWeight};">${scribe.utils.ocr.escapeXml(wordStr.slice(segment.start, segment.end))}</span>`;
+        }).join('');
+      } else {
+        elem.textContent = wordStr;
+      }
+    }
+
+    if (this.word.style.underline && opacity !== 0) {
+      const underlineThickness = this.word.style.bold ? Math.ceil(fontSizeHTML / 12) : Math.ceil(fontSizeHTML / 24);
+      const underlineOffset = Math.ceil(fontSizeHTML / 12) + Math.ceil(fontSizeHTML / 24) / 2;
+      elem.style.textDecoration = 'underline';
+      elem.style.textDecorationThickness = `${underlineThickness}px`;
+      elem.style.textDecorationColor = this._fill;
+      elem.style.textUnderlineOffset = `${underlineOffset}px`;
+    } else if (restyle) {
+      elem.style.textDecoration = '';
+    }
+
+    // Proof mode marks a word the model gave other readings with a dotted rule under its box, so the reader knows the readings list has something for it.
+    if (!pad && this.word.alt?.length && this.viewer.state.displayMode === 'proof') {
+      const mark = document.createElement('i');
+      mark.className = 'scribe-word-readings';
+      mark.style.bottom = `calc(${this.fontDescentPx}px - 4px / var(--scribe-zoom, 1))`;
+      elem.appendChild(mark);
+    }
+
+    elem.classList.add('scribe-word');
+    elem.id = this.word.id;
+
+    // Always sets `outline` (selection/outline or none), so `_styleElem` does not need to suppress it separately.
+    this._applyStateStyleOn(elem);
+
+    return elem;
+  }
+
+  /**
+   * Apply search-match/selection decorations to a specific element (shared by `_applyStateStyle` and `_styleElem`).
+   * @param {HTMLSpanElement} elem
+   */
+  _applyStateStyleOn(elem) {
+    if (this._activeMatch) elem.style.backgroundColor = 'var(--scribe-match-active)';
+    else if (this._fillBox) elem.style.backgroundColor = 'var(--scribe-match)';
+    else elem.style.backgroundColor = '';
+    elem.style.mixBlendMode = this._activeMatch || this._fillBox ? 'multiply' : '';
+
+    if (this._selected) elem.style.outline = 'calc(2px / var(--scribe-zoom, 1)) solid rgba(40,123,181,1)';
+    else if (this._outline) elem.style.outline = 'calc(2px / var(--scribe-zoom, 1)) solid black';
+    else elem.style.outline = 'none';
+  }
+
+  /**
+   * Get the index of the letter that the cursor is closest to.
+   * Used when selecting a letter to edit; when actively editing, `getInputCursorIndex` is used instead.
+   * @param {UiText} itext
+   */
+  static getCursorIndex = (itext) => {
+    const viewer = getViewer(itext);
+    const zoom = viewer.zoomLevel || 1;
+    // The word's client-space left edge, from the span's rect when present, else computed from model geometry.
+    const left = itext.el
+      ? itext.el.getBoundingClientRect().left
+      : viewer.zoomLayer.getBoundingClientRect().left + itext.getClientRect().x * zoom;
+    // Pointer x relative to the word's box-left origin, before the visual-coords side-bearing shift.
+    const relX = (UiText._lastPointerClient.x - left) / zoom - (itext.word.visualCoords ? itext.leftSideBearing : 0);
+
+    let letterIndex = 0;
+    let leftI = -itext.leftSideBearing;
+    for (let i = 0; i < itext.charArr.length; i++) {
+      // For most letters, the letter is selected if the pointer is in the left 75% of the advance.
+      // This could be rewritten to be more precise by using the actual bounding box of each letter,
+      // however this would require calculating additional metrics for each letter.
+      // The 75% rule is a compromise, as setting to 50% would be unintuitive for users trying to select the letter they want to edit,
+      // and setting to 100% would be unintuitive for users trying to position the cursor between letters.
+      // For the last letter, using the 75% rule would make it extremely difficult to select the end of the word.
+      const cutOffPer = i + 1 === itext.charArr.length ? 0.5 : 0.75;
+      const cutOff = leftI + itext.advanceArrTotal[i] * cutOffPer;
+      if (cutOff > relX) break;
+      letterIndex++;
+      leftI += itext.advanceArrTotal[i];
+    }
+    return letterIndex;
+  };
+
+  /**
+   * @param {string} text
+   * @param {number} fontSizeHTMLSmallCaps
+   */
+  static makeSmallCapsDivs = (text, fontSizeHTMLSmallCaps) => {
+    const textDivs0 = text.match(/([a-z]+)|([^a-z]+)/g);
+    if (!textDivs0) return '';
+    const textDivs = textDivs0.map((x) => {
+      const lower = /[a-z]/.test(x);
+      const styleStr = lower ? `style="font-size:${fontSizeHTMLSmallCaps}px"` : '';
+      return `<span class="input-sub" ${styleStr}>${x}</span>`;
+    });
+    return textDivs.join('');
+  };
+
+  /**
+   * Update word textbox following changes.
+   * Whenever a user edits a word in any way (including content and font/style),
+   * the position and character spacing need to be re-calculated so they still overlay with the background image.
+   * @param {UiText} wordI
+   */
+  static updateWordCanvas = (wordI) => {
+    // Re-calculate left position given potentially new left bearing.
+    const {
+      advanceArr, fontSize, kerningArr, charSpacing, charArr, leftSideBearing, rightSideBearing, font,
+    } = scribe.utils.calcWordMetrics(wordI.word, getViewer(wordI).doc.fonts);
+
+    const fm = measureFace(font.fontFaceName, font.fontFaceStyle, font.fontFaceWeight, fontSize);
+
+    wordI.charArr = charArr;
+
+    const charSpacingFinal = !wordI.dynamicWidth ? charSpacing : 0;
+
+    const advanceArrTotal = [];
+    for (let i = 0; i < advanceArr.length; i++) {
+      let leftI = 0;
+      leftI += advanceArr[i] || 0;
+      leftI += kerningArr[i] || 0;
+      leftI += charSpacingFinal || 0;
+      advanceArrTotal.push(leftI);
+    }
+
+    wordI.advanceArrTotal = advanceArrTotal;
+
+    wordI.charSpacing = charSpacingFinal;
+
+    wordI.leftSideBearing = leftSideBearing;
+
+    let width = wordI.dynamicWidth ? advanceArrTotal.reduce((a, b) => a + b, 0) : wordI.word.bbox.right - wordI.word.bbox.left;
+
+    // Subtract the side bearings from the width if they are not excluded from the `ocrWord` coordinates.
+    if (!wordI.dynamicWidth && !wordI.word.visualCoords) width -= (leftSideBearing + rightSideBearing);
+
+    wordI.width(width);
+
+    wordI.scaleX(1);
+
+    wordI.fontSize = fontSize;
+    wordI.height(fontSize * 0.6);
+    // Font size may have changed, so refresh the cached vertical metrics (see the constructor).
+    wordI.fontAscentPx = fm ? fm.asc : font.opentype.ascender / font.opentype.unitsPerEm * fontSize;
+    wordI.fontDescentPx = fm ? fm.desc : -font.opentype.descender / font.opentype.unitsPerEm * fontSize;
+
+    if (wordI.word.style.sup || wordI.word.style.dropcap) {
+      const lineObj = wordI.word.line;
+      wordI.yActual = wordI.topBaseline + (wordI.word.bbox.bottom - lineObj.bbox.bottom - lineObj.baseline[1]);
+    } else {
+      wordI.yActual = wordI.topBaseline;
+    }
+
+    let y = wordI.yActual - fontSize * 0.6;
+    if (!wordI.word.visualCoords && (wordI.word.style.sup || wordI.word.style.dropcap)) {
+      const fontDesc = fm ? -fm.desc : font.opentype.descender / font.opentype.unitsPerEm * fontSize;
+      y = wordI.yActual - fontSize * 0.6 + fontDesc;
+    }
+    wordI._y = y;
+
+    wordI.show();
+
+    if (wordI.el) wordI._styleElem(wordI.el);
+
+    // The word may have shifted or changed width. Keep its edit handles (if any) tracking its edges.
+    getViewer(wordI).repositionControls();
+
+    // A highlighted/marked word that moved or resized shifts its run's band, so rebuild the page's highlight layer.
+    if (wordI.highlightColor || wordI.markupType) getViewer(wordI).renderHighlights(wordI.word.line.page.n);
+
+    // The custom selection engine's text index caches this word's text and metrics, and the edit mutated the page in place, so an identity check cannot detect the staleness.
+    const viewer = getViewer(wordI);
+    if (viewer.useCustomSelection && viewer.textSel) {
+      const n = wordI.word.line.page.n;
+      viewer.textSel.invalidatePage(n);
+      viewer.scheduleMarkRepaint(n);
+      if (!viewer.textSel.isEmpty()) viewer.textSel.renderPage(n);
+    }
+
+    // The readings list hangs under the word, so it follows the word's new geometry.
+    readingsListSync(viewer);
+  };
+
+  /**
+   * Build the absolutely-positioned `<span>` for a word, used both as the editable input and as the read-only word element.
+   * @param {UiText} itext
+   * @param {object} [opts]
+   * @param {boolean} [opts.pad=true] - Add horizontal padding so an edit cursor is visible before the first / after the last letter.
+   * @returns {HTMLSpanElement}
+   */
+  static itextToElem = (itext, { pad = true } = {}) => itext._styleElem(document.createElement('span'), { pad, fresh: true });
+
+  /**
+   * Set cursor position to `index` within the input.
+   * @param {number} index
+   */
+  static setCursor = (index) => {
+    if (!UiText.input) {
+      console.error('Input element not found');
+      return;
+    }
+    const range = document.createRange();
+    const sel = /** @type {Selection} */ (window.getSelection());
+
+    let letterI = 0;
+    for (let i = 0; i < UiText.input.childNodes.length; i++) {
+      const node = UiText.input.childNodes[i];
+      const nodeLen = node.textContent?.length || 0;
+      if (letterI + nodeLen >= index) {
+        const textNode = node.nodeType === 3 ? node : node.childNodes[0];
+        range.setStart(textNode, index - letterI);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        break;
+      } else {
+        letterI += nodeLen;
+      }
+    }
+  };
+
+  /**
+   * Position and show the input for editing.
+   * @param {UiText} itext
+   * @param {?number} cursorIndex - Index to position the cursor at. If `null`, position is determined by mouse location.
+   *    If `-1`, the cursor is positioned at the end of the text.
+   */
+  static addTextInput = (itext, cursorIndex = null) => {
+    let letterIndex = cursorIndex ?? UiText.getCursorIndex(itext);
+    if (letterIndex < 0) letterIndex = itext.charArr.length;
+
+    if (UiText.inputRemove) UiText.inputRemove();
+
+    const inputElem = UiText.itextToElem(itext);
+    inputElem.contentEditable = 'plaintext-only';
+    // The editable input must stay selectable even in modes where `_styleElem` disables glyph selection on the read-only word,
+    // otherwise the caret cannot be placed and text cannot be selected while editing.
+    inputElem.style.userSelect = 'text';
+    inputElem.style.setProperty('-webkit-user-select', 'text');
+    // The input is cloned from a paint-only word (`listening: false` under the custom selection engine), so it inherits pointer events off, leaving the caret unclickable.
+    inputElem.style.pointerEvents = 'auto';
+    // The outline stroke divides by `--scribe-zoom` so the edit frame stays a hairline at any zoom, since the layer sits inside the zoom transform.
+    inputElem.style.outline = 'calc(2px / var(--scribe-zoom, 1)) solid rgba(40,123,181,1)';
+
+    UiText.inputWord = itext;
+    UiText.input = inputElem;
+    UiText.inputInnerHTMLLast = inputElem.innerHTML;
+    UiText.inputCursorLast = letterIndex;
+
+    const fontI = getViewer(itext).doc.fonts.getWordFont(itext.word);
+
+    const fontSizeHTMLSmallCaps = itext.fontSize * fontI.smallCapsMult;
+
+    inputElem.onbeforeinput = () => {
+      const index = getInputCursorIndex();
+      UiText.inputInnerHTMLLast = inputElem.innerHTML;
+      UiText.inputCursorLast = index;
+    };
+
+    if (itext.word.style.smallCaps) {
+      inputElem.oninput = () => {
+        const index = getInputCursorIndex();
+        const textContent = inputElem.textContent || '';
+        inputElem.innerHTML = UiText.makeSmallCapsDivs(textContent, fontSizeHTMLSmallCaps);
+        UiText.setCursor(index);
+        if (itext.inputTextCallback) itext.inputTextCallback(itext);
+      };
+    } else {
+      inputElem.oninput = () => {
+        if (itext.inputTextCallback) itext.inputTextCallback(itext);
+      };
+    }
+
+    UiText.inputRemove = () => {
+      if (!UiText.input) return;
+
+      let textNew = scribe.utils.ocr.replaceLigatures(UiText.input.textContent || '').trim();
+
+      if (UiText.smartQuotes) textNew = scribe.utils.replaceSmartQuotes(textNew);
+
+      // Words are not allowed to be empty.
+      if (textNew) {
+        itext.word.text = textNew;
+        // Style-run indices no longer match the edited text.
+        itext.word.styleRuns = undefined;
+        if (itext.changeTextCallback) itext.changeTextCallback(itext);
+      }
+      UiText.updateWordCanvas(itext);
+      UiText.input.remove();
+      UiText.input = null;
+      UiText.inputRemove = null;
+      UiText.inputWord = null;
+      UiText.inputInnerHTMLLast = '';
+      UiText.inputCursorLast = 0;
+      readingsListSync(getViewer(itext));
+    };
+
+    UiText.input.addEventListener('blur', () => (UiText.inputRemove));
+    UiText.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && UiText.inputRemove) {
+        UiText.inputRemove();
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    });
+
+    // Mount the input in the page's content space so it tracks scroll and zoom.
+    // A word with no span uses its page text group, which is the same space.
+    const parent = itext.el?.parentNode
+      || getViewer(itext).getTextGroup(itext.word.line.page.n, itext.word.line.orientation)
+      || document.body;
+    parent.appendChild(UiText.input);
+
+    UiText.input.focus();
+
+    /**
+     * Returns the cursor position relative to the start of the text box, including all text nodes.
+     * @returns {number}
+     */
+    const getInputCursorIndex = () => {
+      const sel = /** @type {Selection} */ (window.getSelection());
+      // The anchor node may be either (1) a text node or (2) a `<span>` element that contains a text element.
+      const anchor = /** @type {Node} */ (sel.anchorNode);
+      let index = sel.anchorOffset;
+
+      /**
+       * @param {Node} node
+       */
+      const getPrevTextNode = (node) => {
+        if (node.previousSibling && node.previousSibling.nodeType === 3) return node.previousSibling;
+
+        if (node.parentNode instanceof HTMLElement) {
+          if (node.parentNode.classList.contains('scribe-word')) return undefined;
+        }
+
+        const prevSibling = node.parentNode?.previousSibling;
+
+        if (prevSibling) {
+          if (prevSibling.nodeType === 3) return prevSibling;
+          return prevSibling.childNodes[0];
+        }
+
+        return undefined;
+      };
+
+      let node = getPrevTextNode(anchor);
+      while (node) {
+        index += node.textContent?.length || 0;
+        node = getPrevTextNode(node);
+      }
+
+      return index;
+    };
+
+    UiText.setCursor(letterIndex);
+
+    // Hide the read-only word while editing so only the input shows.
+    itext.hide();
+    // The readings list stays out of the way while the editor is open.
+    readingsListSync(getViewer(itext));
+  };
+}
+
+export class UiOcrWord extends UiText {
+  /**
+   * @param {Object} options
+   * @param {number} options.visualLeft
+   * @param {number} options.yActual
+   * @param {number} options.topBaseline
+   * @param {OcrWord} options.word
+   * @param {number} options.rotation
+   * @param {boolean} options.outline - Draw black outline around text.
+   * @param {boolean} options.fillBox
+   * @param {boolean} [options.activeMatch=false]
+   * @param {boolean} options.listening
+   * @param {?string} [options.highlightColor=null]
+   * @param {number} [options.highlightOpacity=1]
+   * @param {?string} [options.highlightGroupId=null]
+   * @param {string} [options.highlightComment='']
+   * @param {?('underline'|'strikeout')} [options.markupType=null]
+   * @param {?string} [options.markupColor=null]
+   * @param {number} [options.markupOpacity=1]
+   * @param {?string} [options.markupGroupId=null]
+   * @param {string} [options.markupComment='']
+   * @param {import('../viewer.js').ScribeViewer} [options.viewer]
+   * @param {boolean} [options.dom=true] - Build the word's `<span>`. See `UiText`.
+   */
+  constructor({
+    visualLeft, yActual, topBaseline, word, rotation = 0,
+    outline = false, fillBox = false, activeMatch = false, listening = true, highlightColor = null, highlightOpacity = 1,
+    highlightGroupId = null, highlightComment = '',
+    markupType = null, markupColor = null, markupOpacity = 1, markupGroupId = null, markupComment = '',
+    viewer, dom = true,
+  }) {
+    const { fill, opacity } = scribe.utils.ocr.getWordFillOpacity(word, viewer?.state.displayMode ?? 'invis',
+      scribe.ScribeDoc.defaults.confThreshMed, scribe.ScribeDoc.defaults.confThreshHigh, scribe.ScribeDoc.defaults.overlayOpacity);
+
+    super({
+      x: visualLeft,
+      yActual,
+      word,
+      rotation,
+      outline,
+      fillBox,
+      activeMatch,
+      opacity,
+      fill,
+      highlightColor,
+      highlightOpacity,
+      highlightGroupId,
+      highlightComment,
+      markupType,
+      markupColor,
+      markupOpacity,
+      markupGroupId,
+      markupComment,
+      changeTextCallback: () => {},
+      viewer,
+      dom,
+    });
+
+    this.listening(listening);
+
+    this.lastX = this.x();
+    this.lastWidth = this.width();
+    this.baselineAdj = 0;
+    this.topBaseline = topBaseline;
+    this.topBaselineOrig = topBaseline;
+  }
+
+  /**
+   * Move the word to a new line baseline, updating `topBaseline`/`yActual` and repositioning the element (setting the fields alone does not move it).
+   * Used for live feedback while the baseline-adjustment slider is dragged.
+   * It matches `updateWordCanvas`'s vertical math but skips the per-word character re-measure, which a baseline change does not affect.
+   * @param {number} topBaseline - New line baseline in page (content) space.
+   */
+  setBaseline(topBaseline) {
+    this.topBaseline = topBaseline;
+
+    // Superscripts and dropcaps sit off the line baseline by a fixed offset.
+    if (this.word.style.sup || this.word.style.dropcap) {
+      const lineObj = this.word.line;
+      this.yActual = topBaseline + (this.word.bbox.bottom - lineObj.bbox.bottom - lineObj.baseline[1]);
+    } else {
+      this.yActual = topBaseline;
+    }
+
+    let y = this.yActual - this.fontSize * 0.6;
+    if (!this.word.visualCoords && (this.word.style.sup || this.word.style.dropcap)) {
+      // `fontDescentPx` is the negated descender, so subtracting it adds the descent to the offset.
+      y -= this.fontDescentPx;
+    }
+    this.y(y);
+
+    // The slider moves the word vertically without going through `updateWordCanvas`,
+    // so reposition any edit handles here too, keeping them on the word's edges.
+    getViewer(this).repositionControls();
+
+    if (this.highlightColor || this.markupType) getViewer(this).renderHighlights(this.word.line.page.n);
+  }
+
+  /**
+   * Update the UI to reflect the properties of selected words.
+   * This should be called when any word is selected, after adding them to the selection.
+   */
+  static updateUI = () => {
+    for (const viewer of ScribeViewer.getAllViewers()) readingsListSync(viewer);
+  };
+
+  /**
+   * Add controls for editing the left/right bounds of a word: a draggable handle `<div>` on each vertical edge.
+   * @param {UiOcrWord} itext
+   */
+  static addControls = (itext) => {
+    const parent = itext.getParent();
+    if (!parent) throw new Error('Object must be added to a layer before drawing controls');
+
+    const viewer = getViewer(itext);
+
+    // White fill, blue border, and rounding make the handle read as a draggable grip rather than a flat bar.
+    // It extends a little above and below the word so it stands proud of the box edge instead of blending in.
+    const handleW = 8;
+    const handlePad = 3;
+    /**
+     * @param {'left'|'right'} side
+     */
+    const makeHandle = (side) => {
+      const handle = document.createElement('div');
+      handle.className = 'scribe-word-handle';
+      Object.assign(handle.style, {
+        position: 'absolute',
+        top: `${itext.y() - handlePad}px`,
+        height: `${itext.height() + handlePad * 2}px`,
+        width: `${handleW}px`,
+        marginLeft: `${-handleW / 2}px`,
+        boxSizing: 'border-box',
+        background: '#ffffff',
+        border: '1.5px solid rgba(40,123,181,1)',
+        borderRadius: `${handleW / 2}px`,
+        boxShadow: '0 1px 2px rgba(0,0,0,0.35)',
+        cursor: 'ew-resize',
+        zIndex: '3',
+        touchAction: 'none',
+        // The text group is `pointer-events: none`, so the handle must opt back in to receive its drags.
+        pointerEvents: 'auto',
+      });
+      const positionHandle = () => {
+        const px = side === 'left' ? itext.x() : itext.x() + itext.width();
+        handle.style.left = `${px}px`;
+        handle.style.top = `${itext.y() - handlePad}px`;
+        handle.style.height = `${itext.height() + handlePad * 2}px`;
+      };
+      positionHandle();
+
+      // Edge positions captured at pointerdown, so each move sets the dragged edge to its start plus the cumulative pointer delta.
+      // Adding the delta to the live bbox instead would re-apply the running total on every event, growing the box far beyond the pointer movement.
+      let startX = 0;
+      let startLeft = 0;
+      let startBboxLeft = 0;
+      let startBboxRight = 0;
+
+      /** @param {PointerEvent} e */
+      const onMove = (e) => {
+        const delta = (e.clientX - startX) / (viewer.zoomLevel || 1);
+        if (side === 'left') {
+          // Keep the dragged left edge at least 7px short of the fixed right edge.
+          const newBboxLeft = Math.min(startBboxLeft + delta, startBboxRight - 7);
+          itext.word.bbox.left = newBboxLeft;
+          itext.x(startLeft + (newBboxLeft - startBboxLeft));
+        } else {
+          // Keep the dragged right edge at least 7px past the fixed left edge.
+          itext.word.bbox.right = Math.max(startBboxRight + delta, startBboxLeft + 7);
+        }
+        // `updateWordCanvas` re-derives the element width from the bbox, so width is not set directly here.
+        UiText.updateWordCanvas(itext);
+        positionHandle();
+      };
+
+      /** @param {PointerEvent} e */
+      const onUp = (e) => {
+        handle.releasePointerCapture(e.pointerId);
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+      };
+
+      /** @param {PointerEvent} e */
+      handle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        startX = e.clientX;
+        startLeft = itext.x();
+        startBboxLeft = itext.word.bbox.left;
+        startBboxRight = itext.word.bbox.right;
+        handle.setPointerCapture(e.pointerId);
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', onUp);
+      });
+
+      /** @type {any} */ (handle).destroy = () => { if (handle.parentNode) handle.parentNode.removeChild(handle); };
+      /** @type {any} */ (handle).reposition = positionHandle;
+      return handle;
+    };
+
+    const leftHandle = makeHandle('left');
+    const rightHandle = makeHandle('right');
+    parent.appendChild(leftHandle);
+    parent.appendChild(rightHandle);
+
+    viewer._controlArr.push(/** @type {any} */ (leftHandle));
+    viewer._controlArr.push(/** @type {any} */ (rightHandle));
+  };
+}

@@ -2,6 +2,8 @@ import { drawColorLegend, getRandomAlphanum } from '../src/common.js';
 import { SVImageHandler } from './ui/SVImageHandler.js';
 import { SVWindow } from './ui/SVWindow.js';
 
+let scribeCanvasPromise = null;
+
 /**
  * There should never be more than 1 `ScrollView` object, as the use of `static` properties creates issues.
  * This is inherited from how the Java ScrollView code is written.
@@ -11,24 +13,25 @@ import { SVWindow } from './ui/SVWindow.js';
 export class ScrollView {
   /**
    *
-   * @param {Object} param
+   * @param {Object} [param]
    * @param {boolean} [param.lightTheme=false]
-   * @param {import('canvaskit-wasm').CanvasKit} [param.CanvasKit] - CanvasKit module. Must be defined if running in Node.js.
    */
   constructor({
     lightTheme = false,
-    CanvasKit,
-  }) {
-    if (typeof OffscreenCanvas === 'undefined' && !CanvasKit) {
-      throw new Error('CanvasKit module must be provided in environments that do not support OffscreenCanvas natively (i.e. Node.js).');
-    }
-
-    /** @type {import('canvaskit-wasm').CanvasKit} */
-    this.CanvasKit = /** @type {import('canvaskit-wasm').CanvasKit} */ (CanvasKit);
-
-    this.createCanvas = typeof process === 'undefined' ? (width, height) => (new OffscreenCanvas(width, height)) : (width, height) => this.CanvasKit.MakeCanvas(width, height);
+  } = {}) {
     this.lightTheme = lightTheme;
     this.svId = getRandomAlphanum(10);
+    this.createCanvas = (width, height) => new OffscreenCanvas(width, height);
+  }
+
+  async _init() {
+    if (this._initDone) return;
+    if (typeof process !== 'undefined') {
+      if (!scribeCanvasPromise) scribeCanvasPromise = import('@scribe.js/canvas');
+      const skia = await scribeCanvasPromise;
+      this.createCanvas = (width, height) => skia.createCanvas(width, height);
+    }
+    this._initDone = true;
   }
 
   /** @type {Object.<string, SVWindow>} */
@@ -50,6 +53,7 @@ export class ScrollView {
    * @returns
    */
   async getAll(createLegend = false) {
+    await this._init();
     /** @type {Object<string, DebugVis>} */
     const outputObj = {};
 
@@ -177,7 +181,7 @@ export class ScrollView {
       }
       console.assert(first);
     } else if (this.imageWaiting) {
-      const image = await SVImageHandler.readImage(inputLine, this.CanvasKit);
+      const image = await SVImageHandler.readImage(inputLine);
       this.windows[this.windowID].drawImageInternal(image, this.imageXPos, this.imageYPos);
       this.imageWaiting = false;
     } else {
@@ -371,6 +375,7 @@ export class ScrollView {
    * @param {string} inputStr
    */
   async processVisStr(inputStr) {
+    await this._init();
     const inputArr = inputStr.split(/[\r\n]+/).filter((x) => x);
     for (let i = 0; i < inputArr.length; i++) {
       await this.IOLoopWrapper(inputArr[i]);

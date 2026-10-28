@@ -1,7 +1,7 @@
 import ocr from '../objects/ocrObjects.js';
 import { LayoutDataTablePage } from '../objects/layoutObjects.js';
 import { calcWordCharMetrics } from '../utils/fontUtils.js';
-import { FontCont } from '../containers/fontContainer.js';
+import { GlobalFonts, DocFonts } from '../containers/fontContainer.js';
 
 const FONT_FAMILY = 'Times New Roman';
 const FONT_SIZE = 14;
@@ -11,14 +11,26 @@ const LINE_HEIGHT = 14.4;
 const MARGIN_VERTICAL = 30;
 const MARGIN_HORIZONTAL = 20;
 
-/** @type {?opentype.Font} */
+/**
+ * Lazily-resolved opentype object for `'Times New Roman'` used to compute text widths and metrics.
+ * Resolved once from `GlobalFonts.getFont` (process-wide built-ins) against a throwaway `DocFonts`,
+ * so the result is the same for every document. Not gated on per-doc state.
+ * @type {?opentypeFont}
+ */
 let fontOpentype = null;
+
+const resolveFontOpentype = () => {
+  if (!fontOpentype) {
+    fontOpentype = GlobalFonts.getFont({ font: FONT_FAMILY }, new DocFonts()).opentype;
+  }
+  return fontOpentype;
+};
 
 /**
  * Calculates the advance of a string in pixels.
  * @param {string} text
  * @param {number} size
- * @param {opentype.Font} font
+ * @param {opentypeFont} font
  */
 function getTextWidth(text, size, font) {
   const { advanceArr, kerningArr } = calcWordCharMetrics(text, font);
@@ -29,7 +41,6 @@ function getTextWidth(text, size, font) {
   const wordLastGlyphMetrics = font.charToGlyph(text.at(-1)).getMetrics();
   const wordFirstGlyphMetrics = font.charToGlyph(text[0]).getMetrics();
 
-  // The `leftSideBearing`/`rightSideBearing`/ numbers reported by Opentype.js are not accurate for mono-spaced fonts, so `xMin`/`xMax` are used instead.
   const wordLeftBearing = wordFirstGlyphMetrics.xMin || 0;
   const lastGlyphMax = wordLastGlyphMetrics.xMax || 0;
   const wordRightBearing = advanceArr[advanceArr.length - 1] - lastGlyphMax;
@@ -82,12 +93,10 @@ function splitIntoWords(line) {
 export async function convertPageText({ textStr, pageDims = null }) {
   let pageIndex = 0;
 
-  if (!fontOpentype) {
-    fontOpentype = (await FontCont.getFont({ font: FONT_FAMILY })).opentype;
-  }
+  const font = resolveFontOpentype();
 
-  const ASCENDER_HEIGHT = fontOpentype.ascender * (FONT_SIZE / fontOpentype.unitsPerEm);
-  const DESCENDER_HEIGHT = fontOpentype.descender * (FONT_SIZE / fontOpentype.unitsPerEm);
+  const ASCENDER_HEIGHT = font.ascender * (FONT_SIZE / font.unitsPerEm);
+  const DESCENDER_HEIGHT = font.descender * (FONT_SIZE / font.unitsPerEm);
 
   const lines = textStr.split(/\r?\n/);
 
@@ -187,7 +196,7 @@ export async function convertPageText({ textStr, pageDims = null }) {
       let lastConsumed = idx;
       for (let j = idx; j < wordTokens.length; j++) {
         const tok = wordTokens[j];
-        let tokWidth = getTextWidth(tok.text, FONT_SIZE, fontOpentype);
+        let tokWidth = getTextWidth(tok.text, FONT_SIZE, font);
         if (tok.isWhitespace) tokWidth += WORD_SPACING;
 
         if (tok.isWhitespace) {
@@ -231,7 +240,7 @@ export async function convertPageText({ textStr, pageDims = null }) {
       if (lineObj.words.length === 0) {
         const nextTok = wordTokens[idx];
         if (nextTok && !nextTok.isWhitespace) {
-          const tokWidth = getTextWidth(nextTok.text, FONT_SIZE, fontOpentype);
+          const tokWidth = getTextWidth(nextTok.text, FONT_SIZE, font);
           const wordBbox = {
             left: Math.round(currentX),
             top: lineTop,

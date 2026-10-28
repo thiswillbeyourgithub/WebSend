@@ -1,0 +1,683 @@
+import {
+  findXrefOffset, parseXref, getPageObjects, getPageContentStream, findFormXObjects, parseFormMatrix,
+} from './parsePdfUtils.js';
+import {
+  bytesToLatin1, matMul,
+} from './pdfPrimitives.js';
+import { tokenizeContentStream } from './contentStream.js';
+import { ObjectCache } from './objectCache.js';
+
+/**
+ * @typedef {{
+ *   type: 'M', x: number, y: number
+ * } | {
+ *   type: 'L', x: number, y: number
+ * } | {
+ *   type: 'C', x1: number, y1: number, x2: number, y2: number, x: number, y: number
+ * } | {
+ *   type: 'Z'
+ * }} PathCommand
+ */
+
+/**
+ * @typedef {{
+ *   commands: PathCommand[],
+ *   fill: boolean,
+ *   stroke: boolean,
+ *   evenOdd: boolean,
+ *   fillColor: number[],
+ *   fillColorSpace: string,
+ *   strokeColor: number[],
+ *   strokeColorSpace: string,
+ *   lineWidth: number,
+ *   lineCap: number,
+ *   lineJoin: number,
+ *   miterLimit: number,
+ *   dashArray: number[],
+ *   dashPhase: number,
+ * }} PaintedPath
+ */
+
+/**
+ * One painted path's hull AABB and identity signals, collected for the path-edit inventory.
+ * @typedef {{left: number, bottom: number, right: number, top: number, paint: 'f'|'s'|'fs', commands: number}} PathPlacement
+ */
+
+/**
+ * Extract all painted vector paths from a single page.
+ *
+ * @param {string} pageObjText - raw text of the Page object
+ * @param {ObjectCache} objCache
+ * @param {Array} [prefetchedTokens] - tokens from `tokenizeContentStream(getPageContentStream(...))`
+ * @param {{ imagePlacements?: Array<{left: number, bottom: number, right: number, top: number, objNum?: number}>, pathPlacements?: Array<PathPlacement>, initialCtm?: number[] }} [collect]
+ *   When `imagePlacements` is present, every image placement (a `Do` surviving form inlining, or an inline image) is appended as its unit square through the live CTM, in PDF points (y-up).
+ *   When `pathPlacements` is present, every painted path is appended as its hull AABB through the live CTM, in the same frame.
+ * @returns {PaintedPath[]}
+ */
+export function parsePagePaths(pageObjText, objCache, prefetchedTokens, collect) {
+  let tokens = prefetchedTokens;
+  if (!tokens) {
+    const contentStreamText = getPageContentStream(pageObjText, objCache);
+    if (!contentStreamText) return [];
+    tokens = tokenizeContentStream(contentStreamText);
+  }
+
+  const expanded = inlineFormXObjects(tokens, pageObjText, objCache, new Set());
+
+  return executePathOperators(expanded, collect);
+}
+
+/**
+ * Resolve Form XObject references in a token stream by inlining their content.
+ * Paths inside a form then execute under the form's /Matrix concatenated onto the CTM live at the `Do` site.
+ *
+ * @param {Array} tokens - tokenized content stream
+ * @param {string} containerObjText - object text of the container (page or form)
+ * @param {ObjectCache} objCache
+ * @param {Set<number>} visited - cycle detection
+ */
+function inlineFormXObjects(tokens, containerObjText, objCache, visited) {
+  // XObject names are scoped to their own container, so this recursive walk is the only place an image `Do` can be resolved to an object number.
+  /** @type {Map<string, number>} */
+  const imageObjNums = new Map();
+  const forms = findFormXObjects(containerObjText, objCache, imageObjNums);
+  if (forms.size === 0 && imageObjNums.size === 0) return tokens;
+
+  const result = [];
+  const operandStack = [];
+
+  // Indexed because for...of can allocate an iterator result object per token, and a page can hold millions of tokens.
+  for (let ti = 0; ti < tokens.length; ti++) {
+    const tok = tokens[ti];
+    if (tok.type !== 'operator') {
+      operandStack.push(tok);
+      result.push(tok);
+      continue;
+    }
+
+    if (tok.value === 'Do' && operandStack.length >= 1) {
+      const name = operandStack[operandStack.length - 1].value;
+      const imageObjNum = imageObjNums.get(name);
+      if (imageObjNum !== undefined) {
+        // The caller's prefetched tokens are shared with other walks, so the identity goes on a fresh token instead of onto `tok`.
+        result.push({ type: 'operator', value: 'Do', imageObjNum });
+        clearStack(operandStack);
+        continue;
+      }
+      const form = forms.get(name);
+      if (form && !visited.has(form.objNum)) {
+        result.pop();
+
+        visited.add(form.objNum);
+        const formObjText = objCache.getObjectText(form.objNum);
+        const formBytes = formObjText ? objCache.getStreamBytes(form.objNum) : null;
+        if (formObjText && formBytes) {
+          const formContentStream = bytesToLatin1(formBytes);
+          const formMatrix = parseFormMatrix(formObjText, objCache);
+
+          const formTokens = tokenizeContentStream(formContentStream);
+          const expanded = inlineFormXObjects(formTokens, formObjText, objCache, visited);
+
+          result.push({ type: 'operator', value: 'q' });
+          for (let mi = 0; mi < formMatrix.length; mi++) result.push({ type: 'number', value: formMatrix[mi] });
+          result.push({ type: 'operator', value: 'cm' });
+          for (let ei = 0; ei < expanded.length; ei++) result.push(expanded[ei]);
+          result.push({ type: 'operator', value: 'Q' });
+        }
+        clearStack(operandStack);
+        continue;
+      }
+    }
+
+    result.push(tok);
+    clearStack(operandStack);
+  }
+
+  return result;
+}
+
+/**
+ * Extract painted vector paths from every page in a PDF.
+ *
+ * @param {Uint8Array} pdfBytes
+ */
+export function extractAllPaths(pdfBytes) {
+  const xrefOffset = findXrefOffset(pdfBytes);
+  const xrefEntries = parseXref(pdfBytes, xrefOffset);
+  const objCache = new ObjectCache(pdfBytes, xrefEntries);
+
+  const pages = getPageObjects(objCache);
+  const result = [];
+
+  for (const { objText } of pages) {
+    result.push(parsePagePaths(objText, objCache));
+  }
+
+  return result;
+}
+
+/**
+ * Empty a reusable operand stack in place.
+ * `stack.length = 0` would make V8 drop the backing store and reallocate it on the next push.
+ * @param {Array<any>} stack
+ */
+function clearStack(stack) {
+  while (stack.length > 0) stack.pop();
+}
+
+/**
+ * Transform a point through a CTM.
+ * @param {number} x
+ * @param {number} y
+ * @param {number[]} ctm
+ */
+function transformPoint(x, y, ctm) {
+  return {
+    x: ctm[0] * x + ctm[2] * y + ctm[4],
+    y: ctm[1] * x + ctm[3] * y + ctm[5],
+  };
+}
+
+/**
+ * Approximate uniform scale factor of a CTM (square-root of the determinant).
+ * @param {number[]} ctm
+ */
+function ctmScale(ctm) {
+  return Math.sqrt(Math.abs(ctm[0] * ctm[3] - ctm[1] * ctm[2]));
+}
+
+/**
+ * Process tokenized content-stream operators and collect painted paths.
+ *
+ * @param {Array<import('./parsePdfDoc.js').PDFToken>} tokens
+ * @param {{ imagePlacements?: Array<{left: number, bottom: number, right: number, top: number, objNum?: number}>, pathPlacements?: Array<PathPlacement>, initialCtm?: number[] }} [collect]
+ * @returns {PaintedPath[]}
+ */
+function executePathOperators(tokens, collect) {
+  /** @type {PaintedPath[]} */
+  const paths = [];
+
+  let ctm = [1, 0, 0, 1, 0, 0];
+  let fillColor = [0, 0, 0];
+  let fillColorSpace = 'gray';
+  let strokeColor = [0, 0, 0];
+  let strokeColorSpace = 'gray';
+  let lineWidth = 1;
+  let lineCap = 0;
+  let lineJoin = 0;
+  let miterLimit = 10;
+  let dashArray = /** @type {number[]} */ ([]);
+  let dashPhase = 0;
+
+  const gstateStack = [];
+
+  /** @type {PathCommand[]} */
+  let currentPath = [];
+  let curX = 0;
+  let curY = 0;
+  let pathStartX = 0;
+  let pathStartY = 0;
+
+  /** @type {Array<any>} */
+  const operandStack = [];
+
+  function popNums(n) {
+    const start = operandStack.length - n;
+    const vals = new Array(n);
+    for (let k = 0; k < n; k++) vals[k] = operandStack[start + k].value;
+    clearStack(operandStack);
+    return vals;
+  }
+
+  /**
+   * Record the placed footprint of an image by transforming the unit square through the live CTM.
+   * An image always paints the unit square (PDF 32000-2 section 8.9.4), so its pixel dimensions do not affect the footprint.
+   * @param {number} [objNum]
+   */
+  function recordImagePlacement(objNum) {
+    if (!collect || !collect.imagePlacements) return;
+    const effCtm = collect.initialCtm ? matMul(ctm, collect.initialCtm) : ctm;
+    const corners = [
+      transformPoint(0, 0, effCtm), transformPoint(1, 0, effCtm),
+      transformPoint(0, 1, effCtm), transformPoint(1, 1, effCtm),
+    ];
+    let minX = Infinity; let maxX = -Infinity;
+    let minY = Infinity; let maxY = -Infinity;
+    for (const p of corners) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    const placement = {
+      left: minX, bottom: minY, right: maxX, top: maxY,
+    };
+    if (objNum !== undefined) placement.objNum = objNum;
+    collect.imagePlacements.push(placement);
+  }
+
+  function emitPath(fill, stroke, evenOdd) {
+    if (currentPath.length === 0) return;
+
+    const cmds = /** @type {PathCommand[]} */ ([]);
+    // The transform is written out because transformPoint allocates an object per point.
+    const [ca, cb, cc, cd, ce, cf] = ctm;
+    for (let cmdI = 0; cmdI < currentPath.length; cmdI++) {
+      const cmd = currentPath[cmdI];
+      switch (cmd.type) {
+        case 'M': case 'L': {
+          cmds.push({ type: cmd.type, x: ca * cmd.x + cc * cmd.y + ce, y: cb * cmd.x + cd * cmd.y + cf });
+          break;
+        }
+        case 'C': {
+          cmds.push({
+            type: 'C',
+            x1: ca * cmd.x1 + cc * cmd.y1 + ce,
+            y1: cb * cmd.x1 + cd * cmd.y1 + cf,
+            x2: ca * cmd.x2 + cc * cmd.y2 + ce,
+            y2: cb * cmd.x2 + cd * cmd.y2 + cf,
+            x: ca * cmd.x + cc * cmd.y + ce,
+            y: cb * cmd.x + cd * cmd.y + cf,
+          });
+          break;
+        }
+        case 'Z':
+          cmds.push({ type: 'Z' });
+          break;
+        // no default
+      }
+    }
+
+    paths.push({
+      commands: cmds,
+      fill,
+      stroke,
+      evenOdd,
+      fillColor: fillColor.slice(),
+      fillColorSpace,
+      strokeColor: strokeColor.slice(),
+      strokeColorSpace,
+      lineWidth: lineWidth * ctmScale(ctm),
+      lineCap,
+      lineJoin,
+      miterLimit,
+      dashArray: dashArray.slice(),
+      dashPhase,
+    });
+
+    // The renderer and the export walker must compute this same box, or a delete silently stops matching its path.
+    if (collect && collect.pathPlacements && cmds.length >= 2) {
+      let minX = Infinity; let maxX = -Infinity;
+      let minY = Infinity; let maxY = -Infinity;
+      for (let cmdI = 0; cmdI < cmds.length; cmdI++) {
+        const cmd = cmds[cmdI];
+        if (cmd.type === 'Z') continue;
+        if (cmd.type === 'C') {
+          if (cmd.x1 < minX) minX = cmd.x1; if (cmd.x1 > maxX) maxX = cmd.x1;
+          if (cmd.y1 < minY) minY = cmd.y1; if (cmd.y1 > maxY) maxY = cmd.y1;
+          if (cmd.x2 < minX) minX = cmd.x2; if (cmd.x2 > maxX) maxX = cmd.x2;
+          if (cmd.y2 < minY) minY = cmd.y2; if (cmd.y2 > maxY) maxY = cmd.y2;
+        }
+        if (cmd.x < minX) minX = cmd.x; if (cmd.x > maxX) maxX = cmd.x;
+        if (cmd.y < minY) minY = cmd.y; if (cmd.y > maxY) maxY = cmd.y;
+      }
+      if (minX <= maxX) {
+        if (collect.initialCtm) {
+          const corners = [
+            transformPoint(minX, minY, collect.initialCtm), transformPoint(maxX, minY, collect.initialCtm),
+            transformPoint(minX, maxY, collect.initialCtm), transformPoint(maxX, maxY, collect.initialCtm),
+          ];
+          minX = Infinity; maxX = -Infinity; minY = Infinity; maxY = -Infinity;
+          for (const p of corners) {
+            if (p.x < minX) minX = p.x;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.y > maxY) maxY = p.y;
+          }
+        }
+        collect.pathPlacements.push({
+          left: minX,
+          bottom: minY,
+          right: maxX,
+          top: maxY,
+          paint: fill && stroke ? 'fs' : (fill ? 'f' : 's'),
+          commands: cmds.length,
+        });
+      }
+    }
+
+    currentPath = [];
+  }
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+
+    if (tok.type === 'inlineImage') {
+      recordImagePlacement();
+      clearStack(operandStack);
+      continue;
+    }
+
+    if (tok.type !== 'operator') {
+      operandStack.push(tok);
+      continue;
+    }
+
+    const op = tok.value;
+
+    switch (op) {
+      // ── XObjects ─────────────────────────────────────────────────
+      case 'Do':
+        // Form XObjects were inlined before this walk (parsePagePaths), so a surviving `Do` is an image or a form that could not be inlined.
+        recordImagePlacement(tok.imageObjNum);
+        clearStack(operandStack);
+        break;
+
+      // ── Graphics state ────────────────────────────────────────────
+      case 'q':
+        gstateStack.push({
+          ctm: ctm.slice(),
+          fillColor: fillColor.slice(),
+          fillColorSpace,
+          strokeColor: strokeColor.slice(),
+          strokeColorSpace,
+          lineWidth,
+          lineCap,
+          lineJoin,
+          miterLimit,
+          dashArray: dashArray.slice(),
+          dashPhase,
+        });
+        clearStack(operandStack);
+        break;
+
+      case 'Q':
+        if (gstateStack.length > 0) {
+          const s = /** @type {typeof gstateStack[0]} */ (gstateStack.pop());
+          ctm = s.ctm;
+          fillColor = s.fillColor;
+          fillColorSpace = s.fillColorSpace;
+          strokeColor = s.strokeColor;
+          strokeColorSpace = s.strokeColorSpace;
+          lineWidth = s.lineWidth;
+          lineCap = s.lineCap;
+          lineJoin = s.lineJoin;
+          miterLimit = s.miterLimit;
+          dashArray = s.dashArray;
+          dashPhase = s.dashPhase;
+        }
+        clearStack(operandStack);
+        break;
+
+      case 'cm':
+        if (operandStack.length >= 6) {
+          const m = popNums(6);
+          ctm = matMul(m, ctm);
+        } else {
+          clearStack(operandStack);
+        }
+        break;
+
+      case 'w': // line width
+        if (operandStack.length >= 1) lineWidth = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'J': // line cap
+        if (operandStack.length >= 1) lineCap = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'j': // line join
+        if (operandStack.length >= 1) lineJoin = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'M': // miter limit
+        if (operandStack.length >= 1) miterLimit = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'd': // dash pattern  [array] phase d
+        if (operandStack.length >= 2) {
+          const phase = operandStack[operandStack.length - 1];
+          const arr = operandStack[operandStack.length - 2];
+          dashPhase = phase.value;
+          dashArray = arr.type === 'array' ? arr.value.map((v) => v.value) : [];
+        }
+        clearStack(operandStack);
+        break;
+
+      // ── Color operators ───────────────────────────────────────────
+      case 'g': // gray fill
+        if (operandStack.length >= 1) {
+          fillColor = popNums(1);
+          fillColorSpace = 'gray';
+        } else { clearStack(operandStack); }
+        break;
+
+      case 'G': // gray stroke
+        if (operandStack.length >= 1) {
+          strokeColor = popNums(1);
+          strokeColorSpace = 'gray';
+        } else { clearStack(operandStack); }
+        break;
+
+      case 'rg': // RGB fill
+        if (operandStack.length >= 3) {
+          fillColor = popNums(3);
+          fillColorSpace = 'rgb';
+        } else { clearStack(operandStack); }
+        break;
+
+      case 'RG': // RGB stroke
+        if (operandStack.length >= 3) {
+          strokeColor = popNums(3);
+          strokeColorSpace = 'rgb';
+        } else { clearStack(operandStack); }
+        break;
+
+      case 'k': // CMYK fill
+        if (operandStack.length >= 4) {
+          fillColor = popNums(4);
+          fillColorSpace = 'cmyk';
+        } else { clearStack(operandStack); }
+        break;
+
+      case 'K': // CMYK stroke
+        if (operandStack.length >= 4) {
+          strokeColor = popNums(4);
+          strokeColorSpace = 'cmyk';
+        } else { clearStack(operandStack); }
+        break;
+
+      case 'cs': // set fill color space (name)
+        if (operandStack.length >= 1) {
+          fillColorSpace = operandStack[operandStack.length - 1].value;
+        }
+        clearStack(operandStack);
+        break;
+
+      case 'CS': // set stroke color space (name)
+        if (operandStack.length >= 1) {
+          strokeColorSpace = operandStack[operandStack.length - 1].value;
+        }
+        clearStack(operandStack);
+        break;
+
+      case 'sc': case 'scn': // set fill color (operand count depends on color space)
+        if (operandStack.length >= 1) {
+          fillColor = operandStack.map((t) => t.value);
+        }
+        clearStack(operandStack);
+        break;
+
+      case 'SC': case 'SCN': // set stroke color
+        if (operandStack.length >= 1) {
+          strokeColor = operandStack.map((t) => t.value);
+        }
+        clearStack(operandStack);
+        break;
+
+      // ── Path construction ─────────────────────────────────────────
+      // In-place operand reads avoid a `popNums` array per operator, which adds up on vector pages.
+      case 'm': { // moveto
+        const len = operandStack.length;
+        if (len >= 2) {
+          curX = operandStack[len - 2].value; curY = operandStack[len - 1].value;
+          pathStartX = curX; pathStartY = curY;
+          currentPath.push({ type: 'M', x: curX, y: curY });
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'l': { // lineto
+        const len = operandStack.length;
+        if (len >= 2) {
+          curX = operandStack[len - 2].value; curY = operandStack[len - 1].value;
+          currentPath.push({ type: 'L', x: curX, y: curY });
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'c': { // curveto (x1 y1 x2 y2 x3 y3)
+        const len = operandStack.length;
+        if (len >= 6) {
+          currentPath.push({
+            type: 'C',
+            x1: operandStack[len - 6].value,
+            y1: operandStack[len - 5].value,
+            x2: operandStack[len - 4].value,
+            y2: operandStack[len - 3].value,
+            x: operandStack[len - 2].value,
+            y: operandStack[len - 1].value,
+          });
+          curX = operandStack[len - 2].value; curY = operandStack[len - 1].value;
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'v': { // curveto: first control point = current point (x2 y2 x3 y3)
+        const len = operandStack.length;
+        if (len >= 4) {
+          currentPath.push({
+            type: 'C',
+            x1: curX,
+            y1: curY,
+            x2: operandStack[len - 4].value,
+            y2: operandStack[len - 3].value,
+            x: operandStack[len - 2].value,
+            y: operandStack[len - 1].value,
+          });
+          curX = operandStack[len - 2].value; curY = operandStack[len - 1].value;
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'y': { // curveto: last control point = endpoint (x1 y1 x3 y3)
+        const len = operandStack.length;
+        if (len >= 4) {
+          currentPath.push({
+            type: 'C',
+            x1: operandStack[len - 4].value,
+            y1: operandStack[len - 3].value,
+            x2: operandStack[len - 2].value,
+            y2: operandStack[len - 1].value,
+            x: operandStack[len - 2].value,
+            y: operandStack[len - 1].value,
+          });
+          curX = operandStack[len - 2].value; curY = operandStack[len - 1].value;
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'h': // closepath
+        currentPath.push({ type: 'Z' });
+        curX = pathStartX; curY = pathStartY;
+        clearStack(operandStack);
+        break;
+
+      case 're': { // rectangle (x y w h)
+        if (operandStack.length >= 4) {
+          const vals = popNums(4);
+          const [rx, ry, rw, rh] = vals;
+          currentPath.push({ type: 'M', x: rx, y: ry });
+          currentPath.push({ type: 'L', x: rx + rw, y: ry });
+          currentPath.push({ type: 'L', x: rx + rw, y: ry + rh });
+          currentPath.push({ type: 'L', x: rx, y: ry + rh });
+          currentPath.push({ type: 'Z' });
+          curX = rx; curY = ry;
+          pathStartX = rx; pathStartY = ry;
+        } else { clearStack(operandStack); }
+        break;
+      }
+
+      // ── Path painting ─────────────────────────────────────────────
+      case 'S': // stroke
+        emitPath(false, true, false);
+        clearStack(operandStack);
+        break;
+
+      case 's': // close + stroke
+        currentPath.push({ type: 'Z' });
+        emitPath(false, true, false);
+        clearStack(operandStack);
+        break;
+
+      case 'f': case 'F': // fill (non-zero winding)
+        emitPath(true, false, false);
+        clearStack(operandStack);
+        break;
+
+      case 'f*': // fill (even-odd)
+        emitPath(true, false, true);
+        clearStack(operandStack);
+        break;
+
+      case 'B': // fill + stroke (non-zero)
+        emitPath(true, true, false);
+        clearStack(operandStack);
+        break;
+
+      case 'B*': // fill + stroke (even-odd)
+        emitPath(true, true, true);
+        clearStack(operandStack);
+        break;
+
+      case 'b': // close + fill + stroke (non-zero)
+        currentPath.push({ type: 'Z' });
+        emitPath(true, true, false);
+        clearStack(operandStack);
+        break;
+
+      case 'b*': // close + fill + stroke (even-odd)
+        currentPath.push({ type: 'Z' });
+        emitPath(true, true, true);
+        clearStack(operandStack);
+        break;
+
+      case 'n': // end path (no paint — used for clipping)
+        currentPath = [];
+        clearStack(operandStack);
+        break;
+
+      // ── Clipping (modifies clip, then path is consumed by next paint/n) ──
+      case 'W': case 'W*':
+        // Clipping is applied implicitly; the path stays for the next paint op.
+        clearStack(operandStack);
+        break;
+
+      // ── Skip text/image/other operators ───────────────────────────
+      default:
+        clearStack(operandStack);
+        break;
+    }
+  }
+
+  return paths;
+}

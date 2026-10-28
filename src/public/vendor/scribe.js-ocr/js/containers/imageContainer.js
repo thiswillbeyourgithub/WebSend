@@ -1,52 +1,77 @@
 import {
   PageMetrics,
 } from '../objects/pageMetricsObjects.js';
-
-import { initMuPDFWorker } from '../../mupdf/mupdf-async.js';
-
-import { updateFontContWorkerMain } from '../fontContainerMain.js';
-import { pageMetricsAll } from './dataContainer.js';
-import {
-  FontCont,
-  FontContainerFont,
-  loadOpentype,
-} from './fontContainer.js';
+import { reassignOutlineIds } from '../objects/outlineObjects.js';
 
 import { gs } from '../generalWorkerMain.js';
 import { imageUtils, ImageWrapper } from '../objects/imageObjects.js';
 import { range } from '../utils/miscUtils.js';
 import { opt } from './app.js';
 
-import { TessScheduler } from '../../tess/TessScheduler.js';
+import { initPdfScheduler, PdfScheduler } from '../pdfWorkerMain.js';
+import { scribeDocDefaults } from './scribeDocDefaults.js';
+import { SKIPPED } from '../../tess/TessScheduler.js';
+import { ca } from '../canvasAdapter.js';
 
-let skipTextMode = false;
+/** @typedef {import('./scribeDoc.js').ScribeDoc} ScribeDoc */
 
-export class MuPDFScheduler {
-  constructor(scheduler, workers) {
-    this.scheduler = scheduler;
-    /** @type {Array<Awaited<ReturnType<typeof initMuPDFWorker>>>} */
-    this.workers = workers;
-    /**
-     * @param {Parameters<typeof import('../../mupdf/mupdf-worker.js').mupdf.pageText>[1]} args
-     * @returns {Promise<ReturnType<typeof import('../../mupdf/mupdf-worker.js').mupdf.pageText>>}
-     */
-    this.pageText = (args) => (this.scheduler.addJob('pageText', args));
-    /**
-     * @param {Parameters<typeof import('../../mupdf/mupdf-worker.js').mupdf.extractAllFonts>[1]} args
-     * @returns {Promise<ReturnType<typeof import('../../mupdf/mupdf-worker.js').mupdf.extractAllFonts>>}
-     */
-    this.extractAllFonts = (args) => (this.scheduler.addJob('extractAllFonts', args));
-    /**
-     * @param {Parameters<typeof import('../../mupdf/mupdf-worker.js').mupdf.drawPageAsPNG>[1]} args
-     * @returns {Promise<ReturnType<typeof import('../../mupdf/mupdf-worker.js').mupdf.drawPageAsPNG>>}
-     */
-    this.drawPageAsPNG = (args, priorityJob = false) => (this.scheduler.addJob('drawPageAsPNG', args, priorityJob));
-    /**
-     * @param {Parameters<typeof import('../../mupdf/mupdf-worker.js').mupdf.pageAnnotations>[1]} args
-     * @returns {Promise<ReturnType<typeof import('../../mupdf/mupdf-worker.js').mupdf.pageAnnotations>>}
-     */
-    this.pageAnnotations = (args) => (this.scheduler.addJob('pageAnnotations', args));
+// Background renders can fail when they reuse a viewer render that is then dropped (skipped).
+// The background render retries when this happens.
+// This cap is an arbitrarily high number, and hitting indicates a logic error.
+const MAX_SKIPPED_RETRY = 32;
+
+// Above the largest size any surface displays a thumbnail at, so CSS only ever downscales and cells stay crisp on high-DPI screens.
+const THUMBNAIL_W = 300;
+
+/** @type {?boolean} */
+let _sabCapability = null;
+/**
+ * Check whether `SharedArrayBuffer` can actually be allocated and shared
+ * across workers in the current runtime. In Node (worker_threads) this is
+ * unconditional; in browsers it requires COOP/COEP / `crossOriginIsolated`.
+ * Probe result is memoized — capabilities don't change at runtime.
+ */
+function canUseSharedArrayBuffer() {
+  if (_sabCapability !== null) return _sabCapability;
+  try {
+    if (typeof SharedArrayBuffer === 'undefined') return (_sabCapability = false);
+    if (typeof process !== 'undefined') {
+      // eslint-disable-next-line no-new
+      new SharedArrayBuffer(1);
+      return (_sabCapability = true);
+    }
+    if (globalThis.crossOriginIsolated !== true) return (_sabCapability = false);
+    // eslint-disable-next-line no-new
+    new SharedArrayBuffer(1);
+    return (_sabCapability = true);
+  } catch {
+    return (_sabCapability = false);
   }
+}
+
+/**
+ * @param {import('../pdfWorkerMain.js').PdfScheduler | import('../pdfWorkerMain.js').PdfSchedulerInProcess} scheduler
+ */
+function poolCanShare(scheduler) {
+  return scheduler instanceof PdfScheduler && scheduler.workers.length > 0 && canUseSharedArrayBuffer();
+}
+
+/**
+ * The bytes to hand a scheduler's `loadPdfInAllWorkers`.
+ * @param {ArrayBuffer | Uint8Array} pdfData
+ * @param {boolean} usePdfSharedBuffer
+ * @param {import('../pdfWorkerMain.js').PdfScheduler | import('../pdfWorkerMain.js').PdfSchedulerInProcess} scheduler
+ * @returns {Uint8Array}
+ */
+function pdfBytesForScheduler(pdfData, usePdfSharedBuffer, scheduler) {
+  const bytes = pdfData instanceof Uint8Array ? pdfData : new Uint8Array(pdfData);
+  if (typeof SharedArrayBuffer !== 'undefined' && bytes.buffer instanceof SharedArrayBuffer) return bytes;
+  if (usePdfSharedBuffer && poolCanShare(scheduler)) {
+    const shared = new Uint8Array(new SharedArrayBuffer(bytes.byteLength));
+    shared.set(bytes);
+    return shared;
+  }
+  return bytes;
 }
 
 /**
@@ -64,19 +89,133 @@ export class MuPDFScheduler {
  * @property {?('color'|'gray'|'binary')} [colorMode]
  */
 
-// TODO: Either separate out the imagebitmap again or edit so it does not get sent between threads.
-// Alternatively, if it is sent between threads, use it reather than making a new one.
-// Actually, definitely do that last option.
+let renderSourceIdCounter = 0;
 
-export class ImageCache {
-  /** @type {Array<ImageWrapper|Promise<ImageWrapper>>} */
-  static nativeSrc = [];
+/**
+ * One render origin: a PDF's worker pool and its bytes.
+ * Its `id` space is separate from `ScribeDoc.id`.
+ * Sources are shared by reference and refcounted,
+ * so a page copied between documents keeps rendering from its origin without reloading bytes or spawning workers.
+ */
+export class RenderSource {
+  /** @type {number} Process-unique source id. */
+  id;
+
+  /** @type {'pdf'} Kind of origin. Image-input pages are self-contained (their blob rides in `nativeSrc`) and never use a source. */
+  kind = 'pdf';
+
+  /**
+   * Original PDF bytes.
+   * It can alias the worker pool's shared memory, so it must never be written to.
+   * @type {?(ArrayBuffer | Uint8Array)}
+   */
+  pdfData = null;
+
+  /**
+   * Page count of `pdfData`.
+   * Page deletions shrink the document's live page counts but never this.
+   * @type {number}
+   */
+  sourcePageCount = 0;
+
+  /** @type {?(import('../pdfWorkerMain.js').PdfScheduler | import('../pdfWorkerMain.js').PdfSchedulerInProcess)} */
+  scheduler = null;
+
+  /** @type {?Promise<import('../pdfWorkerMain.js').PdfScheduler | import('../pdfWorkerMain.js').PdfSchedulerInProcess>} */
+  #schedulerReady = null;
+
+  /** @type {boolean} */
+  #reloadOnWake = false;
+
+  /** @type {number} Live documents referencing this source; the pool is terminated only when this returns to 0. */
+  refCount = 0;
+
+  /** @type {?number} Fixed worker-pool size for this source. Null uses the global sizing. */
+  workerN = null;
+
+  /**
+   * The source document's optimized substitute fonts, carried for overlay fidelity of pages copied out of it.
+   * Placeholder in v1 (the basic editor is invisible-text-only), populated when font fidelity lands.
+   * @type {?Object}
+   */
+  optFonts = null;
+
+  /** @type {?Object} The source document's user-uploaded fonts, carried the same way. Placeholder in v1. */
+  uploadedFonts = null;
+
+  /** @param {number} id */
+  constructor(id) { this.id = id; }
+
+  /**
+   * Get or lazily initialize this source's dedicated PDF worker pool (or the in-process equivalent when `opt.inProcess` is set).
+   * @returns {Promise<import('../pdfWorkerMain.js').PdfScheduler | import('../pdfWorkerMain.js').PdfSchedulerInProcess>}
+   */
+  getScheduler = async () => {
+    if (this.scheduler) return this.scheduler;
+    if (!this.#schedulerReady) {
+      const spawn = initPdfScheduler(this.workerN ?? undefined).then(async (s) => {
+        if (this.#reloadOnWake && this.pdfData) {
+          await s.loadPdfInAllWorkers(pdfBytesForScheduler(this.pdfData, opt.usePdfSharedBuffer, s));
+          this.#reloadOnWake = false;
+        }
+        this.scheduler = s;
+        return s;
+      });
+      // A failed spawn must not poison the source for the session, so the next call retries.
+      spawn.catch(() => {
+        if (this.#schedulerReady === spawn) this.#schedulerReady = null;
+      });
+      this.#schedulerReady = spawn;
+    }
+    return this.#schedulerReady;
+  };
+
+  /**
+   * Release this source's worker pool while keeping the source reopenable.
+   * The retained `pdfData` is reloaded into a fresh pool by the next `getScheduler` call.
+   * No-op while the pool is already down.
+   * Do not call with jobs in flight (e.g. deferred text extraction), because pool teardown kills them.
+   */
+  suspend = async () => {
+    // A pool mid-spawn has no `scheduler` yet, so returning here would leak the finished pool unreachable.
+    if (!this.scheduler && this.#schedulerReady) await this.#schedulerReady.catch(() => {});
+    if (!this.scheduler) return;
+    const s = this.scheduler;
+    this.scheduler = null;
+    this.#schedulerReady = null;
+    this.#reloadOnWake = this.pdfData != null;
+    await s.terminate();
+  };
+
+  terminate = async () => {
+    if (!this.scheduler && this.#schedulerReady) await this.#schedulerReady.catch(() => {});
+    if (this.scheduler) {
+      await this.scheduler.terminate();
+      this.scheduler = null;
+      this.#schedulerReady = null;
+    }
+  };
+}
+
+/**
+ * Per-document image cache and registry of `RenderSource`s.
+ * Each page resolves its raster through `pageMetrics[n].sourceId`, so a page copied from another document renders from its origin.
+ */
+export class ImageStore {
+  /**
+   * Calibrated on a 464-document corpus: warm draw times cluster below ~120ms and only sparsely fill the 120-500ms band,
+   * so a page above this threshold is a genuine outlier.
+   */
+  static EXPENSIVE_DRAW_MS = 450;
 
   /** @type {Array<ImageWrapper|Promise<ImageWrapper>>} */
-  static native = [];
+  nativeSrc = [];
 
   /** @type {Array<ImageWrapper|Promise<ImageWrapper>>} */
-  static binary = [];
+  native = [];
+
+  /** @type {Array<ImageWrapper|Promise<ImageWrapper>>} */
+  binary = [];
 
   // These arrays store the properties of the images.
   // While they are redundant with the properties stored in the ImageWrapper objects,
@@ -84,13 +223,79 @@ export class ImageCache {
   // The imagewrappers are stored as promises, and needing to await them would break things without further changes.
   // See: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/await#control_flow_effects_of_await
   /** @type {Array<ImageProperties>} */
-  static nativeProps = [];
+  nativeProps = [];
 
   /** @type {Array<ImageProperties>} */
-  static binaryProps = [];
+  binaryProps = [];
 
-  /** @type {?ArrayBuffer} */
-  static pdfData = null;
+  /**
+   * Small low-resolution JPEG page previews (one Blob promise per page), rendered on demand by `renderThumbnail`.
+   * Fresh per document (a new doc gets a new `ImageStore`), so it never needs manual clearing.
+   * @type {Array<Promise<?Blob> | undefined>}
+   */
+  thumbnails = [];
+
+  /**
+   * Keyed by the Blob rather than the page index because reordering pages permutes `thumbnails`, leaving an index-keyed URL pointing at another page's image.
+   * @type {Map<Blob, string>}
+   */
+  thumbnailUrls = new Map();
+
+  /**
+   * Object URLs of thumbnails a page has replaced, per page index.
+   * Revoked once the page's next thumbnail URL is handed out, or on `clear`.
+   * @type {Array<Array<string> | undefined>}
+   */
+  retiredThumbnailUrls = [];
+
+  /**
+   * Estimated cost of re-rendering each display slot (ms), from its last render with one-time work excluded.
+   * @type {Array<number|undefined>}
+   */
+  renderDrawMs = [];
+
+  /**
+   * Whether page `n` measured as expensive to render (see `EXPENSIVE_DRAW_MS`).
+   * An unmeasured page reports `false`, taking the cheap-page policy until its first render supplies a measurement.
+   * @param {number} n - Page number
+   */
+  isRenderExpensive = (n) => (this.renderDrawMs[n] ?? 0) > ImageStore.EXPENSIVE_DRAW_MS;
+
+  /**
+   * Record the render-cost measurement for slot `n` from a render result's `perf`, if present.
+   * @param {number} n - Page number
+   * @param {{prepMs: number, drawMs: number, decodeMs: number, flushMs: number}} [perf]
+   */
+  #recordRenderCost(n, perf) {
+    if (!perf || typeof perf.drawMs !== 'number') return;
+    this.renderDrawMs[n] = Math.max(0, perf.drawMs - perf.decodeMs);
+  }
+
+  /**
+   * This document's render sources, keyed by source id: its own primary source plus any copied in from other documents.
+   * Image-input pages are self-contained (their raster is in `nativeSrc`) and are not in this map.
+   * @type {Map<number, RenderSource>}
+   */
+  sources = new Map();
+
+  /** @type {?number} Id of this document's own source in `sources` (the one `openMainPDF` loads into). */
+  primarySourceId = null;
+
+  /**
+   * The owning document.
+   * @type {ScribeDoc}
+   */
+  #doc;
+
+  /**
+   * @param {ScribeDoc} doc - The owning document.
+   */
+  constructor(doc) {
+    this.#doc = doc;
+  }
+
+  /** Owning document's page metrics array (held by reference, mutated in place by the doc). */
+  get #pageMetrics() { return this.#doc.pageMetrics; }
 
   /**
    * @param {ImagePropertiesRequest} props
@@ -99,15 +304,15 @@ export class ImageCache {
    * @param {boolean} [binary=false]
    * @returns {ImageProperties}
    */
-  static fillPropsDefault = (props, inputImage, n, binary = false) => {
+  fillPropsDefault = (props, inputImage, n, binary = false) => {
     /** @type {"binary" | "color" | "gray"} */
     let colorMode = 'binary';
     if (!binary) {
-      const color = props?.colorMode === 'color' || !props?.colorMode && opt.colorMode === 'color';
+      const color = props?.colorMode === 'color' || !props?.colorMode && scribeDocDefaults.colorMode === 'color';
       colorMode = color ? 'color' : 'gray';
     }
 
-    let pageAngle = pageMetricsAll[n].angle || 0;
+    let pageAngle = this.#pageMetrics[n].angle || 0;
     if (Math.abs(pageAngle) < 0.05) pageAngle = 0;
 
     // If no preference is specified for rotation, default to true.
@@ -125,97 +330,377 @@ export class ImageCache {
     };
   };
 
-  /** @type {?Promise<MuPDFScheduler>} */
-  static muPDFScheduler = null;
+  /**
+   * The records the viewer's renders of a display slot apply in place of the document's while a line is open in the editor.
+   * They are the document's records with that line's operators deleted.
+   * Renders for OCR and export keep the document's records.
+   * @type {Map<number, Array<ContentEdit>>}
+   */
+  #ephemeralRecords = new Map();
 
-  static loadCount = 0;
+  /**
+   * Set the records the viewer's renders of display slot `n` apply while a line is open, or clear them with null.
+   * The records apply from the page raster's next render.
+   * @param {number} n - Page number
+   * @param {?Array<ContentEdit>} records
+   */
+  setEphemeralRecords = (n, records) => {
+    if (records) this.#ephemeralRecords.set(n, records);
+    else this.#ephemeralRecords.delete(n);
+  };
 
-  static pageCount = 0;
+  /**
+   * Content-edit payload for display slot `n`'s render jobs.
+   * @param {number} n - Page number
+   * @param {boolean} forViewer - Whether the render serves the on-screen viewer, which shows the open line's ephemeral records.
+   * @returns {?RenderEdits}
+   */
+  #editsForPage = (n, forViewer) => {
+    const records = (forViewer && this.#ephemeralRecords.get(n)) || this.#doc.contentEdits?.pages?.[n] || [];
+    const dims = this.#pageMetrics[n]?.dims;
+    if (records.length === 0 || !dims) return null;
+    return { records, dims: { width: dims.width, height: dims.height } };
+  };
+
+  /** @type {Map<string, Promise<?{ program: ?import('../pdf/glyphResolve.js').EditFontProgram, faceName: ?string, bytes: ?ArrayBuffer }>>} */
+  #editFontCache = new Map();
+
+  /** @type {Map<string, { program: ?import('../pdf/glyphResolve.js').EditFontProgram, faceName: ?string, bytes: ?ArrayBuffer }>} */
+  #editFontResolved = new Map();
+
+  /**
+   * Fetch the font program for `fontObjNum` from display slot `n`'s source document.
+   * In a browser the program is also registered as a FontFace under the returned `faceName`, so the line editor can draw with the exact outlines the raster uses.
+   * @param {number} n - Page number
+   * @param {number} fontObjNum
+   */
+  getEditFont = (n, fontObjNum) => {
+    const pm = this.#pageMetrics[n];
+    const key = `${pm?.sourceId ?? 'p'}_${fontObjNum}`;
+    let entry = this.#editFontCache.get(key);
+    if (!entry) {
+      entry = (async () => {
+        const scheduler = await this.resolveSource(pm).getScheduler();
+        // The source page index lets a pool worker that never parsed that page resolve the font.
+        const payload = await scheduler.getPdfFontBytes({ fontObjNum, pageIndex: pm?.sourcePageN ?? n });
+        // A null payload is a failed lookup, not a font without a program.
+        // Caching it would lock the editor to a substitute face for the session.
+        if (!payload) this.#editFontCache.delete(key);
+        const { parseEditFontPayload } = await import('../pdf/glyphResolve.js');
+        const program = parseEditFontPayload(payload);
+        let faceName = null;
+        if (program?.font && payload?.bytes && typeof FontFace !== 'undefined') {
+          faceName = `_edit_d${this.#doc.id}_${key}`;
+          const { loadFontFace } = await import('./fontContainer.js');
+          const face = loadFontFace(faceName, 'normal', 'normal', payload.bytes);
+          await face.loaded;
+        }
+        const result = { program, faceName, bytes: payload?.bytes ?? null };
+        // Unlike the promise cache above, this keeps failures too, so a render-time consumer never re-fires a lookup that already answered.
+        this.#editFontResolved.set(key, result);
+        return result;
+      })();
+      this.#editFontCache.set(key, entry);
+      entry.catch(() => this.#editFontCache.delete(key));
+    }
+    return entry;
+  };
+
+  /**
+   * The resolution display slot `n`'s words were parsed at, or 0 when the slot is not backed by a PDF.
+   * @param {number} n - Page number
+   */
+  #parseDpi = (n) => {
+    const width300 = this.pdfDims300[n]?.width;
+    return width300 > 0 ? 300 * Math.min(width300, 3500) / width300 : 0;
+  };
+
+  /**
+   * The glyphs of the given words as display slot `n`'s source page draws them.
+   * @param {number} n - Page number
+   * @param {Array<TextEditWordSpec>} words
+   * @returns {Promise<?LineState>} Null when the page is not backed by a PDF.
+   */
+  getLineState = async (n, words) => {
+    const dpi = this.#parseDpi(n);
+    if (!dpi) return null;
+    const pm = this.#pageMetrics[n];
+    const scheduler = await this.resolveSource(pm).getScheduler();
+    return scheduler.getPdfLineState({
+      pageIndex: pm?.sourcePageN ?? n, dpi, records: this.#doc.contentEdits?.pages?.[n] || [], words,
+    });
+  };
+
+  /**
+   * The glyphs of a line of display slot `n` as a replacement would draw them, for the editor's preview.
+   * @param {number} n - Page number
+   * @param {import('../pdf/textPatch.js').TextEditRequest} req
+   * @returns {Promise<TextEditPreview>}
+   */
+  previewTextEdit = async (n, req) => {
+    const dpi = this.#parseDpi(n);
+    if (!dpi) return { refused: 'The page is not backed by a PDF.' };
+    const pm = this.#pageMetrics[n];
+    const scheduler = await this.resolveSource(pm).getScheduler();
+    return scheduler.previewPdfTextEdit({
+      pageIndex: pm?.sourcePageN ?? n, dpi, records: this.#doc.contentEdits?.pages?.[n] || [], req,
+    });
+  };
+
+  /**
+   * Ask the worker to turn an edit of display slot `n`'s words into patch records.
+   * The records are verified against a re-parse of the patched page.
+   * @param {number} n - Page number
+   * @param {import('../pdf/textPatch.js').TextEditRequest} req
+   * @param {string} [groupId]
+   * @returns {Promise<TextEditResult>}
+   */
+  applyTextEdit = async (n, req, groupId) => {
+    const dpi = this.#parseDpi(n);
+    if (!dpi) return { refused: 'The page is not backed by a PDF.' };
+    const pm = this.#pageMetrics[n];
+    const scheduler = await this.resolveSource(pm).getScheduler();
+    return scheduler.applyPdfTextEdit({
+      pageIndex: pm?.sourcePageN ?? n, dpi, records: this.#doc.contentEdits?.pages?.[n] || [], req, groupId,
+    });
+  };
+
+  /**
+   * The settled `getEditFont` result for `fontObjNum` on display slot `n`, or `undefined` when no lookup has settled.
+   * A settled entry with a null `faceName` means no usable face, so fall back rather than retry.
+   * @param {number} n - Page number
+   * @param {number} fontObjNum
+   */
+  getEditFontSync = (n, fontObjNum) => this.#editFontResolved.get(`${this.#pageMetrics[n]?.sourceId ?? 'p'}_${fontObjNum}`);
+
+  /** @type {Map<string, Promise<Type3GlyphHashes>>} */
+  #type3HashCache = new Map();
+
+  /** @type {Map<string, Type3GlyphHashes>} */
+  #type3HashResolved = new Map();
+
+  /**
+   * The outline hash of every Type 3 glyph in display slot `n`'s source document, keyed by font object number and character code.
+   * Requested once per source and kept for the document's life.
+   * @param {number} n - Page number
+   * @returns {Promise<Type3GlyphHashes>}
+   */
+  getType3GlyphHashes = (n) => {
+    const pm = this.#pageMetrics[n];
+    const key = pm?.sourceId ?? 'p';
+    let entry = this.#type3HashCache.get(key);
+    if (!entry) {
+      entry = (async () => {
+        const scheduler = await this.resolveSource(pm).getScheduler();
+        const res = await scheduler.getPdfType3GlyphHashes({});
+        /** @type {Type3GlyphHashes} */
+        const table = { fonts: new Map(), byHash: new Map() };
+        for (const f of res.fonts) {
+          const byCode = new Map();
+          for (let i = 0; i < f.codes.length; i++) {
+            byCode.set(f.codes[i], { hash: f.hashes[i], blank: f.blank[i] });
+            if (!f.hashes[i]) continue;
+            if (!table.byHash.has(f.hashes[i])) table.byHash.set(f.hashes[i], []);
+            table.byHash.get(f.hashes[i]).push([f.objNum, f.codes[i]]);
+          }
+          table.fonts.set(f.objNum, { byCode });
+        }
+        this.#type3HashResolved.set(key, table);
+        return table;
+      })();
+      this.#type3HashCache.set(key, entry);
+      entry.catch(() => this.#type3HashCache.delete(key));
+    }
+    return entry;
+  };
+
+  /**
+   * The settled `getType3GlyphHashes` answer for display slot `n`'s source, or `undefined` when no request has settled.
+   * @param {number} n - Page number
+   */
+  getType3GlyphHashesSync = (n) => this.#type3HashResolved.get(this.#pageMetrics[n]?.sourceId ?? 'p');
+
+  /**
+   * Drop every cached raster of display slot `n`.
+   * The viewer separately drops its own display-width raster and canvas for the page.
+   * @param {number} n - Page number
+   */
+  invalidatePageRender = (n) => {
+    this.native[n] = undefined;
+    this.binary[n] = undefined;
+    this.nativeProps[n] = undefined;
+    this.binaryProps[n] = undefined;
+    const oldThumb = this.thumbnails[n];
+    this.thumbnails[n] = undefined;
+    if (oldThumb) {
+      // A thumbnail rail keeps showing the old picture while the page re-renders, so this URL is retired instead of revoked.
+      Promise.resolve(oldThumb).then((blob) => {
+        if (!blob) return;
+        const url = this.thumbnailUrls.get(blob);
+        if (url) {
+          this.thumbnailUrls.delete(blob);
+          (this.retiredThumbnailUrls[n] ||= []).push(url);
+        }
+      }).catch(() => {});
+    }
+  };
+
+  /** This document's own (primary) render source, or `null` before one is created. @returns {?RenderSource} */
+  get #primarySource() {
+    return this.primarySourceId != null ? this.sources.get(this.primarySourceId) ?? null : null;
+  }
+
+  /** Get (creating if needed) this document's own render source. @returns {RenderSource} */
+  #ensurePrimarySource = () => {
+    let src = this.#primarySource;
+    if (!src) {
+      src = new RenderSource(++renderSourceIdCounter);
+      src.refCount = 1;
+      this.sources.set(src.id, src);
+      this.primarySourceId = src.id;
+    }
+    return src;
+  };
+
+  /**
+   * Resolve the render source for a page.
+   * `sourceId` is `null` for this document's own pages (the primary source) and a concrete id for pages copied in from another document.
+   * @param {import('../objects/pageMetricsObjects.js').PageMetrics} [pm]
+   * @returns {RenderSource}
+   */
+  resolveSource = (pm) => {
+    const id = pm?.sourceId ?? this.primarySourceId;
+    return (id != null && this.sources.get(id)) || this.#ensurePrimarySource();
+  };
+
+  /**
+   * Loaded PDF bytes for this document's own source.
+   * @type {?ArrayBuffer}
+   */
+  get pdfData() { return this.#primarySource?.pdfData ?? null; }
+
+  set pdfData(v) { this.#ensurePrimarySource().pdfData = v; }
+
+  /**
+   * The primary source's worker pool once initialized (else `null`). Accessor over the primary `RenderSource`.
+   * @type {?(import('../pdfWorkerMain.js').PdfScheduler | import('../pdfWorkerMain.js').PdfSchedulerInProcess)}
+   */
+  get pdfScheduler() { return this.#primarySource?.scheduler ?? null; }
+
+  /**
+   * Get or lazily initialize this document's own PDF worker pool (or the in-process equivalent when `opt.inProcess` is set).
+   * Delegates to the primary `RenderSource`.
+   * @returns {Promise<import('../pdfWorkerMain.js').PdfScheduler | import('../pdfWorkerMain.js').PdfSchedulerInProcess>}
+   */
+  getPdfScheduler = async () => this.#ensurePrimarySource().getScheduler();
+
+  loadCount = 0;
+
+  pageCount = 0;
 
   /**
    * The dimensions that each page would be, if it was rendered at 300 DPI.
    * @type {Array<dims>}
    */
-  static pdfDims300 = [];
+  pdfDims300 = [];
 
-  static inputModes = {
+  inputModes = {
     pdf: false,
     image: false,
   };
 
-  static colorModeDefault = 'gray';
+  colorModeDefault = 'gray';
 
   /**
-   * Initializes the MuPDF scheduler.
-   * This is separate from the function that loads the file (`#loadFileMuPDFScheduler`),
-   * as the scheduler starts loading ahead of the file being available for performance reasons.
-   * @param {number} [numWorkers]
+   * Render page `n` from its source and return it as an `ImageWrapper`.
+   * @param {number} n - Page number
+   * @param {boolean} [color=false]
+   * @param {boolean} [forViewer=false]
+   * @param {boolean} [wantBitmap=false] - Take the render as a transferable ImageBitmap (viewer display path) rather than a PNG data URL.
+   *   Ignored outside a browser.
+   * @returns {Promise<ImageWrapper | typeof SKIPPED>}
    */
-  static #initMuPDFScheduler = async (numWorkers) => {
-    // If `numbWorkers` is not specified, use up to 3 workers based on hardware concurrency
-    // and the global `opt.workerN` setting.
-    if (!numWorkers) {
-      if (typeof process === 'undefined') {
-        numWorkers = Math.min(Math.round((globalThis.navigator.hardwareConcurrency || 8) / 2), 3);
-      } else {
-        const cpuN = Math.floor((await import('node:os')).cpus().length / 2);
-        numWorkers = Math.max(Math.min(cpuN - 1, 3), 1);
-      }
-      if (opt.workerN && opt.workerN < numWorkers) {
-        numWorkers = opt.workerN;
-      }
-    }
-
-    const scheduler = new TessScheduler();
-    const workersPromiseArr = range(1, numWorkers).map(async () => {
-      const w = await initMuPDFWorker();
-      w.id = `png-${Math.random().toString(16).slice(3, 8)}`;
-      scheduler.addWorker(w);
-      return w;
-    });
-
-    const workers = await Promise.all(workersPromiseArr);
-
-    return new MuPDFScheduler(scheduler, workers);
-  };
-
-  /**
-   *
-   * @param {ArrayBuffer} fileData
-   * @returns
-   */
-  static #loadFileMuPDFScheduler = async (fileData) => {
-    const scheduler = await ImageCache.getMuPDFScheduler();
-
-    const workersPromiseArr = range(0, scheduler.workers.length - 1).map(async (x) => {
-      const w = scheduler.workers[x];
-
-      if (w.pdfDoc) await w.freeDocument(w.pdfDoc);
-
-      // The ArrayBuffer is transferred to the worker, so a new one must be created for each worker.
-      // const fileData = await file.arrayBuffer();
-      const fileDataCopy = fileData.slice(0);
-      const pdfDoc = await w.openDocument(fileDataCopy, 'document.pdf');
-      w.pdfDoc = pdfDoc;
-    });
-
-    await Promise.all(workersPromiseArr);
-  };
-
-  static #renderImage = async (n, color = false, priorityJob = false) => {
-    if (ImageCache.inputModes.image) {
-      return ImageCache.nativeSrc[n];
-    } if (ImageCache.inputModes.pdf) {
-      const pageMetrics = pageMetricsAll[n];
-      const targetWidth = pageMetrics.dims.width;
-      const dpi = 300 * (targetWidth / ImageCache.pdfDims300[n].width);
-      const muPDFScheduler = await ImageCache.getMuPDFScheduler();
-      return muPDFScheduler.drawPageAsPNG({
-        page: n + 1, dpi, color, skipText: skipTextMode,
-      }, priorityJob).then((res) => new ImageWrapper(n, res, color ? 'color' : 'gray'));
+  #renderImage = async (n, color = false, forViewer = false, wantBitmap = false) => {
+    if (this.inputModes.image) {
+      return this.nativeSrc[n];
+    } if (this.inputModes.pdf) {
+      const colorMode = color ? 'color' : 'gray';
+      const pm = this.#pageMetrics[n];
+      // Display slot `n` may hold a page copied from another document. Render it from its own source, not this doc's.
+      const pdfScheduler = await this.resolveSource(pm).getScheduler();
+      const targetWidth = pm.dims.width;
+      const dpi = 300 * (targetWidth / this.pdfDims300[n].width);
+      // Display slot `n` may have been reordered. Raster its source page, not its position.
+      const sourcePageN = pm.sourcePageN ?? n;
+      // The viewer's display path takes the rendered pixels as a transferable ImageBitmap, skipping the PNG encode/decode round-trip.
+      // Bitmap output needs OffscreenCanvas, so it is browser-only and Node always renders to PNG.
+      const outputFormat = wantBitmap && typeof OffscreenCanvas !== 'undefined' ? 'bitmap' : 'png';
+      const result = await pdfScheduler.renderPdfPage({
+        pageIndex: sourcePageN, colorMode, dpi, outputFormat, edits: this.#editsForPage(n, forViewer),
+      }, forViewer);
+      // The render was dropped from the queue (e.g. evicted to keep the viewer lane bounded).
+      if (result === SKIPPED) return SKIPPED;
+      this.#recordRenderCost(n, result.perf);
+      // A failure/blank render always returns a `dataUrl`, even when a bitmap was requested.
+      if (result.bitmap) return ImageWrapper.fromBitmap(n, result.bitmap, result.colorMode);
+      return new ImageWrapper(n, result.dataUrl, result.colorMode);
     }
     throw new Error('Attempted to render image without image input provided.');
   };
+
+  /**
+   * Render page `n` for viewer display at exactly `targetWidth` pixels wide.
+   * The result is not cached in `native[n]`, so `getNative` consumers (OCR, export, coordinates) still get the full-resolution render.
+   * @param {number} n - Page number
+   * @param {number} targetWidth - Raster width in pixels; `pageMetrics[n].dims.width` renders the same pixels `getNative` would.
+   * @param {boolean} [forViewer=true] - Render in the viewer lane: prioritized, but droppable to `SKIPPED`.
+   *   Pass `false` when the render must complete.
+   * @returns {Promise<ImageWrapper | typeof SKIPPED>}
+   */
+  renderViewerRaster = async (n, targetWidth, forViewer = true) => {
+    if (!this.inputModes.pdf) throw new Error('renderViewerRaster requires PDF input.');
+    const color = scribeDocDefaults.colorMode === 'color';
+    const pm = this.#pageMetrics[n];
+    // Display slot `n` may hold a page copied from another document. Render it from its own source, not this doc's.
+    const pdfScheduler = await this.resolveSource(pm).getScheduler();
+    // Display slot `n` may have been reordered. Raster its source page, not its position.
+    const sourcePageN = pm.sourcePageN ?? n;
+    const result = await pdfScheduler.renderPdfPage({
+      pageIndex: sourcePageN, colorMode: color ? 'color' : 'gray', targetWidth, outputFormat: 'bitmap', edits: this.#editsForPage(n, forViewer),
+    }, forViewer);
+    if (result === SKIPPED) return SKIPPED;
+    this.#recordRenderCost(n, result.perf);
+    if (result.bitmap) return ImageWrapper.fromBitmap(n, result.bitmap, result.colorMode);
+    // Failure placeholder (`ok: false`): a blank PNG so the page is still present.
+    return new ImageWrapper(n, result.dataUrl, result.colorMode);
+  };
+
+  /**
+   * Free the decoded bitmap(s) for page `n` to bound viewer memory (called for pages outside the viewer's retention window).
+   * @param {number} n - Page number
+   */
+  releaseBitmapCache = (n) => {
+    this.#releaseBitmap(this.native, n);
+    this.#releaseBitmap(this.binary, n);
+  };
+
+  /**
+   * Free the decoded bitmap for page `n` in one image store.
+   * @param {Array<?Promise<ImageWrapper|typeof SKIPPED>|?ImageWrapper>} store
+   * @param {number} n - Page number
+   */
+  // eslint-disable-next-line class-methods-use-this
+  #releaseBitmap(store, n) {
+    const entry = store[n];
+    if (!entry) return;
+    Promise.resolve(entry).then((img) => {
+      if (!img || img === SKIPPED) return;
+      // A src==null wrapper has no `src` to re-decode from, so freeing its bitmap would lose the image; the viewer's eviction-compression owns it.
+      if (img.src == null) return;
+      // String-backed wrapper: free only the decoded bitmap so the page can re-decode from `src` on revisit.
+      if (img.imageBitmap) img.imageBitmap = null;
+    }).catch(() => {});
+  }
 
   /**
    * @param {ImageWrapper} inputImage
@@ -224,8 +709,8 @@ export class ImageCache {
    *  Image properties should only be defined if needed, as they can require the image to be re-rendered.
    * @param {boolean} [saveNativeImage=true] - Whether the native image should be saved.
    */
-  static transformImage = async (inputImage, n, props, saveNativeImage = true) => {
-    let pageAngle = pageMetricsAll[n].angle || 0;
+  transformImage = async (inputImage, n, props, saveNativeImage = true) => {
+    let pageAngle = this.#pageMetrics[n].angle || 0;
     if (Math.abs(pageAngle) < 0.05) pageAngle = 0;
 
     // If no preference is specified for rotation, default to true.
@@ -237,11 +722,14 @@ export class ImageCache {
 
     await gs.getGeneralScheduler();
 
+    // Materialize `src` in case the input is a viewer-rendered bitmap-backed wrapper (no-op otherwise).
+    const inputSrc = inputImage.ensureSrc();
+
     const resPromise = (async () => {
       // Wait for non-rotated version before replacing with promise
       await gs.initTesseract({ anyOk: true });
       return gs.recognize({
-        image: inputImage.src,
+        image: inputSrc,
         options: { rotateRadians: angleArg, upscale: upscaleArg },
         output: {
           imageBinary: true, imageColor: saveNativeImage, debug: true, text: false, hocr: false, tsv: false, blocks: false,
@@ -267,155 +755,357 @@ export class ImageCache {
    * @param {ImagePropertiesRequest} [props] - Image properties needed.
    *  Image properties should only be defined if needed, as they can require the image to be re-rendered.
    * @param {boolean} [nativeOnly=true]
-   * @param {boolean} [priorityJob=false] - Whether to make this a priority job, cutting ahead of non-priority jobs.
-   *    This is used to keep the UI responsive when many jobs are queued.
+   * @param {boolean} [forViewer=false] - Whether this render serves the on-screen viewer.
+   *    Viewer renders are served ahead of background work, newest-first, and may be dropped (resolving to SKIPPED) when superseded.
    */
-  static getImages = (n, props, nativeOnly = true, priorityJob = false) => {
-    if (!ImageCache.inputModes.image && !ImageCache.inputModes.pdf) {
+  getImages = (n, props, nativeOnly = true, forViewer = false) => {
+    if (!this.inputModes.image && !this.inputModes.pdf) {
       return { native: undefined, binary: undefined };
     }
 
-    const significantRotation = Math.abs(pageMetricsAll[n].angle || 0) > 0.05;
+    const significantRotation = Math.abs(this.#pageMetrics[n].angle || 0) > 0.05;
 
-    const newNative = !ImageCache.native[n] || !imageUtils.compatible(ImageCache.nativeProps[n], props, significantRotation);
-    const newBinary = !nativeOnly && (!ImageCache.binary[n] || !imageUtils.compatible(ImageCache.binaryProps[n], props, significantRotation));
+    const nativeMissing = !this.native[n] || !imageUtils.compatible(this.nativeProps[n], props, significantRotation);
+    const newBinary = !nativeOnly && (!this.binary[n] || !imageUtils.compatible(this.binaryProps[n], props, significantRotation));
+    // Recognition releases each page's native raster as it finishes, so a binary read served from cache must not re-render it as a side effect.
+    // A native render is left to native consumers, or to a fresh binary that needs one as its derivation input.
+    const newNative = nativeMissing && (nativeOnly || newBinary);
 
     if (newNative || newBinary) {
-      const renderRaw = !ImageCache.native[n] || imageUtils.requiresUndo(ImageCache.nativeProps[n], props);
+      const renderRaw = !this.native[n] || imageUtils.requiresUndo(this.nativeProps[n], props);
       const propsRaw = {
-        colorMode: opt.colorMode, rotated: false, upscaled: false, n,
+        colorMode: scribeDocDefaults.colorMode, rotated: false, upscaled: false, n,
       };
       const renderTransform = newBinary || !imageUtils.compatible(propsRaw, props, significantRotation);
 
-      const propsNew = renderRaw ? propsRaw : JSON.parse(JSON.stringify(ImageCache.nativeProps[n]));
+      const propsNew = renderRaw ? propsRaw : JSON.parse(JSON.stringify(this.nativeProps[n]));
       propsNew.colorMode = props?.colorMode || propsNew.colorMode;
       propsNew.rotated = props?.rotated ?? propsNew.rotated;
       propsNew.upscaled = props?.upscaled ?? propsNew.upscaled;
       const propsNewBinary = JSON.parse(JSON.stringify(propsNew));
       propsNewBinary.colorMode = 'binary';
 
-      const inputNative = ImageCache.native[n];
-      if (newNative) ImageCache.nativeProps[n] = propsNew;
-      if (newBinary) ImageCache.binaryProps[n] = propsNewBinary;
+      const inputNative = this.native[n];
+      if (newNative) this.nativeProps[n] = propsNew;
+      if (newBinary) this.binaryProps[n] = propsNewBinary;
       const res = (async () => {
         /** @type {?ImageWrapper} */
         let img1;
         if (renderRaw) {
-          const color = props?.colorMode === 'color' || !props?.colorMode && opt.colorMode === 'color';
-          img1 = await ImageCache.#renderImage(n, color, priorityJob);
+          const color = props?.colorMode === 'color' || !props?.colorMode && scribeDocDefaults.colorMode === 'color';
+          // Take the fast ImageBitmap path only when this render feeds the viewer directly with no follow-on transform.
+          img1 = await this.#renderImage(n, color, forViewer, forViewer && !renderTransform);
         } else {
           img1 = await inputNative;
         }
+        // Render dropped from the queue: propagate the sentinel so callers leave a placeholder.
+        // The cache slot is cleared below so a later request for this page re-renders.
+        if (img1 === SKIPPED) return { native: SKIPPED, binary: SKIPPED };
         if (renderTransform) {
-          return ImageCache.transformImage(img1, n, props, true);
+          return this.transformImage(img1, n, props, true);
         }
         return { native: img1, binary: null };
       })();
 
-      if (newNative) ImageCache.native[n] = res.then((r) => r.native);
-      if (newBinary) ImageCache.binary[n] = res.then((r) => r.binary);
+      if (newNative) {
+        const nativeP = res.then((r) => r.native);
+        this.native[n] = nativeP;
+        nativeP.then((img) => {
+          if (img === SKIPPED && this.native[n] === nativeP) {
+            this.native[n] = undefined;
+            this.nativeProps[n] = undefined;
+          }
+        }).catch(() => {});
+      }
+      if (newBinary) {
+        const binaryP = res.then((r) => r.binary);
+        this.binary[n] = binaryP;
+        binaryP.then((img) => {
+          if (img === SKIPPED && this.binary[n] === binaryP) {
+            this.binary[n] = undefined;
+            this.binaryProps[n] = undefined;
+          }
+        }).catch(() => {});
+      }
     }
 
-    return { native: ImageCache.native[n], binary: ImageCache.binary[n] };
+    return { native: this.native[n], binary: this.binary[n] };
   };
 
   /**
    * @param {number} n
    * @param {ImagePropertiesRequest} [props]
-   * @param {boolean} [priorityJob=false] - Whether to make this a priority job, cutting ahead of non-priority jobs.
-   *    This is used to keep the UI responsive when many jobs are queued.
+   * @param {boolean} [forViewer=false] - Whether this render serves the on-screen viewer.
+   *    Viewer renders are served ahead of background work, newest-first, and may be dropped (resolving to SKIPPED) when superseded.
    */
-  static getNative = async (n, props, priorityJob) => ImageCache.getImages(n, props, true, priorityJob || false).native;
+  getNative = async (n, props, forViewer) => {
+    // Viewer callers want SKIPPED so they can leave a placeholder; pass it through.
+    if (forViewer) return this.getImages(n, props, true, true).native;
+    // Background (non-viewer) callers (OCR, export, coordinates, ...) cannot handle SKIPPED.
+    // A reused, then dropped, viewer render clears its own cache slot before we observe SKIPPED,
+    // so re-requesting renders fresh on the undroppable FIFO.
+    for (let i = 0; i < MAX_SKIPPED_RETRY; i++) {
+      const native = await this.getImages(n, props, true, false).native;
+      if (native !== SKIPPED) return native;
+    }
+    throw new Error(`getNative: render for page ${n} repeatedly dropped (SKIPPED).`);
+  };
+
+  /**
+   * Render (or return from cache) a small low-resolution preview of page `n`.
+   *
+   * For PDF input the page is drawn directly at thumbnail resolution and encoded in one pass by the renderer,
+   * so it never populates the full-resolution `native[]` cache and the few-KB Blob stays cheap to keep resident across a large document.
+   * The render uses the background lane (`forViewer = false`) so it can never delay an on-screen viewer render.
+   * For image input the full-resolution page image is already in memory, so it is drawn onto a small canvas and encoded the same way.
+   * @param {number} n - Page index.
+   * @param {number} [widthPx=150] - Target preview width in CSS px.
+   * @param {number} [quality=0.6] - JPEG/WebP quality (0-1). WebP quality 1.0 encodes losslessly in Chromium.
+   * @param {boolean} [fresh=false] - Render at exactly `widthPx`, bypassing the thumbnail cache: no cached Blob is returned (first-requested width otherwise wins) and the result is not cached.
+   * @param {'jpeg'|'webp'} [format='jpeg'] - Output encoding. The cache is format-blind, so a non-default format should pass `fresh`.
+   *   JPEG stays the default because Safari cannot encode WebP (an unsupported type falls back to PNG).
+   * @returns {Promise<?Blob>} An encoded image Blob, or `null` if the page cannot be rendered.
+   */
+  renderThumbnail = (n, widthPx = 150, quality = 0.6, fresh = false, format = 'jpeg') => {
+    if (!fresh && this.thumbnails[n]) return this.thumbnails[n];
+    if (!this.inputModes.image && !this.inputModes.pdf) return Promise.resolve(null);
+
+    const p = (async () => {
+      if (this.inputModes.pdf) {
+        const dims300 = this.pdfDims300[n];
+        if (!dims300) return null;
+        const pm = this.#pageMetrics[n];
+        // Display slot `n` may hold a page copied from another document, so render it from its own source, not this doc's.
+        const pdfScheduler = await this.resolveSource(pm).getScheduler();
+        const dpi = 300 * (widthPx / dims300.width);
+        // Display slot `n` may have been reordered, so raster its source page, not its position.
+        const sourcePageN = pm?.sourcePageN ?? n;
+        const result = await pdfScheduler.renderPdfPage({
+          pageIndex: sourcePageN, colorMode: 'color', dpi, outputFormat: format, quality, edits: this.#editsForPage(n, false),
+        }, false);
+        return result && result !== SKIPPED ? result.blob ?? null : null;
+      }
+      const native = await this.getNative(n);
+      if (!native) return null;
+      const bitmap = await ca.getImageBitmap(native.src);
+      const canvas = ca.makeCanvas(widthPx, Math.max(1, Math.round(widthPx * (bitmap.height / bitmap.width))));
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      ca.closeDrawable(bitmap);
+      // `type` for browsers, `mime` for the Node canvas fork: both are needed to get the requested (not PNG) encoding.
+      const mime = `image/${format}`;
+      const blob = await canvas.convertToBlob({ type: mime, mime, quality });
+      ca.closeDrawable(canvas);
+      return blob;
+    })();
+
+    // Whole-document render passes come through here, so caching fresh renders would hold an entire book of Blobs until close.
+    if (!fresh) {
+      this.thumbnails[n] = p;
+      // Clear the cache slot if the render failed, so a later call can retry.
+      p.then((r) => { if (r === null && this.thumbnails[n] === p) this.thumbnails[n] = undefined; })
+        .catch(() => { if (this.thumbnails[n] === p) this.thumbnails[n] = undefined; });
+    }
+    return p;
+  };
+
+  /**
+   * A single object URL for page `n`'s thumbnail, created once and reused by every display surface.
+   * @param {number} n
+   * @returns {Promise<?string>} The URL, or null if the page cannot be rendered.
+   */
+  thumbnailUrl = async (n) => {
+    const blob = await this.renderThumbnail(n, THUMBNAIL_W);
+    if (!blob) return null;
+    // Two `<img>` elements pointing at one URL share a single decode.
+    let url = this.thumbnailUrls.get(blob);
+    if (!url) {
+      url = URL.createObjectURL(blob);
+      this.thumbnailUrls.set(blob, url);
+    }
+    // Revoked a task later, once the caller has swapped its image over to the fresh URL.
+    const retired = this.retiredThumbnailUrls[n];
+    if (retired && retired.length > 0) {
+      this.retiredThumbnailUrls[n] = undefined;
+      setTimeout(() => { for (const old of retired) URL.revokeObjectURL(old); }, 0);
+    }
+    return url;
+  };
+
+  /**
+   * Render a PDF-backed page to a standalone image at a chosen resolution and encoding.
+   *
+   * The render does not populate the full-resolution `native[]` cache.
+   * It runs on the background lane, so it never delays an on-screen viewer render.
+   * @param {number} n - Page index.
+   * @param {Object} [options]
+   * @param {number} [options.dpi=300] - Render resolution in dots per inch (72 renders at the PDF's point size).
+   * @param {'png'|'jpeg'|'webp'|'bitmap'} [options.format='png'] - Output encoding.
+   * @param {number} [options.quality=0.6] - JPEG/WebP quality (0-1); ignored for 'png' and 'bitmap'.
+   * @param {'color'|'gray'} [options.colorMode='color'] - Output color mode.
+   * @returns {Promise<{dataUrl?: string, blob?: Blob, bitmap?: ImageBitmap, colorMode: string, ok: boolean, failReason?: string, failDetail?: string}>}
+   *   The image in `dataUrl` ('png'), `blob` ('jpeg'/'webp'), or `bitmap` ('bitmap').
+   *   `colorMode` is the mode actually used, which downgrades to 'gray' on a page with no color.
+   *   On failure `ok` is false and the image is a blank PNG `dataUrl`, whatever format was requested.
+   */
+  renderPageImage = async (n, options = {}) => {
+    if (!this.pdfDims300[n]) throw new Error(`renderPageImage requires a PDF-backed page; page ${n} is not backed by a PDF.`);
+    const pm = this.#pageMetrics[n];
+    // Display slot `n` may hold a page copied from another document, so render it from its own source, not this doc's.
+    const pdfScheduler = await this.resolveSource(pm).getScheduler();
+    // Display slot `n` may have been reordered, so raster its source page, not its position.
+    const sourcePageN = pm?.sourcePageN ?? n;
+    const result = await pdfScheduler.renderPdfPage({
+      pageIndex: sourcePageN,
+      colorMode: options.colorMode ?? 'color',
+      dpi: options.dpi ?? 300,
+      outputFormat: options.format ?? 'png',
+      quality: options.quality ?? 0.6,
+      edits: this.#editsForPage(n, false),
+    }, false);
+    // Background-lane renders are never superseded, so a drop here means the scheduler is misbehaving.
+    if (!result || result === SKIPPED) throw new Error(`renderPageImage: render for page ${n} was dropped.`);
+    return result;
+  };
 
   /**
    * @param {number} n
    * @param {ImagePropertiesRequest} [props]
-   * @param {boolean} [priorityJob=false] - Whether to make this a priority job, cutting ahead of non-priority jobs.
-   *    This is used to keep the UI responsive when many jobs are queued.
+   * @param {boolean} [forViewer=false] - Whether this render serves the on-screen viewer.
+   *    Viewer renders are served ahead of background work, newest-first, and may be dropped (resolving to SKIPPED) when superseded.
    */
-  static getBinary = async (n, props, priorityJob) => ImageCache.getImages(n, props, false, priorityJob || false).binary;
+  getBinary = async (n, props, forViewer) => {
+    if (forViewer) return this.getImages(n, props, false, true).binary;
+    for (let i = 0; i < MAX_SKIPPED_RETRY; i++) {
+      const binary = await this.getImages(n, props, false, false).binary;
+      if (binary !== SKIPPED) return binary;
+    }
+    throw new Error(`getBinary: render for page ${n} repeatedly dropped (SKIPPED).`);
+  };
 
   /**
-   * Pre-render a range of pages.
-   * This is generally not required, as individual image are rendered as needed.
+   * Pre-render pages.
+   * This is generally not required, as individual images are rendered as needed.
    * The primary use case is reducing latency in the UI by rendering images in advance.
    *
-   * @param {number} min - Min page to render.
-   * @param {number} max - Max page to render.
-   * @param {boolean} binary - Whether to render binary images.
-   * @param {ImagePropertiesRequest} [props]
+   * @param {Object} params
+   * @param {boolean} params.binary - Whether to render binary images.
+   * @param {?Array<number>} [params.pageArr=null] - Array of 0-based page indices to render. Overrides min/max when provided.
+   * @param {number} [params.min=0] - Min page to render (used when pageArr is not provided).
+   * @param {number} [params.max=0] - Max page to render (used when pageArr is not provided).
+   * @param {ImagePropertiesRequest} [params.props]
    */
-  static preRenderRange = async (min, max, binary, props) => {
-    const pagesArr = range(min, max);
+  preRenderRange = async ({
+    binary, pageArr = null, min = 0, max = 0, props,
+  }) => {
+    const pagesArr = pageArr || range(min, max);
     if (binary) {
-      await Promise.all(pagesArr.map((n) => ImageCache.getBinary(n, props).then(() => {
-        opt.progressHandler({ n, type: 'render', info: { } });
+      await Promise.all(pagesArr.map((n) => this.getBinary(n, props).then(() => {
+        this.#doc.progressHandler({ n, type: 'render', info: { } });
       })));
     } else {
-      await Promise.all(pagesArr.map((n) => ImageCache.getNative(n, props).then(() => {
-        opt.progressHandler({ n, type: 'render', info: { } });
+      await Promise.all(pagesArr.map((n) => this.getNative(n, props).then(() => {
+        this.#doc.progressHandler({ n, type: 'render', info: { } });
       })));
     }
   };
 
-  static clear = () => {
-    ImageCache.nativeSrc = [];
-    ImageCache.native = [];
-    ImageCache.binary = [];
-    ImageCache.inputModes.image = false;
-    ImageCache.inputModes.pdf = false;
-    ImageCache.pageCount = 0;
-    ImageCache.pdfDims300.length = 0;
-    ImageCache.loadCount = 0;
-    ImageCache.nativeProps.length = 0;
-    ImageCache.binaryProps.length = 0;
-  };
-
-  static terminate = async () => {
-    ImageCache.clear();
-    if (ImageCache.muPDFScheduler) {
-      const muPDFScheduler = await ImageCache.muPDFScheduler;
-      await muPDFScheduler.scheduler.terminate();
-      ImageCache.muPDFScheduler = null;
+  clear = () => {
+    for (const url of this.thumbnailUrls.values()) URL.revokeObjectURL(url);
+    this.thumbnailUrls.clear();
+    for (const retired of this.retiredThumbnailUrls) if (retired) for (const url of retired) URL.revokeObjectURL(url);
+    this.retiredThumbnailUrls = [];
+    this.nativeSrc = [];
+    this.native = [];
+    this.binary = [];
+    this.inputModes.image = false;
+    this.inputModes.pdf = false;
+    this.pageCount = 0;
+    this.pdfDims300.length = 0;
+    this.loadCount = 0;
+    this.nativeProps.length = 0;
+    this.binaryProps.length = 0;
+    this.renderDrawMs.length = 0;
+    this.#editFontCache.clear();
+    this.#editFontResolved.clear();
+    this.#type3HashCache.clear();
+    this.#type3HashResolved.clear();
+    if (typeof FontFace !== 'undefined') {
+      // `doc.clear()` reissues the id right after this call.
+      const prefix = `_edit_d${this.#doc.id}_`;
+      import('./fontContainer.js').then(({ unregisterFontFacesMatching }) => {
+        unregisterFontFacesMatching((family) => family.startsWith(prefix));
+      }).catch(() => {});
     }
   };
 
-  /**
-   * Gets the MuPDF scheduler if it exists, otherwise creates a new one.
-   * @param {number} [numWorkers] - Number of workers to create.
-   */
-  static getMuPDFScheduler = async (numWorkers) => {
-    if (ImageCache.muPDFScheduler) return ImageCache.muPDFScheduler;
-    ImageCache.muPDFScheduler = ImageCache.#initMuPDFScheduler(numWorkers);
-    return ImageCache.muPDFScheduler;
+  terminate = async () => {
+    this.clear();
+    // Release this document's refcount on each source, terminating only sources no other document still holds.
+    const orphaned = [];
+    for (const src of this.sources.values()) {
+      src.refCount -= 1;
+      if (src.refCount <= 0) orphaned.push(src);
+    }
+    this.sources.clear();
+    this.primarySourceId = null;
+    await Promise.all(orphaned.map((s) => s.terminate()));
   };
 
   /**
-   *
-   * @param {ArrayBuffer | Uint8Array | Blob} fileData
-   * @param {Boolean} [skipText=false] - Whether to skip native text when rendering PDF to image.
+   * @param {ArrayBuffer | Uint8Array | Blob | import('../import/nodeAdapter.js').FileNode} fileData
+   * @param {Object} [options]
+   * @param {boolean} [options.usePdfSharedBuffer] - Share the loaded PDF across PDF workers via
+   *    SharedArrayBuffer instead of cloning per worker. Defaults to `opt.usePdfSharedBuffer`.
+   * @param {number} [options.pdfWorkerN] - Fixed worker-pool size for this document's source.
    */
-  static openMainPDF = async (fileData, skipText = false) => {
-    // Start loading the scheduler ASAP. `pdfFile.arrayBuffer` can take time to run.
-    const muPDFSchedulerP = ImageCache.getMuPDFScheduler();
+  openMainPDF = async (fileData, options = {}) => {
+    const usePdfSharedBuffer = options.usePdfSharedBuffer ?? opt.usePdfSharedBuffer;
+    if (options.pdfWorkerN) this.#ensurePrimarySource().workerN = options.pdfWorkerN;
 
-    ImageCache.pdfData = fileData.arrayBuffer ? await fileData.arrayBuffer() : fileData;
+    const pdfScheduler = await this.getPdfScheduler();
 
-    const muPDFScheduler = await muPDFSchedulerP;
+    /** @type {ArrayBuffer | Uint8Array} */
+    let pdfData;
+    if (usePdfSharedBuffer && poolCanShare(pdfScheduler) && 'sharedBytes' in fileData && typeof fileData.sharedBytes === 'function') {
+      pdfData = await fileData.sharedBytes();
+    } else if (fileData instanceof ArrayBuffer) {
+      pdfData = fileData;
+    } else if (typeof fileData.arrayBuffer === 'function') {
+      pdfData = await fileData.arrayBuffer();
+    } else {
+      pdfData = fileData.buffer.slice(fileData.byteOffset, fileData.byteOffset + fileData.byteLength);
+    }
+    this.pdfData = pdfData;
 
-    await ImageCache.#loadFileMuPDFScheduler(ImageCache.pdfData);
+    const {
+      pageCount, pages, outline, attachments,
+    } = await pdfScheduler.loadPdfInAllWorkers(pdfBytesForScheduler(pdfData, usePdfSharedBuffer, pdfScheduler));
 
-    ImageCache.pageCount = await muPDFScheduler.workers[0].countPages();
+    this.pageCount = pageCount;
+    this.#ensurePrimarySource().sourcePageCount = pageCount;
+    // The outline was parsed in the worker, so renumber its ids from the main-thread counter to keep subsequent edits from colliding.
+    this.#doc.outline = reassignOutlineIds(outline || []);
+    // Embedded files and the portfolio collection, parsed in the worker beside the outline.
+    this.#doc.attachments.collection = attachments?.collection ?? null;
+    this.#doc.attachments.files = attachments?.files ?? [];
 
-    const pageDims1 = await muPDFScheduler.workers[0].pageSizes([300]);
+    this.pdfDims300.length = 0;
+    for (const page of pages) {
+      const widthPts = Math.abs(page.mediaBox[2] - page.mediaBox[0]);
+      const heightPts = Math.abs(page.mediaBox[3] - page.mediaBox[1]);
+      // /Rotate swaps the visual page dimensions for 90°/270°.
+      // The renderer and parser (parsePdfDoc.js) both operate in the
+      // post-rotation coordinate space, so pdfDims300 must match.
+      const rotated = page.rotate === 90 || page.rotate === 270;
+      const visualWidthPts = rotated ? heightPts : widthPts;
+      const visualHeightPts = rotated ? widthPts : heightPts;
+      const width = Math.round(visualWidthPts * 300 / 72);
+      const height = Math.round(visualHeightPts * 300 / 72);
+      this.pdfDims300.push({ width, height });
+    }
 
-    ImageCache.pdfDims300.length = 0;
-    pageDims1.forEach((x) => {
-      ImageCache.pdfDims300.push({ width: x[0], height: x[1] });
-    });
-
-    ImageCache.inputModes.pdf = true;
-    skipTextMode = skipText;
+    this.inputModes.pdf = true;
 
     // Set page metrics based on PDF dimensions.
     // This is always run, even though it is overwritten almost immediately by OCR data when it is uploaded.
@@ -425,25 +1115,11 @@ export class ImageCache {
 
     // For reasons that are unclear, a small number of pages have been rendered into massive files
     // so a hard-cap on resolution must be imposed.
-    const pageDPI = ImageCache.pdfDims300.map((x) => 300 * Math.min(x.width, 3500) / x.width);
+    const pageDPI = this.pdfDims300.map((x) => 300 * Math.min(x.width, 3500) / x.width);
 
-    ImageCache.pdfDims300.forEach((x, i) => {
+    this.pdfDims300.forEach((x, i) => {
       const pageDims = { width: Math.round(x.width * pageDPI[i] / 300), height: Math.round(x.height * pageDPI[i] / 300) };
-      pageMetricsAll[i] = new PageMetrics(pageDims);
+      this.#pageMetrics[i] = new PageMetrics(pageDims);
     });
-
-    // WIP: Extract fonts embedded in PDFs.
-    // This feature is disabled by default as the results are often bad.
-    // In addition to only working for certain font formats, fonts embedded in PDFs are often subsetted and/or corrupted.
-    // Therefore, before this is enabled by default, more sophisticated rules regarding when fonts should be used are needed.
-    if (opt.extractPDFFonts) {
-      muPDFScheduler.extractAllFonts().then(async (x) => {
-        for (let i = 0; i < x.length; i++) {
-          const src = x[i].buffer;
-          FontCont.addFontFromFile(src);
-        }
-        await updateFontContWorkerMain();
-      });
-    }
   };
 }

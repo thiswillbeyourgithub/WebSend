@@ -1,0 +1,228 @@
+/**
+ * Metadata scrubbing for the object-preserving PDF rebuild (subsetPdf/mergePdfs).
+ * Before each object is copied, this removes identifying metadata by dict parse, never regex:
+ * it drops `/Metadata`, `/PieceInfo`, `/AA` top-level keys (the referenced streams then orphan and are not copied),
+ * rewrites filename-leaking OCG layer names, and losslessly strips EXIF/XMP from embedded JPEG/JPX image streams.
+ *
+ * Companion reader: `metadataInspect.js`.
+ */
+import { extractDict, parseDictEntries, decodePdfString } from '../pdfPrimitives.js';
+import { extractRawStreamBytes } from '../parsePdfUtils.js';
+import { stripJpegMetadata, stripJpxMetadata } from './imageMetadata.js';
+
+// Top-level dict keys dropped from every copied object.
+// `Info` is included because outside the trailer a `/Info` key is only ever a document-information dictionary.
+// `LastModified` is a modification-timestamp key that remains after /PieceInfo is dropped.
+const DROP_ALWAYS = new Set(['Metadata', 'PieceInfo', 'AA', 'Info', 'LastModified']);
+// Matches a string that looks like a source filename or path (a leak to scrub).
+// Requires a real file extension or an absolute path, not just a slash, so benign names like "Headers/Footers" don't match.
+const FILENAME_LIKE = /\.(pdf|ai|psd|indd|tiff?|jpe?g|png|docx?|xlsx?|pptx?|eps|svg)\b|[A-Za-z]:\\|\/(?:Users|home|Volumes)\//i;
+// A path-like /URI is blanked as a leaked local path unless it begins with one of these functional URI schemes.
+const WEB_URI_SCHEME = /^\(\s*(?:https?|mailto|ftp|ftps|tel|news|geo|sms):/i;
+
+/**
+ * Dispatch to the right image-stream stripper for a PDF image /Filter.
+ * Returns bytes unchanged for filters that cannot carry identifying metadata (Flate/LZW/CCITT/JBIG2 raster data).
+ * @param {Uint8Array} bytes
+ * @param {string|null} filter - The image's /Filter (e.g. 'DCTDecode', 'JPXDecode').
+ * @returns {Uint8Array}
+ */
+function stripImageStreamMetadata(bytes, filter) {
+  if (!filter) return bytes;
+  if (filter.includes('DCTDecode')) return stripJpegMetadata(bytes);
+  if (filter.includes('JPXDecode')) return stripJpxMetadata(bytes);
+  return bytes;
+}
+
+// A document-information dictionary can hang off any key, so it must be recognised by content, not by the referring key.
+// Any of these fields marks a dict as doc-info, because they never appear on functional objects (unlike `/Title`).
+const INFO_STRONG = ['Author', 'Creator', 'Producer', 'Company', 'Manager'];
+// These fields are scrubbed from a dict already identified as info-like.
+// `/Title` is in the set but only dropped from such a dict, never from a functional one such as an outline item.
+const INFO_FIELDS = new Set([...INFO_STRONG, 'Title', 'Subject', 'Keywords', 'CreationDate', 'ModDate', 'Trapped']);
+
+/**
+ * The text the FILENAME_LIKE / WEB_URI_SCHEME leak tests should run on for one dict entry, with a ref to a string object resolved to its value.
+ * @param {string} valueText
+ * @param {import('../objectCache.js').ObjectCache|null} objCache
+ * @returns {string}
+ */
+function leakTestText(valueText, objCache) {
+  const t = valueText.trim();
+  const m = /^(\d+)\s+\d+\s+R$/.exec(t);
+  if (!m || !objCache) return t;
+  const body = (objCache.getObjectText(Number(m[1])) || '').trim();
+  // WEB_URI_SCHEME anchors on the open paren, so a resolved string is re-wrapped before testing.
+  if (body[0] === '(') return `(${decodePdfString(body)})`;
+  if (body[0] === '<' && body[1] !== '<') return `(${decodePdfString(body.slice(0, body.indexOf('>') + 1))})`;
+  return t;
+}
+
+/** True if a dict body is a document-information dictionary (see INFO_STRONG). */
+function bodyIsInfoLike(body) {
+  for (const e of parseDictEntries(body)) if (INFO_STRONG.includes(e.name)) return true;
+  return false;
+}
+
+// Reviewer-identity metadata on a markup annotation (a comment, not a Widget): author (`/T`), dates (`/CreationDate`, `/M`),
+// annotation name (`/NM`), and rich-text contents (`/RC`).
+// Dropping these keeps the comment visible via `/Contents` and `/AP`.
+const ANNOT_IDENTITY = new Set(['T', 'CreationDate', 'M', 'NM', 'RC']);
+
+/**
+ * True if a dict body is a markup annotation carrying author/date identity (not a form-field Widget).
+ * @param {string} body
+ * @returns {boolean}
+ */
+function bodyIsMarkupAnnot(body) {
+  let isAnnot = false;
+  let isWidget = false;
+  let hasIdentity = false;
+  for (const e of parseDictEntries(body)) {
+    if (e.name === 'Type' && /\/Annot\b/.test(e.valueText)) isAnnot = true;
+    else if (e.name === 'Subtype' && /\/Widget\b/.test(e.valueText)) isWidget = true;
+    else if (e.name === 'T' || e.name === 'CreationDate') hasIdentity = true;
+  }
+  return isAnnot && !isWidget && hasIdentity;
+}
+
+/** Balanced default: strip identifying data, keep accessibility/page-labels/viewer-prefs. */
+export function defaultScrubOpts() {
+  return {
+    stripStructTree: false, stripPageLabels: false, stripViewerPrefs: false, dropOCProperties: false,
+  };
+}
+
+/** True if a dict body has a top-level key this scrub would remove. */
+function bodyHasDropKey(body) {
+  for (const e of parseDictEntries(body)) if (DROP_ALWAYS.has(e.name)) return true;
+  return false;
+}
+
+/**
+ * Rebuild a dict body keeping only non-dropped entries.
+ * @returns {{dict: string, changed: boolean}} `dict` includes the `<<`/`>>` wrapper.
+ */
+function rebuildDict(body, { lengthOverride = null, ocgLabel = null, objCache = null } = {}) {
+  const kept = [];
+  let changed = false;
+  const infoLike = bodyIsInfoLike(body);
+  const markupAnnot = bodyIsMarkupAnnot(body);
+  for (const e of parseDictEntries(body)) {
+    if (DROP_ALWAYS.has(e.name)) { changed = true; continue; }
+    // A document-information dictionary hung off an arbitrary key: strip its identifying fields in place,
+    // leaving the (now-empty) object so whatever references it does not dangle.
+    if (infoLike && INFO_FIELDS.has(e.name)) { changed = true; continue; }
+    // A markup annotation: drop the reviewer's author/date identity, keeping the comment itself.
+    if (markupAnnot && ANNOT_IDENTITY.has(e.name)) { changed = true; continue; }
+    if (e.name === 'Length' && lengthOverride != null) { kept.push(`/Length ${lengthOverride}`); changed = true; continue; }
+    const testText = leakTestText(e.valueText, objCache);
+    if (e.name === 'Name' && ocgLabel && FILENAME_LIKE.test(testText)) { kept.push(`/Name (${ocgLabel})`); changed = true; continue; }
+    // Accessibility alt-text and actual-text often carry the source image's local path or filename.
+    // Drop only when the value looks like a path or filename, keeping real descriptions.
+    if ((e.name === 'Alt' || e.name === 'ActualText') && FILENAME_LIKE.test(testText)) { changed = true; continue; }
+    // A /URI action targeting a local file path (not a web hyperlink) leaks the author's filesystem/software.
+    // Blank it to keep the action well-formed while removing the path.
+    if (e.name === 'URI' && FILENAME_LIKE.test(testText) && !WEB_URI_SCHEME.test(testText.trim())) { kept.push('/URI ()'); changed = true; continue; }
+    // A string-valued /D or /Dest can embed a source filename.
+    // InDesign names its cross-reference destinations "<source-file>:anchor".
+    // The `(`-prefix check limits blanking to such strings, skipping array destinations `[...]` and the /OCProperties /D config dict `<<...>>` (a different use of /D).
+    if ((e.name === 'D' || e.name === 'Dest') && testText.trim().startsWith('(') && FILENAME_LIKE.test(testText)) { kept.push(`/${e.name} ()`); changed = true; continue; }
+    kept.push(`/${e.name} ${e.valueText}`);
+  }
+  if (lengthOverride != null && !kept.some((k) => k.startsWith('/Length '))) kept.push(`/Length ${lengthOverride}`);
+  return { dict: `<<${kept.join(' ')}>>`, changed };
+}
+
+/**
+ * Scrub a dict's text (non-stream): drop metadata keys and empty an info-like dict.
+ * Also serves as the trace-ref transform, so refs under a dropped key are not followed.
+ */
+export function scrubPageDictText(pageText) {
+  const dictStart = pageText.indexOf('<<');
+  if (dictStart === -1) return pageText;
+  const dictText = extractDict(pageText, dictStart);
+  const body = dictText.slice(2, -2);
+  if (!bodyHasDropKey(body) && !bodyIsInfoLike(body)) return pageText;
+  const { dict } = rebuildDict(body);
+  return pageText.slice(0, dictStart) + dict + pageText.slice(dictStart + dictText.length);
+}
+
+/**
+ * Scrub a referenced object that the rebuild is about to copy. Returns:
+ *  - `null` if no scrub needed (caller keeps the fast byte-for-byte copy),
+ *  - a string (scrubbed non-stream object),
+ *  - a `{header, streamData, trailer}` binary object (scrubbed stream object).
+ *
+ * @param {Uint8Array} pdfBytes
+ * @param {import('../objectCache.js').ObjectCache} objCache
+ * @param {{type:number, offset:number}} entry
+ * @param {number} objNum
+ * @param {{imageFilter:(n:number)=>string|null, ocgCounter:{n:number}}} scrubState
+ */
+export function scrubReferencedObject(pdfBytes, objCache, entry, objNum, scrubState) {
+  const objText = objCache.getObjectText(objNum);
+  if (!objText) return null;
+  const dictStart = objText.indexOf('<<');
+  if (dictStart === -1) return null;
+  const dictText = extractDict(objText, dictStart);
+  const body = dictText.slice(2, -2);
+
+  const isOCG = /\/Type\s*\/OCG\b/.test(objText);
+  const ocgLabel = isOCG ? `Layer ${scrubState.ocgCounter.n + 1}` : null;
+  const filter = scrubState.imageFilter ? scrubState.imageFilter(objNum) : null;
+  const isImage = /\/Subtype\s*\/Image\b/.test(objText);
+
+  const dropKey = bodyHasDropKey(body);
+  const infoLike = bodyIsInfoLike(body);
+  const markupAnnot = bodyIsMarkupAnnot(body);
+  const leakyOcg = isOCG && /\/Name\s*(?:[(<]|\d+\s+\d+\s+R)/.test(body) && parseDictEntries(body).some((e) => e.name === 'Name' && FILENAME_LIKE.test(leakTestText(e.valueText, objCache)));
+  const leakyAlt = /\/(?:Alt|ActualText)\s*(?:[(<]|\d+\s+\d+\s+R)/.test(body) && parseDictEntries(body).some((e) => (e.name === 'Alt' || e.name === 'ActualText') && FILENAME_LIKE.test(leakTestText(e.valueText, objCache)));
+  // A link action carrying a filename/path: a local-file /URI, or a string-valued named destination /D or /Dest that embeds a source filename.
+  const leakyLink = /\/(?:URI|D|Dest)\s*(?:\(|\d+\s+\d+\s+R)/.test(body) && parseDictEntries(body).some((e) => {
+    const t = leakTestText(e.valueText, objCache);
+    return (e.name === 'URI' && FILENAME_LIKE.test(t) && !WEB_URI_SCHEME.test(t.trim()))
+      || ((e.name === 'D' || e.name === 'Dest') && t.trim().startsWith('(') && FILENAME_LIKE.test(t));
+  });
+  const streamKw = objText.indexOf('stream', dictStart + dictText.length);
+  const isStream = streamKw !== -1;
+  const strippableImage = isImage && isStream && filter && (filter.includes('DCTDecode') || filter.includes('JPXDecode'));
+
+  if (!dropKey && !infoLike && !markupAnnot && !leakyOcg && !strippableImage && !leakyAlt && !leakyLink) return null;
+  if (isOCG && leakyOcg) scrubState.ocgCounter.n += 1;
+
+  if (!isStream) {
+    const { dict, changed } = rebuildDict(body, { ocgLabel, objCache });
+    return changed ? `${objNum} 0 obj\n${dict}\nendobj\n\n` : null;
+  }
+
+  // Stream object: re-emit dict + (possibly stripped) encoded stream, /Length corrected.
+  let raw;
+  try {
+    raw = extractRawStreamBytes(pdfBytes, entry.offset, objCache.encryptionKey ?? null, objCache.encryptObjNum ?? -1, objCache.cipherMode ?? '', objNum, objCache);
+  } catch { raw = null; }
+  if (!raw || !raw.data) return null; // cannot re-emit safely → leave to raw copy
+  let data = raw.data;
+  if (strippableImage) {
+    const stripped = stripImageStreamMetadata(data, filter);
+    if (stripped.length !== data.length) data = stripped;
+  }
+  const { dict } = rebuildDict(body, { lengthOverride: data.length, ocgLabel, objCache });
+  return { header: `${objNum} 0 obj\n${dict}\nstream\n`, streamData: data, trailer: '\nendstream\nendobj\n\n' };
+}
+
+/** Extract `/Key value` entries to carry forward onto the rebuilt catalog (keep-by-default structure). */
+export function catalogKeepEntries(catBody, opts) {
+  const keep = [];
+  const wants = {
+    StructTreeRoot: !opts.stripStructTree,
+    MarkInfo: !opts.stripStructTree,
+    Lang: true,
+    PageLabels: !opts.stripPageLabels,
+    ViewerPreferences: !opts.stripViewerPrefs,
+  };
+  for (const e of parseDictEntries(catBody)) {
+    if (wants[e.name]) keep.push({ name: e.name, valueText: e.valueText, tracing: e.valueText });
+  }
+  return keep;
+}

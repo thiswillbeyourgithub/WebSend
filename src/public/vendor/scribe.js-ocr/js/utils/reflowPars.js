@@ -1,5 +1,5 @@
 import { OcrPar } from '../objects/ocrObjects.js';
-import { calcBboxUnion, quantile, range } from './miscUtils.js';
+import { calcBboxUnion, quantile } from './miscUtils.js';
 
 /**
  * Assigns paragraphs based on our own heuristics.
@@ -54,6 +54,32 @@ export function assignParagraphs(page, angle) {
     y2Prev = line.bbox.bottom;
   }
 
+  // Ideally, we compare the current line to the next 5 lines.
+  // When there are fewer than 5 lines after the current line, we add previous lines to the window.
+  // Previous lines must be above the current line, and next lines must be below the current line.
+  // This avoids comparing lines that are not in the same column.
+  const windowSize = 5;
+  const medianScratch = /** @type {number[]} */ ([]);
+  /**
+   * Median of `arr` over the indices [lo1, hi1] and [lo2, hi2].
+   * @param {number[]} arr
+   * @param {number} lo1
+   * @param {number} hi1
+   * @param {number} lo2
+   * @param {number} hi2
+   */
+  const windowMedian = (arr, lo1, hi1, lo2, hi2) => {
+    let n = 0;
+    const insert = (v) => {
+      let k = n++;
+      while (k > 0 && medianScratch[k - 1] > v) { medianScratch[k] = medianScratch[k - 1]; k--; }
+      medianScratch[k] = v;
+    };
+    for (let x = lo1; x <= hi1; x++) insert(arr[x]);
+    for (let x = lo2; x <= hi2; x++) insert(arr[x]);
+    return medianScratch[Math.floor(n / 2)];
+  };
+
   /**
    * Calculates expected line start and end positions based on surrounding lines.
    * If this line varies from those values, it may be the first or last line of a paragraph.
@@ -61,31 +87,24 @@ export function assignParagraphs(page, angle) {
    * @returns
    */
   const calcExpected = (lineIndex) => {
-    // Ideally, we compare the current line to the next 5 lines.
-    // When there are fewer than 5 lines after the current line, we add previous lines to the window.
-    // Previous lines must be above the current line, and next lines must be below the current line.
-    // This avoids comparing lines that are not in the same column.
-    const windowSize = 5;
-    const linesPrev = page.lines.slice(Math.max(0, lineIndex - windowSize), lineIndex).filter((x) => x.bbox.bottom <= page.lines[lineIndex].bbox.bottom);
-    const linesNext = page.lines.slice(lineIndex + 1, lineIndex + windowSize + 1).filter((x) => x.bbox.bottom >= page.lines[lineIndex].bbox.bottom);
-    const linesNextN = linesNext.length;
-    const linesPrevN = Math.min(windowSize - linesNextN, linesPrev.length);
+    const bottom = page.lines[lineIndex].bbox.bottom;
+    // These checks only size the window, so it can include lines that fail them.
+    let prevQualifying = 0;
+    for (let x = Math.max(0, lineIndex - windowSize); x < lineIndex; x++) if (page.lines[x].bbox.bottom <= bottom) prevQualifying++;
+    let linesNextN = 0;
+    for (let x = lineIndex + 1; x <= lineIndex + windowSize && x < page.lines.length; x++) if (page.lines[x].bbox.bottom >= bottom) linesNextN++;
+    const linesPrevN = Math.min(windowSize - linesNextN, prevQualifying);
+    if (!linesPrevN && !linesNextN) return null;
 
-    /** @type {Array<number>} */
-    const compIndices = [];
-    if (linesPrevN) compIndices.push(...range(lineIndex - linesPrevN, lineIndex - 1));
-    if (linesNextN) compIndices.push(...range(lineIndex + 1, lineIndex + linesNextN));
-    if (!compIndices.length) return null;
-
-    const lineLeftMedian = quantile(compIndices.map((x) => lineLeftArr[x]), 0.5);
-    const lineRightMedian = quantile(compIndices.map((x) => lineRightArr[x]), 0.5);
-    const lineWidthMedian = quantile(compIndices.map((x) => lineWidthArr[x]), 0.5);
-    const lineSpaceMedian = quantile(compIndices.map((x) => lineSpaceArr[x]), 0.5);
-
-    if (lineLeftMedian === null || lineRightMedian === null || lineWidthMedian === null || lineSpaceMedian === null) return null;
-
+    const lo1 = lineIndex - linesPrevN;
+    const hi1 = lineIndex - 1;
+    const lo2 = lineIndex + 1;
+    const hi2 = lineIndex + linesNextN;
     return {
-      lineLeftMedian, lineRightMedian, lineWidthMedian, lineSpaceMedian,
+      lineLeftMedian: windowMedian(lineLeftArr, lo1, hi1, lo2, hi2),
+      lineRightMedian: windowMedian(lineRightArr, lo1, hi1, lo2, hi2),
+      lineWidthMedian: windowMedian(lineWidthArr, lo1, hi1, lo2, hi2),
+      lineSpaceMedian: windowMedian(lineSpaceArr, lo1, hi1, lo2, hi2),
     };
   };
 
@@ -94,8 +113,30 @@ export function assignParagraphs(page, angle) {
     let endsEarlyInt = false;
     let startsLate = false;
 
-    // For a bullet point list, the first line *after* the line containing the bullet point appears to be indented.
-    const bullet = /^([•◦▪▫●○◼◻➢«»]|((i+|\d+|[a-z])(\.|\)))$)/.test(line.words[0].text);
+    if (h > 0 && line.orientation !== page.lines[h - 1].orientation) {
+      newPar = true;
+      reason = 'orientation change';
+    }
+
+    // `bullet` is the lenient signal (used to suppress `indented` on the next line).
+    // `isRealListItem` is the stricter signal that actually triggers a new paragraph.
+    let bullet = /^([•◦▪▫●○◼◻➢«»]|((i+|\d+|[a-z])(\.|\)))$)/.test(line.words[0].text);
+    // `v.` is a case-name connector, never a list marker.
+    if (bullet && line.words[0].text === 'v.') bullet = false;
+    let isRealListItem = bullet;
+    if (isRealListItem && h > 0) {
+      const prevLine = page.lines[h - 1];
+      const prevLineLast = prevLine.words[prevLine.words.length - 1].text;
+      if (!/[.!?:]$/.test(prevLineLast)) isRealListItem = false;
+      else {
+        // The `.` at end of prev line may be an abbreviation inside a citation
+        // whose paren is still open (`…(MD Tenn.` → `1959) (per curiam)`).
+        const prevText = prevLine.words.map((w) => w.text).join('');
+        const lastOpen = prevText.lastIndexOf('(');
+        const lastClose = prevText.lastIndexOf(')');
+        if (lastOpen > lastClose) isRealListItem = false;
+      }
+    }
     // This will not work with non-English alphabets.  Should be replaced with a more general solution at some point.
     const lowerStart = /[a-z]/.test(line.words[0].text.slice(0, 1));
     const letterEnd = /\w/.test(line.words[line.words.length - 1].text.slice(-1));
@@ -104,7 +145,7 @@ export function assignParagraphs(page, angle) {
     // This heuristic can override some but not all other heuristics that would otherwise split the paragraph.
     const lowerConnection = lowerStart && letterEndPrev;
 
-    if (bullet && h > 0) {
+    if (isRealListItem && h > 0) {
       newPar = true;
       reason = 'bullet/list item';
     }
@@ -147,14 +188,51 @@ export function assignParagraphs(page, angle) {
 
       // Note: `+1` is used to indicate some non-infinitesimal difference, as sometimes infinitesimal differences exist, which are effectively 0.
 
-      // Line flagged as indented if both:
-      // (1) line to start to the right of the median line (by 2.5% of the median width) and
-      // (2) line to start to the right of the previous line and the next line.
-      const indented = lineLeftMedian && (h + 1) < page.lines.length && lineLeftArr[h] > (lineLeftMedian + lineWidthMedian * 0.025)
-        && lineLeftArr[h] > (lineLeftArr[h - 1] + 1) && lineLeftArr[h] > lineLeftArr[h + 1];
+      // Indented = starts right of median AND next line is less indented.
+      // Deliberately not compared to prev line: a body opener after a heading
+      // ("Opinion of the Court" → "Justice X delivered…") sits at the indent
+      // column without being right of the heading's left edge.
+      // Suppress on hanging-indent continuation (same left as prev, prev par's
+      // first line is less indented) — that's wrap text, not a new paragraph.
+      const parInProgress = parArr[parArr.length - 1];
+      const parFirstLineLeft = parLineIndices && parLineIndices.length > 0
+        ? lineLeftArr[parLineIndices[0]] : null;
+      const continuesPrevIndent = parInProgress
+        && parInProgress.lines.length >= 2
+        && lineLeftArr[h - 1] !== undefined
+        && Math.abs(lineLeftArr[h] - lineLeftArr[h - 1]) < (lineWidthMedian * 0.025)
+        && parFirstLineLeft !== null
+        && parFirstLineLeft < lineLeftArr[h] - (lineWidthMedian * 0.025);
+      // Catches the case `continuesPrevIndent` misses: a par whose own first
+      // line is already at the indent column wrapping to a second line at the
+      // same indent (CV entries, definitions).
+      const continuesAtSameIndent = parInProgress
+        && parInProgress.lines.length >= 1
+        && parInProgress.lines[parInProgress.lines.length - 1] === page.lines[h - 1]
+        && lineLeftArr[h - 1] !== undefined
+        && Math.abs(lineLeftArr[h] - lineLeftArr[h - 1]) < (lineWidthMedian * 0.025);
+      const indented = lineLeftMedian && (h + 1) < page.lines.length
+        && lineLeftArr[h] > (lineLeftMedian + lineWidthMedian * 0.025)
+        && lineLeftArr[h] > lineLeftArr[h + 1]
+        && !continuesPrevIndent
+        && !continuesAtSameIndent;
 
-      // All previous lines in paragraph have the same center point.
       const centerAlignedPrev = parLineIndices && parLineIndices.map((x) => lineCenterArr[x]).every((x) => Math.abs(x - lineCenterArr[h - 1]) < (lineWidthMedian * 0.0125));
+
+      // Fully-justified text trivially shares a center too. Require width variance
+      // as evidence of real centering vs. shared-edge alignment.
+      let trulyCenterAlignedPrev = false;
+      if (centerAlignedPrev && parLineIndices) {
+        if (parLineIndices.length > 1) {
+          trulyCenterAlignedPrev = parLineIndices.map((x) => lineWidthArr[x])
+            .some((x) => Math.abs(x - lineWidthArr[h - 1]) > (lineWidthMedian * 0.05));
+        } else if (parLineIndices.length === 1) {
+          const prevIdx = parLineIndices[0];
+          const sharedCenter = Math.abs(lineCenterArr[prevIdx] - lineCenterArr[h]) < (lineWidthMedian * 0.0125);
+          const widthDiffers = Math.abs(lineWidthArr[prevIdx] - lineWidthArr[h]) > (lineWidthMedian * 0.05);
+          trulyCenterAlignedPrev = sharedCenter && widthDiffers;
+        }
+      }
 
       // Line `h` and `h-1` have the same center point.
       const centerAligned = lineCenterArr[h - 1] && Math.abs(lineCenterArr[h - 1] - lineCenterArr[h]) < (lineWidthMedian * 0.0125);
@@ -220,7 +298,7 @@ export function assignParagraphs(page, angle) {
         reason = 'prev line starts late';
 
         // Add a line break if this line is indented
-      } else if (indented && !bulletPrev && !lowerConnection && !centerAlignedPrev) {
+      } else if (indented && !bulletPrev && !lowerConnection && !trulyCenterAlignedPrev) {
         newPar = true;
         reason = 'indentation';
 

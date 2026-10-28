@@ -1,0 +1,1779 @@
+import { InputData, opt } from './app.js';
+import { DocFonts } from './fontContainer.js';
+import { ImageStore } from './imageContainer.js';
+import { scribeDocDefaults } from './scribeDocDefaults.js';
+import { clearObjectProperties, getRandomAlphanum } from '../utils/miscUtils.js';
+import {
+  addHighlights as addHighlightsImpl, addFreeText as addFreeTextImpl, clearHighlights as clearHighlightsImpl,
+  addShapes as addShapesImpl, clearShapes as clearShapesImpl, addTextAnnots as addTextAnnotsImpl, clearTextAnnots as clearTextAnnotsImpl,
+  addRedactions as addRedactionsImpl, removeRedactions as removeRedactionsImpl,
+  addLinks as addLinksImpl, removeLinks as removeLinksImpl,
+} from '../addHighlights.js';
+import { resolveCitation as resolveCitationImpl } from '../resolveCitation.js';
+import { setType3GlyphMappings as setType3GlyphMappingsImpl } from '../type3GlyphMappings.js';
+import { assignPageLineNums } from '../import/assignPageLineNums.js';
+import { setFormValue as setFormValueImpl } from '../formFields.js';
+import { removeCircularRefsRegions, removeCircularRefsDataTables } from '../objects/layoutObjects.js';
+import {
+  addInk as addInkImpl, addStamp as addStampImpl, addFillText as addFillTextImpl, syncFillText as syncFillTextImpl,
+  detectFillTargets as detectFillTargetsImpl,
+} from '../fillSign.js';
+import {
+  deleteTextLines as deleteTextLinesImpl, replaceTextLine as replaceTextLineImpl, deleteImages as deleteImagesImpl, deleteGraphics as deleteGraphicsImpl, ContentEditHistory,
+} from '../textEdits.js';
+import { renderPageStatic as renderPageStaticImpl } from '../debug.js';
+import { exportData as exportDataImpl, download as downloadImpl } from '../export/export.js';
+import { subsetPdf, stripMetadataPdf } from '../export/pdf/subsetPdf.js';
+import { defaultScrubOpts } from '../pdf/metadata/scrubMetadata.js';
+import { getMetadataImpl } from '../pdf/metadata/metadataInspect.js';
+import { getResourceInventoryImpl } from '../pdf/resourceInventory.js';
+import { dropFromWorkers, enableOpt as enableFontOptImpl } from '../fontContainerMain.js';
+import {
+  recognize as recognizeImpl,
+  compareOCR as compareOCRImpl,
+  recognizePageImp as recognizePageImpImpl,
+  renderVis as renderVisImpl,
+  evalOCRPage as evalOCRPageImpl,
+  insertParsedPage as insertParsedPageImpl,
+} from '../recognizeConvert.js';
+import { importFiles as importFilesImpl, importFilesSupp as importFilesSuppImpl } from '../import/import.js';
+import {
+  remapOutline, cloneOutline, makeOutlineNode, findOutlineEntry, isOutlineDescendant, reassignOutlineIds,
+} from '../objects/outlineObjects.js';
+import { runOptimization as runOptimizationImpl } from '../fontEval.js';
+import { clonePage, reIdPage } from '../objects/ocrObjects.js';
+
+/**
+ * The distinct OCR/raw-OCR layer arrays.
+ * Deduped by identity because callers alias layers (e.g. the viewer sets `doc.ocr.active = doc.ocr.pdf`), so a shared array is spliced only once.
+ * @param {Object<string, Array<any>>} layers
+ * @returns {Array<Array<any>>}
+ */
+function uniqueLayers(layers) {
+  return [...new Set(Object.values(layers).filter(Array.isArray))];
+}
+
+/**
+ * Every dense per-page array that must stay index-aligned with `pageMetrics` under page delete/move.
+ * @param {ScribeDoc} doc
+ * @returns {Array<Array<any>>}
+ */
+function densePageArrays(doc) {
+  const arrs = [...uniqueLayers(doc.ocr), ...uniqueLayers(doc.ocrRaw)];
+  arrs.push(doc.pageMetrics, doc.layoutRegions.pages, doc.layoutDataTables.pages, doc.annotations.pages, doc.contentEdits.pages, doc.nativeText.pages, doc.fillShapes.pages);
+  if (Array.isArray(doc.vis)) arrs.push(doc.vis);
+  if (Array.isArray(doc.ocrTiming)) arrs.push(doc.ocrTiming);
+  if (Array.isArray(doc.convertPageWarn)) arrs.push(doc.convertPageWarn);
+  // Source image (image-input docs) and per-page 300-DPI dims are full-length; rendered caches are not (see clearImageCaches).
+  arrs.push(doc.images.nativeSrc, doc.images.pdfDims300);
+  if (Array.isArray(doc.inputData.xmlMode)) arrs.push(doc.inputData.xmlMode);
+  if (Array.isArray(doc.inputData.pageStats)) arrs.push(doc.inputData.pageStats);
+  if (Array.isArray(doc.inputData.ocrApplied)) arrs.push(doc.inputData.ocrApplied);
+  // Dedupe so any aliased array (e.g. ocr.active === ocr.pdf) is spliced exactly once.
+  return [...new Set(arrs)];
+}
+
+/**
+ * Drop the full-resolution render caches so they re-render against the edited page order.
+ * Thumbnails are deliberately not among these; page ops reorder that cache in place via `remapThumbnails` instead of re-rendering it.
+ * @param {ScribeDoc} doc
+ */
+function clearImageCaches(doc) {
+  const { images } = doc;
+  images.native.length = 0;
+  images.binary.length = 0;
+  images.nativeProps.length = 0;
+  images.binaryProps.length = 0;
+}
+
+/**
+ * Renumber the `.n` field on every per-page object whose identity carries its index.
+ * @param {ScribeDoc} doc
+ */
+function renumberPages(doc) {
+  for (const layer of uniqueLayers(doc.ocr)) {
+    for (let i = 0; i < layer.length; i++) if (layer[i]) layer[i].n = i;
+  }
+  const tag = (arr) => { for (let i = 0; i < arr.length; i++) if (arr[i]) arr[i].n = i; };
+  tag(doc.layoutRegions.pages);
+  tag(doc.layoutDataTables.pages);
+  tag(doc.images.nativeProps);
+  tag(doc.images.binaryProps);
+}
+
+/**
+ * Give every page a concrete `sourcePageN`, so a later reorder/delete can carry the real source index
+ * (the default `null` means "identity = my current index", valid only before any edit).
+ * @param {ScribeDoc} doc
+ */
+function materializeSourcePages(doc) {
+  for (let i = 0; i < doc.pageMetrics.length; i++) {
+    const pm = doc.pageMetrics[i];
+    if (pm && pm.sourcePageN == null) pm.sourcePageN = i;
+  }
+}
+
+/**
+ * Give every page a concrete `sourceId`, so a cross-document copy carries the real origin
+ * (the default `null` means "this document's primary source", valid only within the source document).
+ * Image-only documents have no PDF source, so nothing is materialized.
+ * @param {ScribeDoc} doc
+ */
+function materializeSourceIds(doc) {
+  const primaryId = doc.images.primarySourceId;
+  if (primaryId == null) return;
+  for (let i = 0; i < doc.pageMetrics.length; i++) {
+    const pm = doc.pageMetrics[i];
+    if (pm && pm.sourceId == null) pm.sourceId = primaryId;
+  }
+}
+
+/**
+ * Build an independent snapshot of every per-page array entry at index `i`, for later insertion via `insertPages`.
+ * Call `materializeSourcePages(doc)` and `materializeSourceIds(doc)` first so the cloned `pageMetrics.sourcePageN`/`sourceId` are concrete.
+ * @param {ScribeDoc} doc
+ * @param {number} i - Source page index.
+ */
+function snapshotPage(doc, i) {
+  // One clone per unique OCR array so aliased layers (e.g. `ocr.active === ocr.pdf`) share a single cloned page.
+  const ocrCache = new Map();
+  /** @type {Object<string, ?import('../objects/ocrObjects.js').OcrPage>} */
+  const ocr = {};
+  for (const [engine, arr] of Object.entries(doc.ocr)) {
+    if (!Array.isArray(arr) || i >= arr.length || !arr[i]) { ocr[engine] = null; continue; }
+    if (!ocrCache.has(arr)) ocrCache.set(arr, clonePage(arr[i]));
+    ocr[engine] = ocrCache.get(arr) ?? null;
+  }
+  // Give each cloned page fresh word ids so the paste is a distinct instance, not an id-for-id twin of its source.
+  // Otherwise highlight and selection, which are keyed on word id across the render window, would act on the copy and its source together.
+  // The active layer is re-id'd first so its entries win the merge: edit records reference active-layer words.
+  /** @type {Map<string, string>} */
+  const wordIdMap = new Map();
+  for (const p of new Set([ocr.active, ...Object.values(ocr)])) {
+    if (!p) continue;
+    for (const [oldId, newId] of reIdPage(p)) if (!wordIdMap.has(oldId)) wordIdMap.set(oldId, newId);
+  }
+  /** @type {Object<string, string>} */
+  const ocrRaw = {};
+  for (const [engine, arr] of Object.entries(doc.ocrRaw)) {
+    ocrRaw[engine] = Array.isArray(arr) && i < arr.length ? arr[i] : '';
+  }
+  const cloneAt = (arr) => (Array.isArray(arr) ? structuredClone(arr[i]) : undefined);
+  const refAt = (arr) => (Array.isArray(arr) ? arr[i] : undefined);
+  // Re-group the cloned highlight annotations so the copy's highlights form their own group.
+  // Otherwise deleting the source's highlight (matched by group id) would also clear the copy's, and vice-versa.
+  const annotations = cloneAt(doc.annotations.pages);
+  if (Array.isArray(annotations)) {
+    const groupIdMap = new Map();
+    for (const annot of annotations) {
+      if (!annot || annot.groupId == null) continue;
+      if (!groupIdMap.has(annot.groupId)) groupIdMap.set(annot.groupId, getRandomAlphanum(10));
+      annot.groupId = groupIdMap.get(annot.groupId);
+    }
+  }
+
+  const contentEdits = cloneAt(doc.contentEdits.pages);
+  if (Array.isArray(contentEdits)) {
+    const editGroupIdMap = new Map();
+    for (const rec of contentEdits) {
+      if (!rec) continue;
+      rec.id = getRandomAlphanum(10);
+      // A record's font object numbers belong to the source document, and a composed export renumbers objects.
+      // Keeping them would veto every glyph match on the pasted page, while unicode and origin still identify the text.
+      if (rec.glyphs) for (const g of rec.glyphs) delete g.fontObjNum;
+      if (rec.groupId == null) continue;
+      if (!editGroupIdMap.has(rec.groupId)) editGroupIdMap.set(rec.groupId, getRandomAlphanum(10));
+      rec.groupId = editGroupIdMap.get(rec.groupId);
+    }
+  }
+
+  const nativeTextSrc = cloneAt(doc.nativeText.pages);
+  /** @type {Record<string, NativeTextWord>} */
+  const nativeText = {};
+  if (nativeTextSrc) {
+    for (const [id, entry] of Object.entries(nativeTextSrc)) nativeText[wordIdMap.get(id) || id] = entry;
+  }
+
+  const fillShapes = cloneAt(doc.fillShapes.pages);
+  if (fillShapes?.glyphBoxes) {
+    for (const g of fillShapes.glyphBoxes) g.id = wordIdMap.get(g.id) || g.id;
+  }
+
+  return {
+    ocr,
+    ocrRaw,
+    pageMetrics: structuredClone(doc.pageMetrics[i]),
+    layoutRegions: cloneAt(doc.layoutRegions.pages),
+    layoutDataTables: cloneAt(doc.layoutDataTables.pages),
+    annotations,
+    contentEdits,
+    nativeText,
+    fillShapes,
+    srcDocId: doc.id,
+    vis: cloneAt(doc.vis),
+    ocrTiming: cloneAt(doc.ocrTiming),
+    convertPageWarn: cloneAt(doc.convertPageWarn),
+    pageStats: cloneAt(doc.inputData.pageStats),
+    xmlMode: refAt(doc.inputData.xmlMode),
+    ocrApplied: refAt(doc.inputData.ocrApplied),
+    nativeSrc: refAt(doc.images.nativeSrc),
+    pdfDims300: refAt(doc.images.pdfDims300),
+    // The origin's render pool (shared by reference), so a page pasted into another document rasters from its true source.
+    // `null` for image-source pages, whose raster rides in `nativeSrc`.
+    renderSource: doc.images.sources.get(doc.pageMetrics[i].sourceId) ?? null,
+  };
+}
+
+/**
+ * Replace `doc.outline`'s contents in place, keeping the array reference stable
+ * so UI bindings and history snapshots hold a live handle across page/outline edits.
+ * @param {ScribeDoc} doc
+ * @param {Array<import('../objects/outlineObjects.js').OutlineNode>} nodes
+ */
+function setDocOutline(doc, nodes) {
+  doc.outline.length = 0;
+  for (const n of nodes) doc.outline.push(n);
+}
+
+/**
+ * Remap the document outline after a page-order edit.
+ * Bookmarks whose page was removed are dropped, and their surviving descendants promoted.
+ * @param {ScribeDoc} doc
+ * @param {Array<?number>} tags - `tags[newPos]` is the pre-edit index of the page now at `newPos`, or null for a freshly inserted page.
+ */
+function remapOutlineByTags(doc, tags) {
+  if (!doc.outline.length) return;
+  const newByOld = new Map();
+  tags.forEach((old, newPos) => { if (old != null && !newByOld.has(old)) newByOld.set(old, newPos); });
+  setDocOutline(doc, remapOutline(doc.outline, (old) => (newByOld.has(old) ? newByOld.get(old) : null)));
+}
+
+/**
+ * Remap every link annotation's destination after a page-order edit.
+ * A link whose target page was removed is dropped.
+ * @param {ScribeDoc} doc
+ * @param {Array<?number>} tags - `tags[newPos]` is the pre-edit index of the page now at `newPos`, or null for a freshly inserted page.
+ */
+function remapAnnotationDestsByTags(doc, tags) {
+  const { pages } = doc.annotations;
+  if (!pages.length) return;
+  const newByOld = new Map();
+  tags.forEach((old, newPos) => { if (old != null && !newByOld.has(old)) newByOld.set(old, newPos); });
+  for (let i = 0; i < pages.length; i++) {
+    const arr = pages[i];
+    if (!arr || !arr.some((a) => a.type === 'link' && a.dest)) continue;
+    let changed = false;
+    // Rebuild rather than mutate so history snapshots keep their pre-edit entries.
+    /** @type {Array<Annotation>} */
+    const next = [];
+    for (const entry of arr) {
+      if (entry.type !== 'link' || !entry.dest) { next.push(entry); continue; }
+      const ni = newByOld.get(entry.dest.pageIndex);
+      if (ni === undefined) { changed = true; continue; }
+      if (ni === entry.dest.pageIndex) { next.push(entry); continue; }
+      changed = true;
+      next.push({ ...entry, dest: { ...entry.dest, pageIndex: ni } });
+    }
+    if (changed) pages[i] = next;
+  }
+}
+
+/**
+ * Reorder the retained thumbnail cache to match a page-order edit instead of dropping it:
+ * a reorder leaves each thumbnail's pixels unchanged, so re-rendering would be waste.
+ * @param {ScribeDoc} doc
+ * @param {Array<?number>} tags - tags[newPos] is the pre-edit index of the page now at newPos, or null for a freshly inserted page.
+ */
+function remapThumbnails(doc, tags) {
+  const { thumbnails } = doc.images;
+  const remapped = tags.map((old) => (old == null ? undefined : thumbnails[old]));
+  thumbnails.length = 0;
+  for (const t of remapped) thumbnails.push(t);
+}
+
+/**
+ * Re-align the document's FOREIGN render sources (the pools of pages copied in from other documents) with a restored page state,
+ * so undo/redo of a cross-document paste tracks its source rather than leaking it.
+ * A source the target references but the doc dropped is re-registered (redo of the paste).
+ * A source the doc holds but the target does not is released (undo of the paste), terminating that source's worker pool once no live document still holds it.
+ * The document's own primary source is never touched, since it is not part of any page op.
+ * @param {ScribeDoc} doc
+ * @param {?Map<number, import('./imageContainer.js').RenderSource>} target - Foreign sources captured with the snapshot.
+ */
+function reconcileForeignSources(doc, target) {
+  if (!target) return;
+  const { images } = doc;
+  for (const [id, src] of target) {
+    if (!images.sources.has(id)) { images.sources.set(id, src); src.refCount += 1; }
+  }
+  for (const [id, src] of [...images.sources]) {
+    if (id === images.primarySourceId || target.has(id)) continue;
+    images.sources.delete(id);
+    src.refCount -= 1;
+    if (src.refCount <= 0) src.terminate();
+  }
+}
+
+/**
+ * A before/after snapshot of every per-page array plus the outline, for undo/redo of a page operation.
+ * @param {ScribeDoc} doc
+ */
+function capturePageState(doc) {
+  const primaryId = doc.images.primarySourceId;
+  return {
+    arrays: densePageArrays(doc).map((arr) => [arr, arr === doc.pageMetrics ? arr.map((pm) => structuredClone(pm)) : [...arr]]),
+    pageCount: doc.pageMetrics.length,
+    outline: cloneOutline(doc.outline),
+    // Foreign (cross-document) render sources this state references, captured so undo/redo can re-register or release them.
+    // The primary source is excluded because page ops never add or remove it.
+    foreignSources: new Map([...doc.images.sources].filter(([id]) => id !== primaryId)),
+    // The retained thumbnail cache, so undo/redo restore its slot alignment too (no preview re-render on either).
+    thumbnails: [...doc.images.thumbnails],
+  };
+}
+
+/**
+ * Restore a `capturePageState` snapshot, mutating each array in place so references held elsewhere stay valid.
+ * @param {ScribeDoc} doc
+ * @param {ReturnType<typeof capturePageState>} snap
+ */
+function restorePageState(doc, snap) {
+  for (const [arr, values] of snap.arrays) {
+    arr.length = 0;
+    for (const v of values) arr.push(v);
+  }
+  setDocOutline(doc, cloneOutline(snap.outline));
+  renumberPages(doc);
+  clearImageCaches(doc);
+  // Restore the retained thumbnail cache in lockstep with the page order (clearImageCaches no longer drops it).
+  const { thumbnails } = doc.images;
+  thumbnails.length = 0;
+  for (const t of snap.thumbnails) thumbnails.push(t);
+  doc.inputData.pageCount = snap.pageCount;
+  doc.images.pageCount = snap.pageCount;
+  reconcileForeignSources(doc, snap.foreignSources);
+}
+
+/**
+ * Bounded undo/redo history for a document's PAGE operations (delete/move/reorder/insert/paste/duplicate/rotate).
+ * Each recorded op captures a full before/after page-state snapshot that `undo`/`redo` restore.
+ * Non-page edits (word text, style, annotations) are out of scope, since the snapshot does not capture the state they mutate.
+ */
+class PageHistory {
+  static LIMIT = 100;
+
+  /** @param {ScribeDoc} doc */
+  constructor(doc) {
+    this.doc = doc;
+    /** @type {Array<{ before: object, after: object }>} */
+    this.undoStack = [];
+    /** @type {Array<{ before: object, after: object }>} */
+    this.redoStack = [];
+    // While a mutation is running (or an undo/redo is restoring), nested page ops are folded into the outer step.
+    this.suspended = false;
+  }
+
+  get canUndo() { return this.undoStack.length > 0; }
+
+  get canRedo() { return this.redoStack.length > 0; }
+
+  /**
+   * Run a page mutation `fn` and record it as one undoable step (snapshotting before and after).
+   * Re-entrant: a page op invoked from within another recorded op is folded into the outer step rather than recorded separately,
+   * so a composite edit (e.g. a cut = insert + delete) becomes a single undo.
+   * @param {() => void} fn
+   * @param {string} [label] - Description of the step for the undo timeline, e.g. "Deleted 3 pages".
+   */
+  record(fn, label = 'Edited pages') {
+    if (this.suspended) { fn(); return; }
+    const before = capturePageState(this.doc);
+    this.suspended = true;
+    try { fn(); } finally { this.suspended = false; }
+    const after = capturePageState(this.doc);
+    this.undoStack.push({ before, after });
+    if (this.undoStack.length > PageHistory.LIMIT) this.undoStack.shift();
+    this.redoStack.length = 0;
+    // The timeline entry delegates back to this stack rather than replacing it, so its depth stays a valid baseline for callers that unwind a group of page ops back to a saved depth.
+    this.doc.docHistory.record({
+      surface: 'page',
+      label,
+      undo: () => { this.undo(); },
+      redo: () => { this.redo(); },
+    });
+  }
+
+  /** Undo the last recorded page operation. @returns {boolean} whether anything was undone. */
+  undo() {
+    const step = this.undoStack.pop();
+    if (!step) return false;
+    restorePageState(this.doc, step.before);
+    this.redoStack.push(step);
+    return true;
+  }
+
+  /** Redo the last undone page operation. @returns {boolean} whether anything was redone. */
+  redo() {
+    const step = this.redoStack.pop();
+    if (!step) return false;
+    restorePageState(this.doc, step.after);
+    this.undoStack.push(step);
+    return true;
+  }
+
+  clear() {
+    this.undoStack.length = 0;
+    this.redoStack.length = 0;
+  }
+}
+
+/**
+ * The document's single undo/redo timeline, ordered across every editing surface.
+ * Each surface keeps its own restore logic and registers one entry here per user action.
+ */
+export class DocHistory {
+  static LIMIT = 100;
+
+  constructor() {
+    /** @type {Array<{surface: string, label: string, undo: () => any, redo: () => any}>} */
+    this.undoStack = [];
+    /** @type {Array<{surface: string, label: string, undo: () => any, redo: () => any}>} */
+    this.redoStack = [];
+    // Undo handlers re-enter the same mutation functions that record entries, so recording is suspended while one is restoring.
+    this.suspended = false;
+    /** @type {?Array<{surface: string, label: string, undo: () => any, redo: () => any}>} */
+    this._fold = null;
+  }
+
+  get canUndo() { return this.undoStack.length > 0; }
+
+  get canRedo() { return this.redoStack.length > 0; }
+
+  /** @param {{surface: string, label: string, undo: () => any, redo: () => any}} entry */
+  record(entry) {
+    if (this.suspended) return;
+    if (this._fold) { this._fold.push(entry); return; }
+    this.undoStack.push(entry);
+    if (this.undoStack.length > DocHistory.LIMIT) this.undoStack.shift();
+    this.redoStack.length = 0;
+  }
+
+  /**
+   * Run `fn` and fold every entry it records into one undoable step.
+   * `fn` must be synchronous.
+   * A group left open across an await would fold unrelated edits recorded in the gap into this step.
+   * A group opened inside another group folds into the outer one.
+   * @param {string} label - Description of the step for the undo timeline, e.g. "Marked for redaction".
+   * @param {() => any} fn
+   * @returns {any} `fn`'s return value.
+   */
+  group(label, fn) {
+    if (this.suspended || this._fold) return fn();
+    this._fold = [];
+    let result;
+    try {
+      result = fn();
+    } finally {
+      const entries = this._fold;
+      this._fold = null;
+      if (entries.length === 1) this.record({ ...entries[0], label });
+      if (entries.length > 1) {
+        // A child that returns no page list forces a full rebuild for the whole step.
+        const runAll = (list, dir) => {
+          let pages = [];
+          for (const e of list) {
+            const res = e[dir]();
+            if (pages && Array.isArray(res)) pages.push(...res);
+            else pages = null;
+          }
+          return pages;
+        };
+        const reversed = entries.slice().reverse();
+        this.record({
+          surface: 'group',
+          label,
+          undo: () => runAll(reversed, 'undo'),
+          redo: () => runAll(entries, 'redo'),
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Record a field-level edit to existing annotation rows as one undoable entry.
+   * `recordAnnots` cannot see field edits, since it captures rows by reference, so field-editing callers use this instead.
+   * @param {Array<object>} rows - The annotation rows `fn` may edit.
+   * @param {Array<string>} fields - The property names `fn` may change.
+   * @param {Array<number>} pages - The page indices the rows live on.
+   * @param {string} label - Description of the edit for the undo timeline, e.g. "Edited comment".
+   * @param {() => any} fn
+   * @returns {any} `fn`'s return value.
+   */
+  recordAnnotFields(rows, fields, pages, label, fn) {
+    if (this.suspended) return fn();
+    // A null cell means the field was absent, so undo/redo restore absence with delete rather than writing undefined.
+    const capture = () => rows.map((r) => fields.map((f) => (f in r ? { value: r[f] } : null)));
+    const before = capture();
+    const result = fn();
+    const after = capture();
+    const changed = before.some((row, i) => row.some((cell, j) => {
+      const a = after[i][j];
+      return (cell === null) !== (a === null) || (cell !== null && a !== null && cell.value !== a.value);
+    }));
+    if (!changed) return result;
+    const apply = (snap) => () => {
+      rows.forEach((r, i) => fields.forEach((f, j) => {
+        const cell = snap[i][j];
+        if (cell === null) delete r[f];
+        else r[f] = cell.value;
+      }));
+      return pages.slice();
+    };
+    this.record({
+      surface: 'annot', label, undo: apply(before), redo: apply(after),
+    });
+    return result;
+  }
+
+  /**
+   * Undo the most recent action on any surface.
+   * @returns {?{surface: string, label: string, pages: ?Array<number>}} What was undone, or null when the timeline is empty.
+   *   `pages` lists the page indices the action touched, or is null when the caller should rebuild the whole view.
+   */
+  undo() {
+    const entry = this.undoStack.pop();
+    if (!entry) return null;
+    this.suspended = true;
+    let pages = null;
+    try {
+      const res = entry.undo();
+      if (Array.isArray(res)) pages = res;
+    } finally {
+      this.suspended = false;
+    }
+    this.redoStack.push(entry);
+    return { surface: entry.surface, label: entry.label, pages };
+  }
+
+  /**
+   * Re-apply the most recently undone action.
+   * @returns {?{surface: string, label: string, pages: ?Array<number>}}
+   */
+  redo() {
+    const entry = this.redoStack.pop();
+    if (!entry) return null;
+    this.suspended = true;
+    let pages = null;
+    try {
+      const res = entry.redo();
+      if (Array.isArray(res)) pages = res;
+    } finally {
+      this.suspended = false;
+    }
+    this.undoStack.push(entry);
+    return { surface: entry.surface, label: entry.label, pages };
+  }
+
+  /**
+   * Capture the annotation rows an edit is about to touch, to pair with a `recordAnnots` call after the mutation.
+   * @param {{ pages: Array<Array<object>> }} annotations - The document's annotation store.
+   * @param {?Array<number>} ns - Page indices the edit may touch; null means every page.
+   * @returns {{ annotations: object, list: Array<number>, before: Array<Array<object>> }}
+   */
+  // eslint-disable-next-line class-methods-use-this
+  snapshotAnnots(annotations, ns) {
+    const list = [...new Set(ns ?? annotations.pages.map((_, i) => i))]
+      .filter((n) => n >= 0 && n < annotations.pages.length);
+    // Rows are captured by reference, so code holding a row reference still matches it after an undo or redo.
+    return { annotations, list, before: list.map((n) => (annotations.pages[n] || []).slice()) };
+  }
+
+  /**
+   * Record the annotation edit performed since `snapshotAnnots` as one undoable entry.
+   * @param {ReturnType<DocHistory['snapshotAnnots']>} snap
+   * @param {string} label - Description of the edit for the undo timeline, e.g. "Added highlight".
+   */
+  recordAnnots(snap, label) {
+    const { annotations, list, before } = snap;
+    const after = list.map((n) => (annotations.pages[n] || []).slice());
+    const changed = [];
+    for (let i = 0; i < list.length; i++) {
+      if (before[i].length !== after[i].length || before[i].some((row, j) => row !== after[i][j])) changed.push(i);
+    }
+    if (changed.length === 0) return;
+    // Both directions install copies, so the captured arrays stay pristine across repeated undo and redo cycles.
+    this.record({
+      surface: 'annot',
+      label,
+      undo: () => { changed.forEach((i) => { annotations.pages[list[i]] = before[i].slice(); }); return changed.map((i) => list[i]); },
+      redo: () => { changed.forEach((i) => { annotations.pages[list[i]] = after[i].slice(); }); return changed.map((i) => list[i]); },
+    });
+  }
+
+  /**
+   * Capture the layout regions and data tables an edit is about to touch, to pair with a `recordLayout` call after the mutation.
+   * @param {ScribeDoc} doc
+   * @param {?Array<number>} ns - Page indices the edit may touch; null means every page.
+   */
+  // eslint-disable-next-line class-methods-use-this
+  snapshotLayout(doc, ns) {
+    const list = [...new Set(ns ?? doc.layoutDataTables.pages.map((_, i) => i))]
+      .filter((n) => n >= 0 && n < doc.layoutDataTables.pages.length);
+    // Deep clones rather than reference captures: drags and splits mutate coords and back-references in place.
+    const capture = (/** @type {number} */ n) => ({
+      regions: removeCircularRefsRegions([doc.layoutRegions.pages[n]])[0],
+      tables: removeCircularRefsDataTables([doc.layoutDataTables.pages[n]])[0],
+    });
+    return {
+      doc, list, capture, before: list.map(capture),
+    };
+  }
+
+  /**
+   * Record the layout edit performed since `snapshotLayout` as one undoable entry.
+   * It also clears the touched pages' `default` flags, which is what stops a later recognition result from replacing user-edited tables, so undo restores the prior flags too.
+   * @param {ReturnType<DocHistory['snapshotLayout']>} snap
+   * @param {string} label - Description of the edit for the undo timeline, e.g. "Split column".
+   */
+  recordLayout(snap, label) {
+    if (this.suspended) return;
+    const {
+      doc, list, capture, before,
+    } = snap;
+    /** @type {Array<number>} */
+    const changed = [];
+    for (let i = 0; i < list.length; i++) {
+      if (JSON.stringify(capture(list[i])) !== JSON.stringify(before[i])) changed.push(i);
+    }
+    if (changed.length === 0) return;
+    changed.forEach((i) => {
+      doc.layoutRegions.pages[list[i]].default = false;
+      doc.layoutDataTables.pages[list[i]].default = false;
+    });
+    const after = changed.map((i) => capture(list[i]));
+    // Both directions install fresh clones into the live page wrappers, so page identity survives and the captured states stay pristine across repeated undo and redo cycles.
+    const install = (/** @type {number} */ n, /** @type {ReturnType<typeof capture>} */ state) => {
+      const clone = structuredClone(state);
+      const regionsPage = doc.layoutRegions.pages[n];
+      regionsPage.boxes = clone.regions.boxes;
+      Object.values(regionsPage.boxes).forEach((box) => { box.page = regionsPage; });
+      regionsPage.default = clone.regions.default;
+      const tablesPage = doc.layoutDataTables.pages[n];
+      tablesPage.tables.length = 0;
+      clone.tables.tables.forEach((table) => {
+        table.page = tablesPage;
+        table.boxes.forEach((box) => { box.table = table; });
+        tablesPage.tables.push(table);
+      });
+      tablesPage.default = clone.tables.default;
+    };
+    this.record({
+      surface: 'layout',
+      label,
+      undo: () => { changed.forEach((i) => install(list[i], before[i])); return changed.map((i) => list[i]); },
+      redo: () => { changed.forEach((i, k) => install(list[i], after[k])); return changed.map((i) => list[i]); },
+    });
+  }
+
+  clear() {
+    this.undoStack.length = 0;
+    this.redoStack.length = 0;
+  }
+}
+
+let docIdCounter = 0;
+
+/**
+ * Every document created in this process.
+ * `scribe.terminate()` closes these, so releasing the shared pool cannot strand a document's PDF workers.
+ * A document stays listed after `close()`, because a closed document can import another file and spawn a new pool.
+ * @type {Set<WeakRef<ScribeDoc>>}
+ */
+export const liveDocs = new Set();
+
+const liveDocsFinalizer = new FinalizationRegistry((/** @type {WeakRef<ScribeDoc>} */ ref) => liveDocs.delete(ref));
+
+let warnedDocTerminate = false;
+
+/**
+ * A single document being processed, holding its imported pages, OCR text, layout, and fonts.
+ */
+export class ScribeDoc {
+  static defaults = scribeDocDefaults;
+
+  constructor() {
+    /**
+     * Identifier for the document currently loaded into this object.
+     */
+    this.id = ++docIdCounter;
+
+    const selfRef = new WeakRef(this);
+    liveDocs.add(selfRef);
+    liveDocsFinalizer.register(this, selfRef);
+
+    /** Input modes and basic file metadata for this document. */
+    this.inputData = new InputData();
+
+    /** @type {Object<string, Array<import('../objects/ocrObjects.js').OcrPage>>} */
+    this.ocr = { active: [] };
+
+    /** @type {Object<string, Array<string>>} */
+    this.ocrRaw = { active: [] };
+
+    /** @type {Array<PageMetrics>} */
+    this.pageMetrics = [];
+
+    /**
+     * Per-page gzipped debug visualization instructions.
+     * Populated when recognition runs with `debugVis` enabled.
+     * Render to canvases on demand with `renderVis`.
+     * @type {Array<Uint8Array>}
+     */
+    this.vis = [];
+
+    /**
+     * Per-page recognition cost by OCR layer name, milliseconds by timing code.
+     * @type {Array<Record<string, OcrPageTiming>|undefined>}
+     */
+    this.ocrTiming = [];
+
+    /** @type {Array<Object<string, string>>} */
+    this.convertPageWarn = [];
+
+    /** @type {{ debugImg: {[key: string]: Array<Array<CompDebugBrowser|CompDebugNode>> | undefined} }} */
+    this.debug = { debugImg: {} };
+
+    /** @type {{ pages: Array<LayoutPage> }} */
+    this.layoutRegions = { pages: [] };
+
+    /** @type {{ pages: Array<LayoutDataTablePage> }} */
+    this.layoutDataTables = { pages: [] };
+
+    /**
+     * `restored` marks a `.scribe`-restored state, which a fresh parse must not overwrite.
+     * Every mutation of these arrays must record on `docHistory` (`snapshotAnnots`/`recordAnnots`, or `recordAnnotFields` for field edits).
+     * An unrecorded mutation is silently destroyed when a later undo restores its page's array.
+     * @type {{ pages: Array<Array<Annotation>>, restored: boolean }}
+     */
+    this.annotations = { pages: [], restored: false };
+
+    /**
+     * PDF export applies these destructively to the content stream.
+     * `.scribe` saves keep them unapplied.
+     * @type {{ pages: Array<Array<ContentEdit>> }}
+     */
+    this.contentEdits = { pages: [] };
+
+    /**
+     * Per-page native-text metadata, keyed by word id.
+     * Presence of an entry marks that word editable.
+     * Serialized only into the `.scribe` `session` block, so a default export omits it.
+     * @type {{pages: Array<Record<string, NativeTextWord>>}}
+     */
+    this.nativeText = { pages: [] };
+
+    /**
+     * Characters recorded against Type 3 glyph outlines, keyed by the glyph's path hash.
+     * The parser's `type3GlyphMappings` option and the PDF export use the same key.
+     * Written through `setType3GlyphMappings`, which applies each change to the words in place.
+     * Serialized only into the `.scribe` `session` block, so a default export omits it.
+     * @type {Map<string, string>}
+     */
+    this.type3GlyphMappings = new Map();
+
+    /**
+     * Per-page image/path placements and fill-detection shapes from the PDF parse, in the page-pixel frame.
+     * Serialized only into the `.scribe` `session` block, so a default export omits it.
+     * A restore beside the PDF runs no parse of its own, so the persisted copy is what keeps Edit Graphics working there.
+     * @type {{pages: Array<?PageFillShapes>}}
+     */
+    this.fillShapes = { pages: [] };
+
+    /**
+     * Cross-page table links the automatic pass found plausible but would not make on its own.
+     * In-memory only, recomputed at import and never serialized.
+     * @type {Array<{n: number, prevN: number, tableId: string, prevTableId: string, reason: string}>}
+     */
+    this.tableLinkSuggestions = [];
+
+    /**
+     * Workbook export preferences, keyed by the id of a chain's head table.
+     * `names` holds only the sheet names the user typed.
+     * Serialized only into the `.scribe` `session` block, so a default export omits it.
+     * @type {{excluded: Record<string, true>, names: Record<string, string>}}
+     */
+    this.tableExport = { excluded: {}, names: {} };
+
+    /**
+     * Assistant conversations, in creation order.
+     * Serialized only into the `.scribe` `session` block, so a default export omits it.
+     * @type {{chats: Array<AssistantChatRecord>}}
+     */
+    this.assistantChats = { chats: [] };
+
+    /**
+     * The Redactions workspace's term list.
+     * The marks themselves are ordinary `redact` annotations, so this store only maps terms to them.
+     * Serialized only into the `.scribe` `session` block, so a default export omits it.
+     * @type {{terms: Array<RedactionTermRecord>, matchCase: boolean, scannedAt: ?string}}
+     */
+    this.redactions = { terms: [], matchCase: false, scannedAt: null };
+
+    /**
+     * Document outline (bookmarks) as an editable tree; destinations are zero-based page indices.
+     * Empty when the document has no bookmarks. Populated from the PDF on open (`ImageStore.openMainPDF`).
+     * @type {Array<import('../objects/outlineObjects.js').OutlineNode>}
+     */
+    this.outline = [];
+
+    /**
+     * Embedded files and, for a portfolio, the collection that presents them.
+     * Derived from the PDF on every open and never serialized.
+     * `files` is empty for a document with none.
+     * @type {import('../pdf/parseAttachments.js').Attachments}
+     */
+    this.attachments = { collection: null, files: [] };
+
+    /**
+     * Resolves once this document's text extraction has completed.
+     * Already resolved except during a `deferText` import, where extraction continues in the background after `importFiles` returns.
+     * Resolves rather than rejects on `terminate()`, so waiters cannot hang on a dead worker pool.
+     * @type {Promise<?Awaited<ReturnType<typeof import('../extractPDFText.js').extractInternalPDFText>>>}
+     */
+    this.textReady = Promise.resolve(null);
+
+    /**
+     * Settles a pending deferred `textReady`.
+     * Non-null exactly while a deferred extraction is in flight, so it doubles as the "text not ready yet" test.
+     * @type {?() => void}
+     */
+    this._textReadySettle = null;
+
+    this.fonts = new DocFonts();
+    this.fonts.id = this.id;
+
+    this.images = new ImageStore(this);
+
+    /** Bounded undo/redo history for this document's page operations. */
+    this.docHistory = new DocHistory();
+
+    this.history = new PageHistory(this);
+
+    this.contentEditHistory = new ContentEditHistory(this);
+
+    /**
+     * Per-document handlers consulted by emit sites during `recognize()` etc.
+     * These should be set if documents require separate per-document reporting,
+     * such as a client/server setup with multiple users.
+     * Uses without the need for document-level reporting should use
+     * `opt.progressHandler`/`opt.warningHandler`/`opt.errorHandler`,
+     * which are used for all documents by default.
+     * @type {(msg: any) => void}
+     */
+    this.progressHandler = (msg) => opt.progressHandler?.(msg);
+
+    /** @type {(w: { message: string, page?: number }) => void} */
+    this.warningHandler = ({ message }) => opt.warningHandler?.(message);
+
+    /** @type {(e: { message: string, page?: number }) => void} */
+    this.errorHandler = ({ message }) => opt.errorHandler?.(message);
+  }
+
+  /**
+   * Delete a layout region from the page it belongs to.
+   * @param {LayoutRegion} region - Region to delete.
+   */
+  deleteLayoutRegion(region) {
+    const n = region.page.n;
+    const snap = this.docHistory.snapshotLayout(this, [n]);
+    for (const [key, value] of Object.entries(this.layoutRegions.pages[n].boxes)) {
+      if (value.id === region.id) {
+        delete this.layoutRegions.pages[n].boxes[key];
+        break;
+      }
+    }
+    this.docHistory.recordLayout(snap, 'Deleted layout region');
+  }
+
+  /**
+   * Delete a layout data table from the page it belongs to.
+   * @param {LayoutDataTable} table - Table to delete.
+   */
+  deleteLayoutDataTable(table) {
+    const n = table.page.n;
+    const idx = this.layoutDataTables.pages[n].tables.findIndex((t) => t.id === table.id);
+    if (idx >= 0) {
+      const snap = this.docHistory.snapshotLayout(this, [n]);
+      this.layoutDataTables.pages[n].tables.splice(idx, 1);
+      this.docHistory.recordLayout(snap, 'Deleted table');
+    }
+  }
+
+  /**
+   * Delete page `i` from this document's live page model.
+   * @param {number} i - 0-based page index.
+   */
+  deletePage(i) {
+    // Deferred text extraction (`importFiles` deferText) writes per-page results by import-time index,
+    // so editing the page model while it is in flight corrupts the document.
+    if (this._textReadySettle) { console.warn('Page edit ignored: text import is still in progress.'); return; }
+    if (i < 0 || i >= this.pageMetrics.length) return;
+    this.history.record(() => {
+      materializeSourcePages(this);
+      const tags = this.pageMetrics.map((_, k) => k);
+      for (const arr of [...densePageArrays(this), tags]) if (i < arr.length) arr.splice(i, 1);
+      remapOutlineByTags(this, tags);
+      remapAnnotationDestsByTags(this, tags);
+      remapThumbnails(this, tags);
+      clearImageCaches(this);
+      renumberPages(this);
+      this.inputData.pageCount = this.pageMetrics.length;
+      this.images.pageCount = this.pageMetrics.length;
+    }, 'Deleted page');
+  }
+
+  /**
+   * Move page `from` to index `to` (its final position in the new order) in this document's live page model.
+   * @param {number} from
+   * @param {number} to
+   */
+  movePage(from, to) {
+    // See `deletePage`: no page-model restructuring while a deferred extraction is in flight.
+    if (this._textReadySettle) { console.warn('Page edit ignored: text import is still in progress.'); return; }
+    const len = this.pageMetrics.length;
+    if (from < 0 || from >= len || to < 0 || to >= len || from === to) return;
+    this.history.record(() => {
+      materializeSourcePages(this);
+      const tags = this.pageMetrics.map((_, k) => k);
+      for (const arr of [...densePageArrays(this), tags]) {
+        if (from >= arr.length) continue;
+        const [item] = arr.splice(from, 1);
+        arr.splice(to, 0, item);
+      }
+      remapOutlineByTags(this, tags);
+      remapAnnotationDestsByTags(this, tags);
+      remapThumbnails(this, tags);
+      clearImageCaches(this);
+      renumberPages(this);
+    }, 'Moved page');
+  }
+
+  /**
+   * Delete several pages at once from this document's live page model.
+   * @param {Array<number>} indices - 0-based page indices to remove.
+   */
+  deletePages(indices) {
+    // See `deletePage`: no page-model restructuring while a deferred extraction is in flight.
+    if (this._textReadySettle) { console.warn('Page edit ignored: text import is still in progress.'); return; }
+    // Splice high-to-low so each removal leaves the lower indices valid.
+    const sorted = [...new Set(indices)].filter((i) => i >= 0 && i < this.pageMetrics.length).sort((a, b) => b - a);
+    if (sorted.length === 0) return;
+    this.history.record(() => {
+      materializeSourcePages(this);
+      const tags = this.pageMetrics.map((_, k) => k);
+      for (const arr of [...densePageArrays(this), tags]) {
+        for (const i of sorted) if (i < arr.length) arr.splice(i, 1);
+      }
+      remapOutlineByTags(this, tags);
+      remapAnnotationDestsByTags(this, tags);
+      remapThumbnails(this, tags);
+      clearImageCaches(this);
+      renumberPages(this);
+      this.inputData.pageCount = this.pageMetrics.length;
+      this.images.pageCount = this.pageMetrics.length;
+    }, `Deleted ${sorted.length === 1 ? 'page' : `${sorted.length} pages`}`);
+  }
+
+  /**
+   * Move several pages to a single contiguous block in this document's live page model, keeping their relative order.
+   * The pages are pulled out, then re-inserted starting at `to` (an index into the array after removal).
+   * @param {Array<number>} indices - 0-based page indices to move.
+   * @param {number} to - Block start position in the post-removal order.
+   */
+  movePages(indices, to) {
+    // See `deletePage`: no page-model restructuring while a deferred extraction is in flight.
+    if (this._textReadySettle) { console.warn('Page edit ignored: text import is still in progress.'); return; }
+    const sorted = [...new Set(indices)].filter((i) => i >= 0 && i < this.pageMetrics.length).sort((a, b) => a - b);
+    if (sorted.length === 0) return;
+    this.history.record(() => {
+      materializeSourcePages(this);
+      const tags = this.pageMetrics.map((_, k) => k);
+      for (const arr of [...densePageArrays(this), tags]) {
+        const pulled = [];
+        for (let k = sorted.length - 1; k >= 0; k--) {
+          if (sorted[k] < arr.length) pulled.unshift(arr.splice(sorted[k], 1)[0]);
+        }
+        arr.splice(Math.max(0, Math.min(to, arr.length)), 0, ...pulled);
+      }
+      remapOutlineByTags(this, tags);
+      remapAnnotationDestsByTags(this, tags);
+      remapThumbnails(this, tags);
+      clearImageCaches(this);
+      renumberPages(this);
+    }, `Moved ${sorted.length === 1 ? 'page' : `${sorted.length} pages`}`);
+  }
+
+  /**
+   * Snapshot pages `indices` for a later `insertPages`.
+   * Pure: the document is not mutated apart from materializing `sourcePageN`/`sourceId`.
+   * Returned snapshots are fully detached, so the source pages may be edited or deleted before they are pasted.
+   * @param {Array<number>} indices - 0-based page indices to clone, in any order.
+   * @returns {Array<ReturnType<typeof snapshotPage>>} One snapshot per valid index, in ascending page order.
+   */
+  copyPages(indices) {
+    // Copying while a deferred extraction is in flight would snapshot pages without their text,
+    // silently degrading a later paste. Refused (empty clipboard), consistent with `deletePage`.
+    if (this._textReadySettle) { console.warn('Page copy ignored: text import is still in progress.'); return []; }
+    const sorted = [...new Set(indices)].filter((i) => i >= 0 && i < this.pageMetrics.length).sort((a, b) => a - b);
+    if (sorted.length === 0) return [];
+    materializeSourcePages(this);
+    materializeSourceIds(this);
+    return sorted.map((i) => snapshotPage(this, i));
+  }
+
+  /**
+   * Insert page snapshots as a contiguous block starting at index `to`.
+   * Each full-length per-page array is spliced in lockstep.
+   * Arrays that are not full-length for this document (e.g. `images.nativeSrc` for a PDF, whose rasters come from the worker via `sourcePageN`) are left untouched,
+   * mirroring how delete/move guard on per-array length.
+   * @param {Array<ReturnType<typeof snapshotPage>>} snapshots - Page snapshots from `copyPages`.
+   * @param {number} to - Insertion index (0..pageMetrics.length).
+   */
+  insertPages(snapshots, to) {
+    // See `deletePage`: no page-model restructuring while a deferred extraction is in flight.
+    if (this._textReadySettle) { console.warn('Page edit ignored: text import is still in progress.'); return; }
+    if (!Array.isArray(snapshots) || snapshots.length === 0) return;
+    this.history.record(() => {
+      const prevLen = this.pageMetrics.length;
+      const at = Math.max(0, Math.min(to, prevLen));
+      materializeSourcePages(this);
+      // Page-identity tags: existing pages carry their old index.
+      const tags = this.pageMetrics.map((_, k) => k);
+      // Splice only arrays that span every existing page. A sparse/empty array would misalign if inserted into.
+      const spliceFull = (arr, values) => {
+        if (Array.isArray(arr) && arr.length === prevLen) arr.splice(at, 0, ...values);
+      };
+
+      const ocrSeen = new Set();
+      for (const [engine, arr] of Object.entries(this.ocr)) {
+        if (!Array.isArray(arr) || ocrSeen.has(arr)) continue;
+        ocrSeen.add(arr);
+        spliceFull(arr, snapshots.map((b) => b.ocr[engine] ?? null));
+      }
+      const rawSeen = new Set();
+      for (const [engine, arr] of Object.entries(this.ocrRaw)) {
+        if (!Array.isArray(arr) || rawSeen.has(arr)) continue;
+        rawSeen.add(arr);
+        spliceFull(arr, snapshots.map((b) => b.ocrRaw[engine] ?? ''));
+      }
+      spliceFull(this.pageMetrics, snapshots.map((b) => b.pageMetrics));
+      spliceFull(this.layoutRegions.pages, snapshots.map((b) => b.layoutRegions));
+      spliceFull(this.layoutDataTables.pages, snapshots.map((b) => b.layoutDataTables));
+      spliceFull(this.annotations.pages, snapshots.map((b) => {
+        // A cross-document paste drops internal links, whose page targets are meaningless in the destination document.
+        if (b.srcDocId === this.id || !Array.isArray(b.annotations)) return b.annotations;
+        return b.annotations.filter((a) => !(a.type === 'link' && a.dest));
+      }));
+      spliceFull(this.contentEdits.pages, snapshots.map((b) => b.contentEdits ?? []));
+      spliceFull(this.nativeText.pages, snapshots.map((b) => b.nativeText ?? {}));
+      spliceFull(this.fillShapes.pages, snapshots.map((b) => b.fillShapes ?? null));
+      spliceFull(this.vis, snapshots.map((b) => b.vis));
+      spliceFull(this.ocrTiming, snapshots.map((b) => b.ocrTiming));
+      spliceFull(this.convertPageWarn, snapshots.map((b) => b.convertPageWarn));
+      spliceFull(this.images.nativeSrc, snapshots.map((b) => b.nativeSrc));
+      spliceFull(this.images.pdfDims300, snapshots.map((b) => b.pdfDims300));
+      spliceFull(this.inputData.xmlMode, snapshots.map((b) => b.xmlMode));
+      spliceFull(this.inputData.pageStats, snapshots.map((b) => b.pageStats));
+      spliceFull(this.inputData.ocrApplied, snapshots.map((b) => b.ocrApplied));
+      spliceFull(tags, snapshots.map(() => null));
+      remapOutlineByTags(this, tags);
+      remapAnnotationDestsByTags(this, tags);
+      remapThumbnails(this, tags);
+
+      // Register a copied page's foreign render source so it keeps rendering and subsetting from its origin.
+      for (const b of snapshots) {
+        const src = b.renderSource;
+        if (src && !this.images.sources.has(src.id)) {
+          this.images.sources.set(src.id, src);
+          src.refCount += 1;
+        }
+      }
+
+      clearImageCaches(this);
+      renumberPages(this);
+      this.inputData.pageCount = this.pageMetrics.length;
+      this.images.pageCount = this.pageMetrics.length;
+    }, `Inserted ${snapshots.length === 1 ? 'page' : `${snapshots.length} pages`}`);
+  }
+
+  /**
+   * Duplicate pages `indices`, inserting the copies as a contiguous block starting at `to`.
+   * @param {Array<number>} indices - 0-based page indices to duplicate.
+   * @param {number} to - Insertion index (0..pageMetrics.length).
+   */
+  duplicatePages(indices, to) {
+    this.insertPages(this.copyPages(indices), to);
+  }
+
+  /**
+   * Rotate pages `indices` by `deltaDeg` (a multiple of 90), composed onto each page's existing rotation.
+   * Recorded as one undoable step. Rebuilding the display is the caller's responsibility.
+   * @param {Array<number>} indices - 0-based page indices.
+   * @param {number} deltaDeg - Clockwise degrees to add (e.g. 90, -90, 180).
+   * @returns {boolean} Whether any page was rotated (so a caller can skip a redundant rebuild).
+   */
+  rotatePages(indices, deltaDeg) {
+    const targets = [...new Set(indices)].filter((n) => this.pageMetrics[n]);
+    if (targets.length === 0) return false;
+    this.history.record(() => {
+      for (const n of targets) {
+        const pm = this.pageMetrics[n];
+        pm.rotation = ((((pm.rotation || 0) + deltaDeg) % 360) + 360) % 360;
+      }
+    }, `Rotated ${targets.length === 1 ? 'page' : `${targets.length} pages`}`);
+    return true;
+  }
+
+  /**
+   * Add a bookmark to the document outline, recorded as one undoable step.
+   * @param {{ title?: string, pageIndex?: ?number, parentId?: ?number, atIndex?: ?number }} [spec]
+   *   `pageIndex` null makes a title-only (structural) node; `parentId` null adds at the top level;
+   *   `atIndex` null appends.
+   * @returns {number} The new node's id.
+   */
+  addBookmark({
+    title = '', pageIndex = null, parentId = null, atIndex = null,
+  } = {}) {
+    const node = makeOutlineNode({ title, dest: pageIndex == null ? null : { pageIndex, view: ['Fit'] } });
+    this.history.record(() => {
+      const siblings = parentId == null ? this.outline : (findOutlineEntry(this.outline, parentId)?.node.children ?? this.outline);
+      const at = atIndex == null ? siblings.length : Math.max(0, Math.min(atIndex, siblings.length));
+      siblings.splice(at, 0, node);
+    }, 'Added bookmark');
+    return node.id;
+  }
+
+  /**
+   * Rename a bookmark. Recorded as one undoable step. No-op if `id` is unknown.
+   * @param {number} id
+   * @param {string} title
+   */
+  renameBookmark(id, title) {
+    if (!findOutlineEntry(this.outline, id)) return;
+    this.history.record(() => { findOutlineEntry(this.outline, id).node.title = title; }, 'Renamed bookmark');
+  }
+
+  /**
+   * Point a bookmark at a different page (or make it title-only with `null`). Recorded. No-op if `id` is unknown.
+   * @param {number} id
+   * @param {?number} pageIndex
+   */
+  setBookmarkDest(id, pageIndex) {
+    if (!findOutlineEntry(this.outline, id)) return;
+    this.history.record(() => {
+      findOutlineEntry(this.outline, id).node.dest = pageIndex == null ? null : { pageIndex, view: ['Fit'] };
+    }, 'Changed bookmark destination');
+  }
+
+  /**
+   * Reparent/reorder a bookmark: detach it and insert under `parentId` (null = top level) at `atIndex` (null = append).
+   * Recorded as one undoable step.
+   * No-op if `id` is unknown or the move would nest the node inside its own subtree.
+   * @param {number} id
+   * @param {?number} parentId
+   * @param {?number} atIndex
+   */
+  moveBookmark(id, parentId = null, atIndex = null) {
+    const entry = findOutlineEntry(this.outline, id);
+    if (!entry) return;
+    if (parentId != null && isOutlineDescendant(entry.node, parentId)) return;
+    this.history.record(() => {
+      const e = findOutlineEntry(this.outline, id);
+      e.siblings.splice(e.index, 1);
+      const siblings = parentId == null ? this.outline : (findOutlineEntry(this.outline, parentId)?.node.children ?? this.outline);
+      const at = atIndex == null ? siblings.length : Math.max(0, Math.min(atIndex, siblings.length));
+      siblings.splice(at, 0, e.node);
+    }, 'Moved bookmark');
+  }
+
+  /**
+   * Replace the entire outline. Recorded as one undoable step.
+   * Every node gets a fresh id, so callers may pass plain `{ title, dest, action, open, children }` trees.
+   * @param {Array<import('../objects/outlineObjects.js').OutlineNode>} nodes
+   * @returns {Array<import('../objects/outlineObjects.js').OutlineNode>} A clone of the outline being replaced.
+   */
+  replaceOutline(nodes) {
+    const prev = cloneOutline(this.outline);
+    reassignOutlineIds(nodes);
+    this.history.record(() => { setDocOutline(this, nodes); }, 'Replaced bookmarks');
+    return prev;
+  }
+
+  /**
+   * Remove bookmarks by id (each with its whole subtree). Recorded as one undoable step.
+   * @param {Array<number>} ids
+   */
+  removeBookmarks(ids) {
+    if (!ids.some((id) => findOutlineEntry(this.outline, id))) return;
+    this.history.record(() => {
+      for (const id of ids) {
+        const e = findOutlineEntry(this.outline, id);
+        if (e) e.siblings.splice(e.index, 1);
+      }
+    }, 'Deleted bookmarks');
+  }
+
+  /**
+   * Undo the most recent edit on any surface: page and outline operations, content edits, annotation changes, and form fills.
+   * @returns {boolean} Whether anything was undone (so a caller can skip a redundant rebuild).
+   */
+  undo() { return !!this.docHistory.undo(); }
+
+  /**
+   * Re-apply the most recently undone edit.
+   * @returns {boolean} Whether anything was redone.
+   */
+  redo() { return !!this.docHistory.redo(); }
+
+  /** Whether there is an edit available to undo. */
+  get canUndo() { return this.docHistory.canUndo; }
+
+  /** Whether there is an undone edit available to redo. */
+  get canRedo() { return this.docHistory.canRedo; }
+
+  /**
+   * Reset all of this document's data and issue it a new id.
+   * The returned promise waits only for the previous file's fonts to leave the workers.
+   */
+  async clear() {
+    // Settle any pending deferred extraction so its waiters resolve rather than hang.
+    this._textReadySettle?.();
+    this._textReadySettle = null;
+    this.textReady = Promise.resolve(null);
+    this.inputData.clear();
+    clearObjectProperties(this.ocr);
+    this.ocr.active = [];
+    clearObjectProperties(this.ocrRaw);
+    this.ocrRaw.active = [];
+    this.annotations.pages.length = 0;
+    this.annotations.restored = false;
+    this.contentEdits.pages.length = 0;
+    this.nativeText.pages.length = 0;
+    this.type3GlyphMappings.clear();
+    this.fillShapes.pages.length = 0;
+    this.assistantChats.chats.length = 0;
+    this.redactions.terms.length = 0;
+    this.redactions.matchCase = false;
+    this.redactions.scannedAt = null;
+    this.layoutRegions.pages.length = 0;
+    this.layoutDataTables.pages.length = 0;
+    this.tableExport.excluded = {};
+    this.tableExport.names = {};
+    this.pageMetrics.length = 0;
+    this.outline.length = 0;
+    this.attachments.collection = null;
+    this.attachments.files.length = 0;
+    this.convertPageWarn.length = 0;
+    this.ocrTiming.length = 0;
+    this.images.clear();
+    this.fonts.clear();
+    this.docHistory.clear();
+    this.history.clear();
+    this.contentEditHistory.clear();
+    // `dropFromWorkers` drops the entry keyed by the current id, so it must run before the id changes.
+    const dropped = dropFromWorkers(this.fonts).catch((err) => opt.warningHandler(`Could not drop the previous file's fonts from the workers: ${err}`));
+    this.id = ++docIdCounter;
+    this.fonts.id = this.id;
+    await dropped;
+  }
+
+  /**
+   * Release this document's resources.
+   * Terminates its PDF worker pool, clears its image cache, and drops its optimized fonts from the main thread and the shared general-pool workers.
+   * Does not touch the shared general/OCR pool or the process-wide built-in fonts.
+   * The document remains usable, and a later `importFiles` spawns a fresh pool.
+   */
+  async close() {
+    // In-flight extraction jobs die with the worker pool below and never settle `textReady`, so settle it now to let waiters proceed rather than hang.
+    this._textReadySettle?.();
+    this._textReadySettle = null;
+    await this.images.terminate();
+    this.fonts.clear();
+    await dropFromWorkers(this.fonts);
+  }
+
+  /** @deprecated Use `doc.close()`. */
+  async terminate() {
+    if (!warnedDocTerminate) {
+      warnedDocTerminate = true;
+      opt.warningHandler('doc.terminate() is deprecated and will be removed in a future release. Use doc.close() instead.');
+    }
+    return this.close();
+  }
+
+  /**
+   * Preload the PDF code and workers.
+   * This is done automatically by `importFiles`, but pre-loading resources reduces the delay between upload and rendering the first page.
+   */
+  async preloadPdfWorkers() {
+    await this.images.getPdfScheduler();
+  }
+
+  /**
+   * Serialize the layout data tables as JSON, stripping circular references.
+   */
+  serializeLayoutDataTables() {
+    const pages = structuredClone(this.layoutDataTables.pages);
+    pages.forEach((page) => {
+      page.tables.forEach((table) => {
+        // @ts-ignore
+        delete table.page;
+        table.boxes.forEach((box) => {
+          // @ts-ignore
+          delete box.table;
+        });
+      });
+    });
+    return JSON.stringify(pages);
+  }
+
+  /**
+   * Add highlight annotations using page:line references or page-level quote matching.
+   * @param {Parameters<typeof addHighlightsImpl>[1]} highlights
+   * @returns {ReturnType<typeof addHighlightsImpl>}
+   */
+  addHighlights(highlights) {
+    return addHighlightsImpl(this, highlights);
+  }
+
+  /**
+   * Resolve a citation against the active layer.
+   * @param {string} text - A citation such as "34", "34:14" or "¶ 12".
+   * @returns {ReturnType<typeof resolveCitationImpl>} The spans in page order.
+   */
+  resolveCitation(text) {
+    return resolveCitationImpl(this.ocr.active || [], text);
+  }
+
+  /**
+   * Add FreeText (text label) annotations at fixed page positions.
+   * @param {Parameters<typeof addFreeTextImpl>[1]} annotations
+   * @returns {ReturnType<typeof addFreeTextImpl>}
+   */
+  addFreeText(annotations) {
+    return addFreeTextImpl(this, annotations);
+  }
+
+  /**
+   * Set a form field's value by its fully-qualified name.
+   * Regenerates the field's lifted words in the page text.
+   * @param {Parameters<typeof setFormValueImpl>[1]} name
+   * @param {Parameters<typeof setFormValueImpl>[2]} value
+   * @returns {ReturnType<typeof setFormValueImpl>}
+   */
+  setFormValue(name, value) {
+    return setFormValueImpl(this, name, value);
+  }
+
+  /**
+   * Place a drawn fill & sign item on page n.
+   * @param {Parameters<typeof addInkImpl>[1]} n
+   * @param {Parameters<typeof addInkImpl>[2]} item
+   * @returns {ReturnType<typeof addInkImpl>}
+   */
+  addInk(n, item) {
+    return addInkImpl(this, n, item);
+  }
+
+  /**
+   * Place an image fill & sign item on page n.
+   * @param {Parameters<typeof addStampImpl>[1]} n
+   * @param {Parameters<typeof addStampImpl>[2]} item
+   * @returns {ReturnType<typeof addStampImpl>}
+   */
+  addStamp(n, item) {
+    return addStampImpl(this, n, item);
+  }
+
+  /**
+   * Place a typed-text fill & sign item on page n.
+   * PDF export flattens it into page content instead of writing a FreeText annotation.
+   * @param {Parameters<typeof addFillTextImpl>[1]} n
+   * @param {Parameters<typeof addFillTextImpl>[2]} item
+   * @returns {ReturnType<typeof addFillTextImpl>}
+   */
+  addFillText(n, item) {
+    return addFillTextImpl(this, n, item);
+  }
+
+  /**
+   * Detect fillable areas (checkboxes, blank lines) on page n from the document's own content.
+   * @param {Parameters<typeof detectFillTargetsImpl>[1]} n
+   * @returns {ReturnType<typeof detectFillTargetsImpl>}
+   */
+  detectFillTargets(n) {
+    return detectFillTargetsImpl(this, n);
+  }
+
+  /**
+   * Regenerate a fill-text row's bbox and lifted words after its contents or position change.
+   * @param {Parameters<typeof syncFillTextImpl>[1]} n
+   * @param {Parameters<typeof syncFillTextImpl>[2]} row
+   * @param {Parameters<typeof syncFillTextImpl>[3]} [prevBbox]
+   */
+  syncFillText(n, row, prevBbox) {
+    syncFillTextImpl(this, n, row, prevBbox);
+  }
+
+  /**
+   * Remove all highlights previously added by `addHighlights`.
+   */
+  clearHighlights() {
+    clearHighlightsImpl(this);
+  }
+
+  /**
+   * Add vector shape annotations at fixed page positions.
+   * @param {Parameters<typeof addShapesImpl>[1]} shapes
+   * @returns {ReturnType<typeof addShapesImpl>}
+   */
+  addShapes(shapes) {
+    return addShapesImpl(this, shapes);
+  }
+
+  /**
+   * Remove all shape annotations previously added by `addShapes`.
+   */
+  clearShapes() {
+    clearShapesImpl(this);
+  }
+
+  /**
+   * Add freestanding /Text annotations at fixed page positions.
+   * @param {Parameters<typeof addTextAnnotsImpl>[1]} textAnnots
+   * @returns {ReturnType<typeof addTextAnnotsImpl>}
+   */
+  addTextAnnots(textAnnots) {
+    return addTextAnnotsImpl(this, textAnnots);
+  }
+
+  /**
+   * Remove all freestanding /Text annotations previously added by `addTextAnnots`.
+   */
+  clearTextAnnots() {
+    clearTextAnnotsImpl(this);
+  }
+
+  /**
+   * Add redaction marks.
+   * Marks stay reviewable/deletable (and persist in `.scribe` saves); every other export applies them by permanently removing the marked content.
+   * @param {Parameters<typeof addRedactionsImpl>[1]} redactions
+   * @returns {ReturnType<typeof addRedactionsImpl>}
+   */
+  addRedactions(redactions) {
+    return addRedactionsImpl(this, redactions);
+  }
+
+  /**
+   * Remove redaction marks (all of them, or one page's, or one group's).
+   * @param {Parameters<typeof removeRedactionsImpl>[1]} [filter]
+   */
+  removeRedactions(filter) {
+    removeRedactionsImpl(this, filter);
+  }
+
+  /**
+   * Add link annotations (external URLs or internal page jumps) at fixed page positions.
+   * @param {Parameters<typeof addLinksImpl>[1]} links
+   * @returns {ReturnType<typeof addLinksImpl>}
+   */
+  addLinks(links) {
+    return addLinksImpl(this, links);
+  }
+
+  /**
+   * Remove link annotations (all of them, or one page's).
+   * @param {Parameters<typeof removeLinksImpl>[1]} [filter]
+   */
+  removeLinks(filter) {
+    removeLinksImpl(this, filter);
+  }
+
+  /**
+   * Delete whole lines of visible native PDF text.
+   * Records one undoable step in `contentEditHistory`.
+   * A large delete mutates pages progressively, so await the result before reading them.
+   * @param {Parameters<typeof deleteTextLinesImpl>[1]} lines
+   * @param {Parameters<typeof deleteTextLinesImpl>[2]} [label]
+   * @returns {ReturnType<typeof deleteTextLinesImpl>}
+   */
+  deleteTextLines(lines, label) {
+    return deleteTextLinesImpl(this, lines, label);
+  }
+
+  /**
+   * Replace a line of visible native PDF text with new text, optionally toggling bold/italic per word.
+   * The raster, search, selection, and every export reflect the change.
+   * Records one undoable step in `contentEditHistory`.
+   * @param {Parameters<typeof replaceTextLineImpl>[1]} line
+   * @param {Parameters<typeof replaceTextLineImpl>[2]} newText
+   * @param {Parameters<typeof replaceTextLineImpl>[3]} [opts]
+   * @returns {ReturnType<typeof replaceTextLineImpl>}
+   */
+  replaceTextLine(line, newText, opts) {
+    return replaceTextLineImpl(this, line, newText, opts);
+  }
+
+  /**
+   * Delete the image placements matching the given extents, as one undoable step.
+   * @param {Parameters<typeof deleteImagesImpl>[1]} items
+   * @returns {ReturnType<typeof deleteImagesImpl>}
+   */
+  deleteImages(items) {
+    return deleteImagesImpl(this, items);
+  }
+
+  /**
+   * Delete the image and path placements matching the given extents, as one undoable step.
+   * @param {Parameters<typeof deleteGraphicsImpl>[1]} items
+   * @returns {ReturnType<typeof deleteGraphicsImpl>}
+   */
+  deleteGraphics(items) {
+    return deleteGraphicsImpl(this, items);
+  }
+
+  /**
+   * Render a page to a canvas, including the OCR text drawn over the page image.
+   * @param {Parameters<typeof renderPageStaticImpl>[1]} page
+   * @param {Parameters<typeof renderPageStaticImpl>[2]} [options]
+   * @returns {ReturnType<typeof renderPageStaticImpl>}
+   */
+  renderPageStatic(page, options) {
+    return renderPageStaticImpl(this, page, options);
+  }
+
+  /**
+   * Render a PDF-backed page to a standalone image at a chosen resolution and encoding.
+   * @param {Parameters<ImageStore['renderPageImage']>[0]} n
+   * @param {Parameters<ImageStore['renderPageImage']>[1]} [options]
+   * @returns {ReturnType<ImageStore['renderPageImage']>}
+   */
+  renderPageImage(n, options) {
+    return this.images.renderPageImage(n, options);
+  }
+
+  /**
+   * Export this document's OCR data to the specified format.
+   * @param {Parameters<typeof exportDataImpl>[1]} [format]
+   * @param {Parameters<typeof exportDataImpl>[2]} [options]
+   * @returns {ReturnType<typeof exportDataImpl>}
+   */
+  exportData(format, options) {
+    return exportDataImpl(this, format, options);
+  }
+
+  /**
+   * Run `exportData` and save the result as a download (browser) or local file (Node.js).
+   * @param {Parameters<typeof downloadImpl>[1]} format
+   * @param {Parameters<typeof downloadImpl>[2]} fileName
+   * @param {Parameters<typeof downloadImpl>[3]} [options]
+   * @returns {ReturnType<typeof downloadImpl>}
+   */
+  download(format, fileName, options) {
+    return downloadImpl(this, format, fileName, options);
+  }
+
+  /**
+   * Record characters against Type 3 glyph outlines and apply them to every word drawn with those glyphs, in place, as one undoable step.
+   * @param {Parameters<typeof setType3GlyphMappingsImpl>[1]} entries - `[pathHash, text]` pairs; a null or empty text removes the outline's character.
+   * @param {Parameters<typeof setType3GlyphMappingsImpl>[2]} [options]
+   * @returns {ReturnType<typeof setType3GlyphMappingsImpl>} The pages whose words changed.
+   */
+  setType3GlyphMappings(entries, options) {
+    return setType3GlyphMappingsImpl(this, entries, options);
+  }
+
+  /**
+   * Recognize this document's pages with the OCR engine.
+   * @param {Parameters<typeof recognizeImpl>[1]} [options]
+   * @returns {ReturnType<typeof recognizeImpl>}
+   */
+  recognize(options) {
+    // The page:line pass runs once on the layer recognition leaves active, whichever internal exit produced it.
+    return recognizeImpl(this, options).then((res) => {
+      if (this.ocr.active) assignPageLineNums(this.ocr.active);
+      return res;
+    });
+  }
+
+  /**
+   * Install a parsed `OcrPage` into this doc.
+   * @param {Parameters<typeof insertParsedPageImpl>[1]} n
+   * @param {Parameters<typeof insertParsedPageImpl>[2]} page
+   * @param {Parameters<typeof insertParsedPageImpl>[3]} options
+   */
+  insertParsedPage(n, page, options) {
+    return insertParsedPageImpl(this, n, page, options);
+  }
+
+  /**
+   * Compare two sets of OCR data.
+   * @param {Parameters<typeof compareOCRImpl>[1]} ocrA
+   * @param {Parameters<typeof compareOCRImpl>[2]} ocrB
+   * @param {Parameters<typeof compareOCRImpl>[3]} [options]
+   * @param {Parameters<typeof compareOCRImpl>[4]} [progressCallback]
+   * @returns {ReturnType<typeof compareOCRImpl>}
+   */
+  compareOCR(ocrA, ocrB, options, progressCallback = null) {
+    return compareOCRImpl(this, ocrA, ocrB, options, progressCallback);
+  }
+
+  /**
+   * Recognize a single page (or sub-region) with the OCR engine.
+   * @param {Parameters<typeof recognizePageImpImpl>[1]} n
+   * @param {Parameters<typeof recognizePageImpImpl>[2]} legacy
+   * @param {Parameters<typeof recognizePageImpImpl>[3]} lstm
+   * @param {Parameters<typeof recognizePageImpImpl>[4]} areaMode
+   * @param {Parameters<typeof recognizePageImpImpl>[5]} [tessOptions]
+   * @param {Parameters<typeof recognizePageImpImpl>[6]} [debugVis]
+   * @param {Parameters<typeof recognizePageImpImpl>[7]} [langs]
+   * @param {Parameters<typeof recognizePageImpImpl>[8]} [vanillaMode]
+   * @returns {ReturnType<typeof recognizePageImpImpl>}
+   */
+  recognizePageImp(n, legacy, lstm, areaMode, tessOptions = {}, debugVis = false, langs = null, vanillaMode = false) {
+    return recognizePageImpImpl(this, n, legacy, lstm, areaMode, tessOptions, debugVis, langs, vanillaMode);
+  }
+
+  /**
+   * Render a page's stored debug visualizations to canvases.
+   * @param {Parameters<typeof renderVisImpl>[1]} n
+   * @returns {ReturnType<typeof renderVisImpl>}
+   */
+  renderVis(n) {
+    return renderVisImpl(this, n);
+  }
+
+  /**
+   * Evaluate the OCR accuracy of a single page or line.
+   * @param {Parameters<typeof evalOCRPageImpl>[1]} params
+   * @returns {ReturnType<typeof evalOCRPageImpl>}
+   */
+  evalOCRPage(params) {
+    return evalOCRPageImpl(this, params);
+  }
+
+  /**
+   * Import files for processing into this document.
+   * @param {Parameters<typeof importFilesImpl>[1]} files
+   * @param {Parameters<typeof importFilesImpl>[2]} [options]
+   * @returns {ReturnType<typeof importFilesImpl>}
+   */
+  importFiles(files, options) {
+    return importFilesImpl(this, files, options);
+  }
+
+  /**
+   * Import supplemental OCR files into this document (e.g. an alternate OCR version or ground truth).
+   * @param {Parameters<typeof importFilesSuppImpl>[1]} files
+   * @param {Parameters<typeof importFilesSuppImpl>[2]} ocrName
+   * @returns {ReturnType<typeof importFilesSuppImpl>}
+   */
+  importFilesSupp(files, ocrName) {
+    return importFilesSuppImpl(this, files, ocrName);
+  }
+
+  /**
+   * Run font optimization and validation for this document.
+   * @param {Parameters<typeof runOptimizationImpl>[1]} ocrArr
+   * @returns {ReturnType<typeof runOptimizationImpl>}
+   */
+  runOptimization(ocrArr) {
+    return runOptimizationImpl(this, ocrArr);
+  }
+
+  /**
+   * Enable or disable use of optimized fonts for this document, syncing the change to worker threads.
+   * Optimized fonts must already exist (via `runOptimization`) for this to have an effect.
+   * @param {Parameters<typeof enableFontOptImpl>[1]} enable
+   * @param {Parameters<typeof enableFontOptImpl>[2]} [force]
+   * @returns {ReturnType<typeof enableFontOptImpl>}
+   */
+  enableFontOpt(enable, force) {
+    return enableFontOptImpl(this.fonts, enable, force);
+  }
+
+  /**
+   * List the identifying-metadata categories present in this document's PDF source(s).
+   * Returns null for an image-only document (no PDF source).
+   * @returns {ReturnType<typeof getMetadataImpl>}
+   */
+  getMetadata() {
+    return getMetadataImpl(this);
+  }
+
+  /**
+   * The bytes of one embedded file (a portfolio member or a plain attachment), decoded by the PDF worker.
+   * @param {string} key - The file's `key` in `doc.attachments.files`.
+   * @returns {Promise<ArrayBuffer>} Rejects when no file has that key or its stream cannot be read.
+   */
+  async getAttachmentBytes(key) {
+    const file = this.attachments.files.find((f) => f.key === key);
+    if (!file) throw new Error(`No embedded file is keyed “${key}”.`);
+    const scheduler = await this.images.getPdfScheduler();
+    const res = await scheduler.getPdfEmbeddedFileBytes({ objNum: file.objNum });
+    if (!res) throw new Error(`The embedded file “${key}” has no readable stream.`);
+    return res.bytes;
+  }
+
+  /**
+   * The byte inventory of this document's PDF source.
+   * Lists every image, embedded font program, Form XObject and content stream with its on-disk size and the pages that use it, plus the file's remainder.
+   * Returns null for an image-only document (no PDF source).
+   * @returns {ReturnType<typeof getResourceInventoryImpl>}
+   */
+  getResourceInventory() {
+    return getResourceInventoryImpl(this);
+  }
+
+  /**
+   * Produce a privacy-cleaned copy of this document's PDF with identifying metadata removed.
+   * The visible pages stay byte-faithful to the source, honoring page reorder/delete.
+   * Removed: `/Info`, XMP, `/PieceInfo`, embedded files, image EXIF/GPS, actions/JavaScript, prior revisions, signatures, and filename-leaking layer names.
+   * Accessibility tags, page labels, language, and viewer preferences are kept by default.
+   * Emits `warningHandler` if a digital signature had to be dropped.
+   * @param {object} [options] - Overrides the Balanced scrub defaults (`stripStructTree`, `stripPageLabels`, `stripViewerPrefs`, `dropOCProperties`); see `defaultScrubOpts`.
+   * @returns {Promise<Uint8Array>}
+   */
+  async stripMetadata(options = {}) {
+    const { images } = this;
+    if (!images || !images.pdfData) {
+      throw new Error('stripMetadata requires a document with a PDF source (image-only imports carry no PDF metadata).');
+    }
+    const warningHandler = (/** @type {string} */ message) => this.warningHandler({ message });
+
+    const primaryId = images.primarySourceId;
+    const pageCount = this.inputData?.pageCount ?? 0;
+    const sourceArr = [];
+    let multiSource = false;
+    let edited = false;
+    for (let p = 0; p < pageCount; p++) {
+      const pm = this.pageMetrics?.[p];
+      const src = pm?.sourcePageN ?? p;
+      if (src !== p) edited = true;
+      if ((pm?.sourceId ?? primaryId) !== primaryId) multiSource = true;
+      sourceArr.push(src);
+    }
+    if (multiSource) {
+      throw new Error('stripMetadata does not yet support documents assembled from multiple PDF sources '
+        + '(cross-document page copy); export the document to a single PDF first, then strip its metadata.');
+    }
+
+    // stripMetadataPdf enumerates every source page, so an unedited document cleans in full even when its in-memory page metrics are incomplete.
+    if (!edited) return stripMetadataPdf(images.pdfData, options, warningHandler);
+
+    // Page reorder/delete: subset the source to the current display order, scrubbing as it rebuilds.
+    const scrub = { opts: { ...defaultScrubOpts(), ...options } };
+    const out = await subsetPdf(images.pdfData, sourceArr, { scrub, warningHandler });
+    return out instanceof Uint8Array ? out : new Uint8Array(out);
+  }
+}

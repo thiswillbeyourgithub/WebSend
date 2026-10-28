@@ -57,14 +57,11 @@ function isSentenceEnding(word) {
   return true;
 }
 
-/** @type {?opentype.Font} */
-let fontOpentype = null;
-
 /**
  * Calculates the advance of a string in pixels.
  * @param {string} text
  * @param {number} size
- * @param {opentype.Font} font
+ * @param {opentypeFont} font
  */
 function getTextWidth(text, size, font) {
   const charMetrics = calcWordCharMetrics(text, font);
@@ -244,7 +241,7 @@ function formatNumber(num, numFmt) {
  * @param {ParsedNumbering} numberingData
  * @param {Map<string, number[]>} counters
  */
-function generateParNum(numId, ilvl, numberingData, counters) {
+function generateMarker(numId, ilvl, numberingData, counters) {
   const abstractNumId = numberingData.numIdToAbstractNumId.get(numId);
   if (!abstractNumId) return undefined;
 
@@ -461,7 +458,7 @@ export function parseFootnotes(footnotesXml) {
  * @property {string} [footnoteId] - If type is 'footnote', this is the footnote ID
  * @property {number} [footnoteIndex] - If type is 'footnote', this is the 1-based footnote number
  * @property {string} [paraId] - The paragraph ID from Word (w14:paraId attribute)
- * @property {string} [parNum] - The paragraph number (e.g., "1.1", "1.2") if numbered
+ * @property {string} [marker] - The list marker as Word renders it, if numbered
  * @property {string | null} [styleId] - The Word style ID (e.g., "Heading1", "Normal")
  */
 
@@ -503,17 +500,19 @@ export function parseParagraphs(docXml, footnotesMap = new Map(), stylesMap = ne
       const styleName = styleId.toLowerCase();
       if (styleName === 'title' || styleName.startsWith('heading') || styleName.startsWith('toc')) {
         parType = 'title';
+      } else if (styleName.startsWith('quote') || styleName === 'intensequote') {
+        parType = 'blockquote';
       }
     }
 
     const parStyle = styleId ? stylesMap.get(styleId) : null;
 
     // Extract paragraph numbering
-    let parNum;
+    let marker;
     if (numberingData && styleId) {
       const styleNum = numberingData.styleToNumbering.get(styleId);
       if (styleNum) {
-        parNum = generateParNum(styleNum.numId, styleNum.ilvl, numberingData, numberingCounters);
+        marker = generateMarker(styleNum.numId, styleNum.ilvl, numberingData, numberingCounters);
       }
     }
 
@@ -525,10 +524,10 @@ export function parseParagraphs(docXml, footnotesMap = new Map(), stylesMap = ne
       const footnoteRefMatch = runContent.match(/<w:footnoteReference\s+[^>]*w:id="([^"]+)"/);
       if (footnoteRefMatch) {
         const footnoteId = footnoteRefMatch[1];
-        if (footnotesMap.has(footnoteId) && !footnoteOrder.includes(footnoteId)) {
+        if (!footnotesMap.has(footnoteId)) continue;
+        if (!footnoteOrder.includes(footnoteId)) {
           footnoteOrder.push(footnoteId);
         }
-        // Add a superscript marker for the footnote number
         const footnoteIndex = footnoteOrder.indexOf(footnoteId) + 1;
         runs.push({
           text: String(footnoteIndex),
@@ -565,7 +564,7 @@ export function parseParagraphs(docXml, footnotesMap = new Map(), stylesMap = ne
 
     if (runs.length > 0) {
       paragraphs.push({
-        runs, type: parType, paraId, parNum, styleId,
+        runs, type: parType, paraId, marker, styleId,
       });
     }
   }
@@ -679,9 +678,7 @@ export async function convertDocDocx({ docxData, pageDims = null, lineSplitMode 
 const convertDocumentXML = async ({
   documentXml, footnotesXml = null, stylesXml = null, numberingXml = null, pageDims = null, lineSplitMode = 'width',
 }) => {
-  if (!fontOpentype) {
-    fontOpentype = (await FontCont.getFont({ font: FONT_FAMILY })).opentype;
-  }
+  const fontOpentype = (await FontCont.getFont({ font: FONT_FAMILY })).opentype;
 
   const ASCENDER_HEIGHT = fontOpentype.ascender * (FONT_SIZE / fontOpentype.unitsPerEm);
   const DESCENDER_HEIGHT = fontOpentype.descender * (FONT_SIZE / fontOpentype.unitsPerEm);
@@ -732,7 +729,7 @@ const convertDocumentXML = async ({
     const parFootnoteId = paragraph.footnoteId;
     const parFootnoteIndex = paragraph.footnoteIndex;
     const parParaId = paragraph.paraId;
-    const parParNum = paragraph.parNum;
+    const parMarker = paragraph.marker;
     const parStyleId = paragraph.styleId;
 
     while (runIndex < parRuns.length) {
@@ -797,6 +794,19 @@ const convertDocumentXML = async ({
               if (lineSplitMode !== 'sentence' && lastWord.bbox.left + combinedWidth > MARGIN_HORIZONTAL + availableWidth) {
                 lineComplete = true;
                 break;
+              }
+
+              const tailStyle = lastWord.styleRuns && lastWord.styleRuns.length > 0
+                ? { ...lastWord.style, ...lastWord.styleRuns[lastWord.styleRuns.length - 1].style }
+                : lastWord.style;
+              if (tailStyle.bold !== run.styles.bold || tailStyle.italic !== run.styles.italic
+                || tailStyle.smallCaps !== run.styles.smallCaps) {
+                const delta = {};
+                if (run.styles.bold !== lastWord.style.bold) delta.bold = run.styles.bold;
+                if (run.styles.italic !== lastWord.style.italic) delta.italic = run.styles.italic;
+                if (run.styles.smallCaps !== lastWord.style.smallCaps) delta.smallCaps = run.styles.smallCaps;
+                lastWord.styleRuns = lastWord.styleRuns || [];
+                lastWord.styleRuns.push({ i: lastWord.text.length, style: delta });
               }
 
               lastWord.text = combinedText;
@@ -902,10 +912,10 @@ const convertDocumentXML = async ({
       if (parParaId) parObj.id = parParaId;
       parObj.lines = parLines;
       parObj.type = parType;
-      if (parParNum) {
-        parObj.parNum = parParNum;
+      if (parMarker) {
+        parObj.marker = parMarker;
       } else if (parFootnoteIndex !== undefined) {
-        parObj.parNum = String(parFootnoteIndex);
+        parObj.marker = String(parFootnoteIndex);
       }
       if (parStyleId) parObj.debug.sourceStyle = parStyleId;
       for (const ln of parLines) ln.par = parObj;

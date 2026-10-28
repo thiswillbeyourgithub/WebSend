@@ -118,6 +118,28 @@ export function quantile(arr, ntile) {
 }
 
 /**
+ * Statistical median of `arr`.
+ * Not interchangeable with `quantile(arr, 0.5)`, which returns the upper of the two middle values when the count is even and `null` when empty.
+ * @param {Array<number>} arr
+ */
+export function median(arr) {
+  const s = arr.slice().sort((a, b) => a - b);
+  if (!s.length) return 0;
+  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+}
+
+/**
+ * Normalize a heading line for an exact equality test against an outline bookmark title.
+ * @param {string} s
+ * @returns {string}
+ */
+export function normalizeHeadingText(s) {
+  // Trailing soft punctuation only: stripping internal punctuation would let distinct lines collide and promote the wrong line to a heading.
+  // A near-miss is harmless, since no match just means no promotion.
+  return (s || '').replace(/\s+/g, ' ').trim().toLowerCase().replace(/[.,:;]+$/, '');
+}
+
+/**
  *
  * @param {Array<number>} arr
  * @returns {number}
@@ -192,7 +214,16 @@ export function calcLang(str) {
   return 'eng';
 }
 
-// Reads OCR files, which may be compressed as .gz or uncompressed
+/**
+ * @param {Uint8Array} bytes
+ * @returns {Promise<Uint8Array>}
+ */
+async function gunzipBytes(bytes) {
+  // Node's zlib decompresses several times faster than DecompressionStream, which is the largest single cost in opening a saved session.
+  if (typeof process !== 'undefined') return (await import('node:zlib')).gunzipSync(bytes);
+  const decompressedStream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(decompressedStream).arrayBuffer());
+}
 
 /**
  * Reads an OCR file, which may be compressed as .gz or uncompressed.
@@ -205,40 +236,22 @@ export async function readOcrFile(file) {
     const fileUint8Array = new Uint8Array(file);
 
     const isGzipped = fileUint8Array[0] === 0x1F && fileUint8Array[1] === 0x8B;
-    if (isGzipped) {
-      const ds = new DecompressionStream('gzip');
-      const decompressedStream = new Blob([file]).stream().pipeThrough(ds);
-      file = await new Response(decompressedStream).arrayBuffer();
-    }
+    const bytes = isGzipped ? await gunzipBytes(fileUint8Array) : fileUint8Array;
     const decoder = new TextDecoder('utf-8');
-    return decoder.decode(file);
+    return decoder.decode(bytes);
   }
 
   // Any string is assumed to be the file contents.
   if (typeof file === 'string') return file;
 
-  // The `typeof process` condition is necessary to avoid error in Node.js versions <20, where `File` is not defined.
-  if (typeof process === 'undefined' && file instanceof File) {
+  if (file && typeof file.arrayBuffer === 'function') {
     // Check for gzip magic bytes instead of relying on filename
-    const arrayBuffer = await file.arrayBuffer();
-    const fileUint8Array = new Uint8Array(arrayBuffer);
+    const fileUint8Array = new Uint8Array(await file.arrayBuffer());
     const isGzipped = fileUint8Array[0] === 0x1F && fileUint8Array[1] === 0x8B;
-    if (isGzipped) {
-      const ds = new DecompressionStream('gzip');
-      const decompressedStream = new Blob([arrayBuffer]).stream().pipeThrough(ds);
-      const decompressed = await new Response(decompressedStream).arrayBuffer();
-      return new TextDecoder('utf-8').decode(decompressed);
-    }
-    const decoder = new TextDecoder('utf-8');
-    return decoder.decode(arrayBuffer);
+    return new TextDecoder('utf-8').decode(isGzipped ? await gunzipBytes(fileUint8Array) : fileUint8Array);
   }
 
-  if (typeof process !== 'undefined') {
-    if (!file?.fileData?.toString) throw new Error('Invalid input. Must be a FileNode, ArrayBuffer, or string.');
-    // @ts-ignore
-    return file.fileData.toString();
-  }
-  throw new Error('Invalid input. Must be a File, ArrayBuffer, or string.');
+  throw new Error('Invalid input. Must be a File, FileNode, ArrayBuffer, or string.');
 }
 
 /**
@@ -391,50 +404,40 @@ export function objectAssignDefined(target, ...sources) {
   return target;
 }
 
-// Sans/serif lookup for common font families. These should not include spaces or underscores--multi-word font names should be concatenated.
+// Sans/serif/symbol lookup for common font families. These should not include spaces or underscores--multi-word font names should be concatenated.
 // Fonts that should not be added (both Sans and Serif variants):
 // DejaVu
-const serifFonts = ['SerifDefault', 'Baskerville', 'Bembo', 'Bodoni', 'Bookman', 'C059', 'Calibri', 'Cambria', 'Century', 'Cheltenham', 'Courier', 'Garamond', 'Georgia',
+const serifFonts = ['SerifDefault', 'Archer', 'Baskerville', 'Bembo', 'Bodoni', 'Bookman', 'C059', 'Calibri', 'Cambria', 'Century', 'Cheltenham', 'Courier', 'Garamond', 'Georgia',
   'LucidaBright', 'Minion', 'NimbusMono', 'Optima', 'P052', 'Palatino', 'Times'];
-const sansFonts = ['SansDefault', 'Avenir', 'Arial', 'Calibri', 'Candara', 'Carlito', 'Comic', 'Franklin', 'Frutiger', 'Futura', 'Gotham', 'Gothic',
-  'Helvetica', 'Impact', 'Interstate', 'Myriad', 'Tahoma', 'Trebuchet', 'Univers', 'Verdana'];
+const sansFonts = ['SansDefault', 'Amplitude', 'Avenir', 'Arial', 'Calibri', 'Candara', 'Carlito', 'Clarika', 'Comic', 'Franklin', 'Frutiger', 'Futura', 'Gotham', 'Gothic',
+  'Halvorsen', 'Helvetica', 'Impact', 'Interstate', 'Kievit', 'Lato', 'Myriad', 'Segoe', 'Tahoma', 'Trebuchet', 'Univers', 'Verdana'];
+const symbolFonts = ['SymbolDefault', 'Dingbats', 'Wingdings', 'Webdings', 'ZapfDingbats', 'Symbol', 'SymbolMT', 'Quivira'];
 
 const serifFontsRegex = new RegExp(serifFonts.reduce((x, y) => `${x}|${y}`), 'i');
 const sansFontsRegex = new RegExp(sansFonts.reduce((x, y) => `${x}|${y}`), 'i');
-
-const unidentifiedFonts = new Set();
-
-export class FontProps {
-  static sansFontsDoc = new Set();
-
-  static serifFontsDoc = new Set();
-
-  static sizeMult = {};
-}
+const symbolFontsRegex = new RegExp(symbolFonts.reduce((x, y) => `${x}|${y}`), 'i');
 
 /**
- * Given a font name from Tesseract/Abbyy XML, determine if it should be represented by sans font or serif font.
+ * Given a font name, determine which built-in font category it should be represented by:
+ * sans-serif, serif, or symbol.
  *
- * @param {string|null|undefined} fontName - The name of the font to determine the type of. If the font name
- * is falsy, the function will return "Default".
- * @returns {('SansDefault'|'SerifDefault'|'Default')}
+ * @param {string|null|undefined} fontName - The name of the font to determine the type of.
+ *    If the font name is falsy, the function will return "Default".
+ * @returns {('SansDefault'|'SerifDefault'|'SymbolDefault'|'Default')}
  */
 export function determineSansSerif(fontName) {
   // Remove underscores and spaces from the font name.
   fontName = fontName?.replaceAll(/[_\s]/gi, '');
 
-  /** @type {('SansDefault'|'SerifDefault'|'Default')} */
+  /** @type {('SansDefault'|'SerifDefault'|'SymbolDefault'|'Default')} */
   let fontFamily = 'Default';
-  // Font support is currently limited to 1 font for Sans and 1 font for Serif.
   if (fontName && !['Default', 'GlyphLessFont', 'HiddenHorzOCR'].includes(fontName)) {
-    // First, test to see if "sans" or "serif" is in the name of the font
-    if (/(^|\W|_)sans($|\W|_)/i.test(fontName)) {
+    if (symbolFontsRegex.test(fontName)) {
+      fontFamily = 'SymbolDefault';
+    } else if (/(^|\W|_)sans($|\W|_)/i.test(fontName)) {
       fontFamily = 'SansDefault';
     } else if (/(^|\W|_)serif($|\W|_)/i.test(fontName)) {
       fontFamily = 'SerifDefault';
-
-    // If not, check against a list of known sans/serif fonts.
-    // This list is almost certainly incomplete, so should be added to when new fonts are encountered.
     } else if (serifFontsRegex.test(fontName)) {
       fontFamily = 'SerifDefault';
     } else if (sansFontsRegex.test(fontName)) {
@@ -444,15 +447,6 @@ export function determineSansSerif(fontName) {
         fontFamily = 'SerifDefault';
       } else if (/san/i.test(fontName)) {
         fontFamily = 'SansDefault';
-      // This comes after the hard-coded values, as the hard-coded values are considered more reliable.
-      // If recognition decides the font named "Arial" is a serif font, it's probably wrong.
-      } else if (FontProps.sansFontsDoc.has(fontName)) {
-        fontFamily = 'SansDefault';
-      } else if (FontProps.serifFontsDoc.has(fontName)) {
-        fontFamily = 'SerifDefault';
-      } else if (!unidentifiedFonts.has(fontName)) {
-        unidentifiedFonts.add(fontName);
-        console.log(`Unidentified font: ${fontName}`);
       }
     }
   }
@@ -606,12 +600,24 @@ export const getStyleLookup = (style) => {
   return styleStr;
 };
 
+/** @type {Map<string, string>} */
+const cleanFamilyNameCache = new Map();
+
 /**
  * Identify specific font families and return a standardized name.
  * This function is not intended to map names to fonts supported by this program,
  * but rather simply to normalize the names of common fonts to a single name.
  */
 export const cleanFamilyName = (family) => {
+  const cached = cleanFamilyNameCache.get(family);
+  if (cached !== undefined) return cached;
+  const result = cleanFamilyNameInner(family);
+  if (cleanFamilyNameCache.size < 4096) cleanFamilyNameCache.set(family, result);
+  return result;
+};
+
+/** @param {string} family */
+const cleanFamilyNameInner = (family) => {
   let familyClean = family;
   if (/NimbusRom/i.test(family)) {
     familyClean = 'NimbusRoman';
@@ -649,3 +655,17 @@ export const cleanFamilyName = (family) => {
 
   return familyClean;
 };
+
+/**
+ * Concatenate an array of `Uint8Array` chunks into one contiguous `Uint8Array`.
+ * @param {Uint8Array[]} chunks
+ * @returns {Uint8Array}
+ */
+export function concatBytes(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const res = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { res.set(c, off); off += c.length; }
+  return res;
+}

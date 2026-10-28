@@ -1,0 +1,177 @@
+/**
+ * Geometry shared by the PDF export rewriter and the page renderer.
+ * A native-text edit or redaction must suppress exactly the same glyphs on screen and in the exported file.
+ */
+
+/**
+ * Map a rect from the page-pixel frame (top-left origin, the frame OCR words and edit records live in) to content-stream user space.
+ * Inverts the box-origin + /Rotate transform the importer bakes into its initial CTM.
+ * @param {bbox} bboxPx
+ * @param {{width: number, height: number}} dims - Page dimensions in the page-pixel frame.
+ * @param {number[]} box - Effective page box (CropBox when present, else MediaBox).
+ * @param {number} rotate - Source PDF /Rotate (0/90/180/270).
+ * @returns {?[number, number, number, number]} `[x0, y0, x1, y1]`, or null for a degenerate rect.
+ */
+export function pageRectToContentRect(bboxPx, dims, box, rotate) {
+  const corners = [
+    [bboxPx.left, bboxPx.top], [bboxPx.right, bboxPx.top],
+    [bboxPx.left, bboxPx.bottom], [bboxPx.right, bboxPx.bottom],
+  ];
+  let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity;
+  for (const [px, py] of corners) {
+    const [x, y] = pagePointToContentPoint(px, py, dims, box, rotate);
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+  }
+  if (!(x1 > x0 && y1 > y0)) return null;
+  return [x0, y0, x1, y1];
+}
+
+/**
+ * Map a point from the page-pixel frame to content-stream user space.
+ * @param {number} px
+ * @param {number} py
+ * @param {{width: number, height: number}} dims - Page dimensions in the page-pixel frame.
+ * @param {number[]} box - Effective page box (CropBox when present, else MediaBox).
+ * @param {number} rotate - Source PDF /Rotate (0/90/180/270).
+ * @returns {[number, number]}
+ */
+export function pagePointToContentPoint(px, py, dims, box, rotate) {
+  const contentW = Math.abs(box[2] - box[0]);
+  const contentH = Math.abs(box[3] - box[1]);
+  const ox = Math.min(box[0], box[2]);
+  const oy = Math.min(box[1], box[3]);
+  const rot = ((rotate % 360) + 360) % 360;
+  const visW = rot % 180 === 0 ? contentW : contentH;
+  const visH = rot % 180 === 0 ? contentH : contentW;
+  const vx = px * (visW / dims.width);
+  const vy = visH - py * (visH / dims.height);
+  if (rot === 90) return [contentW + ox - vy, vx + oy];
+  if (rot === 180) return [contentW + ox - vx, contentH + oy - vy];
+  if (rot === 270) return [vy + ox, contentH + oy - vx];
+  return [vx + ox, vy + oy];
+}
+
+/**
+ * Map a deleteImage record into content user space for the strike test.
+ * @param {ImageEditDelete} rec
+ * @param {{width: number, height: number}} dims
+ * @param {number[]} box
+ * @param {number} rotate
+ * @returns {?{rect: [number, number, number, number], sites: Array<{objNum: ?number, rect: [number, number, number, number]}>, tol: number}}
+ */
+export function mapImageDelete(rec, dims, box, rotate) {
+  const rect = pageRectToContentRect(rec.rect, dims, box, rotate);
+  if (!rect) return null;
+  const sites = [];
+  for (const s of rec.sites || []) {
+    const r = pageRectToContentRect(s, dims, box, rotate);
+    if (r) sites.push({ objNum: Number.isFinite(s.objNum) ? /** @type {number} */ (s.objNum) : null, rect: r });
+  }
+  if (sites.length === 0) return null;
+  const [ax, ay] = pagePointToContentPoint(0, 0, dims, box, rotate);
+  const [bx, by] = pagePointToContentPoint(1, 0, dims, box, rotate);
+  const tol = 2 * Math.hypot(bx - ax, by - ay);
+  return { rect, sites, tol };
+}
+
+/**
+ * Whether an image draw is one of a deleteImage record's placements.
+ * A draw matching no site survives, so a bystander image inside the rect is never removed.
+ * @param {number[]} ctm - The draw's full CTM.
+ * @param {{rect: [number, number, number, number], sites: Array<{objNum: ?number, rect: [number, number, number, number]}>, tol: number}} gate
+ * @param {?number} objNum - The drawn image's object number, or null when unresolved.
+ */
+export function imageDrawMatchesDelete(ctm, gate, objNum) {
+  let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity;
+  for (const [u, v] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+    const x = u * ctm[0] + v * ctm[2] + ctm[4];
+    const y = u * ctm[1] + v * ctm[3] + ctm[5];
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+  }
+  const t = gate.tol;
+  if (x0 < gate.rect[0] - t || y0 < gate.rect[1] - t || x1 > gate.rect[2] + t || y1 > gate.rect[3] + t) return false;
+  for (const s of gate.sites) {
+    if (Math.abs(x0 - s.rect[0]) > t || Math.abs(y0 - s.rect[1]) > t
+      || Math.abs(x1 - s.rect[2]) > t || Math.abs(y1 - s.rect[3]) > t) continue;
+    if (s.objNum !== null && objNum !== null && objNum !== undefined && s.objNum !== objNum) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Map a deletePath record into content user space for the strike test.
+ * @param {PathEditDelete} rec
+ * @param {{width: number, height: number}} dims
+ * @param {number[]} box
+ * @param {number} rotate
+ * @returns {?{rect: [number, number, number, number], sites: Array<{rect: [number, number, number, number], paint: string, commands: number}>, tol: number}}
+ */
+export function mapPathDelete(rec, dims, box, rotate) {
+  // Corner mapping rather than `pageRectToContentRect`, which drops the zero-height extent a stroked hairline legitimately has.
+  const mapRect = (r) => {
+    let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity;
+    for (const [px, py] of [[r.left, r.top], [r.right, r.top], [r.left, r.bottom], [r.right, r.bottom]]) {
+      const [x, y] = pagePointToContentPoint(px, py, dims, box, rotate);
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+    }
+    return /** @type {[number, number, number, number]} */ ([x0, y0, x1, y1]);
+  };
+  const sites = [];
+  for (const s of rec.sites || []) {
+    // A malformed site (hand-edited session) is dropped, so the strike fails toward keeping content.
+    if (typeof s.commands !== 'number' || (s.paint !== 'f' && s.paint !== 's' && s.paint !== 'fs')) continue;
+    sites.push({ rect: mapRect(s), paint: s.paint, commands: s.commands });
+  }
+  if (sites.length === 0) return null;
+  const [ax, ay] = pagePointToContentPoint(0, 0, dims, box, rotate);
+  const [bx, by] = pagePointToContentPoint(1, 0, dims, box, rotate);
+  const tol = 2 * Math.hypot(bx - ax, by - ay);
+  return { rect: mapRect(rec.rect), sites, tol };
+}
+
+/**
+ * Whether a painted path draw is one of a deletePath record's sites.
+ * A draw matching no site survives, so a bystander path inside the rect is never removed.
+ * @param {[number, number, number, number]} hull - The draw's hull AABB in content user space, curve control points included.
+ * @param {{rect: [number, number, number, number], sites: Array<{rect: [number, number, number, number], paint: string, commands: number}>, tol: number}} gate
+ * @param {'f'|'s'|'fs'} paint
+ * @param {number} commands
+ */
+export function pathDrawMatchesDelete(hull, gate, paint, commands) {
+  const t = gate.tol;
+  if (hull[0] < gate.rect[0] - t || hull[1] < gate.rect[1] - t || hull[2] > gate.rect[2] + t || hull[3] > gate.rect[3] + t) return false;
+  for (const s of gate.sites) {
+    if (Math.abs(hull[0] - s.rect[0]) > t || Math.abs(hull[1] - s.rect[1]) > t
+      || Math.abs(hull[2] - s.rect[2]) > t || Math.abs(hull[3] - s.rect[3]) > t) continue;
+    if (s.paint !== paint || s.commands !== commands) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Whether a glyph's em box overlaps any of the rects.
+ * @param {number[]} trm - Full render matrix (size/Tz/rise prefix * Tm * CTM), 6 elements.
+ * @param {number} advEm - Glyph advance in em units (PDF /Widths value / 1000).
+ * @param {boolean} vertical
+ * @param {Array<[number, number, number, number]>} rects - `[x0, y0, x1, y1]` user-space rects.
+ */
+export function glyphEmBoxHitsRects(trm, advEm, vertical, rects) {
+  let u0; let u1; let v0; let v1;
+  if (vertical) {
+    u0 = -0.6; u1 = 0.6; v0 = -1.1; v1 = 0.35;
+  } else {
+    u0 = -0.1; u1 = advEm + 0.05; v0 = -0.3; v1 = 0.95;
+  }
+  let gx0 = Infinity; let gy0 = Infinity; let gx1 = -Infinity; let gy1 = -Infinity;
+  for (const [u, v] of [[u0, v0], [u1, v0], [u0, v1], [u1, v1]]) {
+    const gx = u * trm[0] + v * trm[2] + trm[4];
+    const gy = u * trm[1] + v * trm[3] + trm[5];
+    gx0 = Math.min(gx0, gx); gy0 = Math.min(gy0, gy); gx1 = Math.max(gx1, gx); gy1 = Math.max(gy1, gy);
+  }
+  for (const b of rects) {
+    if (gx0 < b[2] && gx1 > b[0] && gy0 < b[3] && gy1 > b[1]) return true;
+  }
+  return false;
+}

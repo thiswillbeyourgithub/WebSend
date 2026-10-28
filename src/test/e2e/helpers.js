@@ -62,4 +62,17 @@ async function pairAndVerify(browser) {
     return { ctxA, pageA, ctxB, pageB };
 }
 
-module.exports = { pairAndVerify };
+/**
+ * Whether poppler's `pdftotext` is installed. Specs that inspect the text
+ * layer of an exported PDF skip themselves without it.
+ */
+function hasPdftotext() {
+    try {
+        require('child_process').execFileSync('pdftotext', ['-v'], { stdio: 'ignore' });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+module.exports = { pairAndVerify, hasPdftotext };

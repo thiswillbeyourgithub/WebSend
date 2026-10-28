@@ -1,0 +1,4518 @@
+/* eslint-disable import/no-cycle */
+import scribe from '../scribe.js';
+import { pageMatchIds, search } from './js/viewerSearch.js';
+import {
+  UiDataColumn, UiLayout, UiRegion, layout,
+} from './js/viewerLayout.js';
+import { clearObjectProperties } from '../js/utils/miscUtils.js';
+import { nativeTextForPage } from '../js/textEdits.js';
+import { loadBuiltInFontsRaw } from '../js/fontContainerMain.js';
+import { UiText, UiOcrWord } from './js/viewerWordObjects.js';
+import { ViewerImageCache, IOS_WEBKIT } from './js/viewerImageCache.js';
+import { IS_MAC } from './js/platform.js';
+import {
+  contextMenuFunc, mouseupFunc2, showTouchCallout, hideTouchCallout,
+} from './js/viewerCanvasInteraction.js';
+import {
+  deleteSelectedWord, modifySelectedWordBbox, modifySelectedWordStyle,
+} from './js/viewerModifySelectedWords.js';
+import { getAllFileEntries } from './js/dragAndDrop.js';
+import { deleteSelectedLayoutDataTable, deleteSelectedLayoutRegion } from './js/viewerModifySelectedLayout.js';
+import {
+  annotMatchesWord, applyHighlight, removeHighlight, modifyHighlightComment, updateHighlightGroupOutline,
+} from './js/viewerHighlights.js';
+import { renderPageNotes } from './js/viewerNotes.js';
+import { renderPageRedactions, updateRedactTab, hideRedactTabSoon } from './js/viewerRedactions.js';
+import { renderPageFormFields } from './js/viewerFormFields.js';
+import { renderPageFillItems, selectedFillItem, deselectFillItem } from './js/viewerFillSign.js';
+import { ensureLayerStyleSheet, COMMENT_MARK_SVG } from './js/viewerLayerStyles.js';
+import {
+  ScribeViewerState, ScribeViewerOpts, CanvasSelection,
+  registerViewer, unregisterViewer, getActiveViewer, setActiveViewer,
+  getDefaultViewer, getAllViewers, findViewerForTarget,
+} from './js/viewerRuntime.js';
+import { DEBUG_RENDER_SCHED } from '../tess/TessScheduler.js';
+import { parIsFurniture } from '../js/objects/ocrObjects.js';
+
+/**
+ * @typedef {{left: number, right: number, top: number, bottom: number}} FillTerritory
+ */
+
+/**
+ * @typedef {Object} SelectionEngine
+ * @property {'custom'|'dom'} kind
+ * @property {() => void} install
+ * @property {() => void} clear
+ * @property {() => Array<UiOcrWord>} getWords
+ * @property {() => boolean} isInView
+ * @property {() => Set<number>} pages
+ * @property {() => void} [uninstall]
+ * @property {(speed: number) => void} [onScroll]
+ * @property {() => void} [endScrollHide]
+ * @property {() => void} [startInteractionHide]
+ * @property {(renderedLines: Array<OcrLine>, colExtents: Map<OcrLine, {left: number, right: number}>, pageDims: dims) => Map<OcrLine, FillTerritory>} [computeFillLimits]
+ * @property {(lineDiv: HTMLDivElement, lim: FillTerritory|undefined, angleAdjLine: {x: number, y: number}, selectText: boolean) => (hitL: number, hitR: number) => void} [makeLineFiller]
+ */
+
+/**
+ * @typedef {{kind: 'custom'|'dom', attach: (viewer: ScribeViewer) => SelectionEngine}} SelectionEngineRegistration
+ */
+
+/**
+ * Per-viewer canvas controller. Owns its own scroll container, document, selection, and event state.
+ * Multiple instances can coexist on the same page. Each operates independently.
+ *
+ * For backward compatibility, the existing static `ScribeViewer.X` API is preserved as a facade.
+ * It delegates to a default instance (the first one constructed, created lazily on first access).
+ * Single-viewer applications can continue to use the static API unchanged.
+ */
+export class ScribeViewer {
+  /**
+   * Number of pages ahead and behind the current page to keep the text DOM built before `destroyText` evicts it.
+   * Wider than the +/-1 build window (see `displayPage`) so scrolling back over recently-seen pages reuses their word spans instead of rebuilding.
+   */
+  static textRetainPages = 8;
+
+  /**
+   * After a deferred (fast-scroll or invis) page change, wait this long (ms) with no further page change before building the landed page's word DOM.
+   * A fast sweep across many pages keeps rescheduling this, so it builds only the page it settles on rather than every page flown past (see `updateCurrentPage`).
+   */
+  static deferredTextSettleMs = 100;
+
+  /**
+   * Scroll speed (fraction of viewport height per frame) above which a page scrolls away too fast to read, so its word build is deferred (see `updateCurrentPage`).
+   * Invis mode defers at any speed, since its text is invisible.
+   */
+  static deferTextVelocityFraction = 0.5;
+
+  /**
+   * Scroll speed (fraction of viewport height per frame) above which full-res page rasters are deferred to low-res previews (see `updateCurrentPage`).
+   * Far below `deferTextVelocityFraction` because raster completions clump ~40-60ms of main-thread canvas insert each and starve the scroll loop.
+   */
+  static deferRasterVelocityFraction = 0.13;
+
+  /**
+   * Resume threshold for full rasters once deferred, below `deferRasterVelocityFraction` so the two form a hysteresis band against velocity noise flapping the strategy.
+   */
+  static resumeRasterVelocityFraction = 0.09;
+
+  /**
+   * The desktop `deferRasterVelocityFraction` is tuned for chunky wheel deltas and sits above fling speeds, so an iOS momentum glide would full-render every page it flies past and kill the tab.
+   * This cutoff catches any real fling while leaving deliberate reading scrolls fully rendered.
+   */
+  static iosDeferRasterVelocityFraction = 0.016;
+
+  /** Resume partner of `iosDeferRasterVelocityFraction`, below it so the two form a hysteresis band. */
+  static iosResumeRasterVelocityFraction = 0.011;
+
+  /**
+   * Delay (ms) after the last scroll frame before restoring the invis-mode text layers hidden during a sustained scroll (see `_updateScrollTextHide`).
+   */
+  static scrollTextHideSettleMs = 200;
+
+  /**
+   * Cumulative scroll distance within one gesture (fraction of viewport height) that engages the mid-scroll text-layer hide.
+   * High enough that a few wheel ticks don't churn the layers (each hide/show is a compositor update), low enough that a page-to-page scroll engages early.
+   */
+  static scrollTextHideDistanceFraction = 0.5;
+
+  /**
+   * Serve text selection from the OCR model (`js/viewerTextSelection.js`); set false for the invisible DOM text layer with the browser's native selection.
+   */
+  static customSelection = true;
+
+  /** Blank vertical space (content px) between stacked pages, applied above the first page and below each page. */
+  static pageMargin = 30;
+
+  /**
+   * In free-pan mode, how much blank scrollable space to add around the document, as a fraction of the largest page's width (left/right) and height (top/bottom).
+   * One page-dimension lets a page be panned fully off an edge.
+   */
+  static freePanGutterFraction = 1;
+
+  constructor() {
+    this.state = new ScribeViewerState();
+    this.opt = new ScribeViewerOpts();
+    this.CanvasSelection = new CanvasSelection(this);
+    /**
+     * The selection engine, resolved by `_sel()` from what the build registered: the model-driven engine, the invisible-text DOM engine, or null when `enableHTMLOverlay` is off.
+     * @type {?SelectionEngine}
+     */
+    this._selEngine = null;
+    /** Latch for `_sel()`: the engine choice is made once, on first use after `init`. */
+    this._selEngineInit = false;
+    /**
+     * The model-driven text selection, set by the custom engine's `attach` (`js/selection/customSelectionEngine.js`) and null under the DOM engine.
+     * @type {?import('./js/viewerTextSelection.js').TextSelection}
+     */
+    this.textSel = null;
+    this.imageCache = new ViewerImageCache(this);
+    /** @type {import('../js/containers/scribeDoc.js').ScribeDoc} */
+    this._doc = new scribe.ScribeDoc();
+
+    /** @type {HTMLElement} */
+    this.elem = /** @type {any} */ (null);
+    /** @type {?HTMLDivElement} */
+    this._linkStatusEl = null;
+    /** @type {?AnnotationLink} */
+    this._linkStatusEntry = null;
+    /** @type {?HTMLButtonElement} */
+    this._linkConfirmEl = null;
+    /** @type {?((event: PointerEvent) => void)} */
+    this._linkConfirmDocDown = null;
+    /** @type {?(() => void)} */
+    this._linkConfirmScroll = null;
+    /** @type {boolean} */
+    this._linkConfirmHover = false;
+    /**
+     * The outer element of the UI component that owns this viewer
+     * (e.g. a wrapper that also contains a toolbar), if any.
+     * Used to decide whether a click landed on the viewer's own controls when managing keyboard focus.
+     * Defaults to `elem` when unset.
+     * @type {?HTMLElement}
+     */
+    this.outerElem = null;
+    /** @type {HTMLDivElement} */
+    this.HTMLOverlayBackstopElem = /** @type {any} */ (null);
+
+    this.textOverlayHidden = false;
+
+    /**
+     * [Debug] When `true` the text overlay is never built, unlike `textOverlayHidden` which only hides an already-built one.
+     * Meaningful only under the DOM selection engine (the built-in engine draws selection from the model, not from an overlay).
+     */
+    this.textOverlayDisabledDebug = false;
+
+    /** @type {Array<number>} */
+    this._pageStopsStart = [];
+    /** @type {Array<number>} */
+    this._pageStopsEnd = [];
+    /**
+     * Layout rows: each holds 1-2 consecutive pages sharing one vertical band.
+     * @type {Array<{start: number, count: number}>}
+     */
+    this._rows = [];
+    /** @type {Array<number>} Page index -> its row index. */
+    this._pageRow = [];
+    /** @type {Array<number>} Page index -> its x origin in content space. */
+    this._pageLefts = [];
+    /** Largest row extents, in content px. */
+    this._maxRowWidth = 0;
+    this._maxRowHeight = 0;
+
+    /** @type {?Function} */
+    this.displayPageCallback = null;
+
+    /** @type {?Function} Fired after an undo/redo, so host UI (e.g. the bookmarks panel) can refresh non-page state. */
+    this.onEditCallback = null;
+    /**
+     * Host hook for a click on an unsigned signature field.
+     * Unsigned fields render as clickable sign-here targets only when a host sets this.
+     * @type {?(n: number, row: AnnotationField) => void}
+     */
+    this.onSignatureFieldClick = null;
+
+    /**
+     * Fired after every page-structure or rotation edit made through the viewer's page verbs, including undo/redo of them.
+     * For host UI that passively mirrors the page list (the phone filmstrip, the bookmarks/comments panels) and would otherwise go stale when an edit originates elsewhere.
+     * Rotation edits pass 'rotate', so a host can refresh surfaces that are unsafe to touch during structural edits' animations.
+     * @type {?(kind?: 'rotate') => void}
+     */
+    this.onPageEditCallback = null;
+
+    /**
+     * Per-page container `<div>`s, indexed by page number. Each holds the page `<canvas>` raster,
+     * the per-page text layer, and (in the editor) the overlay layer. Positioned in content space.
+     * @type {Array<?HTMLDivElement>}
+     */
+    this.pageContainerArr = [];
+
+    /**
+     * Per-page frozen copies of outgoing raster canvases.
+     * Each covers its page until a fresh canvas attaches.
+     * @type {?Object<number, ?HTMLCanvasElement>}
+     */
+    this._rasterGhosts = null;
+    /**
+     * Per-page callers of `refreshPageRaster` waiting for the fresh raster to attach.
+     * @type {?Object<number, Array<() => void>>}
+     */
+    this._rasterSwapWaiters = null;
+
+    /**
+     * The scrolling viewport. `overflow:auto`; its `scrollTop/Left` is the scroll position.
+     * @type {HTMLDivElement}
+     */
+    this.scrollContainer = /** @type {any} */ (null);
+    /**
+     * Cached scroll-container box metrics (client/scroll height/width).
+     * Reading them forces a synchronous layout, but they change only on viewport resize or content/zoom,
+     * so they are cached and invalidated (set `null`) in `resize` and `_updateContentSize`.
+     * @type {?{clientHeight: number, clientWidth: number, scrollHeight: number, scrollWidth: number}}
+     */
+    this._scrollMetricsCache = null;
+    /**
+     * Last scroll position read cleanly in `updateCurrentPage`, before the per-frame word build dirties layout.
+     * @type {number}
+     */
+    this._scrollTop = 0;
+    /** @type {number} */
+    this._scrollLeft = 0;
+    /**
+     * Settle timer for a deferred page build (see `updateCurrentPage`).
+     * A deferred word build (fast scroll, or any scroll in invis mode) or raster window (preview glide) arms it.
+     * Firing builds the landed page in full and ends any glide.
+     * @type {?ReturnType<typeof setTimeout>}
+     */
+    this._deferredTextTimer = null;
+    /**
+     * The find glide in progress, or null.
+     * @type {?{raf: number}}
+     */
+    this._scrollGlide = null;
+    /**
+     * Whether page rasters are currently deferred to previews.
+     * Set/cleared with hysteresis in `updateCurrentPage`; force-cleared by any settled full render in `displayPage`.
+     * @type {boolean}
+     */
+    this._rasterDeferred = false;
+    /**
+     * Whether the scroll is in the tail of a preview-mode glide, where page boundaries raster only the centered page.
+     * The settled full render clears it and fills the window.
+     * @type {boolean}
+     */
+    this._rasterTail = false;
+    /**
+     * Sized to the whole document (max display width x last page stop, times zoom) so the native scrollbar gets the right extent. Holds `zoomLayer`.
+     * @type {HTMLDivElement}
+     */
+    this.contentSizer = /** @type {any} */ (null);
+    /**
+     * Wraps every page container; carries the single CSS `transform: scale(zoom)`.
+     * @type {HTMLDivElement}
+     */
+    this.zoomLayer = /** @type {any} */ (null);
+
+    /** Current zoom factor (was `stage.scaleX()`). The public `zoom()` method multiplies this. */
+    this.zoomLevel = 1;
+
+    /** Document extent in content space (unscaled): max page display width, and the last page stop. */
+    this._contentWidth = 0;
+    this._contentHeight = 0;
+
+    /**
+     * Per-page text-layer containers, indexed by page then line orientation (0/1/2/3 = 0/90/180/270deg).
+     * The +-1 page virtualization keys off the page index.
+     * @type {Array<Object<string, HTMLDivElement>>}
+     */
+    this._textGroups = [];
+    /**
+     * Per-page highlight-layer containers, indexed by page then line orientation, mirroring `_textGroups`.
+     * Drawn below the text layer and above the page raster, with `mix-blend-mode: multiply` so highlighted glyphs stay crisp.
+     * @type {Array<Object<string, HTMLDivElement>>}
+     */
+    this._highlightGroups = [];
+    /**
+     * Per-page selection-layer containers, indexed by page then line orientation.
+     * Holds the custom selection's rectangles and the search-match rectangles, above the highlight bands.
+     * @type {Array<Object<string, HTMLDivElement>>}
+     */
+    this._selectGroups = [];
+    /**
+     * Per-page `word.id` -> word object, built alongside `_wordObjs` so a selection can resolve ids in one step.
+     * @type {Array<Map<string, UiOcrWord>>}
+     */
+    this._wordObjMaps = [];
+    /** Pages whose search-match rectangles need redrawing on the next frame. @type {Set<number>} */
+    this._markRepaintPages = new Set();
+    /** @type {?number} */
+    this._markRepaintRaf = null;
+    /**
+     * Called after the custom text selection changes (including when it is cleared).
+     * The host UI registers here to enable or disable selection-dependent controls.
+     * @type {?() => void}
+     */
+    this.onSelectionChange = null;
+    /**
+     * Per-page maps from highlight group id to that group's fill rects, rebuilt with the fill layer, so hover feedback can lift every band of a group at once (including bands on other pages).
+     * @type {Array<Map<string, Array<HTMLDivElement>>>}
+     */
+    this._highlightRectsByGroup = [];
+    /**
+     * Per-page comment marks, rebuilt with the fill layer.
+     * The geometry is cached so a zoom change can re-place the marks without a rebuild.
+     * @type {Array<Array<{el: HTMLSpanElement, right: number, top: number, bottom: number, nextLeft: ?number}>>}
+     */
+    this._commentMarks = [];
+    /**
+     * Called with the page index after that page's highlight or redaction layer is rebuilt.
+     * The thumbnail panel registers here to keep its overlays current.
+     * @type {?(n: number) => void}
+     */
+    this.onAnnotationsRendered = null;
+    /**
+     * Called with the page index after the user edits that page's annotations.
+     * Hosts register here to mark the document dirty for saving.
+     * @type {?(n: number) => void}
+     */
+    this.onAnnotationsEdited = null;
+    /**
+     * Called with the page index after that page's layout data tables change.
+     * @type {?(n: number) => void}
+     */
+    this.onLayoutTablesEdited = null;
+    /**
+     * Called by the shell with the current page index after each page display.
+     * The Extract Tables workspace sets it so its list follows the page.
+     * @type {?((n: number) => void)}
+     */
+    this.onTablesPageChanged = null;
+    /**
+     * Called with a highlight group id when the pointer enters a highlight, and null when it leaves.
+     * The comments panel registers here to light the hovered highlight's row.
+     * @type {?(groupId: ?string) => void}
+     */
+    this.onHighlightHover = null;
+    /**
+     * Rebuild the comments side panel so an open panel reflects a comment/note edited elsewhere (mini toolbar, note card).
+     * The host registers this when the comments panel is installed.
+     * @type {?() => void}
+     */
+    this._rebuildCommentsPanel = null;
+    /** @type {Array<?HTMLDivElement>} */
+    this._overlayGroups = [];
+    /** @type {Array<?HTMLDivElement>} Per-page sticky-note layer (z above words/highlights, survives layout-mode teardown). */
+    this._notesGroups = [];
+    /** @type {Array<?HTMLDivElement>} Per-page redaction-mark layer (above highlights, below notes; never blocks the pointer). */
+    this._redactGroups = [];
+    /** @type {Array<?HTMLDivElement>} */
+    this._fieldGroups = [];
+    /** @type {Array<?HTMLDivElement>} Per-page fill & sign items layer. */
+    this._itemGroups = [];
+    /** @type {Array<?HTMLDivElement>} Per-page redaction "Preview" tab layer, kept out of the multiply-blending mark layer so the tab label stays opaque. */
+    this._redactTabGroups = [];
+    /**
+     * State of the floating "Preview" tab over the hovered redaction mark.
+     * @type {?{el: HTMLSpanElement, n: number, groupId: string, left: number, top: number, hideT: number, pinned: boolean, on: boolean}}
+     */
+    this._redactTab = null;
+    /** @type {Array<number>} */
+    this.textGroupsRenderIndices = [];
+    /** @type {Array<number>} */
+    this.overlayGroupsRenderIndices = [];
+
+    /** The drag-select marquee `<div>`, shown only while a selection is in progress. */
+    this.selectingRectangle = /** @type {any} */ (null);
+
+    /** @type {?UiOcrWord} */
+    this.contextMenuWord = null;
+
+    /**
+     * Rendered word objects per page (the DOM word layer), indexed by page number.
+     * The text group's DOM children are per-line `<div>`s, so the word objects are tracked here rather than read back off the group.
+     * @type {Array<Array<UiOcrWord>>}
+     */
+    this._wordObjs = [];
+    /**
+     * Pages with a table-preview font harvest in flight, so a render never schedules a second one.
+     * @type {Set<number>}
+     */
+    this._tpFontPending = new Set();
+    /** @type {Array<Array<UiRegion>>} */
+    this._regionObjs = [];
+    /** @type {Array<Array<UiDataColumn>>} */
+    this._dataColumnObjs = [];
+
+    /**
+     * Contains the x and y coordinates of the last right-click event.
+     * Required for "right click" functions that are position-dependent,
+     * as the cursor moves between the initial right click and selecting the option.
+     */
+    this.contextMenuPointer = { x: 0, y: 0 };
+
+    this.selecting = false;
+    this.enableCanvasSelection = false;
+    this.enableHTMLOverlay = false;
+
+    /** @type {bbox} */
+    this.bbox = {
+      top: 0, left: 0, right: 0, bottom: 0,
+    };
+
+    /** @type {('select'|'addWord'|'recognizeWord'|'recognizeArea'|'printCoords'|'addLayoutBoxOrder'|'addLayoutBoxExclude'|'addLayoutBoxImage'|'addLayoutBoxDataTable')} */
+    this.mode = 'select';
+
+    this.drag = {
+      isPinching: false,
+      isDragging: false,
+      isResizingColumns: false,
+      dragDeltaTotal: 0,
+      lastX: 0,
+      lastY: 0,
+      /** @type {?{x: number, y: number}} */
+      lastCenter: null,
+      /** @type {?number} */
+      lastDist: null,
+    };
+
+    /**
+     * Page containers hidden during an active iOS pinch.
+     * @type {Array<HTMLDivElement>}
+     */
+    this._pinchHiddenPages = [];
+
+    /**
+     * Deferred-commit state of the active iOS pinch, folded into the real zoom and scroll at final finger lift.
+     * @type {?{startZoom: number, startDist: number, startCenter: {x: number, y: number}, baseLeft: number, baseTop: number,
+     *   startScrollLeft: number, startScrollTop: number, lastCenter: {x: number, y: number}, lastScale: number,
+     *   lastTx: number, lastTy: number, minScale: number, moveScrollLeft: number, moveScrollTop: number, needsRebase: boolean}}
+     */
+    this._pinchGesture = null;
+
+    /** `performance.now()` of the last pinch end, so a two-finger lift is never misread as a double-tap. */
+    this._lastPinchEndT = 0;
+
+    // Browser-style middle-button autoscroll (hold and move) for OCR viewing (`invis`) mode.
+    this.autoScroll = {
+      active: false,
+      originX: 0,
+      originY: 0,
+      pointerX: 0,
+      pointerY: 0,
+      /** @type {?number} */
+      rafId: null,
+      /** @type {?HTMLDivElement} */
+      indicator: null,
+    };
+
+    this.runSetInitial = true;
+
+    /** @type {?ReturnType<typeof setTimeout>} Debounce for re-rastering page canvases after a zoom settles. */
+    this._rerasterTimer = null;
+
+    /**
+     * Whether a zoom gesture is in flight.
+     */
+    this._zoomGestureActive = false;
+
+    /** Per-instance controls array (transformers/handles for the currently selected word). */
+    /** @type {Array<any>} */
+    this._controlArr = [];
+
+    /** @type {Array<HTMLElement>} */
+    this._highlightOutlineRects = [];
+
+    // The highlight color the tool currently applies, mirrored here for the context menu.
+    // Null when highlighting is disabled.
+    /** @type {?string} */
+    this._highlightColor = null;
+
+    // Whether a redact tool is present, mirrored here for the context menu's "Redact" item.
+    /** @type {boolean} */
+    this._redactEnabled = false;
+
+    // Host callback fired after a marking gesture.
+    /** @type {?(marksAdded: number) => void} */
+    this._onRedactMark = null;
+
+    // The host's Automate panel, mirrored here for the context menu's hand-off rows.
+    /** @type {?ReturnType<typeof import('./js/controls/automatePanel.js').createAutomatePanel>} */
+    this._automatePanel = null;
+
+    // Edit Text mode state, mirrored here by the tool for the context menu, touch callout, and link gating.
+    this._editTextActive = false;
+    /** @type {?(kw: any) => boolean} The context menu's "Identify font" verb, installed by the Inspect Document mode while it is on. */
+    this._inspectIdentify = null;
+    // True while the tool's line-range drag owns a touch, so the touchmove pan and the long-press context menu stand aside.
+    this._editTextLineDrag = false;
+    /** @type {?() => Array<OcrLine>} */
+    this._editTextSelectedLines = null;
+    /** @type {?() => boolean} */
+    this._editTextDeleteSelection = null;
+    /**
+     * Bold/italic state of the selected lines' words, or of the open line editor's target.
+     * @type {?(prop: 'bold'|'italic') => {present: boolean, on: boolean, locked: boolean}}
+     */
+    this._editTextStyleState = null;
+    /** @type {?(prop: 'bold'|'italic') => void} Toggle bold/italic on every word of the selected lines, or on the open line editor's target. */
+    this._editTextToggleStyle = null;
+    /** @type {?() => {present: boolean, color: ?string, mixed: boolean}} Ink of the selected lines' words, or of the open line editor's target. */
+    this._editTextColorState = null;
+    /** @type {?(hex: string) => void} Set the ink of every word of the selected lines, or of the open line editor's target. */
+    this._editTextSetColor = null;
+    /**
+     * Draw the selected lines, or the open line editor's target, in `hex` without committing.
+     * Null lifts the preview.
+     * @type {?(hex: ?string) => void}
+     */
+    this._editTextPreviewColor = null;
+    /**
+     * Start the page sampler, a loupe over the page whose center pixel a release picks.
+     * @type {?(onPick: (hex: string) => void, opts?: {onMove?: (hex: string) => void, onCancel?: () => void}) => void}
+     */
+    this._editTextSample = null;
+    /** @type {?() => {cur: string, applied: Array<string>}} The ink the text-color button applies, and the inks applied this session, most recent first. */
+    this._editTextInkState = null;
+    /** @type {?HTMLSpanElement} The style controls the desktop mode banner mounts while the mode runs. */
+    this._editTextBannerTools = null;
+    /** @type {?(menuRect: DOMRect) => void} Dock the floating style bar above the edit-only context menu. */
+    this._editTextMenuShown = null;
+    /** @type {?() => void} Hide the floating style bar if it is docked to the edit-only context menu. */
+    this._editTextMenuHidden = null;
+    /** @type {?(clientX: number, clientY: number) => ?Object} Aim the edit-only context menu by selecting the line under the point, or return null when no editable line is there. */
+    this._editTextMenuTarget = null;
+    /**
+     * Whether a press on `target` keeps the edit-only context menu open.
+     * @type {?(target: ?EventTarget) => boolean}
+     */
+    this._editTextMenuHolds = null;
+    /** @type {?() => void} Open the line editor on the last menu target. */
+    this._editTextEditLine = null;
+    /** @type {?() => void} */
+    this._editTextCopySelection = null;
+    /** @type {?ReturnType<typeof import('./js/editTextLineEditor.js').createLineEditor>} */
+    this._editTextLineEditor = null;
+
+    this._graphicsEditActive = false;
+    /**
+     * Aim the graphics-edit context menu by selecting the placement under the point, or return null when none is there.
+     * @type {?(clientX: number, clientY: number) => ?{count: number, images: number, paths: number}}
+     */
+    this._graphicsEditMenuTarget = null;
+    /** @type {?() => {count: number, images: number, paths: number}} */
+    this._graphicsEditSelectedCounts = null;
+    /** @type {?() => boolean} */
+    this._graphicsEditDeleteSelection = null;
+    /** @type {?() => ?{left: number, top: number, right: number, bottom: number}} Client-rect union of the graphics selection, anchoring the touch callout. */
+    this._graphicsEditSelectionAnchor = null;
+
+    // Whether an Edit Pages control gates the thumbnail rail's page mutations.
+    // Hosts without one keep a rail that is always armed under `enablePageEditing`.
+    /** @type {boolean} */
+    this._editPagesGate = false;
+
+    /** @type {?(message: string, undo: () => void) => void} Fired after a destructive one-tap action (the touch callout's delete), with a message and an undo for the host to surface. */
+    this._onDestructiveAction = null;
+
+    // Seams for the touch action callout, so the modules that open it (the selection engine, the comment-card press routing) need not import it.
+    /** @type {?(kind: 'selection'|'markup', kw?: any, slot?: 'highlight'|'line') => void} */
+    this._touchCalloutShow = null;
+    /** @type {?() => void} */
+    this._touchCalloutHide = null;
+
+    // Phone-layout seams the hosting app sets and this file only reads.
+    /** @type {boolean} */
+    this._phoneUi = false;
+    /** @type {?() => void} Fired when an editing mode's selection changed. */
+    this._modeSelectionChanged = null;
+    /** @type {?(text: string) => void} A short status line for the running mode. */
+    this._modeStatus = null;
+    /** @type {?(open: boolean) => void} Fired when the Edit Text line editor opens or closes. */
+    this._editTextEditorOpenChanged = null;
+
+    /**
+     * Pointer type ('mouse' | 'touch' | 'pen') of the most recent canvas pointerdown.
+     * Compatibility mouse events (click, mousemove) carry no pointer type, so their handlers read it from here; per-event discrimination, never a device-level flag.
+     * @type {string}
+     */
+    this._lastPrimaryPointerType = 'mouse';
+
+    this._searchState = {
+      search: '',
+      /**
+       * Ordered list of matches across the whole doc, one entry per occurrence.
+       * @type {Array<{pageN: number, wordIds: Array<string>}>}
+       * */
+      matchList: [],
+      /**
+       * Index into `matchList` of the currently-focused match, or -1 when none.
+       * @type {number}
+       * */
+      activeMatch: -1,
+    };
+    /**
+     * Ids of the words currently lit by a citation jump.
+     * @type {Set<string>}
+     */
+    this._citationIds = new Set();
+
+    this.evalStats = [];
+    this._evalStatsConfig = {
+      /** @type {string|undefined} */
+      ocrActive: undefined,
+      ignorePunct: scribe.ScribeDoc.defaults.ignorePunct,
+      ignoreCap: scribe.ScribeDoc.defaults.ignoreCap,
+    };
+
+    /** @type {?EventTarget} */
+    this._mouseDownTarget = null;
+
+    /** @param {*} event */
+    this.interactionCallback = (event) => {};
+    /** @param {boolean} deselect */
+    // eslint-disable-next-line no-unused-vars
+    this.destroyControlsCallback = (deselect) => {};
+
+    registerViewer(this);
+  }
+
+  /**
+   * The selection engines available to viewers, each registered by importing its module
+   * (`js/selection/customSelectionEngine.js`, `js/selection/domSelectionEngine.js`), so a bundle ships only the engines it imports.
+   * @type {{dom: ?SelectionEngineRegistration, custom: ?SelectionEngineRegistration}}
+   */
+  static _selectionEngines = { dom: null, custom: null };
+
+  /** @param {SelectionEngineRegistration} engine */
+  static registerSelectionEngine(engine) {
+    ScribeViewer._selectionEngines[engine.kind] = engine;
+  }
+
+  /**
+   * Whether text interaction is served by the model-driven `textSel` rather than the browser's native selection over invisible word spans.
+   */
+  get useCustomSelection() {
+    return this._sel()?.kind === 'custom';
+  }
+
+  /**
+   * This viewer's selection engine, resolved and installed on first use rather than at `init`.
+   * @returns {?SelectionEngine}
+   */
+  _sel() {
+    // Lazy because apps set enableHTMLOverlay/enableCanvasSelection after construction; the first render or pointer gesture is the first moment the choice is needed.
+    if (!this._selEngineInit && this.elem) {
+      this._selEngineInit = true;
+      this._selEngine = this._resolveSelectionEngine();
+      this._selEngine?.install();
+    }
+    return this._selEngine;
+  }
+
+  /**
+   * Pick and attach this viewer's selection engine from what the build registered.
+   */
+  _resolveSelectionEngine() {
+    if (!this.enableHTMLOverlay) return null;
+    const { dom, custom } = ScribeViewer._selectionEngines;
+    if (this.enableCanvasSelection) {
+      // Canvas selection (the editor's marquee) builds on the word-span layer, so it needs the DOM engine.
+      if (!dom) throw new Error('enableCanvasSelection requires the DOM selection engine: import scribe-ui/js/selection/domSelectionEngine.js');
+      return dom.attach(this);
+    }
+    // Otherwise use custom, except fall to DOM when both are registered and the customSelection switch is off.
+    if (custom && (ScribeViewer.customSelection || !dom)) return custom.attach(this);
+    if (dom) return dom.attach(this);
+    throw new Error('No selection engine registered: import scribe-ui/js/selection/customSelectionEngine.js, scribe-ui/js/selection/domSelectionEngine.js, or both');
+  }
+
+  /**
+   * [Debug] Swap this viewer's selection engine live, rebuilding the text layers so already-rendered pages adopt the new one.
+   * It swaps by flipping the class-level `customSelection` switch, so both engines must be registered.
+   * @param {'custom'|'dom'} kind
+   */
+  setSelectionEngineDebug(kind) {
+    if (this._sel()?.kind === kind) return;
+    this.clearTextSelection();
+    this._selEngine?.uninstall?.();
+    this.textSel?.destroy();
+    this.textSel = null;
+    this._selEngine = null;
+    this._selEngineInit = false;
+    ScribeViewer.customSelection = kind === 'custom';
+    // The overlay-disable debug flag is DOM-engine-only; clear it when leaving that engine, or pages stay overlay-less with no way to toggle it back.
+    if (kind === 'custom') this.textOverlayDisabledDebug = false;
+    this.destroyText(false);
+    this.displayPage(this.state.cp.n, false, true);
+  }
+
+  /** @returns {import('../js/containers/scribeDoc.js').ScribeDoc} */
+  get doc() { return this._doc; }
+
+  set doc(value) {
+    const prev = this._doc;
+    this._doc = value;
+    if (prev && prev !== value && this.scrollContainer) this.clear();
+  }
+
+  /** Remove every per-page DOM container (raster, text, overlay) and reset the page-group bookkeeping. */
+  _clearPageDom() {
+    for (const pc of this.pageContainerArr) {
+      if (pc) pc.remove();
+    }
+    if (this._rasterGhosts) {
+      for (const k of Object.keys(this._rasterGhosts)) this._removeRasterGhost(Number(k));
+      this._rasterGhosts = null;
+    }
+    if (this._rasterSwapWaiters) {
+      for (const waiters of Object.values(this._rasterSwapWaiters)) for (const resolve of waiters) resolve();
+      this._rasterSwapWaiters = null;
+    }
+    this.pageContainerArr.length = 0;
+    this._textGroups.length = 0;
+    this._highlightGroups.length = 0;
+    this._highlightRectsByGroup.length = 0;
+    this._commentMarks.length = 0;
+    this.textGroupsRenderIndices.length = 0;
+    this._overlayGroups.length = 0;
+    this._notesGroups.length = 0;
+    this._redactGroups.length = 0;
+    this._fieldGroups.length = 0;
+    this._itemGroups.length = 0;
+    this._redactTabGroups.length = 0;
+    this._redactTab = null;
+    this.overlayGroupsRenderIndices.length = 0;
+    this._selectGroups.length = 0;
+    this._wordObjMaps.length = 0;
+    // Runs on every document swap, page reorder, rotation, and teardown, so drop the selection's now-stale cached geometry and range.
+    this.textSel?.invalidateAll();
+  }
+
+  /**
+   * Drop every rendered page (DOM containers, rasters, text, and overlay groups) and reset the display state.
+   * Call this after `doc.clear()`, which empties the document in place without firing the `doc` setter, so the stale pages would otherwise linger until the next rebuild.
+   * Assigning a new document instead clears the view on its own, via the setter.
+   */
+  clear() {
+    this.destroyControls();
+
+    this._clearPageDom();
+
+    this._highlightOutlineRects.length = 0;
+
+    this._invalidateLayout();
+
+    this.imageCache.clear();
+
+    this.evalStats.length = 0;
+    this._evalStatsConfig = {
+      ocrActive: undefined,
+      ignorePunct: scribe.ScribeDoc.defaults.ignorePunct,
+      ignoreCap: scribe.ScribeDoc.defaults.ignoreCap,
+    };
+
+    this._searchState = {
+      search: '', matchList: [], activeMatch: -1,
+    };
+    this._citationIds = new Set();
+
+    this.state.cp.n = 0;
+    this.state.searchMode = false;
+  }
+
+  /**
+   * @param {number} n
+   * @param {boolean} [start=true]
+   * @returns {number}
+   */
+  getPageStop(n, start = true) {
+    // In centered mode the first page always starts one margin down.
+    // Free-pan adds a gutter above it, so fall through to the computed stop there instead of shortcutting.
+    if (start && n === 0 && !this.opt.freePan) return ScribeViewer.pageMargin;
+
+    if (start && this._pageStopsStart[n]) return this._pageStopsStart[n];
+    if (!start && this._pageStopsEnd[n]) return this._pageStopsEnd[n];
+
+    this.calcPageLayout();
+
+    if (start && this._pageStopsStart[n]) return this._pageStopsStart[n];
+    if (!start && this._pageStopsEnd[n]) return this._pageStopsEnd[n];
+
+    // @ts-ignore
+    return null;
+  }
+
+  /**
+   * Free-pan gutter (content px) padding the document on each side so pages can be dragged past the viewport edges.
+   * @returns {{x: number, y: number}}
+   */
+  _panGutter() {
+    if (!this.opt.freePan) return { x: 0, y: 0 };
+    const k = ScribeViewer.freePanGutterFraction;
+    return { x: this._maxRowWidth * k, y: this._maxRowHeight * k };
+  }
+
+  /**
+   * Partition the document into rows and lay them out, filling the per-page stops, x origins, and row indices.
+   * Each row is centered as a unit, and its members are top-aligned, so a page's stop is also its container's top.
+   */
+  calcPageLayout() {
+    const margin = ScribeViewer.pageMargin;
+    const perRow = this.state.pagesPerRow === 2 ? 2 : 1;
+
+    this._rows.length = 0;
+    this._pageRow.length = 0;
+    this._pageLefts.length = 0;
+
+    const nPages = this.doc.pageMetrics.length;
+    /** @type {Array<{start: number, count: number, width: number, height: number}>} */
+    const rows = [];
+    let maxRowWidth = 0;
+    let maxRowHeight = 0;
+    let complete = true;
+    for (let i = 0; i < nPages;) {
+      const count = Math.min(perRow === 2 && this.state.coverAlone && i === 0 ? 1 : perRow, nPages - i);
+      let width = 0;
+      let height = 0;
+      for (let k = 0; k < count; k++) {
+        const dims = this.getDisplayDims(i + k);
+        if (!dims) { complete = false; break; }
+        width += dims.width + (k > 0 ? margin : 0);
+        if (dims.height > height) height = dims.height;
+      }
+      if (!complete) break;
+      rows.push({
+        start: i, count, width, height,
+      });
+      if (width > maxRowWidth) maxRowWidth = width;
+      if (height > maxRowHeight) maxRowHeight = height;
+      i += count;
+    }
+    this._maxRowWidth = maxRowWidth;
+    this._maxRowHeight = maxRowHeight;
+
+    const gutter = this._panGutter();
+    if (complete) this._contentWidth = maxRowWidth + gutter.x * 2;
+
+    let y = gutter.y + margin;
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      this._rows.push({ start: row.start, count: row.count });
+      let x = (this._contentWidth - row.width) / 2;
+      for (let k = 0; k < row.count; k++) {
+        const n = row.start + k;
+        this._pageRow[n] = r;
+        this._pageStopsStart[n] = y;
+        this._pageStopsEnd[n] = y + row.height + margin;
+        this._pageLefts[n] = x;
+        x += /** @type {dims} */ (this.getDisplayDims(n)).width + margin;
+      }
+      y += row.height + margin;
+    }
+    if (!complete) return;
+    this._contentHeight = y + gutter.y;
+    this._updateContentSize();
+  }
+
+  /**
+   * Row index of page `n`, or null while the page has no computed layout (no dims yet).
+   * @param {number} n
+   * @returns {?number}
+   */
+  rowOfPage(n) {
+    if (this._pageRow[n] === undefined) this.calcPageLayout();
+    return this._pageRow[n] ?? null;
+  }
+
+  /**
+   * The page indices of row `rowIdx`, in reading order. Empty for an out-of-range row.
+   * @param {number} rowIdx
+   * @returns {Array<number>}
+   */
+  rowPages(rowIdx) {
+    const row = this._rows[rowIdx];
+    if (!row) return [];
+    const out = [];
+    for (let k = 0; k < row.count; k++) out.push(row.start + k);
+    return out;
+  }
+
+  /**
+   * Distance between two pages' rows.
+   * Falls back to page distance while either page has no layout yet.
+   * @param {number} a
+   * @param {number} b
+   * @returns {number}
+   */
+  rowDistance(a, b) {
+    const ra = this.rowOfPage(a);
+    const rb = this.rowOfPage(b);
+    if (ra === null || rb === null) return Math.abs(a - b);
+    return Math.abs(ra - rb);
+  }
+
+  /**
+   * Pages of the rows within `rowRadius` of page `n`'s row, in index order.
+   * @param {number} n
+   * @param {number} [rowRadius=1]
+   * @returns {Array<number>}
+   */
+  windowPages(n, rowRadius = 1) {
+    const r = this.rowOfPage(n);
+    const out = [];
+    if (r === null) {
+      const last = this.doc.pageMetrics.length - 1;
+      for (let i = Math.max(0, n - rowRadius); i <= Math.min(last, n + rowRadius); i++) out.push(i);
+      return out;
+    }
+    for (let ri = Math.max(0, r - rowRadius); ri <= Math.min(this._rows.length - 1, r + rowRadius); ri++) {
+      const row = this._rows[ri];
+      for (let k = 0; k < row.count; k++) out.push(row.start + k);
+    }
+    return out;
+  }
+
+  /**
+   * First page of the row `dir` rows from page `n`'s, the next/prev navigation target.
+   * At a document edge the result is deliberately out of range, so the caller's `displayPage` bounds guard owns the no-op and still fires its callback.
+   * @param {number} n
+   * @param {number} dir - +1 or -1.
+   * @returns {number}
+   */
+  rowStep(n, dir) {
+    const r = this.rowOfPage(n);
+    if (r === null) return n + dir;
+    const row = this._rows[r + dir];
+    if (row) return row.start;
+    return dir > 0 ? this.doc.pageMetrics.length : -1;
+  }
+
+  /**
+   * Displayed dims of row `rowIdx` as one block, its width including the inter-page gutter and its height the tallest member.
+   * Null when the row is out of range or a member has no dims.
+   * @param {number} rowIdx
+   * @returns {?dims}
+   */
+  rowDisplayDims(rowIdx) {
+    const row = this._rows[rowIdx];
+    if (!row) return null;
+    let width = 0;
+    let height = 0;
+    for (let k = 0; k < row.count; k++) {
+      const dims = this.getDisplayDims(row.start + k);
+      if (!dims) return null;
+      width += dims.width + (k > 0 ? ScribeViewer.pageMargin : 0);
+      if (dims.height > height) height = dims.height;
+    }
+    return { width, height };
+  }
+
+  /** Drop the computed layout (rows, stops, lefts) so the next query recomputes it. */
+  _invalidateLayout() {
+    this._pageStopsStart.length = 0;
+    this._pageStopsEnd.length = 0;
+    this._rows.length = 0;
+    this._pageRow.length = 0;
+    this._pageLefts.length = 0;
+  }
+
+  /**
+   * Switch between the single-page column and two-page (side-by-side) view.
+   * The cursor's row is re-anchored on screen, and the zoom is left alone for the host to refit.
+   * @param {1|2} pagesPerRow
+   * @param {boolean} [coverAlone] - Lay out page 0 alone, for book-style facing pages. Kept unchanged when omitted.
+   */
+  setPagesPerRow(pagesPerRow, coverAlone = this.state.coverAlone) {
+    if (pagesPerRow !== 1 && pagesPerRow !== 2) return;
+    if (this.state.pagesPerRow === pagesPerRow && this.state.coverAlone === coverAlone) return;
+    this.state.pagesPerRow = pagesPerRow;
+    this.state.coverAlone = coverAlone;
+    if (!this.scrollContainer || !this.doc || this.doc.pageMetrics.length === 0) return;
+    this.destroyControls();
+    this._invalidateLayout();
+    this.calcPageLayout();
+    this.displayPage(this.state.cp.n, true, false);
+    this._scheduleReraster();
+  }
+
+  /**
+   * Snap a content-space coordinate so the page lands on a whole device pixel after the zoom transform.
+   * A fractional device-pixel offset would otherwise blur the whole page.
+   * @param {number} coord - Content-space position.
+   * @returns {number} The position adjusted so `coord * zoom * devicePixelRatio` is a whole number.
+   */
+  _snapToDevice(coord) {
+    const s = this.zoomLevel * (window.devicePixelRatio || 1);
+    return s > 0 ? Math.round(coord * s) / s : coord;
+  }
+
+  /** Size the content sizer to the scaled document extent so the native scrollbars get the right range, and re-center the pages. */
+  _updateContentSize() {
+    if (!this.contentSizer) return;
+    this._scrollMetricsCache = null; // content extent changing -> cached scrollHeight/Width are stale
+    // Pages are centered within the document's own content width, independent of the viewport.
+    // A viewport-only change (window or sidebar resize) therefore moves no page, re-centering the whole block via `_updateHCentering` instead.
+    const eff = this._contentWidth;
+    const z = this.zoomLevel;
+    const sizerW = `${eff * z}px`;
+    const sizerH = `${this._contentHeight * z}px`;
+    if (this.contentSizer.style.width !== sizerW) this.contentSizer.style.width = sizerW;
+    if (this.contentSizer.style.height !== sizerH) this.contentSizer.style.height = sizerH;
+    // Containers built before `calcPageLayout` finalized `_contentWidth` can keep a stale position, so re-place all.
+    // The write guards read inline style (no forced layout), so skipping unmoved pages costs nothing.
+    // Read the layout arrays directly, since `_pageLeft`/`getPageStop` could re-enter `calcPageLayout`.
+    // Skipped mid-gesture, since the snap changes with every zoom step and a moved container repaints its whole subtree, word spans included.
+    if (!this._zoomGestureActive) {
+      for (let n = 0; n < this.pageContainerArr.length; n++) {
+        const pc = this.pageContainerArr[n];
+        if (!pc) continue;
+        if (this._pageLefts[n] !== undefined) {
+          const left = `${this._snapToDevice(this._pageLefts[n])}px`;
+          if (pc.style.left !== left) pc.style.left = left;
+        }
+        if (this._pageStopsStart[n] !== undefined) {
+          const top = `${this._snapToDevice(this._pageStopsStart[n])}px`;
+          if (pc.style.top !== top) pc.style.top = top;
+        }
+      }
+    }
+    this._updateHCentering(this.scrollContainer ? this.scrollContainer.clientWidth : 0);
+  }
+
+  /**
+   * Scale the zoom layer and mirror the scale into the `--scribe-zoom` custom property.
+   * Strokes on scaled descendants divide it back out with `calc(Npx / var(--scribe-zoom, 1))` so they keep a constant on-screen width at any zoom.
+   * Every site that scales the layer must go through here so the property never drifts from the transform outside a zoom gesture.
+   * @param {number} z
+   */
+  _applyZoomTransform(z) {
+    this.zoomLayer.style.transform = `scale(${z})`;
+    if (this._zoomGestureActive) return;
+    this.zoomLayer.style.setProperty('--scribe-zoom', String(z));
+    for (let n = 0; n < this._commentMarks.length; n++) {
+      if (this._commentMarks[n]) this._placeCommentMarks(n);
+    }
+  }
+
+  /**
+   * Left offset of page `n` within the content width (its row centered as a unit), keeping page positions viewport-independent so a resize never moves them.
+   * @param {number} n
+   * @returns {number}
+   */
+  _pageLeft(n) {
+    if (this._pageLefts[n] === undefined) this.calcPageLayout();
+    return this._pageLefts[n] ?? 0;
+  }
+
+  /**
+   * Re-center the fixed-width content block horizontally within the viewport.
+   * Because page positions are viewport-independent, centering is one margin on the content sizer,
+   * so a resize or sidebar drag reflows just this box instead of walking every page and dirtying its word layer.
+   * Snapped to a whole device pixel so the page raster stays crisp at rest.
+   * @param {number} viewportWidth - The scroll container's inner width in CSS px.
+   */
+  _updateHCentering(viewportWidth) {
+    if (!this.contentSizer) return;
+    const contentPx = this._contentWidth * this.zoomLevel;
+    const dpr = window.devicePixelRatio || 1;
+    // Center only when the viewport is wider than the content. Otherwise the content overflows and scrolls from the left edge.
+    const raw = Math.max(0, (viewportWidth - contentPx) / 2);
+    const offset = `${Math.round(raw * dpr) / dpr}px`;
+    if (this.contentSizer.style.marginLeft !== offset) this.contentSizer.style.marginLeft = offset;
+  }
+
+  /**
+   * Map a point in page `n`'s coordinate space (image px) to client (viewport) px.
+   * @param {number} n
+   * @param {{x: number, y: number}} pt
+   * @returns {{x: number, y: number}}
+   */
+  contentToClient(n, pt) {
+    const rect = this.zoomLayer.getBoundingClientRect();
+    const cx = this._pageLeft(n) + pt.x;
+    const cy = this.getPageStop(n) + pt.y;
+    return { x: rect.left + cx * this.zoomLevel, y: rect.top + cy * this.zoomLevel };
+  }
+
+  /**
+   * Map a client (viewport) point to content space (continuous page-stop space; scroll/zoom independent).
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {{x: number, y: number}}
+   */
+  clientToContent(clientX, clientY) {
+    const rect = this.zoomLayer.getBoundingClientRect();
+    return { x: (clientX - rect.left) / this.zoomLevel, y: (clientY - rect.top) / this.zoomLevel };
+  }
+
+  /**
+   * Map a client (viewport) point to page space, returning the page it falls in.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {{n: number, x: number, y: number}}
+   */
+  clientToPage(clientX, clientY) {
+    const { x: cx, y: cy } = this.clientToContent(clientX, clientY);
+    const n = this.pageAtContentPoint(cx, cy);
+    return { n, x: cx - this._pageLeft(n), y: cy - this.getPageStop(n) };
+  }
+
+  /**
+   * The page at a content-space point, resolving x within the row so a point on the facing page lands on it.
+   * A point in a margin or the inter-page gutter resolves to the nearest member.
+   * @param {number} cx
+   * @param {number} cy
+   * @returns {number} Page index, or -1 past the last row.
+   */
+  pageAtContentPoint(cx, cy) {
+    const first = this.calcPage(cy);
+    if (first < 0) return first;
+    const r = this.rowOfPage(first);
+    const row = r === null ? null : this._rows[r];
+    if (!row || row.count === 1) return first;
+    let best = first;
+    let bestDist = Infinity;
+    for (let k = 0; k < row.count; k++) {
+      const n = row.start + k;
+      const left = this._pageLefts[n];
+      const dims = this.getDisplayDims(n);
+      if (left === undefined || !dims) continue;
+      if (cx >= left && cx < left + dims.width) return n;
+      const d = cx < left ? left - cx : cx - (left + dims.width);
+      if (d < bestDist) { bestDist = d; best = n; }
+    }
+    return best;
+  }
+
+  /**
+   * The rotation, in degrees, that `createGroup` applies to page `n`'s group for orientation `orientation`.
+   * @param {number} n
+   * @param {number} orientation
+   */
+  _groupRotation(n, orientation) {
+    const metrics = this.doc.pageMetrics[n];
+    const textRotation = scribe.ScribeDoc.defaults.autoRotate ? 0 : (metrics.angle || 0);
+    return textRotation + orientation * 90 + (metrics.rotation || 0);
+  }
+
+  /**
+   * Map a displayed-page point into the local space of page `n`'s orientation group, the space the OCR line and word boxes live in.
+   * Inverts the centre-rotation `createGroup` applies.
+   * @param {number} n
+   * @param {number} orientation
+   * @param {number} x
+   * @param {number} y
+   * @returns {{x: number, y: number}}
+   */
+  pageToLocal(n, orientation, x, y) {
+    const disp = this.getDisplayDims(n);
+    const dims = this.doc.pageMetrics[n].dims;
+    const localW = orientation % 2 === 1 ? dims.height : dims.width;
+    const localH = orientation % 2 === 1 ? dims.width : dims.height;
+    const rad = -this._groupRotation(n, orientation) * (Math.PI / 180);
+    const dx = x - disp.width / 2;
+    const dy = y - disp.height / 2;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    return { x: dx * cos - dy * sin + localW / 2, y: dx * sin + dy * cos + localH / 2 };
+  }
+
+  /**
+   * Map a point in page `n`'s orientation-group local space to content (page-stop) space.
+   * @param {number} n
+   * @param {number} orientation
+   * @param {number} x
+   * @param {number} y
+   * @returns {{x: number, y: number}}
+   */
+  localToContent(n, orientation, x, y) {
+    const disp = this.getDisplayDims(n);
+    const dims = this.doc.pageMetrics[n].dims;
+    const localW = orientation % 2 === 1 ? dims.height : dims.width;
+    const localH = orientation % 2 === 1 ? dims.width : dims.height;
+    const rad = this._groupRotation(n, orientation) * (Math.PI / 180);
+    const dx = x - localW / 2;
+    const dy = y - localH / 2;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    return {
+      x: this._pageLeft(n) + disp.width / 2 + dx * cos - dy * sin,
+      y: this.getPageStop(n) + disp.height / 2 + dx * sin + dy * cos,
+    };
+  }
+
+  /**
+   * Page dimensions as displayed, accounting for a 90/270 user rotation (which swaps width/height).
+   * The stored `pageMetrics[n].dims` is left unrotated; export uses it with the composed /Rotate.
+   * @param {number} n
+   * @returns {dims}
+   */
+  getDisplayDims(n) {
+    const dims = this.doc.pageMetrics[n]?.dims;
+    if (!dims) return dims;
+    const rotation = this.doc.pageMetrics[n].rotation || 0;
+    return (rotation % 180 === 90) ? { width: dims.height, height: dims.width } : dims;
+  }
+
+  /**
+   * Rotate page `n` by `deltaDeg` (a multiple of 90), updating its user rotation.
+   * @param {number} n
+   * @param {number} deltaDeg
+   */
+  rotatePage(n, deltaDeg) {
+    this.rotatePages([n], deltaDeg);
+  }
+
+  /**
+   * Rebuild all per-page DOM state after a structural page edit (delete/move), then re-render at `cp`.
+   * Unlike `rotatePage`, this also drops the overlay groups: a structural edit renumbers every page,
+   * so overlay groups cached by page index would otherwise land on the wrong page.
+   * @param {number} cp - Page to display after the rebuild.
+   */
+  _rebuildPages(cp, follow = false) {
+    this._clearPageDom();
+    this._invalidateLayout();
+    this.imageCache.clear();
+
+    this.calcPageLayout();
+
+    // The scroll position survives the rebuild, so leave it unless `follow` is set (`cp` was the moved page, chase it)
+    // or `cp` has scrolled out of the viewport.
+    const zoom = this.zoomLevel;
+    const { clientHeight } = this._scrollMetrics();
+    const dims = this.getDisplayDims(cp);
+    const top = this.getPageStop(cp) * zoom;
+    const bottom = top + (dims ? dims.height * zoom : 0);
+    const viewTop = this.scrollContainer.scrollTop;
+    if (follow || top >= viewTop + clientHeight || bottom <= viewTop) {
+      this.scrollContainer.scrollTop = Math.max(0, top - 100 * zoom);
+    }
+    // Render `cp`'s window; the surrounding read-ahead extends it to cover the rest of the viewport.
+    this.displayPage(cp, false, true);
+  }
+
+  /**
+   * Whether the document can take a page edit now.
+   * @returns {boolean}
+   */
+  _pageEditable() {
+    // A provisional document applies a page edit only after its real document has loaded.
+    // A real document ignores page edits while its deferred text import runs.
+    return !!this.doc && this.doc.id >= 0 && !this.doc._textReadySettle;
+  }
+
+  /**
+   * Resolve once the document can take a page edit.
+   * For a provisional document, calling it starts the real document's load.
+   * @returns {Promise<boolean>} False when no document is open, the load failed, or another document took the view meanwhile.
+   */
+  async _awaitPageEditable() {
+    const doc = this.doc;
+    if (!doc) return false;
+    if (doc.id < 0) {
+      const seed = /** @type {{_requestHydration?: () => Promise<unknown>}} */ (/** @type {unknown} */ (doc));
+      if (!seed._requestHydration) return false;
+      try { await seed._requestHydration(); } catch { return false; }
+    }
+    const real = this.doc;
+    if (!real || real.id < 0) return false;
+    if (real.textReady) await real.textReady.catch(() => {});
+    return this.doc === real;
+  }
+
+  /**
+   * Delete page `n` from the document and rebuild the view. The last remaining page cannot be deleted.
+   * @param {number} n
+   */
+  deletePage(n) {
+    if (!this.doc || n < 0 || n >= this.doc.pageMetrics.length) return;
+    if (this.doc.pageMetrics.length <= 1) return;
+    if (!this._pageEditable()) { this._awaitPageEditable().then((ok) => { if (ok) this.deletePage(n); }); return; }
+    this.doc.deletePage(n);
+    let cp = this.state.cp.n;
+    if (n < cp) cp -= 1;
+    cp = Math.max(0, Math.min(cp, this.doc.pageMetrics.length - 1));
+    this._rebuildPages(cp);
+    if (this.onPageEditCallback) this.onPageEditCallback();
+  }
+
+  /**
+   * Move page `from` to index `to` and rebuild the view, keeping the current page in view.
+   * @param {number} from
+   * @param {number} to
+   */
+  movePage(from, to) {
+    if (!this.doc) return;
+    const len = this.doc.pageMetrics.length;
+    if (from < 0 || from >= len || to < 0 || to >= len || from === to) return;
+    if (!this._pageEditable()) { this._awaitPageEditable().then((ok) => { if (ok) this.movePage(from, to); }); return; }
+    this.doc.movePage(from, to);
+    // Follow the shown page when it is the one being moved, so the view chases it to its new slot.
+    const followed = this.state.cp.n === from;
+    let cp = this.state.cp.n;
+    if (cp === from) cp = to;
+    else if (from < to && cp > from && cp <= to) cp -= 1;
+    else if (from > to && cp >= to && cp < from) cp += 1;
+    this._rebuildPages(cp, followed);
+    if (this.onPageEditCallback) this.onPageEditCallback();
+  }
+
+  /**
+   * Delete several pages at once, then rebuild the view a single time. Never deletes every page.
+   * @param {Array<number>} indices
+   */
+  deletePages(indices) {
+    if (!this.doc) return;
+    const len = this.doc.pageMetrics.length;
+    let valid = [...new Set(indices)].filter((i) => i >= 0 && i < len).sort((a, b) => a - b);
+    if (valid.length >= len) valid = valid.slice(0, len - 1); // keep at least one page
+    if (valid.length === 0) return;
+    if (!this._pageEditable()) { this._awaitPageEditable().then((ok) => { if (ok) this.deletePages(indices); }); return; }
+    this.doc.deletePages(valid);
+    // Shift the current page up by the deletions below it; if it was itself deleted this lands on the page that follows the deleted block.
+    const removedBelow = valid.filter((i) => i < this.state.cp.n).length;
+    const cp = Math.max(0, Math.min(this.state.cp.n - removedBelow, this.doc.pageMetrics.length - 1));
+    this._rebuildPages(cp);
+    if (this.onPageEditCallback) this.onPageEditCallback();
+  }
+
+  /**
+   * Move several pages to a contiguous block starting at `to` (post-removal index), then rebuild the view once.
+   * @param {Array<number>} indices
+   * @param {number} to
+   */
+  movePages(indices, to) {
+    if (!this.doc) return;
+    const len = this.doc.pageMetrics.length;
+    const valid = [...new Set(indices)].filter((i) => i >= 0 && i < len).sort((a, b) => a - b);
+    if (valid.length === 0) return;
+    if (!this._pageEditable()) { this._awaitPageEditable().then((ok) => { if (ok) this.movePages(indices, to); }); return; }
+    const cpIndexInBlock = valid.indexOf(this.state.cp.n);
+    this.doc.movePages(valid, to);
+    // The displayed page follows its content: into the moved block if it was selected, else by the net shift.
+    let cp;
+    if (cpIndexInBlock >= 0) {
+      cp = to + cpIndexInBlock;
+    } else {
+      const removedBelow = valid.filter((i) => i < this.state.cp.n).length;
+      cp = this.state.cp.n - removedBelow + (this.state.cp.n - removedBelow >= to ? valid.length : 0);
+    }
+    cp = Math.max(0, Math.min(cp, this.doc.pageMetrics.length - 1));
+    this._rebuildPages(cp, cpIndexInBlock >= 0);
+    if (this.onPageEditCallback) this.onPageEditCallback();
+  }
+
+  /**
+   * Insert page snapshots as a contiguous block at `to`, then rebuild the view once, landing on the first inserted page.
+   * When `removeSourceIndices` is given (a cut), the original source pages are deleted after the insert, with their indices shifted for the pages inserted ahead of them.
+   * @param {Array<object>} snapshots - Page snapshots from `doc.copyPages`.
+   * @param {number} to - Insertion index.
+   * @param {{ removeSourceIndices?: Array<number>, keepCurrentPage?: boolean }} [options]
+   * @returns {?{ start: number, count: number, cp: number }} The inserted range and the page landed on (`cp`), or `null` if nothing was pasted.
+   *   Callers doing an in-place rail splice need `cp` because `state.cp.n` updates asynchronously (the rebuild's `displayPage` is not awaited), so it is stale right after this returns.
+   *   A document that cannot take the edit yet also returns `null`.
+   *   The paste then lands once the document can take it.
+   */
+  pastePages(snapshots, to, { removeSourceIndices, keepCurrentPage } = {}) {
+    if (!this.doc || !this.opt.enablePageEditing) return null;
+    if (!Array.isArray(snapshots) || snapshots.length === 0) return null;
+    if (!this._pageEditable()) {
+      this._awaitPageEditable().then((ok) => { if (ok) this.pastePages(snapshots, to, { removeSourceIndices, keepCurrentPage }); });
+      return null;
+    }
+    const count = snapshots.length;
+    const insertAt = Math.max(0, Math.min(to, this.doc.pageMetrics.length));
+    // Remember the page in view before the insert shifts indices, so `keepCurrentPage` can stay on the same page.
+    const prevCp = this.state.cp.n;
+    // Sources at or after the insertion point shifted up by the inserted block. Delete them in the new index space.
+    const shifted = (removeSourceIndices && removeSourceIndices.length)
+      ? removeSourceIndices.filter((i) => i >= 0).map((i) => (i >= insertAt ? i + count : i))
+      : null;
+    // A cut is insert-then-delete-sources.
+    // Record both as ONE undoable step, so a single undo reverses the whole move rather than leaving the intermediate state
+    // where the pages exist in both their old and new places (which a later export would duplicate).
+    // The inner verbs fold into this outer record via PageHistory's re-entrancy guard.
+    // A plain copy has no `shifted`, so this records exactly the one insert.
+    this.doc.history.record(() => {
+      this.doc.insertPages(snapshots, insertAt);
+      if (shifted) this.doc.deletePages(shifted);
+    });
+
+    let start = insertAt;
+    if (shifted) {
+      // Sources removed below the inserted block pull it up by that many slots.
+      const removedBelow = shifted.filter((i) => i < start).length;
+      start = Math.max(0, start - removedBelow);
+    }
+    // Land on the freshly inserted block (a paste, which selects what it added), or, for an insert-from-file that should not disturb the reader,
+    // stay on the page they were viewing, which shifts down by `count` only when the block lands at or before it.
+    // Mirrors how `deletePage` keeps the current page rather than jumping.
+    const landing = keepCurrentPage ? (prevCp >= insertAt ? prevCp + count : prevCp) : start;
+    const cp = Math.max(0, Math.min(landing, this.doc.pageMetrics.length - 1));
+    this._rebuildPages(cp);
+    if (this.onPageEditCallback) this.onPageEditCallback();
+    return { start, count, cp };
+  }
+
+  /**
+   * Rotate several pages by `deltaDeg`, then rebuild the view once.
+   * Rotation is a display transform persisted as each page's /Rotate on export.
+   * @param {Array<number>} indices
+   * @param {number} deltaDeg
+   */
+  rotatePages(indices, deltaDeg) {
+    if (!this.doc) return;
+    if (!this._pageEditable()) { this._awaitPageEditable().then((ok) => { if (ok) this.rotatePages(indices, deltaDeg); }); return; }
+    if (!this.doc.rotatePages(indices, deltaDeg)) return;
+    this._clearPageDom();
+    this._invalidateLayout();
+    this.imageCache.clear();
+    this.calcPageLayout();
+    this.displayPage(this.state.cp.n, false, true);
+    if (this.onPageEditCallback) this.onPageEditCallback('rotate');
+  }
+
+  /**
+   * Undo the most recent edit on any surface and refresh the view to match.
+   * Page and outline entries are skipped when the host disabled page editing.
+   * @returns {boolean} Whether anything was undone.
+   */
+  undo() {
+    return this._applyHistory('undo');
+  }
+
+  /**
+   * Re-apply the most recently undone edit and refresh the view to match.
+   * @returns {boolean} Whether anything was redone.
+   */
+  redo() {
+    return this._applyHistory('redo');
+  }
+
+  /**
+   * Pop one entry from the document's unified history and refresh the view to match.
+   * @param {'undo'|'redo'} dir
+   * @returns {boolean}
+   */
+  _applyHistory(dir) {
+    if (!this.doc) return false;
+    const stack = dir === 'undo' ? this.doc.docHistory.undoStack : this.doc.docHistory.redoStack;
+    const top = stack[stack.length - 1];
+    if (!top) return false;
+    if (top.surface === 'page' && !this.opt.enablePageEditing) return false;
+    const res = this.doc.docHistory[dir]();
+    if (!res) return false;
+    if (res.surface === 'page' || !res.pages) {
+      this._rebuildPages(Math.max(0, Math.min(this.state.cp.n, this.doc.pageMetrics.length - 1)));
+      if (this.onEditCallback) this.onEditCallback();
+      if (this.onPageEditCallback) this.onPageEditCallback();
+      return true;
+    }
+    const pageSet = new Set(res.pages);
+    // A layout repaint replaces the overlay DOM, so live selection handles go stale and are dropped first.
+    const layoutRepaint = (n) => (this.state.layoutMode && this.rowDistance(n, this.state.cp.n) < 2) || this.overlayGroupsRenderIndices.includes(n);
+    if ([...pageSet].some(layoutRepaint)) this.destroyControls();
+    for (const n of pageSet) {
+      this.refreshPageRaster(n);
+      this.renderWords(n);
+      this.renderHighlights(n);
+      this.renderNotes(n);
+      this.renderFillItems(n);
+      this.renderRedactions(n);
+      this.renderFormFields(n);
+      this.annotationsEdited(n);
+      if (layoutRepaint(n)) {
+        layout.renderLayoutBoxes(this, n);
+        this.layoutTablesEdited(n);
+      }
+      if (this.textSel) {
+        this.textSel.invalidatePage(n);
+        this.textSel.renderPage(n);
+      }
+    }
+    // The tools rebuild the comments panel directly after annotation edits, so undo makes the same call.
+    if (this._rebuildCommentsPanel) this._rebuildCommentsPanel();
+    if (this.onEditCallback) this.onEditCallback();
+    return true;
+  }
+
+  /** Center of the scrolling viewport, in client (viewport) coordinates. Used as a default zoom anchor. */
+  getViewportCenter() {
+    const rect = this.scrollContainer.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+
+  /**
+   * Apply a zoom by `scaleBy`, keeping the content point currently under `center` fixed in the viewport.
+   * @param {number} scaleBy
+   * @param {{x: number, y: number}} center  Client (viewport) coordinates.
+   */
+  _zoomStageImp(scaleBy, center) {
+    const oldZoom = this.zoomLevel;
+    const newZoom = oldZoom * scaleBy;
+    const scRect = this.scrollContainer.getBoundingClientRect();
+    // Scaled-content position currently under `center`.
+    const sx = center.x - scRect.left + this.scrollContainer.scrollLeft;
+    const sy = center.y - scRect.top + this.scrollContainer.scrollTop;
+    // The same unscaled content point, projected at the new zoom.
+    const nx = (sx / oldZoom) * newZoom;
+    const ny = (sy / oldZoom) * newZoom;
+
+    this.zoomLevel = newZoom;
+    this._applyZoomTransform(newZoom);
+    this._updateContentSize();
+
+    // Force layout before the scroll writes: iOS WebKit otherwise clamps them against the pre-resize scroll range and every zoom-in step deep in a document careens toward the document start.
+    // Chromium flushes layout on the scroll write itself, so this read costs it nothing extra.
+    this._scrollMetrics();
+
+    this.scrollContainer.scrollLeft = nx - (center.x - scRect.left);
+    this.scrollContainer.scrollTop = ny - (center.y - scRect.top);
+  }
+
+  /**
+   * @param {number} scaleBy
+   * @param {?{x: number, y: number}} [center=null]
+   */
+  _zoomStage(scaleBy, center = null) {
+    if (!center) {
+      const selectedWords = this.CanvasSelection.getUiWords();
+      if (selectedWords.length > 0) {
+        // Word rects are in content space; convert the selection centre to a client point for the anchor.
+        const rects = selectedWords.map((x) => x.getClientRect());
+        const left = Math.min(...rects.map((r) => r.x));
+        const right = Math.max(...rects.map((r) => r.x + r.width));
+        const top = Math.min(...rects.map((r) => r.y));
+        const bottom = Math.max(...rects.map((r) => r.y + r.height));
+        const rect = this.zoomLayer.getBoundingClientRect();
+        center = {
+          x: rect.left + ((left + right) / 2) * this.zoomLevel,
+          y: rect.top + ((top + bottom) / 2) * this.zoomLevel,
+        };
+      } else {
+        center = this.getViewportCenter();
+      }
+    }
+
+    if (!this._zoomGestureActive) {
+      this._zoomGestureActive = true;
+      // Not on iOS, which sizes a promoted surface from the unscaled layout box (see `_setPinching`).
+      if (!IOS_WEBKIT) this.zoomLayer.style.willChange = 'transform';
+    }
+    // Scheduled ahead of the step, since the settle is the only thing that clears the flag and a throw below would otherwise leave it set.
+    this._scheduleReraster();
+    this._zoomStageImp(scaleBy, center);
+    this.updateCurrentPage();
+  }
+
+  /** After a zoom settles, end the zoom gesture and re-raster the visible page canvases at the new resolution so they stay crisp. */
+  _scheduleReraster() {
+    if (this._rerasterTimer) clearTimeout(this._rerasterTimer);
+    this._rerasterTimer = setTimeout(() => {
+      this._rerasterTimer = null;
+      // Mid-pinch a finger pause would otherwise land fresh canvases inside the actively-animating layer.
+      // `_setPinching(false)` re-schedules, so the render happens once, after the gesture.
+      if (this.drag.isPinching) return;
+      if (this._zoomGestureActive) {
+        this._zoomGestureActive = false;
+        this.zoomLayer.style.willChange = '';
+        this._applyZoomTransform(this.zoomLevel);
+        this._updateContentSize();
+      }
+      if (this.doc.inputData.pdfMode || this.doc.inputData.imageMode) {
+        this.imageCache.renderAheadBehindBrowser(this.state.cp.n);
+      }
+    }, 150);
+  }
+
+  /**
+   * Scroll-container box metrics (client/scroll height/width).
+   * Reading them forces a layout but they don't change during a scroll, so they are read once and reused until `resize`/`_updateContentSize` invalidate the cache.
+   * @returns {{clientHeight: number, clientWidth: number, scrollHeight: number, scrollWidth: number}}
+   */
+  _scrollMetrics() {
+    let m = this._scrollMetricsCache;
+    if (!m) {
+      const sc = this.scrollContainer;
+      m = {
+        clientHeight: sc.clientHeight,
+        clientWidth: sc.clientWidth,
+        scrollHeight: sc.scrollHeight,
+        scrollWidth: sc.scrollWidth,
+      };
+      this._scrollMetricsCache = m;
+    }
+    return m;
+  }
+
+  /**
+   * @param {number} [scrollSpeed=0] - Scroll distance (px) since the previous frame, supplied only by the scroll listener.
+   *   Used to decide whether the page is changing too fast to read, and so whether to defer the build.
+   * @returns {boolean}
+   */
+  updateCurrentPage(scrollSpeed = 0) {
+    if (!this.scrollContainer) return false;
+    // Read and cache the scroll position here for the scrollbar geometry to reuse without a per-frame reflow.
+    // Reading it before the frame's word build dirties layout keeps it cheap.
+    this._scrollTop = this.scrollContainer.scrollTop;
+    this._scrollLeft = this.scrollContainer.scrollLeft;
+    const { clientHeight: clientH, scrollHeight } = this._scrollMetrics();
+    const y = (this._scrollTop + clientH / 2) / this.zoomLevel;
+    const pageNew = this.calcPage(y);
+
+    // The destination is already the current page during a find glide, so frames still centered on the page being left must not flip it back.
+    if (this._scrollGlide && pageNew !== this.state.cp.n) return false;
+
+    // Row-stable cursor: while the center row still holds the cursor's page, scrolling must not move it.
+    // Without this, an explicitly navigated right-hand page would snap back to its row's first page.
+    if (pageNew >= 0 && this.state.cp.n !== pageNew && this.rowDistance(this.state.cp.n, pageNew) > 0) {
+      // The scroll clamps at either end of the document, which can leave the viewport center on the neighbor of a short first or last page the user navigated to.
+      // Scrolling toward an end carries the cursor along with the center, so this guard never stops a scroll from moving it.
+      const atTop = this._scrollTop <= 0;
+      const atBottom = this._scrollTop + clientH >= scrollHeight - 1;
+      if ((atTop && this.state.cp.n < pageNew) || (atBottom && this.state.cp.n > pageNew)) return false;
+      // Defer the word build when the page changes too fast to read: update the page now and (re)arm a settle timer, so a fast sweep builds only the landing page.
+      // Invis mode always defers (its text is invisible).
+      // Visible modes defer only above the speed threshold, so a normal slow scroll builds immediately.
+      const fast = scrollSpeed > clientH * ScribeViewer.deferTextVelocityFraction;
+      const defer = this.state.displayMode === 'invis' || fast;
+      // The raster strategy defers on its own, much lower cutoff than text (see the statics for why).
+      // A slow scroll that never entered a glide rasters every page immediately across the full window.
+      const deferFrac = IOS_WEBKIT ? ScribeViewer.iosDeferRasterVelocityFraction : ScribeViewer.deferRasterVelocityFraction;
+      const resumeFrac = IOS_WEBKIT ? ScribeViewer.iosResumeRasterVelocityFraction : ScribeViewer.resumeRasterVelocityFraction;
+      if (this._rasterDeferred) {
+        if (scrollSpeed < clientH * resumeFrac) this._rasterDeferred = false;
+      } else if (scrollSpeed > clientH * deferFrac) {
+        // The full raster window is cold when a glide decelerates below the cutoff, and firing it while still moving clumps completions into the decelerating frames.
+        // The tail flag limits boundary rasters to the centered page; the settled render (displayPage below) fills the full window once the scroll holds still.
+        this._rasterDeferred = true;
+        this._rasterTail = true;
+      }
+      const deferRaster = this._rasterDeferred ? true : (this._rasterTail ? 'current' : false);
+      this.displayPage(pageNew, false, false, defer, deferRaster);
+      // Arm the settle timer whenever the raster is deferred, even if text built immediately:
+      // only the settled render below fills the full raster window and ends the glide tail.
+      // The displayPage call above cancels any pending timer when text is not deferred,
+      // so without this re-arm a glide in a visible mode leaves previews until the next zoom.
+      if (defer || deferRaster !== false) {
+        if (this._deferredTextTimer) clearTimeout(this._deferredTextTimer);
+        // Fire only once the scroll position holds still.
+        // A fixed delay would fire mid-glide, because at low speeds page boundaries fall further apart than the delay.
+        let armTop = this._scrollTop;
+        const onSettle = () => {
+          this._deferredTextTimer = null;
+          const top = this.scrollContainer ? this.scrollContainer.scrollTop : armTop;
+          if (Math.abs(top - armTop) > 2) {
+            armTop = top;
+            this._deferredTextTimer = setTimeout(onSettle, ScribeViewer.deferredTextSettleMs);
+            return;
+          }
+          this.displayPage(this.state.cp.n, false, false);
+        };
+        this._deferredTextTimer = setTimeout(onSettle, ScribeViewer.deferredTextSettleMs);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Page indices spanned by the current selection, middle pages of a multi-page selection included.
+   * @returns {Set<number>}
+   */
+  _selectionPages() {
+    return this._sel()?.pages() ?? new Set();
+  }
+
+  /**
+   * Hide the built text layers during a sustained scroll.
+   * `_endScrollTextHide` restores them at settle.
+   * @param {number} speed - Scroll distance (px) since the previous frame.
+   */
+  _updateScrollTextHide(speed) {
+    // Only the DOM engine puts text in the DOM, so only it has word/filler elements to stop compositing mid-scroll.
+    this._sel()?.onScroll?.(speed);
+  }
+
+  /**
+   * Restore every hidden text layer and reset the scroll gesture.
+   */
+  _endScrollTextHide() {
+    this._sel()?.endScrollHide?.();
+  }
+
+  /**
+   * Hide the built text layers until `endInteractionTextHide`.
+   * Without hiding them, a host interaction that moves or re-clips the content repaints every built word each frame.
+   */
+  startInteractionTextHide() {
+    this._sel()?.startInteractionHide?.();
+  }
+
+  /** Restore the text layers hidden by `startInteractionTextHide`; sharing the scroll-hide restore keeps either hide source from leaving a group stuck hidden. */
+  endInteractionTextHide() {
+    this._endScrollTextHide();
+  }
+
+  /**
+   * Scroll the viewport by a pixel delta. Positive `deltaY` follows a downward drag (revealing content above).
+   * The old stage model moved `stage.y` (negative-of-scroll) by `+delta`, so native scroll uses the inverse sign.
+   * Native `overflow:auto` clamps the range, so the old manual page-bound clamps are gone.
+   * @param {Object} coords
+   * @param {number} [coords.deltaX=0]
+   * @param {number} [coords.deltaY=0]
+   */
+  pan({ deltaX = 0, deltaY = 0 }) {
+    if (!this.scrollContainer) return;
+    this.scrollContainer.scrollLeft -= deltaX;
+    this.scrollContainer.scrollTop -= deltaY;
+  }
+
+  /**
+   * Zoom in or out on the canvas. Used for buttons and other controls.
+   * @param {number} scaleBy
+   * @param {?{x: number, y: number}} [center=null]
+   */
+  zoom(scaleBy, center = null) {
+    this._zoomStage(scaleBy, center);
+  }
+
+  /**
+   * Toggle between width-fit and a zoom that fits the text column under the tap to the viewport width.
+   * @param {{x: number, y: number}} center - Tap point in client coordinates.
+   */
+  _toggleDoubleTapZoom(center) {
+    if (!this.scrollContainer || !(this._contentWidth > 0) || !(this.zoomLevel > 0)) return;
+    const sc = this.scrollContainer;
+    const fitZoom = sc.clientWidth / this._contentWidth;
+    const zoomedIn = this.zoomLevel > fitZoom * 1.15;
+    let targetZoom = zoomedIn ? fitZoom : fitZoom * 2.2;
+    /** @type {?number} */
+    let columnX = null;
+    if (!zoomedIn) {
+      const { x: tapX, y: tapY } = this.clientToContent(center.x, center.y);
+      const n = this.pageAtContentPoint(tapX, tapY);
+      const page = this.doc.ocr.active?.[n];
+      const disp = this.getDisplayDims(n);
+      if (page && disp) {
+        const lines = [];
+        for (const line of page.lines) {
+          if (parIsFurniture(line.par)) continue;
+          const a = this.localToContent(n, line.orientation, line.bbox.left, line.bbox.top);
+          const b = this.localToContent(n, line.orientation, line.bbox.right, line.bbox.bottom);
+          const left = Math.min(a.x, b.x);
+          const right = Math.max(a.x, b.x);
+          if (right - left >= disp.width * 0.05) lines.push({ left, right });
+        }
+        let column = lines.filter((l) => l.left <= tapX && tapX <= l.right);
+        if (column.length < 3) {
+          let seedX = tapX;
+          let nearestDist = Infinity;
+          for (const l of lines) {
+            const dist = Math.max(l.left - tapX, tapX - l.right);
+            if (dist > 0 && dist < nearestDist) { nearestDist = dist; seedX = (l.left + l.right) / 2; }
+          }
+          column = lines.filter((l) => l.left <= seedX && seedX <= l.right);
+        }
+        if (column.length >= 3) {
+          const lefts = column.map((l) => l.left).sort((a, b) => a - b);
+          const rights = column.map((l) => l.right).sort((a, b) => a - b);
+          const left = lefts[Math.floor(lefts.length * 0.1)];
+          const right = rights[Math.ceil(rights.length * 0.9) - 1];
+          // Keep the floor above the 1.15x zoomed-in threshold so the next double tap zooms back out.
+          const pageFit = sc.clientWidth / disp.width;
+          const pad = sc.clientWidth * 0.03;
+          targetZoom = Math.min(pageFit * 4, Math.max(pageFit * 1.2, (sc.clientWidth - 2 * pad) / (right - left)));
+          columnX = (left + right) / 2;
+        }
+      }
+    }
+    const totalScale = targetZoom / this.zoomLevel;
+    const step = (scaleBy) => {
+      this.zoom(scaleBy, center);
+      if (columnX !== null) sc.scrollLeft = columnX * this.zoomLevel - sc.clientWidth / 2;
+    };
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      step(totalScale);
+      return;
+    }
+    const FRAMES = 9;
+    const weightSum = (FRAMES * (FRAMES + 1)) / 2;
+    let frame = 0;
+    const tick = () => {
+      frame++;
+      // Multiplicative ease-out: the largest factor lands on the first frame.
+      step(totalScale ** ((FRAMES - frame + 1) / weightSum));
+      if (frame < FRAMES) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+
+  /**
+   * Resize the canvas to new pixel dimensions.
+   * @param {number} width
+   * @param {number} height
+   */
+  resize(width, height) {
+    if (!this.scrollContainer || !(width > 0) || !(height > 0)) return;
+    this.scrollContainer.style.width = `${width}px`;
+    this.scrollContainer.style.height = `${height}px`;
+    this._scrollMetricsCache = null;
+    // Pages are centered within `_contentWidth` independent of the viewport, so a resize moves no page and needs no O(pages) re-center walk.
+    // Re-centering the whole block within the new viewport takes one snapped margin that the browser reflows as a single box, which keeps a sidebar drag or animation smooth.
+    this._updateHCentering(width);
+  }
+
+  /**
+   * Initiates dragging when the middle mouse button is pressed.
+   * @param {MouseEvent} event
+   */
+  startDrag(event) {
+    this.drag.isDragging = true;
+    this.drag.lastX = event.clientX;
+    this.drag.lastY = event.clientY;
+    event.preventDefault();
+  }
+
+  /** @param {MouseEvent} event */
+  executeDrag(event) {
+    if (!this.drag.isDragging) return;
+    const deltaX = event.clientX - this.drag.lastX;
+    const deltaY = event.clientY - this.drag.lastY;
+
+    if (Math.round(deltaX) === 0 && Math.round(deltaY) === 0) return;
+
+    this.drag.dragDeltaTotal += Math.abs(deltaX) + Math.abs(deltaY);
+
+    this.drag.lastX = event.clientX;
+    this.drag.lastY = event.clientY;
+
+    this.pan({ deltaX, deltaY });
+  }
+
+  /**
+   * Flip the pinch-in-progress flag, hiding iOS's heaviest compositing layers for the duration and refreshing the view once at the end.
+   * @param {boolean} v
+   */
+  _setPinching(v) {
+    if (this.drag.isPinching === v) return;
+    this.drag.isPinching = v;
+    if (IOS_WEBKIT && this.zoomLayer) {
+      // iOS sizes each promoted surface from the unscaled layout box x device scale, so compositing every page-sized group and container while the zoom layer animates kills the tab mid-gesture.
+      // The `scribe-pinch` class hides the rotated groups and the loop below hides far-offscreen page containers, so nothing visible changes.
+      this.zoomLayer.classList.toggle('scribe-pinch', v);
+      if (v) {
+        const sc = this.scrollContainer;
+        const z = this.zoomLevel || 1;
+        const viewTop = sc.scrollTop / z;
+        const viewBottom = (sc.scrollTop + sc.clientHeight) / z;
+        /** @type {Array<HTMLDivElement>} */
+        this._pinchHiddenPages = [];
+        for (let n = 0; n < this.pageContainerArr.length; n++) {
+          const pc = this.pageContainerArr[n];
+          if (!pc) continue;
+          const top = this._pageStopsStart[n];
+          const dims = this.getDisplayDims(n);
+          if (top === undefined || !dims) continue;
+          const near = top + dims.height > viewTop - dims.height && top < viewBottom + dims.height;
+          if (!near) {
+            pc.style.display = 'none';
+            this._pinchHiddenPages.push(pc);
+          }
+        }
+      } else {
+        const sc = this.scrollContainer;
+        if (sc && sc.style.overflow !== 'hidden') {
+          sc.style.overflow = 'hidden';
+          sc.getBoundingClientRect();
+          requestAnimationFrame(() => { sc.style.overflow = 'auto'; });
+        }
+        this._commitPinchGesture();
+        for (const pc of this._pinchHiddenPages || []) pc.style.display = '';
+        this._pinchHiddenPages = [];
+      }
+    }
+    if (!v) {
+      this._lastPinchEndT = performance.now();
+      // The gesture suppressed re-rastering and possibly moved the view, so refresh both now.
+      this.updateCurrentPage();
+      this._scheduleReraster();
+    }
+  }
+
+  /**
+   * Stops dragging when the mouse button is released.
+   * @param {Event} [event]
+   */
+  stopDragPinch(event) {
+    this.drag.isDragging = false;
+    this._setPinching(false);
+    this.drag.dragDeltaTotal = 0;
+    this.drag.lastCenter = null;
+    this.drag.lastDist = null;
+  }
+
+  /**
+   * Begin browser-style middle-button autoscroll: the document scrolls toward the cursor's offset from the press point.
+   * Used in OCR viewing (`invis`) mode in place of the 1:1 drag-pan.
+   * @param {MouseEvent} event
+   */
+  startAutoScroll(event) {
+    this.stopAutoScroll(false);
+    event.preventDefault(); // suppress the browser's own middle-click autoscroll
+    const a = this.autoScroll;
+    a.active = true;
+    a.originX = event.clientX;
+    a.originY = event.clientY;
+    a.pointerX = event.clientX;
+    a.pointerY = event.clientY;
+
+    if (this.scrollContainer) this.scrollContainer.style.cursor = 'all-scroll';
+
+    // Anchor indicator: a circle with a center dot at the press point (the familiar autoscroll affordance).
+    const ind = document.createElement('div');
+    Object.assign(ind.style, {
+      position: 'fixed',
+      left: `${a.originX}px`,
+      top: `${a.originY}px`,
+      width: '40px',
+      height: '40px',
+      marginLeft: '-20px',
+      marginTop: '-20px',
+      borderRadius: '50%',
+      border: '1px solid rgba(0,0,0,0.35)',
+      background: 'rgba(255,255,255,0.55)',
+      boxShadow: '0 0 3px rgba(0,0,0,0.3)',
+      zIndex: '2147483647',
+      pointerEvents: 'none',
+    });
+    const dot = document.createElement('div');
+    Object.assign(dot.style, {
+      position: 'absolute',
+      left: '50%',
+      top: '50%',
+      width: '4px',
+      height: '4px',
+      marginLeft: '-2px',
+      marginTop: '-2px',
+      borderRadius: '50%',
+      background: 'rgba(0,0,0,0.6)',
+    });
+    ind.appendChild(dot);
+    document.body.appendChild(ind);
+    a.indicator = ind;
+
+    const DEAD = 12; // px of slack before any scrolling starts (rejects click jitter)
+    const TOE = 40; // px of the ramp's flat toe hidden behind the dead zone, so scrolling starts already climbing the curve instead of from its flat bottom
+    const RANGE = 600; // px of ramp travel from its zero to full speed
+    const SPAN = RANGE + TOE; // full ramp length, of which the TOE lives behind the dead zone
+    const MIN = 10 / 60; // px-per-frame floor of the ramp, which combined with TOE and MAX puts the dead-zone edge speed at ~22 px/s
+    const MAX = 800; // px-per-frame at full deflection (~48000 px/s at 60fps)
+    const EXP = 3; // >1 -> gentle near the start, steep at the extremes
+    const tick = () => {
+      if (!a.active) return;
+      // Ramp each axis through its own dead zone so a near-vertical hold does not creep sideways.
+      // Negate because pan's delta is grab-style: a positive ramp (cursor down/right) would otherwise scroll the view up/left, away from the cursor.
+      const ramp = (/** @type {number} */ d) => {
+        const past = Math.abs(d) - DEAD;
+        if (past <= 0) return 0;
+        const r = Math.min(past + TOE, SPAN); // start TOE px up the curve, so the dead zone hides the flat toe
+        return Math.sign(d) * (MIN + (MAX - MIN) * (r / SPAN) ** EXP);
+      };
+      const vX = ramp(a.pointerX - a.originX);
+      const vY = ramp(a.pointerY - a.originY);
+      if (vX !== 0 || vY !== 0) this.pan({ deltaX: -vX, deltaY: -vY });
+      a.rafId = requestAnimationFrame(tick);
+    };
+    a.rafId = requestAnimationFrame(tick);
+  }
+
+  /**
+   * Stop middle-button autoscroll and clean up its indicator and cursor.
+   * @param {boolean} [settle=true] - Render the landing page at full resolution now.
+   *   Pass false when the stop is not the user finishing a scroll.
+   */
+  stopAutoScroll(settle = true) {
+    const a = this.autoScroll;
+    if (!a.active) return;
+    a.active = false;
+    if (a.rafId !== null) {
+      cancelAnimationFrame(a.rafId);
+      a.rafId = null;
+    }
+    if (this.scrollContainer) this.scrollContainer.style.cursor = '';
+    if (a.indicator) {
+      a.indicator.remove();
+      a.indicator = null;
+    }
+    if (!settle) return;
+
+    // Autoscroll stops instantly with no coast, so render the landing page at full resolution now instead of waiting for the deferred-text settle timer.
+    // `updateCurrentPage` pins `cp` to the centred page so a late scroll frame no-ops instead of re-deferring; `displayPage` clears the pending timer.
+    this.updateCurrentPage();
+    this.displayPage(this.state.cp.n, false, false);
+  }
+
+  /** @param {TouchEvent} event */
+  executePinchTouch(event) {
+    const touch1 = event.touches[0];
+    const touch2 = event.touches[1];
+    if (!touch1 || !touch2) return;
+    this._setPinching(true);
+    const p1 = { x: touch1.clientX, y: touch1.clientY };
+    const p2 = { x: touch2.clientX, y: touch2.clientY };
+
+    const center = {
+      x: (p1.x + p2.x) / 2,
+      y: (p1.y + p2.y) / 2,
+    };
+    const dist = Math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2);
+
+    if (IOS_WEBKIT) {
+      // iOS latches a native pan on the first finger before the second arrives, and a scroll gesture already in progress ignores preventDefault.
+      // Per-frame scroll writes from here fight that native pan: the view shakes violently and the tile churn kills the tab.
+      // The live gesture is instead a temporary transform on the content sizer, re-anchored each frame against the native pan, and `_commitPinchGesture` folds it in at release.
+      const sc = this.scrollContainer;
+      let g = this._pinchGesture;
+      if (!g) {
+        const rect = this.contentSizer.getBoundingClientRect();
+        // Floor the gesture at the width-fit zoom: below it the scroll range collapses and the clamp teleports the view to the document start.
+        const fitZoom = this._contentWidth > 0 ? sc.clientWidth / this._contentWidth : 0;
+        g = {
+          startZoom: this.zoomLevel,
+          startDist: dist,
+          startCenter: center,
+          baseLeft: rect.left,
+          baseTop: rect.top,
+          startScrollLeft: sc.scrollLeft,
+          startScrollTop: sc.scrollTop,
+          lastCenter: center,
+          lastScale: 1,
+          lastTx: 0,
+          lastTy: 0,
+          minScale: fitZoom > 0 && this.zoomLevel > 0 ? Math.min(1, fitZoom / this.zoomLevel) : 0,
+          moveScrollLeft: sc.scrollLeft,
+          moveScrollTop: sc.scrollTop,
+          needsRebase: false,
+        };
+        this._pinchGesture = g;
+        this.contentSizer.style.transformOrigin = '0 0';
+      }
+      // The sizer's untransformed position, tracking any native-pan scroll movement since the gesture began.
+      const originLeft = g.baseLeft - (sc.scrollLeft - g.startScrollLeft);
+      const originTop = g.baseTop - (sc.scrollTop - g.startScrollTop);
+      if (g.needsRebase) {
+        // Resuming after a 2->1->2 finger drop: fold the frozen transform into the new pair's baselines so the picture does not jump.
+        g.needsRebase = false;
+        g.startCenter = {
+          x: (center.x - originLeft - g.lastTx) / g.lastScale + g.baseLeft,
+          y: (center.y - originTop - g.lastTy) / g.lastScale + g.baseTop,
+        };
+        g.startDist = dist / g.lastScale;
+      }
+      const scale = Math.max(dist / g.startDist, g.minScale);
+      // Content point under the fingers at gesture start, in sizer-local CSS px.
+      const px = g.startCenter.x - g.baseLeft;
+      const py = g.startCenter.y - g.baseTop;
+      const tx = center.x - originLeft - scale * px;
+      const ty = center.y - originTop - scale * py;
+      this.contentSizer.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      g.lastCenter = center;
+      g.lastScale = scale;
+      g.lastTx = tx;
+      g.lastTy = ty;
+      g.moveScrollLeft = sc.scrollLeft;
+      g.moveScrollTop = sc.scrollTop;
+      return;
+    }
+
+    if (!this.drag.lastDist || !this.drag.lastCenter) {
+      this.drag.lastCenter = center;
+      this.drag.lastDist = dist;
+      return;
+    }
+
+    // Two fingers moving together pan. The spread between them zooms, as on every native pinch surface.
+    this.pan({ deltaX: center.x - this.drag.lastCenter.x, deltaY: center.y - this.drag.lastCenter.y });
+    this._zoomStage(dist / this.drag.lastDist, center);
+    this.drag.lastDist = dist;
+    this.drag.lastCenter = center;
+  }
+
+  /**
+   * Fold the deferred iOS pinch into the real zoom + scroll in one frame.
+   * Called when the gesture drops below two fingers, so the swap happens while the picture is still glued to the fingers.
+   * No-op when no gesture is pending.
+   */
+  _commitPinchGesture() {
+    const g = this._pinchGesture;
+    if (!g) return;
+    this._pinchGesture = null;
+    if (!this.contentSizer || !this.scrollContainer) return;
+    this.contentSizer.style.transform = '';
+    const sc = this.scrollContainer;
+    const scRect = sc.getBoundingClientRect();
+    const scale = g.lastScale || 1;
+    // Belt and braces under the live floor in `executePinchTouch`: a zoom below width-fit collapses the scroll range and the clamp teleports the view to the document start.
+    const fitZoom = this._contentWidth > 0 ? sc.clientWidth / this._contentWidth : 0;
+    const newZoom = Math.max(g.startZoom * scale, fitZoom);
+    // Content point that sat under the fingers at gesture start; the transform kept it glued to `lastCenter`.
+    const contentX = (g.startScrollLeft + (g.startCenter.x - scRect.left)) / g.startZoom;
+    const contentY = (g.startScrollTop + (g.startCenter.y - scRect.top)) / g.startZoom;
+    // Any single-finger native pan since the last two-finger frame, read before the resize below.
+    // Shrinking the sizer clamps the current scroll first, and a later read would fold the clamp distance into these deltas and drag the landing toward the document start.
+    const panLeft = sc.scrollLeft - g.moveScrollLeft;
+    const panTop = sc.scrollTop - g.moveScrollTop;
+    this.zoomLevel = newZoom;
+    this._applyZoomTransform(newZoom);
+    this._updateContentSize();
+    // Fresh layout before the scroll writes, so iOS clamps them against the resized scroll range.
+    this._scrollMetrics();
+    sc.scrollLeft = contentX * newZoom - (g.lastCenter.x - scRect.left) + panLeft;
+    sc.scrollTop = contentY * newZoom - (g.lastCenter.y - scRect.top) + panTop;
+  }
+
+  /**
+   * Whether a DOM target is page background (not a word span or a layout box). Used to detect deselect clicks.
+   * @param {?EventTarget} el
+   */
+  // eslint-disable-next-line class-methods-use-this
+  _isBackgroundTarget(el) {
+    const node = /** @type {any} */ (el);
+    return !node || typeof node.closest !== 'function' || !node.closest('.scribe-word, [data-scribe-kind]');
+  }
+
+  /**
+   * Attach the viewer to a DOM element. Builds the native scroll container, content/zoom layers, and event handlers.
+   * @param {HTMLDivElement} elem
+   * @param {number} width
+   * @param {number} height
+   */
+  init(elem, width, height) {
+    this.elem = elem;
+    ensureLayerStyleSheet();
+
+    const scrollContainer = document.createElement('div');
+    scrollContainer.className = 'scribe-viewport';
+    Object.assign(scrollContainer.style, {
+      position: 'relative',
+      overflow: 'auto',
+      width: `${width}px`,
+      height: `${height}px`,
+      // Hide the native scrollbars; the custom overlay scrollbars (panels.js) are the visible UI.
+      scrollbarWidth: 'none',
+      // One finger pans natively, keeping the platform's momentum.
+      touchAction: 'pan-x pan-y',
+      // Reaching the document edge must not scroll-chain into a host page or trigger pull-to-refresh.
+      overscrollBehavior: 'contain',
+    });
+
+    const contentSizer = document.createElement('div');
+    contentSizer.className = 'scribe-content';
+    contentSizer.style.position = 'relative';
+
+    const zoomLayer = document.createElement('div');
+    zoomLayer.className = 'scribe-zoom';
+    Object.assign(zoomLayer.style, {
+      position: 'absolute', top: '0', left: '0', transformOrigin: '0 0',
+    });
+
+    contentSizer.appendChild(zoomLayer);
+    scrollContainer.appendChild(contentSizer);
+    elem.appendChild(scrollContainer);
+
+    this.scrollContainer = scrollContainer;
+    this.contentSizer = contentSizer;
+    this.zoomLayer = zoomLayer;
+
+    // Drag-select marquee, shown only while a selection is in progress. Positioned in content space.
+    const marquee = document.createElement('div');
+    Object.assign(marquee.style, {
+      position: 'absolute', background: 'rgba(40,123,181,0.5)', pointerEvents: 'none', display: 'none', zIndex: '6',
+    });
+    zoomLayer.appendChild(marquee);
+    this.selectingRectangle = marquee;
+
+    // `contextMenuFunc` lazily builds the shared menu, then shows only the actions that apply
+    // (none on a read-only viewer, where it returns before suppressing the browser's own menu).
+    scrollContainer.addEventListener('contextmenu', (event) => {
+      if ((this.useCustomSelection && this.textSel?.isDragging()) || this._editTextLineDrag) { event.preventDefault(); return; }
+      contextMenuFunc(this, event);
+    });
+
+    // The fill & sign palette stops an armed placement press in its capture handler, so this bubble-phase listener never deselects during placement.
+    scrollContainer.addEventListener('pointerdown', (event) => {
+      if (!selectedFillItem(this)) return;
+      if (event.target instanceof Element && event.target.closest('.scribe-item')) return;
+      deselectFillItem(this);
+    });
+
+    // The touch action callout is the touch replacement for the context menu above.
+    this._touchCalloutShow = (kind, kw, slot) => showTouchCallout(this, kind, kw, slot);
+    this._touchCalloutHide = () => hideTouchCallout();
+    scrollContainer.addEventListener('pointerdown', (event) => {
+      this._lastPrimaryPointerType = event.pointerType || 'mouse';
+      this._lastPointerDownClient = { x: event.clientX, y: event.clientY };
+    }, { capture: true, passive: true });
+
+    // Click-to-follow for parsed /Link regions.
+    // Under the custom engine, mouse and pen clicks are confirmed in the selection engine's own pointer flow, so this handler covers only the DOM engine and touch taps.
+    scrollContainer.addEventListener('click', (event) => {
+      if (event.detail > 1) return;
+      // Ctrl/Cmd stays live as the ask bypass.
+      if (event.shiftKey || event.altKey) return;
+      if (this.state.layoutMode || this.enableCanvasSelection) return;
+      if (event.target instanceof Element
+        && event.target.closest('.scribe-hl-cmark, .scribe-note-icon, .scribe-cmt-card, .scribe-redact-tab, [contenteditable]')) return;
+      if (this.useCustomSelection) {
+        if (this._lastPrimaryPointerType !== 'touch') return;
+        if (this.textSel && !this.textSel.isEmpty()) return;
+      } else {
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed) return;
+      }
+      const entry = this.linkAt(event.clientX, event.clientY);
+      if (!entry) return;
+      // Press and release must land on the same region, so the click that ends a drag never navigates.
+      const down = this._lastPointerDownClient;
+      if (down && this.linkAt(down.x, down.y) !== entry) return;
+      this._linkActivate(entry, event);
+    });
+
+    // Show a hovered /Link region's destination in a bottom-left status bubble.
+    let linkStatusRaf = /** @type {?number} */ (null);
+    scrollContainer.addEventListener('pointermove', (event) => {
+      if (linkStatusRaf !== null) return;
+      const {
+        clientX, clientY, buttons, pointerType,
+      } = event;
+      linkStatusRaf = requestAnimationFrame(() => {
+        linkStatusRaf = null;
+        // A sample queued just before the pointer crossed onto the strip would land after its mouseenter and wrongly hide the readout, so the strip's hover claim wins over this deferred path.
+        if (this._linkConfirmHover) return;
+        // Touch has no hover, and a held button means a drag or selection is underway, not a hover.
+        const entry = (pointerType === 'touch' || buttons) ? null : this.linkAt(clientX, clientY);
+        this._linkStatusUpdate(entry);
+      });
+    });
+    scrollContainer.addEventListener('pointerleave', () => this._linkStatusUpdate(null));
+
+    // On native scroll, update the current page (coalesced to one update per frame),
+    // passing the per-frame scroll distance as the speed `updateCurrentPage` uses to decide whether to defer the word build.
+    let scrollRaf = /** @type {?number} */ (null);
+    let lastScrollTopForSpeed = scrollContainer.scrollTop;
+    scrollContainer.addEventListener('scroll', () => {
+      if (scrollRaf !== null) return;
+      scrollRaf = requestAnimationFrame(() => {
+        scrollRaf = null;
+        const st = scrollContainer.scrollTop;
+        const speed = Math.abs(st - lastScrollTopForSpeed);
+        lastScrollTopForSpeed = st;
+        this.updateCurrentPage(speed);
+        this._updateScrollTextHide(speed);
+      });
+    });
+
+    // Middle-button 1:1 drag-pan (non-`invis` modes; `invis` mode uses autoscroll instead).
+    scrollContainer.addEventListener('mousemove', (event) => this.executeDrag(event));
+
+    // Marks are pointer-transparent, so the "Preview" tab reveal hit-tests them on every move instead of using DOM hover.
+    scrollContainer.addEventListener('mousemove', (event) => updateRedactTab(this, event));
+    scrollContainer.addEventListener('mouseleave', () => hideRedactTabSoon(this));
+
+    // Hovering any word of a highlight lifts every band of its group and swaps in a pointer cursor,
+    // signalling the highlight is an engageable object (its actions live in the right-click menu).
+    // Delegated rather than per-word so it tracks highlights applied or removed after the words were built.
+    // The custom engine does this from geometry instead (`TextSelection._onHoverMove`), having no word elements to delegate to.
+    if (!this.useCustomSelection) {
+      /** @type {?{wordEl: HTMLElement, rects: Array<HTMLDivElement>}} */
+      let hlLift = null;
+      const clearHlLift = () => {
+        if (!hlLift) return;
+        for (const rect of hlLift.rects) rect.classList.remove('scribe-hl-hover');
+        hlLift.wordEl.style.cursor = '';
+        hlLift = null;
+        if (this.onHighlightHover) this.onHighlightHover(null);
+      };
+      scrollContainer.addEventListener('mouseover', (event) => {
+        const wordEl = event.target instanceof Element ? /** @type {?HTMLElement} */ (event.target.closest('.scribe-word')) : null;
+        if (hlLift && hlLift.wordEl === wordEl) return;
+        clearHlLift();
+        if (!wordEl) return;
+        if (this.linkAt(event.clientX, event.clientY)) wordEl.style.cursor = 'pointer';
+        const kw = /** @type {any} */ (wordEl)._scribeObj;
+        if (!kw || !kw.highlightColor) return;
+        /** @type {Array<HTMLDivElement>} */
+        const rects = [];
+        if (kw.highlightGroupId) {
+          // A group can span pages (a selection highlighted across a page break), so gather bands from every page's map.
+          for (const map of this._highlightRectsByGroup) {
+            const arr = map && map.get(kw.highlightGroupId);
+            if (arr) rects.push(...arr);
+          }
+        } else if (kw.highlightRectElem) {
+          // A group-less highlight (imported without ids) lifts just its own band.
+          rects.push(kw.highlightRectElem);
+        }
+        for (const rect of rects) rect.classList.add('scribe-hl-hover');
+        wordEl.style.cursor = 'pointer';
+        hlLift = { wordEl, rects };
+        if (this.onHighlightHover) this.onHighlightHover(kw.highlightGroupId || null);
+      });
+      scrollContainer.addEventListener('mouseleave', clearHlLift);
+    }
+
+    // A single finger is left to the container's native pan.
+    // The uncancelled touchstart lets the browser synthesize the compatibility mouse events that tap-driven UI inside the canvas relies on.
+    scrollContainer.addEventListener('touchstart', (event) => {
+      if (this.mode !== 'select') return;
+      if (event.touches.length < 2) return;
+      event.preventDefault();
+      this._setPinching(true);
+      // A second finger re-landing while a deferred gesture is pending resumes it rather than starting a fresh one.
+      if (this._pinchGesture) this._pinchGesture.needsRebase = true;
+      this.drag.lastDist = null;
+      this.drag.lastCenter = null;
+    }, { passive: false });
+
+    scrollContainer.addEventListener('touchmove', (event) => {
+      // A press-and-hold has claimed this touch for a text selection or a line-range drag; native panning would fight the drag.
+      if ((this.useCustomSelection && this.textSel.isDragging()) || this._editTextLineDrag) { event.preventDefault(); return; }
+      if (!event.touches[1]) return;
+      event.preventDefault();
+      this.executePinchTouch(event);
+    }, { passive: false });
+
+    scrollContainer.addEventListener('touchend', (event) => {
+      // Clearing the trackers makes a re-placed second finger start a fresh gesture instead of jumping from the stale distance.
+      // The deferred iOS pinch commits only at final lift: with a finger still down the native pan owns the scroll offset and rolls back the commit's scroll writes.
+      if (event.touches.length < 2) {
+        this.drag.lastDist = null;
+        this.drag.lastCenter = null;
+      }
+      // The pointerup handler, which fires first, also clears this; clearing here too keeps the flag from sticking when a pointerup is retargeted or suppressed mid-gesture.
+      if (event.touches.length === 0) this._setPinching(false);
+    });
+
+    scrollContainer.addEventListener('touchcancel', (event) => {
+      if (event.touches.length > 0) return;
+      // The system stole the gesture, and the contract for touchcancel is abort, not commit: discard the deferred pinch and restore the pre-gesture view.
+      // Returning from the system UI then never lands on a half-applied zoom.
+      if (this._pinchGesture) {
+        this._pinchGesture = null;
+        if (this.contentSizer) this.contentSizer.style.transform = '';
+      }
+      this.drag.lastDist = null;
+      this.drag.lastCenter = null;
+      this._setPinching(false);
+    });
+
+    // Double-tap toggles between the width-fit zoom and a reading zoom anchored at the tap point.
+    const dblTap = {
+      downX: 0, downY: 0, lastUpT: 0, lastUpX: 0, lastUpY: 0, downOwned: false,
+    };
+    scrollContainer.addEventListener('pointerdown', (event) => {
+      if (event.pointerType !== 'touch') return;
+      dblTap.downX = event.clientX;
+      dblTap.downY = event.clientY;
+      // While a field editor is open every tap counts as owned, because at phone zoom a field is a few pixels tall and the second tap of a double tap often lands just outside it.
+      // The editor is read at press, because the focus change this press causes tears it down before the lift.
+      dblTap.downOwned = (event.target instanceof Element
+        && !!event.target.closest('.scribe-hl-cmark, .scribe-note-icon, .scribe-cmt-card, .scribe-field, .scribe-item, .scribe-redact-tab, [contenteditable]'))
+        || !!this.elem?.querySelector('.scribe-field-input');
+    });
+    scrollContainer.addEventListener('pointerup', (event) => {
+      if (event.pointerType !== 'touch') return;
+      // In the editing modes every tap picks an object, so a second one must not also yank the page under the finger by zooming.
+      if (this._editTextActive || this._graphicsEditActive) { dblTap.lastUpT = 0; return; }
+      if (dblTap.downOwned) { dblTap.lastUpT = 0; return; }
+      if (this.mode !== 'select' || this.drag.isPinching
+        || performance.now() - this._lastPinchEndT < 300
+        || (this.useCustomSelection && this.textSel?.isDragging())) { dblTap.lastUpT = 0; return; }
+      // Only a stationary press is a tap; a pan or fling lifts far from its press point.
+      if (Math.hypot(event.clientX - dblTap.downX, event.clientY - dblTap.downY) > 12) { dblTap.lastUpT = 0; return; }
+      const near = Math.hypot(event.clientX - dblTap.lastUpX, event.clientY - dblTap.lastUpY) < 30;
+      if (near && event.timeStamp - dblTap.lastUpT < 350) {
+        dblTap.lastUpT = 0;
+        this._toggleDoubleTapZoom({ x: event.clientX, y: event.clientY });
+      } else {
+        dblTap.lastUpT = event.timeStamp;
+        dblTap.lastUpX = event.clientX;
+        dblTap.lastUpY = event.clientY;
+      }
+    });
+
+    // Marquee drag-select (editor only; `enableCanvasSelection` is false in the read-only viewer).
+    scrollContainer.addEventListener('pointerdown', (event) => {
+      setActiveViewer(this);
+      if (this.doc.pageMetrics.length === 0) return;
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      if (!this.enableCanvasSelection) return;
+      if (event.pointerType === 'touch' && this.mode === 'select') return;
+
+      this._mouseDownTarget = /** @type {any} */ (event.target);
+      const start = this.clientToContent(event.clientX, event.clientY);
+      this.bbox.left = start.x;
+      this.bbox.top = start.y;
+      this.bbox.right = start.x;
+      this.bbox.bottom = start.y;
+      marquee.style.width = '0';
+      marquee.style.height = '0';
+      this.selecting = true;
+    });
+
+    // A native drag beginning inside an existing selection pointercancels the pointer gesture already underway, so the new selection dies a character or two in under a "no-drop" cursor.
+    // Under the custom engine that selection is the browser's own and invisible, left by an earlier drag across selectable text on the page.
+    scrollContainer.addEventListener('dragstart', (event) => event.preventDefault());
+
+    scrollContainer.addEventListener('pointermove', (event) => {
+      if (!this.selecting) return;
+      event.preventDefault();
+      const end = this.clientToContent(event.clientX, event.clientY);
+      this.bbox.right = end.x;
+      this.bbox.bottom = end.y;
+      Object.assign(marquee.style, {
+        display: '',
+        left: `${Math.min(this.bbox.left, this.bbox.right)}px`,
+        top: `${Math.min(this.bbox.top, this.bbox.bottom)}px`,
+        width: `${Math.abs(this.bbox.right - this.bbox.left)}px`,
+        height: `${Math.abs(this.bbox.bottom - this.bbox.top)}px`,
+      });
+    });
+
+    scrollContainer.addEventListener('pointerup', (event) => {
+      // Suppress the native pointer-up default only when we own canvas selection and are not in layout mode.
+      // The read-only HTML-overlay viewer relies on native selection,
+      // so preventing the default there would stop the browser collapsing a selection on click and leave text stuck highlighted.
+      if (this.enableCanvasSelection && !this.state.layoutMode) event.preventDefault();
+
+      const mouseUpTarget = /** @type {HTMLElement} */ (event.target);
+      const editingWord = !!UiText.input;
+
+      // If a word is being edited, the only allowed action is clicking outside the word to deselect it.
+      if (editingWord) {
+        // The comparisons below match only the word, not the input element,
+        // so without inInput the opening double-click's own mouseup would close the editor instantly.
+        const inInput = UiText.input && mouseUpTarget instanceof Node && UiText.input.contains(mouseUpTarget);
+        if (inInput || this._mouseDownTarget === UiText.inputWord || mouseUpTarget === UiText.inputWord) {
+          this.selecting = false;
+          return;
+        }
+        this.destroyControls();
+      } else if (event.button === 0 && this._isBackgroundTarget(mouseUpTarget)
+        && (this.selecting || this._isBackgroundTarget(/** @type {any} */ (this._mouseDownTarget)))) {
+        this.destroyControls();
+      }
+
+      this.selecting = false;
+
+      // A drag or pinch rather than a click: stop the gesture and skip the click handler.
+      if (event.button === 1 || (this.drag.isDragging && this.drag.dragDeltaTotal > 10) || this.drag.isPinching || this.drag.isResizingColumns) {
+        marquee.style.display = 'none';
+        this.stopAutoScroll();
+        this.stopDragPinch(event);
+        return;
+      }
+
+      // `mouseupFunc2` hides the marquee itself, after reading whether one was drawn.
+      // Hiding it here would make that read always false and collapse every drag-select into the single-word click path.
+      if (this.enableCanvasSelection) mouseupFunc2(this, event);
+      this.mode = 'select';
+    });
+  }
+
+  /**
+   * Set the initial position and zoom of the canvas to reasonable defaults.
+   * @param {dims} imgDims - Dimensions of image
+   */
+  setInitialPositionZoom(imgDims) {
+    this.runSetInitial = false;
+
+    const totalHeight = this.scrollContainer.clientHeight;
+    const interfaceHeight = 100;
+    const bottomMarginHeight = 50;
+    const targetHeight = totalHeight - interfaceHeight - bottomMarginHeight;
+
+    const zoom = targetHeight / imgDims.height;
+    this.zoomLevel = zoom;
+    this._applyZoomTransform(zoom);
+    // Populate `_contentWidth`/`_contentHeight` and size the content sizer before the scroll writes below.
+    // Without this, on the first call both are still 0, so the content sizer gets zero height and the browser clamps the centering scroll to 0,
+    // opening the document far below the viewport.
+    this.calcPageLayout();
+    // `_contentWidth` is symmetric about the document centre (equal free-pan gutters), so centering it centers the document.
+    // `scrollTop` skips the top gutter so the first page starts at the top of the viewport, not below a band of free-pan blank space.
+    this.scrollContainer.scrollLeft = Math.max(0, (this._contentWidth * zoom - this.scrollContainer.clientWidth) / 2);
+    this.scrollContainer.scrollTop = this._panGutter().y * zoom;
+  }
+
+  /**
+   * Render the OCR word overlay for page `n`, clearing any existing words first.
+   * @param {number} n
+   */
+  async renderWords(n) {
+    let ocrData = this.doc.ocr.active?.[n];
+
+    const noInfo = this.doc.inputData.xmlMode[n] === undefined;
+    const noInput = !this.doc.inputData.xmlMode[n] && !(this.doc.inputData.imageMode || this.doc.inputData.pdfMode);
+    const xmlMissing = this.doc.inputData.xmlMode[n]
+      && (ocrData === undefined || ocrData === null || this.doc.pageMetrics[n].dims === undefined);
+
+    const pageStopsMissing = this.getPageStop(n) === null;
+
+    const imageMissing = false;
+    const pdfMissing = false;
+
+    if (this._textGroups[n]) {
+      for (const group of Object.values(this._textGroups[n])) {
+        // The Edit Text tool's line editor and ink-preview canvases outlive a word rebuild; the tool removes them itself.
+        group.replaceChildren(...group.querySelectorAll('.scribe-edit-text-editor, .scribe-edit-text-inkpreview'));
+      }
+    }
+    // Clear the highlight layer here too, so a page that loses its text (no-data early return below) does not strand stale bands.
+    if (this._highlightGroups[n]) {
+      for (const group of Object.values(this._highlightGroups[n])) {
+        group.replaceChildren();
+      }
+    }
+    if (this._selectGroups[n]) {
+      for (const group of Object.values(this._selectGroups[n])) {
+        group.replaceChildren();
+      }
+      this.textSel?.destroyPage(n);
+    }
+    this._wordObjs[n] = [];
+    this._wordObjMaps[n] = null;
+
+    if (UiText.inputWord && UiText.inputWord.word.line.page.n === n && UiText.inputRemove) {
+      UiText.inputRemove();
+    }
+    this.CanvasSelection.deselectAllWords(n);
+
+    // Guard sits after the clears, not at the function top, so disabling the overlay still sheds its stale groups and words.
+    if (this.textOverlayDisabledDebug) return;
+
+    if (noInfo || noInput || xmlMissing || imageMissing || pdfMissing || pageStopsMissing) {
+      return;
+    }
+
+    if (this.doc.inputData.evalMode) {
+      await this._compareGroundTruth();
+      ocrData = this.doc.ocr.active?.[n];
+    }
+
+    if (this.doc.inputData.xmlMode[n]) {
+      // Word geometry is measured against the built-in fonts, which the fast open paths (deferText imports, provisional seeds) start loading without awaiting.
+      await loadBuiltInFontsRaw();
+      // A document swapped or re-recognized during the await must not paint this page's stale words.
+      if (this.doc.ocr.active?.[n] !== ocrData) return;
+      this._renderCanvasWords(ocrData);
+
+      // The page re-renders once when faces land, and that re-render finds every key settled, failures included, so it fires nothing and the cycle stops.
+      // Awaiting the lookups instead would block the page on a worker font conversion, since `displayPage` awaits `renderWords`.
+      if (this.state.tablePreview && ocrData.textSource === 'pdf' && !this._tpFontPending.has(n)) {
+        const nt = nativeTextForPage(this.doc, ocrData);
+        const seen = new Set();
+        const pending = [];
+        for (const line of ocrData.lines) {
+          for (const w of line.words) {
+            const f = nt[w.id]?.fontObjNum;
+            if (typeof f !== 'number' || !Number.isFinite(f) || seen.has(f)) continue;
+            seen.add(f);
+            if (this.doc.images.getEditFontSync(n, f) === undefined) pending.push(this.doc.images.getEditFont(n, f));
+          }
+        }
+        if (pending.length) {
+          const doc = this.doc;
+          this._tpFontPending.add(n);
+          Promise.allSettled(pending).then((results) => {
+            this._tpFontPending.delete(n);
+            if (!results.some((r) => r.status === 'fulfilled' && r.value?.faceName)) return;
+            if (!this.state.tablePreview || this.doc !== doc || this.doc.ocr.active?.[n] !== ocrData) return;
+            if (!this.textGroupsRenderIndices.includes(n)) return;
+            this.renderWords(n).then(() => {
+              if (this.state.layoutMode) layout.renderLayoutBoxes(this, n);
+            });
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Re-render page `n`'s raster after a content change, e.g. a native-text edit.
+   * @param {number} n
+   * @returns {Promise<void>} Settles once the fresh raster is attached (at once when no render was started).
+   */
+  refreshPageRaster(n) {
+    const pc = this.pageContainerArr[n];
+    const old = pc ? /** @type {?HTMLCanvasElement} */ (/** @type {any} */ (pc)._canvas) : null;
+    if (old && old.width > 0 && old.style.display !== 'none') {
+      if (!this._rasterGhosts) this._rasterGhosts = /** @type {Object<number, ?HTMLCanvasElement>} */ ({});
+      this._removeRasterGhost(n);
+      const ghost = document.createElement('canvas');
+      ghost.width = old.width;
+      ghost.height = old.height;
+      ghost.getContext('2d')?.drawImage(old, 0, 0);
+      // The copied class keeps the ghost subject to the image-layer hide rule.
+      ghost.className = old.className;
+      ghost.style.cssText = old.style.cssText;
+      pc.appendChild(ghost);
+      this._rasterGhosts[n] = ghost;
+    }
+    this.doc?.images?.invalidatePageRender(n);
+    this.imageCache.invalidatePage(n);
+    this.imageCache.addPageCanvas(n);
+    // The ghost comes off when a fresh canvas attaches (`addPageCanvas`), not when a render promise settles.
+    // A superseded or failed render settles without attaching pixels, so removing the ghost on that settlement would blank the page until the surviving render lands.
+    if (!this.imageCache.pageCanvases[n]) {
+      this._removeRasterGhost(n);
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      if (!this._rasterSwapWaiters) this._rasterSwapWaiters = {};
+      (this._rasterSwapWaiters[n] ||= []).push(resolve);
+    });
+  }
+
+  /**
+   * Drop page `n`'s swap ghost and release the `refreshPageRaster` callers waiting on it.
+   * Called once fresh pixels for the page are on screen.
+   * @param {number} n
+   */
+  _rasterAttached(n) {
+    this._removeRasterGhost(n);
+    const waiters = this._rasterSwapWaiters?.[n];
+    if (!waiters) return;
+    delete /** @type {Object<number, Array<() => void>>} */ (this._rasterSwapWaiters)[n];
+    for (const resolve of waiters) resolve();
+  }
+
+  /**
+   * Drop page `n`'s frozen swap ghost.
+   * @param {number} n
+   */
+  _removeRasterGhost(n) {
+    const ghost = this._rasterGhosts?.[n];
+    if (!ghost) return;
+    /** @type {Object<number, ?HTMLCanvasElement>} */ (this._rasterGhosts)[n] = null;
+    ghost.remove();
+    // Zeroing the dimensions frees the backing store now rather than at GC.
+    ghost.width = 0;
+    ghost.height = 0;
+  }
+
+  /**
+   * Render page `n` in the UI.
+   * @param {number} n
+   * @param {boolean} [scroll=false]
+   * @param {boolean} [refresh=true]
+   * @param {boolean} [deferText=false] - Skip building/evicting the word DOM and overlays, doing only the cheap page change (raster, scrollbars, page number).
+   *   Used while scrolling too fast to read the text (or any scroll in invis mode). `updateCurrentPage` schedules the real build for when the scroll settles.
+   * @param {boolean|'current'} [deferRaster=false] - Raster strategy for this page change (see `updateCurrentPage`):
+   *   true = skip full rasters and show low-res previews;
+   *   'current' = raster only page `n`, with no ahead/behind window;
+   *   false = full raster window, and clears any glide tail.
+   */
+  async displayPage(n, scroll = false, refresh = true, deferText = false, deferRaster = false) {
+    if (Number.isNaN(n) || n < 0 || n > (this.doc.inputData.pageCount - 1)) {
+      if (this.displayPageCallback) this.displayPageCallback();
+      return;
+    }
+
+    // A real build supersedes any pending deferred one (e.g. a click or the settle timer landing mid-scroll).
+    if (!deferText && this._deferredTextTimer) {
+      clearTimeout(this._deferredTextTimer);
+      this._deferredTextTimer = null;
+    }
+
+    if (this.runSetInitial) {
+      const rowIdx = this.rowOfPage(n);
+      const rowDims = rowIdx === null ? null : this.rowDisplayDims(rowIdx);
+      this.setInitialPositionZoom(rowDims || this.doc.pageMetrics[n].dims);
+    }
+
+    // Issue the raster request before the synchronous word-DOM build so render workers can start on the target page instead of waiting.
+    // Must run after setInitialPositionZoom so the canvases raster at the correct zoom.
+    if (this.doc.inputData.pdfMode || this.doc.inputData.imageMode) {
+      if (deferRaster === true) {
+        // Full rasters are suppressed here, so the flown-past pages need a cheap preview to avoid blank.
+        // Point the look-ahead in the scroll direction, the sign of the jump to `n`.
+        this.imageCache.ensurePreviewWindow(n, Math.sign(n - this.state.cp.n) || 1);
+        if (IOS_WEBKIT) this.imageCache.sweepCaches(n);
+      } else {
+        this.imageCache.renderAheadBehindBrowser(n, deferRaster === 'current' ? 0 : undefined);
+        if (!deferRaster) {
+          // A full-window render ends any preview glide, so the next boundaries return to the normal slow-scroll path.
+          this._rasterDeferred = false;
+          this._rasterTail = false;
+        }
+      }
+    }
+
+    const hideBackground = this.state.displayMode === 'ebook';
+    this.elem?.classList.toggle('scribe-ebook', hideBackground);
+    for (const pc of this.pageContainerArr) {
+      const canvas = pc && /** @type {any} */ (pc)._canvas;
+      if (canvas) canvas.style.display = hideBackground ? 'none' : '';
+    }
+
+    this.textOverlayHidden = false;
+
+    // Re-check the bounds at each use rather than baking them into the list.
+    // The awaits below yield, so a document swapped or shrunk meanwhile must not receive renders for pages it no longer has.
+    const windowArr = [n, ...this.windowPages(n).filter((p) => p !== n)];
+    const inDoc = (p) => p < this.doc.pageMetrics.length && (p === n || p < this.doc.ocr.active.length);
+
+    if (!deferText) {
+      for (const p of windowArr) {
+        if (!inDoc(p)) continue;
+        if (refresh || !this.textGroupsRenderIndices.includes(p)) {
+          // A refresh can follow an in-place edit of the page's words (a merge, a split), which the index's page-identity check cannot see.
+          if (refresh && this.useCustomSelection && this.textSel) this.textSel.invalidatePage(p);
+          await this.renderWords(p);
+        }
+      }
+    }
+
+    for (const p of windowArr) {
+      if (!inDoc(p)) continue;
+      this.renderNotes(p);
+      this.renderRedactions(p);
+      this.renderFormFields(p);
+      this.renderFillItems(p);
+    }
+
+    if (scroll) {
+      // Land page `n` as the current page.
+      // The scroll fires `updateCurrentPage`, which picks the row at the viewport centre.
+      // Top-aligning a short row with the usual 100px gap would put that centre in the next row,
+      // so top-align only tall rows and centre short ones to keep `n` current.
+      const rowIdx = this.rowOfPage(n);
+      const rowDims = rowIdx === null ? null : this.rowDisplayDims(rowIdx);
+      const height = rowDims ? rowDims.height : this.getDisplayDims(n)?.height;
+      const pageTop = this.getPageStop(n);
+      const halfView = this._scrollMetrics().clientHeight / (2 * this.zoomLevel);
+      const top = height && halfView > height + 100 ? pageTop + height / 2 - halfView : pageTop - 100;
+      this.scrollContainer.scrollTop = Math.max(0, top * this.zoomLevel);
+    }
+
+    if (DEBUG_RENDER_SCHED && this.state.cp.n !== n) {
+      console.log(`[render-sched] current page -> ${n} (was ${this.state.cp.n})`);
+    }
+    this.state.cp.n = n;
+
+    if (!deferText) {
+      this.destroyText();
+      this.destroyOverlay();
+    }
+
+    if (this.displayPageCallback) this.displayPageCallback();
+
+    if (this.state.layoutMode && !deferText) {
+      for (const p of windowArr) {
+        if (!inDoc(p)) continue;
+        if (refresh || !this.overlayGroupsRenderIndices.includes(p)) {
+          layout.renderLayoutBoxes(this, p);
+        }
+      }
+    }
+  }
+
+  /**
+   * Navigate to a within-page destination: an outline (bookmark) entry or a comment row's anchor.
+   * A rotated page falls back to a plain page jump because its raster no longer shares the parse-time vertical axis that `yFrac` indexes.
+   * @param {{ pageIndex: number, yFrac?: number }} dest
+   */
+  goToOutlineDest(dest) {
+    const n = dest.pageIndex;
+    if (!Number.isInteger(n) || n < 0 || n > (this.doc.inputData.pageCount - 1)) return;
+    const dims = this.getDisplayDims(n);
+    const userRotation = (this.doc.pageMetrics[n]?.rotation || 0) % 360;
+    const yFrac = (typeof dest.yFrac === 'number' && userRotation === 0 && dims) ? dest.yFrac : null;
+    if (yFrac == null || yFrac < 0.02) {
+      this.displayPage(n, true, false);
+      return;
+    }
+
+    this.displayPage(n, false, false);
+    // The same 100px lead-in displayPage's own page jump uses, so the two scroll styles agree at the page top.
+    this.scrollContainer.scrollTop = Math.max(0, (this.getPageStop(n) + yFrac * dims.height - 100) * this.zoomLevel);
+  }
+
+  /**
+   * The link annotation under a client point, or null.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {?AnnotationLink}
+   */
+  linkAt(clientX, clientY) {
+    if (this._editTextActive || this._graphicsEditActive) return null;
+    const pagesAnnots = this.doc.annotations?.pages;
+    if (!pagesAnnots || pagesAnnots.length === 0) return null;
+    const { n, x, y } = this.clientToPage(clientX, clientY);
+    const arr = pagesAnnots[n];
+    if (!arr || arr.length === 0 || !this.doc.pageMetrics[n]?.dims) return null;
+    // Link bboxes live in base (orientation-0) space, the frame the OCR word boxes use.
+    const local = this.pageToLocal(n, 0, x, y);
+    for (const entry of arr) {
+      if (entry.type !== 'link') continue;
+      const b = entry.bbox;
+      if (local.x >= b.left && local.x <= b.right && local.y >= b.top && local.y <= b.bottom) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * Navigate a link annotation.
+   * @param {AnnotationLink} entry
+   */
+  _followLink(entry) {
+    this._linkStatusUpdate(null);
+    if (entry.dest) {
+      this.goToOutlineDest(entry.dest);
+    } else if (entry.uri && /^(https?:|mailto:)/i.test(entry.uri.trim())) {
+      // A PDF can carry a javascript: URI that must never execute, so only http and mailto open.
+      window.open(entry.uri, '_blank', 'noopener,noreferrer');
+    }
+  }
+
+  /**
+   * Route an activated link annotation.
+   * Internal destinations navigate at once, external targets ask first.
+   * @param {AnnotationLink} entry
+   * @param {{clientX: number, clientY: number, ctrlKey: boolean, metaKey: boolean}} event - The confirming pointer or click event.
+   */
+  _linkActivate(entry, event) {
+    if (entry.dest) {
+      this._followLink(entry);
+      return;
+    }
+    // The same scheme allowlist `_followLink` enforces, applied up front so blocked URIs get no ask either.
+    if (!entry.uri || !/^(https?:|mailto:)/i.test(entry.uri.trim())) return;
+    // Ctrl-click is the Mac's right-click.
+    if (event.metaKey || (event.ctrlKey && !IS_MAC)) {
+      this._followLink(entry);
+      return;
+    }
+    this._linkConfirmShow(entry, event);
+  }
+
+  /**
+   * Show the click-to-open confirm strip under an external link.
+   * The whole strip is the open control.
+   * Esc, scrolling, or a press anywhere else dismisses it.
+   * @param {AnnotationLink} entry
+   * @param {{clientX: number, clientY: number}} event - The click the strip is answering, used to resolve the page.
+   */
+  _linkConfirmShow(entry, event) {
+    this._linkConfirmHide(false);
+    const uri = /** @type {string} */ (entry.uri).trim();
+    if (!document.getElementById('scribe-link-confirm-style')) {
+      const style = document.createElement('style');
+      style.id = 'scribe-link-confirm-style';
+      // Token vars resolve when the app stylesheet is present and fall back to the light palette when the viewer is embedded bare.
+      style.textContent = `
+        .scribe-link-confirm {
+          position: absolute; z-index: 31; box-sizing: border-box;
+          display: flex; align-items: center; gap: 8px;
+          height: 34px; padding: 0 12px;
+          background: var(--scribe-surface, #ffffff); color: var(--scribe-ink, #1f2530);
+          border: 1px solid var(--scribe-line, #e4e8ef); border-radius: 6px;
+          box-shadow: var(--scribe-menu-shadow, 0 1px 2px rgba(20, 30, 60, .10), 0 5px 14px rgba(20, 30, 60, .12));
+          font: 12.5px -apple-system, system-ui, 'Segoe UI', sans-serif;
+          cursor: pointer; appearance: none; text-align: left;
+          opacity: 0; transform: translateY(-2px); transition: opacity .1s ease, transform .1s ease;
+        }
+        .scribe-link-confirm.scribe-link-confirm-in { opacity: 1; transform: none; }
+        /* The hover token is a translucent tint, so it layers over the opaque surface rather than replacing it. */
+        .scribe-link-confirm:hover { background-image: linear-gradient(var(--scribe-hover, rgba(28, 42, 68, .06)), var(--scribe-hover, rgba(28, 42, 68, .06))); }
+        .scribe-link-confirm:focus-visible {
+          outline: none;
+          box-shadow: 0 0 0 2px var(--scribe-accent-ring, rgba(28, 98, 212, .30)), var(--scribe-menu-shadow, 0 1px 2px rgba(20, 30, 60, .10), 0 5px 14px rgba(20, 30, 60, .12));
+        }
+        .scribe-link-confirm-url { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .scribe-link-confirm-url .scribe-link-confirm-dim { color: var(--scribe-ink-3, #98a1b0); }
+        .scribe-link-confirm-url .scribe-link-confirm-host { color: var(--scribe-ink, #1f2530); font-weight: 600; }
+        .scribe-link-confirm-arrow { flex: none; width: 13px; height: 13px; color: var(--scribe-accent, #1c62d4); }
+        @media (prefers-reduced-motion: reduce) { .scribe-link-confirm { transition: none; } }
+      `;
+      document.head.appendChild(style);
+    }
+
+    // Min/max of the two mapped corners keeps the link rect upright on rotated pages.
+    const { n } = this.clientToPage(event.clientX, event.clientY);
+    const b = entry.bbox;
+    const p1 = this.localToContent(n, 0, b.left, b.top);
+    const p2 = this.localToContent(n, 0, b.right, b.bottom);
+    const zl = this.zoomLayer.getBoundingClientRect();
+    const z = this.zoomLevel;
+    const link = {
+      left: zl.left + Math.min(p1.x, p2.x) * z,
+      top: zl.top + Math.min(p1.y, p2.y) * z,
+      bottom: zl.top + Math.max(p1.y, p2.y) * z,
+    };
+
+    let scheme = '';
+    let host = uri;
+    let path = '';
+    const m = uri.match(/^(https?:\/\/)([^/?#]*)(.*)$/i);
+    if (m) {
+      [, scheme, host, path] = m;
+    } else if (/^mailto:/i.test(uri)) {
+      scheme = uri.slice(0, 'mailto:'.length);
+      host = uri.slice('mailto:'.length);
+    }
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'scribe-link-confirm';
+    el.setAttribute('aria-label', `Open ${uri}`);
+    const urlElem = document.createElement('span');
+    urlElem.className = 'scribe-link-confirm-url';
+    for (const [cls, text] of [['scribe-link-confirm-dim', scheme], ['scribe-link-confirm-host', host], ['scribe-link-confirm-dim', path]]) {
+      if (!text) continue;
+      const piece = document.createElement('span');
+      piece.className = cls;
+      piece.textContent = text;
+      urlElem.appendChild(piece);
+    }
+    const arrow = document.createElement('span');
+    arrow.className = 'scribe-link-confirm-arrow';
+    arrow.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block;width:100%;height:100%;" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg>';
+    el.append(urlElem, arrow);
+    this.elem.appendChild(el);
+    this._linkConfirmEl = el;
+
+    const elemRect = this.elem.getBoundingClientRect();
+    const sc = this.scrollContainer.getBoundingClientRect();
+    el.style.maxWidth = `${Math.min(460, sc.width - 16)}px`;
+    const w = el.offsetWidth;
+    const x = Math.min(Math.max(link.left, sc.left + 8), sc.right - w - 8) - elemRect.left;
+    let y = link.bottom + 4 - elemRect.top;
+    if (y + el.offsetHeight > sc.bottom - elemRect.top - 8) y = link.top - elemRect.top - el.offsetHeight - 4;
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    requestAnimationFrame(() => el.classList.add('scribe-link-confirm-in'));
+    el.focus({ preventScroll: true });
+
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this._linkConfirmHide(true);
+      this._followLink(entry);
+    });
+    el.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      this._linkConfirmHide(true);
+    });
+    // The strip truncates long URLs, so hovering it reads out the full target in the status bubble.
+    // The hover flag gives these handlers authority over the bubble, which the frame-deferred scroll-area hover path yields to.
+    el.addEventListener('mouseenter', () => {
+      this._linkConfirmHover = true;
+      this._linkStatusUpdate(entry);
+    });
+    el.addEventListener('mouseleave', () => {
+      this._linkConfirmHover = false;
+      this._linkStatusUpdate(null);
+    });
+    this._linkConfirmDocDown = (e) => {
+      if (this._linkConfirmEl && e.target instanceof Node && !this._linkConfirmEl.contains(e.target)) this._linkConfirmHide(false);
+    };
+    document.addEventListener('pointerdown', this._linkConfirmDocDown, true);
+    this._linkConfirmScroll = () => this._linkConfirmHide(false);
+    this.scrollContainer.addEventListener('scroll', this._linkConfirmScroll, { passive: true });
+  }
+
+  /**
+   * Remove the link confirm strip and its listeners.
+   * @param {boolean} refocus - Whether to hand keyboard focus back to the document.
+   */
+  _linkConfirmHide(refocus) {
+    if (this._linkConfirmDocDown) {
+      document.removeEventListener('pointerdown', this._linkConfirmDocDown, true);
+      this._linkConfirmDocDown = null;
+    }
+    if (this._linkConfirmScroll) {
+      this.scrollContainer.removeEventListener('scroll', this._linkConfirmScroll);
+      this._linkConfirmScroll = null;
+    }
+    if (!this._linkConfirmEl) return;
+    this._linkConfirmEl.remove();
+    this._linkConfirmEl = null;
+    // The strip can vanish while the pointer rests on it, where no mouseleave will fire, so its hover claim and bubble readout clear here.
+    this._linkConfirmHover = false;
+    this._linkStatusUpdate(null);
+    if (refocus) this.scrollContainer.focus({ preventScroll: true });
+  }
+
+  /**
+   * Show, update, or hide the link-status bubble.
+   * The bubble reads out a hovered link's destination in the bottom-left corner, as a browser does for a hovered hyperlink.
+   * @param {?AnnotationLink} entry - The hovered link region, or null to hide.
+   */
+  _linkStatusUpdate(entry) {
+    if (!entry) {
+      if (this._linkStatusEl) this._linkStatusEl.style.display = 'none';
+      this._linkStatusEntry = null;
+      return;
+    }
+    if (entry === this._linkStatusEntry) return;
+    this._linkStatusEntry = entry;
+    if (!this._linkStatusEl) {
+      const el = document.createElement('div');
+      el.className = 'scribe-link-status';
+      Object.assign(el.style, {
+        position: 'absolute',
+        left: '0',
+        bottom: '0',
+        zIndex: '30',
+        maxWidth: '60%',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        background: '#f8f8f8',
+        color: '#333',
+        border: '1px solid #d0d0d0',
+        borderLeft: 'none',
+        borderBottom: 'none',
+        borderTopRightRadius: '4px',
+        padding: '2px 8px',
+        font: '12px system-ui, sans-serif',
+        pointerEvents: 'none',
+      });
+      this.elem.appendChild(el);
+      this._linkStatusEl = el;
+    }
+    this._linkStatusEl.textContent = entry.uri || (entry.dest ? `Go to page ${entry.dest.pageIndex + 1}` : '');
+    this._linkStatusEl.style.display = 'block';
+  }
+
+  /**
+   * Ensure the per-page container `<div>` exists (positioned in content space, sized to the displayed page),
+   * creating it and attaching it to the zoom layer if needed.
+   * @param {number} n
+   * @returns {?HTMLDivElement}
+   */
+  _ensurePageContainer(n) {
+    let pc = this.pageContainerArr[n];
+    if (pc) return pc;
+    const disp = this.getDisplayDims(n);
+    if (!disp) return null;
+    // Resolve the page stop first: it runs `calcPageLayout`, which fills the `_pageLefts` the next line reads.
+    const top = this._snapToDevice(this.getPageStop(n));
+    const left = this._snapToDevice(this._pageLeft(n));
+    pc = document.createElement('div');
+    pc.className = 'scribe-page';
+    pc.dataset.page = String(n);
+    Object.assign(pc.style, {
+      position: 'absolute',
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${disp.width}px`,
+      height: `${disp.height}px`,
+      outline: 'calc(1px / var(--scribe-zoom, 1)) solid black',
+      background: '#fff',
+    });
+    // Insert the container in page-index order (before the nearest already-built higher-index page, or append if none), not at the end.
+    // Native selection follows DOM order, but pages build lazily out of order (n, n-1, n+1 in `displayPage`), so appending would let a cross-page selection skip a middle page.
+    // The custom engine reads order from the model and does not care, but the word-editing path still uses native selection.
+    let nextPc = null;
+    for (let i = n + 1; i < this.pageContainerArr.length; i++) {
+      if (this.pageContainerArr[i]) { nextPc = this.pageContainerArr[i]; break; }
+    }
+    this.zoomLayer.insertBefore(pc, nextPc);
+    this.pageContainerArr[n] = pc;
+    // A page built while a selection spans it (scrolled into view mid-drag) draws its part of it now.
+    if (this.useCustomSelection && !this.textSel.isEmpty()) this.textSel.renderPage(n);
+    return pc;
+  }
+
+  /**
+   * Build a per-page, per-orientation group `<div>`.
+   * The group's local space is the page's unrotated space.
+   * It is sized to that space, rotated about its centre, and centred within the displayed page.
+   * Not yet attached to the DOM.
+   * @param {number} n
+   * @param {number} [orientation=0]
+   * @returns {HTMLDivElement}
+   */
+  createGroup(n, orientation = 0) {
+    const dims = this.doc.pageMetrics[n].dims;
+    const disp = this.getDisplayDims(n);
+    const userRotation = this.doc.pageMetrics[n].rotation || 0;
+    const angle = this.doc.pageMetrics[n].angle || 0;
+    const textRotation = scribe.ScribeDoc.defaults.autoRotate ? 0 : angle;
+    const rotation = textRotation + orientation * 90 + userRotation;
+    const localW = orientation % 2 === 1 ? dims.height : dims.width;
+    const localH = orientation % 2 === 1 ? dims.width : dims.height;
+    const group = document.createElement('div');
+    group.className = 'scribe-group';
+    Object.assign(group.style, {
+      position: 'absolute',
+      left: `${disp.width * 0.5 - localW * 0.5}px`,
+      top: `${disp.height * 0.5 - localH * 0.5}px`,
+      width: `${localW}px`,
+      height: `${localH}px`,
+      transformOrigin: `${localW * 0.5}px ${localH * 0.5}px`,
+      transform: rotation ? `rotate(${rotation}deg)` : 'none',
+      zIndex: '1',
+    });
+    return group;
+  }
+
+  /**
+   * @param {number} n
+   * @param {number} [orientation=0]
+   */
+  getTextGroup(n, orientation = 0) {
+    if (!this._textGroups[n]) this._textGroups[n] = {};
+    if (!this._textGroups[n][orientation]) {
+      const group = this.createGroup(n, orientation);
+      // The group box is sized to the whole page, so a rotated-orientation group overlaps the other orientation groups.
+      // An interactive container would then swallow selection and clicks meant for the text under it.
+      // Keep the container transparent to the pointer.
+      // The word spans opt back in with their own `pointer-events: auto`.
+      group.style.pointerEvents = 'none';
+      group.classList.add('scribe-layer-text');
+      this._textGroups[n][orientation] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._textGroups[n][orientation];
+  }
+
+  /**
+   * @param {number} n
+   * @param {number} [rotation=0]
+   */
+  setTextGroupRotation(n, rotation = 0) {
+    this.getTextGroup(n);
+    const userRotation = this.doc.pageMetrics[n]?.rotation || 0;
+    for (const [key, group] of Object.entries(this._textGroups[n])) {
+      group.style.transform = `rotate(${Number(key) * 90 + rotation + userRotation}deg)`;
+    }
+    // Keep the selection groups rotated in lock-step too, so selection and match rectangles track the words.
+    if (this._selectGroups[n]) {
+      for (const [key, group] of Object.entries(this._selectGroups[n])) {
+        group.style.transform = `rotate(${Number(key) * 90 + rotation + userRotation}deg)`;
+      }
+    }
+    // Keep the highlight groups rotated in lock-step with their text groups, so the band tracks the words on a skewed/rotated page.
+    if (this._highlightGroups[n]) {
+      for (const [key, group] of Object.entries(this._highlightGroups[n])) {
+        group.style.transform = `rotate(${Number(key) * 90 + rotation + userRotation}deg)`;
+      }
+    }
+  }
+
+  /**
+   * The per-page highlight fill layer, one group per line orientation like the text layer.
+   * It blends with `mix-blend-mode: multiply` so a highlight tints the paper to its colour while the text layer above stays at full contrast.
+   * @param {number} n
+   * @param {number} [orientation=0]
+   * @returns {HTMLDivElement}
+   */
+  getHighlightGroup(n, orientation = 0) {
+    if (!this._highlightGroups[n]) this._highlightGroups[n] = {};
+    if (!this._highlightGroups[n][orientation]) {
+      const group = this.createGroup(n, orientation);
+      group.style.zIndex = '0';
+      group.style.pointerEvents = 'none';
+      group.style.mixBlendMode = 'multiply';
+      group.classList.add('scribe-layer-highlight');
+      this._highlightGroups[n][orientation] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._highlightGroups[n][orientation];
+  }
+
+  /**
+   * The per-page selection layer, one group per line orientation like the highlight layer.
+   * @param {number} n
+   * @param {number} [orientation=0]
+   * @returns {?HTMLDivElement}
+   */
+  getSelectGroup(n, orientation = 0) {
+    if (!this._selectGroups[n]) this._selectGroups[n] = {};
+    if (!this._selectGroups[n][orientation]) {
+      const pc = this._ensurePageContainer(n);
+      if (!pc) return null;
+      const group = this.createGroup(n, orientation);
+      // zIndex 1 sits above the highlight bands; the layer's `multiply` blend tints a selection over a highlight without washing out the glyphs beneath.
+      group.style.zIndex = '1';
+      group.classList.add('scribe-layer-select');
+      this._selectGroups[n][orientation] = group;
+      pc.appendChild(group);
+    }
+    return this._selectGroups[n][orientation];
+  }
+
+  /**
+   * Page `n`'s word objects, keyed by word id, building them if this is the first caller to need them.
+   * @param {number} n
+   * @returns {Map<string, UiOcrWord>}
+   */
+  ensureWordObjs(n) {
+    const existing = this._wordObjMaps[n];
+    if (existing) return existing;
+    const page = this.doc.ocr.active?.[n];
+    if (!page || !this.doc.pageMetrics[n]) return new Map();
+    this._buildWordObjs(page);
+    return this._wordObjMaps[n] || new Map();
+  }
+
+  /**
+   * Redraw page `n`'s search-match rectangles once the current burst of flag changes settles.
+   * @param {number} n
+   */
+  scheduleMarkRepaint(n) {
+    if (!this.useCustomSelection) return;
+    this._markRepaintPages.add(n);
+    // viewerSearch flips activeMatch/fillBox word by word; coalescing into one rAF keeps that a single repaint.
+    if (this._markRepaintRaf !== null) return;
+    this._markRepaintRaf = requestAnimationFrame(() => {
+      this._markRepaintRaf = null;
+      for (const page of this._markRepaintPages) {
+        if (this.pageContainerArr[page]) this.textSel.renderMarks(page);
+      }
+      this._markRepaintPages.clear();
+    });
+  }
+
+  /** @param {number} n */
+  getOverlayGroup(n) {
+    if (!this._overlayGroups[n]) {
+      const group = this.createGroup(n);
+      group.style.zIndex = '2';
+      group.classList.add('scribe-layer-overlay');
+      this._overlayGroups[n] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._overlayGroups[n];
+  }
+
+  /**
+   * The per-page sticky-note layer.
+   * Kept out of the overlay layer so notes survive the layout-mode toggle that tears the overlay down.
+   * @param {number} n
+   * @returns {?HTMLDivElement}
+   */
+  getNotesGroup(n) {
+    if (!this._notesGroups[n]) {
+      const group = this.createGroup(n);
+      group.style.zIndex = '3';
+      // Transparent to the pointer so empty areas pass clicks through to the text; icons opt back in via CSS.
+      group.style.pointerEvents = 'none';
+      group.classList.add('scribe-layer-notes');
+      this._notesGroups[n] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._notesGroups[n];
+  }
+
+  /**
+   * Render page n note icons into its notes layer.
+   * @param {number} n
+   */
+  renderNotes(n) {
+    if (!this.opt.enableComments) return;
+    renderPageNotes(this, n);
+  }
+
+  /**
+   * The per-page redaction-mark layer, lazily created; above highlights and text, below notes.
+   * @param {number} n
+   * @returns {?HTMLDivElement}
+   */
+  getRedactionsGroup(n) {
+    if (!this._redactGroups[n]) {
+      const group = this.createGroup(n);
+      group.style.zIndex = '2';
+      group.style.pointerEvents = 'none'; // Content under a mark stays selectable.
+      group.style.mixBlendMode = 'multiply'; // Darkens rather than covers, so the hatch reads behind the glyphs and they keep full contrast.
+      group.classList.add('scribe-layer-redact');
+      this._redactGroups[n] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._redactGroups[n];
+  }
+
+  /**
+   * The per-page redaction "Preview" tab layer, lazily created; above the marks, unblended so the label stays opaque.
+   * @param {number} n
+   * @returns {?HTMLDivElement}
+   */
+  getRedactTabGroup(n) {
+    if (!this._redactTabGroups[n]) {
+      const group = this.createGroup(n);
+      group.style.zIndex = '2';
+      group.style.pointerEvents = 'none';
+      group.classList.add('scribe-layer-redact-tab');
+      this._redactTabGroups[n] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._redactTabGroups[n];
+  }
+
+  /**
+   * Render page n redaction marks into their layer.
+   * No visibility gate: a mark changes what an export will contain, so every viewer must show it.
+   * @param {number} n
+   */
+  renderRedactions(n) {
+    renderPageRedactions(this, n);
+    if (this.onAnnotationsRendered) this.onAnnotationsRendered(n);
+  }
+
+  /**
+   * The per-page form-field overlay layer.
+   * @param {number} n
+   * @returns {?HTMLDivElement}
+   */
+  getFieldsGroup(n) {
+    if (!this._fieldGroups[n]) {
+      const group = this.createGroup(n);
+      group.style.zIndex = '2';
+      group.style.pointerEvents = 'none';
+      group.classList.add('scribe-layer-fields');
+      this._fieldGroups[n] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._fieldGroups[n];
+  }
+
+  /** @param {number} n */
+  renderFormFields(n) {
+    if (!this.opt.enableForms) return;
+    renderPageFormFields(this, n);
+  }
+
+  /**
+   * The per-page fill & sign items layer, lazily created.
+   * @param {number} n
+   * @returns {?HTMLDivElement}
+   */
+  getItemsGroup(n) {
+    if (!this._itemGroups[n]) {
+      const group = this.createGroup(n);
+      group.style.zIndex = '2';
+      group.style.pointerEvents = 'none';
+      group.classList.add('scribe-layer-items');
+      this._itemGroups[n] = group;
+      const pc = this._ensurePageContainer(n);
+      if (pc) pc.appendChild(group);
+    }
+    return this._itemGroups[n];
+  }
+
+  /**
+   * Render page n fill & sign items and freetext/shape comment rows into their layer.
+   * @param {number} n
+   */
+  renderFillItems(n) {
+    if (!this.opt.enableForms) return;
+    renderPageFillItems(this, n);
+  }
+
+  /**
+   * Show or hide the OCR text layer (word boxes and lines) across every page.
+   * @param {boolean} [visible=true]
+   */
+  setTextLayerVisible(visible = true) {
+    this.elem?.classList.toggle('scribe-hide-text-layer', !visible);
+  }
+
+  /**
+   * Show or hide the layout layer (regions, data columns, reading-order boxes) across every page.
+   * @param {boolean} [visible=true]
+   */
+  setOverlayLayerVisible(visible = true) {
+    this.elem?.classList.toggle('scribe-hide-overlay-layer', !visible);
+  }
+
+  /**
+   * Show or hide the page image (raster background) layer across every page.
+   * The `ebook` display mode also hides the image and takes precedence, so this has no effect while that mode is active.
+   * @param {boolean} [visible=true]
+   */
+  setImageLayerVisible(visible = true) {
+    this.elem?.classList.toggle('scribe-hide-image-layer', !visible);
+  }
+
+  /**
+   * The page at a content-space y: the first page of the row whose band contains it.
+   * @param {number} y
+   */
+  calcPage(y) {
+    if (this._pageStopsEnd[this._pageStopsEnd.length - 1] === undefined) {
+      this.calcPageLayout();
+    }
+    return this._pageStopsEnd.findIndex((y1) => y1 > y);
+  }
+
+  /**
+   * The current vertical scroll position as a continuous fractional page index, measured at the viewport centre.
+   * Falls back to the integer current page when layout is not ready.
+   * @returns {number}
+   */
+  scrollPageFraction() {
+    if (!this.scrollContainer || !this.doc || !this.doc.pageMetrics.length) return this.state.cp.n;
+    const y = (this.scrollContainer.scrollTop + this._scrollMetrics().clientHeight / 2) / this.zoomLevel;
+    let n = this.calcPage(y);
+    if (n < 0) n = this.doc.pageMetrics.length - 1; // past the last page's end
+    const top = this._pageStopsStart[n];
+    const bot = this._pageStopsEnd[n];
+    if (top === undefined || bot === undefined || bot <= top) return n;
+    // Crossing a row advances the fraction by the row's page count, keeping the index continuous over pages.
+    const r = this._pageRow[n];
+    const count = r === undefined ? 1 : (this._rows[r]?.count ?? 1);
+    return n + Math.max(0, Math.min(1, (y - top) / (bot - top))) * count;
+  }
+
+  calcSelectionImageCoords() {
+    // `this.bbox` holds the marquee in content space; reduce it to the page-local box the OCR expects.
+    const left = Math.min(this.bbox.left, this.bbox.right);
+    const top = Math.min(this.bbox.top, this.bbox.bottom);
+    const n = this.pageAtContentPoint(left, top);
+
+    const canvasCoordsPage = {
+      left: left - this._pageLeft(n),
+      top: top - this.getPageStop(n),
+      width: Math.abs(this.bbox.right - this.bbox.left),
+      height: Math.abs(this.bbox.bottom - this.bbox.top),
+    };
+
+    const imageRotated = true;
+    const angle = this.doc.pageMetrics[n].angle || 0;
+
+    const imageCoords = scribe.utils.coords.canvasToImage(canvasCoordsPage, imageRotated, scribe.ScribeDoc.defaults.autoRotate, n, this.doc.pageMetrics, angle);
+
+    imageCoords.left = Math.round(imageCoords.left);
+    imageCoords.top = Math.round(imageCoords.top);
+    imageCoords.width = Math.round(imageCoords.width);
+    imageCoords.height = Math.round(imageCoords.height);
+
+    const pageDims = this.doc.pageMetrics[n].dims;
+    const leftClip = Math.max(0, imageCoords.left);
+    const topClip = Math.max(0, imageCoords.top);
+    // Tesseract has a bug where subtracting 1 from the width/height when setting the rectangle to the full image fixes it.
+    // See: https://github.com/naptha/tesseract.js/issues/936
+    const rightClip = Math.min(pageDims.width - 1, imageCoords.left + imageCoords.width);
+    const bottomClip = Math.min(pageDims.height - 1, imageCoords.top + imageCoords.height);
+    imageCoords.left = leftClip;
+    imageCoords.top = topClip;
+    imageCoords.width = rightClip - leftClip;
+    imageCoords.height = bottomClip - topClip;
+
+    return { box: imageCoords, n };
+  }
+
+  /**
+   * Scroll so `kw` sits at the vertical center of the viewport, nudging horizontally only when it would sit off an edge.
+   * @param {UiOcrWord} kw - A word in the rendered window.
+   * @param {object} [options]
+   * @param {boolean} [options.glide=false] - Glide to the word when it is within a screen's height; farther, or under reduced motion, jump.
+   */
+  scrollToWord(kw, { glide = false } = {}) {
+    // `getClientRect` is in content space; multiply by zoom to get the on-screen offset from the scroll origin.
+    const rect = kw.getClientRect();
+    const margin = 30;
+    const sc = this.scrollContainer;
+    const zoom = this.zoomLevel || 1;
+    const top = (rect.y + rect.height / 2) * zoom - sc.clientHeight / 2;
+    const leftPx = rect.x * zoom - sc.scrollLeft;
+    const rightPx = (rect.x + rect.width) * zoom - sc.scrollLeft;
+    if (rightPx > sc.clientWidth - margin) sc.scrollLeft += rightPx - (sc.clientWidth - margin);
+    else if (leftPx < margin) sc.scrollLeft -= margin - leftPx;
+    if (this._scrollGlide) {
+      cancelAnimationFrame(this._scrollGlide.raf);
+      this._scrollGlide = null;
+    }
+    const from = sc.scrollTop;
+    const target = Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, top));
+    const distance = Math.abs(target - from);
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // Beyond a screen, jump: the glide renders nothing on its way, so a longer one could pass pages that were never drawn.
+    if (!glide || reduce || distance === 0 || distance > sc.clientHeight) {
+      sc.scrollTop = top;
+      this.updateCurrentPage();
+      return;
+    }
+    const duration = Math.min(450, 300 + 0.6 * distance);
+    const t0 = performance.now();
+    const glideState = { raf: 0 };
+    this._scrollGlide = glideState;
+    const step = (now) => {
+      if (this._scrollGlide !== glideState) return;
+      const k = Math.min(1, (now - t0) / duration);
+      // Power 3.5 approximates cubic-bezier(.3, .8, .3, 1).
+      // A plain cubic keeps moving late in the glide, so it stops abruptly.
+      sc.scrollTop = from + (target - from) * (1 - (1 - k) ** 3.5);
+      if (k < 1) {
+        glideState.raf = requestAnimationFrame(step);
+        return;
+      }
+      this._scrollGlide = null;
+      this.updateCurrentPage();
+    };
+    glideState.raf = requestAnimationFrame(step);
+  }
+
+  getUiWords() {
+    /** @type {Array<UiOcrWord>} */
+    const words = [];
+    for (const idx of this.windowPages(this.state.cp.n)) {
+      if (this.useCustomSelection && this.doc.ocr.active?.[idx]) this.ensureWordObjs(idx);
+      if (this._wordObjs[idx]) words.push(...this._wordObjs[idx]);
+    }
+    // A destroyed word can briefly linger in the registry, so drop it before a caller measuring its geometry dereferences the null `el`.
+    return words.filter((w) => !w._destroyed);
+  }
+
+  /** Drop the current text selection, whichever engine holds it. */
+  clearTextSelection() {
+    this._sel()?.clear();
+  }
+
+  /**
+   * Whether this viewer has a text selection at least partly inside the document viewport.
+   */
+  hasTextSelection() {
+    return this._sel()?.isInView() ?? false;
+  }
+
+  /**
+   * The overlay words under this viewer's text selection.
+   * Empty when the selection lies wholly outside the document viewport.
+   * @returns {Array<UiOcrWord>}
+   */
+  getWordsUnderTextSelection() {
+    const sel = this._sel();
+    return sel?.isInView() ? sel.getWords() : [];
+  }
+
+  getUiRegions() {
+    /** @type {Array<UiRegion>} */
+    const regions = [];
+    for (const idx of this.windowPages(this.state.cp.n)) {
+      const group = this._overlayGroups[idx];
+      if (!group) continue;
+      group.querySelectorAll('[data-scribe-kind="layout"]').forEach((el) => {
+        const obj = /** @type {any} */ (el)._scribeObj;
+        if (obj instanceof UiRegion) regions.push(obj);
+      });
+    }
+    return regions;
+  }
+
+  getUiDataColumns() {
+    /** @type {Array<UiDataColumn>} */
+    const columns = [];
+    for (const idx of this.windowPages(this.state.cp.n)) {
+      const group = this._overlayGroups[idx];
+      if (!group) continue;
+      group.querySelectorAll('[data-scribe-kind="layout"]').forEach((el) => {
+        const obj = /** @type {any} */ (el)._scribeObj;
+        if (obj instanceof UiDataColumn) columns.push(obj);
+      });
+    }
+    return columns;
+  }
+
+  getDataTables() { return [...new Set(this.getUiDataColumns().map((x) => x.layoutBox.table))]; }
+
+  getUiDataTables() { return [...new Set(this.getUiDataColumns().map((x) => x.uiTable))]; }
+
+  /** @param {boolean} [deselect=true] - Deselect all words, layout boxes, and data columns. */
+  destroyControls(deselect = true) {
+    this._controlArr.forEach((control) => control.destroy());
+    this._controlArr.length = 0;
+
+    if (deselect) this.CanvasSelection.deselectAll();
+
+    if (UiText.inputRemove) UiText.inputRemove();
+
+    this.destroyControlsCallback(deselect);
+  }
+
+  /**
+   * Move the selected word's edit handles back onto its edges after it moves or resizes.
+   */
+  repositionControls() {
+    for (const control of this._controlArr) control.reposition?.();
+  }
+
+  /**
+   * Destroy objects in the overlay layer. By default, only objects outside the current view are destroyed.
+   * @param {boolean} [outsideViewOnly=true]
+   */
+  destroyOverlay(outsideViewOnly = true) {
+    for (let i = 0; i < this.overlayGroupsRenderIndices.length; i++) {
+      const n = this.overlayGroupsRenderIndices[i];
+      if (this.rowDistance(n, this.state.cp.n) > 1 || !outsideViewOnly) {
+        this._overlayGroups[n]?.replaceChildren();
+        this._regionObjs[n] = [];
+        this._dataColumnObjs[n] = [];
+        this.overlayGroupsRenderIndices.splice(i, 1);
+        i--;
+      }
+    }
+  }
+
+  /**
+   * Destroy objects in the text layer. By default, only objects outside the current view are destroyed.
+   * @param {boolean} [outsideViewOnly=true]
+   */
+  destroyText(outsideViewOnly = true) {
+    for (let i = 0; i < this.textGroupsRenderIndices.length; i++) {
+      const n = this.textGroupsRenderIndices[i];
+      if (Math.abs(n - this.state.cp.n) > ScribeViewer.textRetainPages || !outsideViewOnly) {
+        for (const group of Object.values(this._textGroups[n])) {
+          group.replaceChildren();
+        }
+        if (this._highlightGroups[n]) {
+          for (const group of Object.values(this._highlightGroups[n])) {
+            group.replaceChildren();
+          }
+        }
+        if (this._selectGroups[n]) {
+          for (const group of Object.values(this._selectGroups[n])) {
+            group.replaceChildren();
+          }
+          this.textSel?.destroyPage(n);
+        }
+        this._wordObjs[n] = [];
+        this._wordObjMaps[n] = null;
+        this.textGroupsRenderIndices.splice(i, 1);
+        i--;
+      }
+    }
+  }
+
+  /**
+   * Recolor every word for the current display mode (proof, ebook, eval, etc.).
+   * Covers all rendered pages, not just the active window, since off-screen pages kept built (`textRetainPages`) would otherwise keep the previous mode's colors until rebuilt.
+   */
+  setWordColorOpacity() {
+    for (const pageWords of this._wordObjs) {
+      if (!pageWords) continue;
+      for (const obj of pageWords) {
+        const { fill, opacity } = scribe.utils.ocr.getWordFillOpacity(obj.word, this.state.displayMode,
+          scribe.ScribeDoc.defaults.confThreshMed, scribe.ScribeDoc.defaults.confThreshHigh, scribe.ScribeDoc.defaults.overlayOpacity);
+        obj.fill(fill);
+        obj.opacity(opacity);
+      }
+    }
+  }
+
+  /**
+   * Compare the active OCR pages against the ground truth and update `evalStats`.
+   */
+  async _compareGroundTruth() {
+    const oemActive = Object.keys(this.doc.ocr).find((key) => this.doc.ocr[key] === this.doc.ocr.active && key !== 'active');
+
+    if (!oemActive) {
+      console.error('No OCR data active');
+      return;
+    }
+
+    const evalStatsConfigNew = {
+      ocrActive: oemActive,
+      ignorePunct: scribe.ScribeDoc.defaults.ignorePunct,
+      ignoreCap: scribe.ScribeDoc.defaults.ignoreCap,
+    };
+    /** @type {Parameters<typeof this.doc.compareOCR>[2]} */
+    const compOptions = {
+      ignorePunct: scribe.ScribeDoc.defaults.ignorePunct,
+      ignoreCap: scribe.ScribeDoc.defaults.ignoreCap,
+      confThreshHigh: scribe.ScribeDoc.defaults.confThreshHigh,
+      confThreshMed: scribe.ScribeDoc.defaults.confThreshMed,
+    };
+
+    if (JSON.stringify(this._evalStatsConfig) !== JSON.stringify(evalStatsConfigNew) || this.evalStats.length === 0) {
+      this._evalStatsConfig = evalStatsConfigNew;
+
+      // TODO: This will overwrite any edits made by the user while `compareOCR` is running.
+      // Is this a problem that is likely to occur in real use? If so, how should it be fixed?
+      const res = await this.doc.compareOCR(this.doc.ocr.active, this.doc.ocr['Ground Truth'], compOptions);
+
+      this.doc.ocr[oemActive] = res.ocr;
+      this.doc.ocr.active = this.doc.ocr[oemActive];
+
+      clearObjectProperties(this.evalStats);
+      Object.assign(this.evalStats, res.metrics);
+    }
+  }
+
+  /**
+   * Draw the debug paragraph outlines (`opt.outlinePars`).
+   * @param {OcrPage} page
+   * @param {number} angle
+   */
+  _renderParOutlines(page, angle) {
+    if (this.doc?.inputData?.pdfType !== 'text' && (!page.textSource || !['textract', 'abbyy', 'google_vision', 'azure_doc_intel', 'docx'].includes(page.textSource))) {
+      scribe.utils.assignParagraphs(page, angle);
+    }
+    const imageRotated = Math.abs(angle) > 0.05;
+    page.pars.forEach((par, i) => {
+      const angleAdj = imageRotated ? scribe.utils.ocr.calcLineStartAngleAdj(par.lines[0]) : { x: 0, y: 0 };
+      this._addBlockOutline(page.n, par.bbox, angleAdj, i + 1, par.reason, par.lines[0]?.orientation ?? 0, par.lines, par.type);
+    });
+  }
+
+  /**
+   * Build page `n`'s word objects without elements: the geometry, font metrics, and highlight/search state that highlight bands, search marks, and selection need.
+   * @param {OcrPage} page
+   */
+  _buildWordObjs(page) {
+    const angle = this.doc.pageMetrics[page.n].angle || 0;
+    const imageRotated = Math.abs(angle) > 0.05;
+    const pageAnnotations = this.doc.annotations.pages[page.n] || [];
+    const matchIdArr = this.state.searchMode ? pageMatchIds(this, page.n) : [];
+    const activeMatchEntry = this.state.searchMode ? this._searchState.matchList[this._searchState.activeMatch] : null;
+    const activeIds = activeMatchEntry && activeMatchEntry.pageN === page.n ? new Set(activeMatchEntry.wordIds) : new Set();
+
+    /** @type {Array<UiOcrWord>} */
+    const words = [];
+    /** @type {Map<string, UiOcrWord>} */
+    const byId = new Map();
+
+    for (const lineObj of page.lines) {
+      const angleAdjLine = imageRotated ? scribe.utils.ocr.calcLineStartAngleAdj(lineObj) : { x: 0, y: 0 };
+      /** @type {?UiOcrWord} */
+      let prevWordCanvas = null;
+      for (const wordObj of lineObj.words) {
+        if (!wordObj.text) continue;
+        const angleAdjWord = imageRotated ? scribe.utils.ocr.calcWordAngleAdj(wordObj) : { x: 0, y: 0 };
+        const visualBaseline = lineObj.bbox.bottom + lineObj.baseline[1] + angleAdjLine.y + angleAdjWord.y;
+        const top = (wordObj.style.sup || wordObj.style.dropcap)
+          ? wordObj.bbox.bottom + angleAdjLine.y + angleAdjWord.y : visualBaseline;
+
+        const annot = pageAnnotations.find((a) => annotMatchesWord(a, wordObj.bbox));
+        const lineAnnot = pageAnnotations.find((a) => annotMatchesWord(a, wordObj.bbox, 'line'));
+
+        const wordCanvas = new UiOcrWord({
+          visualLeft: wordObj.bbox.left + angleAdjLine.x + angleAdjWord.x,
+          yActual: top,
+          topBaseline: visualBaseline,
+          rotation: 0,
+          word: wordObj,
+          fillBox: matchIdArr.includes(wordObj.id) && !activeIds.has(wordObj.id),
+          activeMatch: activeIds.has(wordObj.id) || this._citationIds.has(wordObj.id),
+          highlightColor: annot ? annot.color : null,
+          highlightOpacity: annot ? annot.opacity : 1,
+          highlightGroupId: annot ? (annot.groupId || null) : null,
+          highlightComment: annot ? (annot.comment || '') : '',
+          markupType: lineAnnot ? /** @type {'underline'|'strikeout'} */ (lineAnnot.type) : null,
+          markupColor: lineAnnot ? lineAnnot.color : null,
+          markupOpacity: lineAnnot ? lineAnnot.opacity : 1,
+          markupGroupId: lineAnnot ? (lineAnnot.groupId || null) : null,
+          markupComment: lineAnnot ? (lineAnnot.comment || '') : '',
+          viewer: this,
+          dom: false,
+        });
+
+        // Words of one highlight group split the gap between them so the group reads as one continuous band, not per-word rectangles.
+        if (wordCanvas.highlightColor && prevWordCanvas && prevWordCanvas.highlightColor
+          && wordCanvas.highlightGroupId && wordCanvas.highlightGroupId === prevWordCanvas.highlightGroupId) {
+          const gap = (wordCanvas.x() - (prevWordCanvas.x() + prevWordCanvas.width())) / 2;
+          wordCanvas.highlightGapLeft = gap;
+          prevWordCanvas.highlightGapRight = gap;
+        }
+        prevWordCanvas = wordCanvas;
+        words.push(wordCanvas);
+        byId.set(wordObj.id, wordCanvas);
+      }
+    }
+
+    this._wordObjs[page.n] = words;
+    this._wordObjMaps[page.n] = byId;
+  }
+
+  /**
+   * Draw OCR words for a page into the text layer.
+   * @param {OcrPage} page
+   */
+  _renderCanvasWords(page) {
+    const angle = this.doc.pageMetrics[page.n].angle || 0;
+    const textRotation = scribe.ScribeDoc.defaults.autoRotate ? 0 : angle;
+
+    this.setTextGroupRotation(page.n, textRotation);
+
+    if (!this.textGroupsRenderIndices.includes(page.n)) this.textGroupsRenderIndices.push(page.n);
+
+    // Under the custom engine in `invis` mode, no text enters the DOM; highlights and search render from word objects and the engine hit-tests selection geometrically.
+    // Visible modes (proof/eval/ebook/annot) instead fall through to the span path below, where the words are the display.
+    if (this.useCustomSelection && this.state.displayMode === 'invis') {
+      if (this.opt.outlinePars) this._renderParOutlines(page, angle);
+      // Word objects exist to carry highlight and search state; a page with neither needs none.
+      const needsWords = (this.doc.annotations.pages[page.n] || []).length > 0 || this.state.searchMode || this._citationIds.size > 0;
+      if (needsWords && !this._wordObjMaps[page.n]) this._buildWordObjs(page);
+      this.renderHighlights(page.n);
+      /** @type {NonNullable<typeof this.textSel>} */ (this.textSel).renderMarks(page.n);
+      /** @type {NonNullable<typeof this.textSel>} */ (this.textSel).renderPage(page.n);
+      return;
+    }
+    if (this.useCustomSelection) this._wordObjMaps[page.n] = null;
+
+    const matchIdArr = this.state.searchMode ? pageMatchIds(this, page.n) : [];
+
+    // Word IDs of the currently-focused match, computed only when that match is on this page, so it renders distinctly from the others.
+    const activeMatchEntry = this.state.searchMode ? this._searchState.matchList[this._searchState.activeMatch] : null;
+    const activeIds = activeMatchEntry && activeMatchEntry.pageN === page.n ? new Set(activeMatchEntry.wordIds) : new Set();
+
+    const imageRotated = Math.abs(angle ?? 0) > 0.05;
+
+    const pageAnnotations = this.doc.annotations.pages[page.n] || [];
+
+    if (!this._wordObjs[page.n]) this._wordObjs[page.n] = [];
+
+    // Native selection only maps a pointer to a caret where it lands on real text,
+    // so the render loop below fills every non-glyph gap of a line's territory ("band") with an invisible selectable span in reading order.
+    // The following passes compute each line's band so the bands tile the page with no dead space.
+    const pageDims = this.doc.pageMetrics[page.n].dims;
+    const renderedLines = page.lines.filter((l) => l.words.some((w) => w.text));
+
+    // Each line's horizontal extent is its COLUMN's width, not its own bbox; otherwise a short line (a paragraph's last line) leaves a gap in the selection out to the column edge.
+    // A short line x-overlaps its column's full-width lines, so the union recovers that width.
+    // The vertical window keeps a distant full-width title from welding separate columns into one extent.
+    /** @type {Map<OcrLine, {left: number, right: number}>} */
+    const colExtents = new Map();
+    for (const l of renderedLines) {
+      const lb = l.bbox;
+      const dilate = (lb.bottom - lb.top) * 3;
+      const ext = { left: lb.left, right: lb.right };
+      for (const m of renderedLines) {
+        const mb = m.bbox;
+        if (mb.top >= lb.bottom + dilate || mb.bottom <= lb.top - dilate) continue;
+        if (mb.left < lb.right && mb.right > lb.left) {
+          ext.left = Math.min(ext.left, mb.left);
+          ext.right = Math.max(ext.right, mb.right);
+        }
+      }
+      colExtents.set(l, ext);
+    }
+
+    // Filler territories exist only for native selection, so only the DOM engine computes them.
+    /** @type {Map<OcrLine, {left: number, right: number, top: number, bottom: number}>} */
+    const fillLimits = this._sel()?.computeFillLimits?.(renderedLines, colExtents, pageDims)
+      ?? new Map();
+    // The custom engine owns hit-testing and selection, so its glyph spans must not be natively selectable.
+    const selectText = this.state.displayMode === 'invis' && !this.useCustomSelection;
+
+    if (this.opt.outlinePars) this._renderParOutlines(page, angle);
+
+    for (let i = 0; i < page.lines.length; i++) {
+      const lineObj = page.lines[i];
+
+      const group = this.getTextGroup(page.n, lineObj.orientation);
+
+      const angleAdjLine = imageRotated ? scribe.utils.ocr.calcLineStartAngleAdj(lineObj) : { x: 0, y: 0 };
+
+      if (this.opt.outlineLines) {
+        const heightAdj = Math.abs(Math.tan(angle * (Math.PI / 180)) * (lineObj.bbox.right - lineObj.bbox.left));
+        const height1 = lineObj.bbox.bottom - lineObj.bbox.top - heightAdj;
+        const height2 = lineObj.words[0] ? lineObj.words[0].bbox.bottom - lineObj.words[0].bbox.top : 0;
+        const height = Math.max(height1, height2);
+
+        const lineRect = document.createElement('div');
+        Object.assign(lineRect.style, {
+          position: 'absolute',
+          left: `${lineObj.bbox.left + angleAdjLine.x}px`,
+          top: `${lineObj.bbox.bottom + lineObj.baseline[1] + angleAdjLine.y - height}px`,
+          width: `${lineObj.bbox.right - lineObj.bbox.left}px`,
+          height: `${height}px`,
+          border: 'calc(1px / var(--scribe-zoom, 1)) solid rgba(0,0,255,0.75)',
+          boxSizing: 'border-box',
+          pointerEvents: 'none',
+        });
+
+        group.appendChild(lineRect);
+      }
+
+      // Words wrap in a per-line `<div>` so triple-click selects one line, not the whole page.
+      // Do not make it a positioned/sized stacking context to speed up hit-testing: the engine does not bounds-cull child stacking contexts under the zoom transform.
+      const lineDiv = document.createElement('div');
+      lineDiv.className = 'scribe-line';
+      group.appendChild(lineDiv);
+
+      const lineWords = lineObj.words.filter((w) => w.text);
+      const lim = fillLimits.get(lineObj);
+      /** @type {(hitL: number, hitR: number) => void} */
+      const appendFiller = this._sel()?.makeLineFiller?.(lineDiv, lim, angleAdjLine, selectText)
+        ?? (() => {});
+      let lineWordIdx = 0;
+
+      /** @type {UiOcrWord|null} */
+      let prevWordCanvas = null;
+      for (const wordObj of lineObj.words) {
+        if (!wordObj.text) continue;
+
+        const outlineWord = this.opt.outlineWords || this.state.displayMode === 'eval' && wordObj.conf > scribe.ScribeDoc.defaults.confThreshHigh && !wordObj.matchTruth;
+
+        const angleAdjWord = imageRotated ? scribe.utils.ocr.calcWordAngleAdj(wordObj) : { x: 0, y: 0 };
+
+        const visualBaseline = lineObj.bbox.bottom + lineObj.baseline[1] + angleAdjLine.y + angleAdjWord.y;
+
+        let top = visualBaseline;
+        if (wordObj.style.sup || wordObj.style.dropcap) top = wordObj.bbox.bottom + angleAdjLine.y + angleAdjWord.y;
+
+        const visualLeft = wordObj.bbox.left + angleAdjLine.x + angleAdjWord.x;
+
+        const annot = pageAnnotations.find((a) => annotMatchesWord(a, wordObj.bbox));
+        const lineAnnot = pageAnnotations.find((a) => annotMatchesWord(a, wordObj.bbox, 'line'));
+
+        const wordCanvas = new UiOcrWord({
+          visualLeft,
+          yActual: top,
+          topBaseline: visualBaseline,
+          rotation: 0,
+          word: wordObj,
+          outline: outlineWord,
+          fillBox: matchIdArr.includes(wordObj.id) && !activeIds.has(wordObj.id),
+          activeMatch: activeIds.has(wordObj.id) || this._citationIds.has(wordObj.id),
+          highlightColor: annot ? annot.color : null,
+          highlightOpacity: annot ? annot.opacity : 1,
+          highlightGroupId: annot ? (annot.groupId || null) : null,
+          highlightComment: annot ? (annot.comment || '') : '',
+          markupType: lineAnnot ? /** @type {'underline'|'strikeout'} */ (lineAnnot.type) : null,
+          markupColor: lineAnnot ? lineAnnot.color : null,
+          markupOpacity: lineAnnot ? lineAnnot.opacity : 1,
+          markupGroupId: lineAnnot ? (lineAnnot.groupId || null) : null,
+          markupComment: lineAnnot ? (lineAnnot.comment || '') : '',
+          // Paint-only under the custom engine: the spans are display, never pointer targets.
+          listening: !this.state.layoutMode && !this.useCustomSelection,
+          viewer: this,
+        });
+
+        if (wordCanvas.highlightColor && prevWordCanvas && prevWordCanvas.highlightColor
+          && wordCanvas.highlightGroupId && wordCanvas.highlightGroupId === prevWordCanvas.highlightGroupId) {
+          const gap = (wordCanvas.x() - (prevWordCanvas.x() + prevWordCanvas.width())) / 2;
+          wordCanvas.highlightGapLeft = gap;
+          prevWordCanvas.highlightGapRight = gap;
+        }
+
+        // The filler before this word: from the band's left edge (or the previous word's middle) to this word's middle.
+        // Splitting at word middles puts the band above and below each word-half under the filler whose caret is the nearer word boundary.
+        if (lim) {
+          const midW = (wordObj.bbox.left + wordObj.bbox.right) / 2;
+          if (lineWordIdx === 0) {
+            appendFiller(lim.left, midW);
+          } else {
+            appendFiller((lineWords[lineWordIdx - 1].bbox.left + lineWords[lineWordIdx - 1].bbox.right) / 2, midW);
+          }
+        }
+        lineWordIdx++;
+
+        prevWordCanvas = wordCanvas;
+        lineDiv.appendChild(wordCanvas.el);
+        this._wordObjs[page.n].push(wordCanvas);
+      }
+
+      // The trailing filler: from the last word's middle out to the band's right edge.
+      if (lim && lineWordIdx > 0) {
+        const last = lineWords[lineWordIdx - 1];
+        appendFiller((last.bbox.left + last.bbox.right) / 2, lim.right);
+      }
+    }
+
+    this.renderHighlights(page.n);
+
+    if (this.useCustomSelection) {
+      // The engine's consumers look words up by id.
+      // In visible modes the words already exist as spans, so index them rather than a separate dom:false `_buildWordObjs`.
+      const byId = new Map();
+      for (const kw of this._wordObjs[page.n]) byId.set(kw.word.id, kw);
+      this._wordObjMaps[page.n] = byId;
+      /** @type {NonNullable<typeof this.textSel>} */ (this.textSel).renderMarks(page.n);
+      /** @type {NonNullable<typeof this.textSel>} */ (this.textSel).renderPage(page.n);
+    }
+  }
+
+  /**
+   * The signal every annotation-mutating tool emits after changing `doc.annotations`.
+   * On a provisional document an edit is a deliberate act, so it starts the full load.
+   * @param {number} pageN
+   */
+  annotationsEdited(pageN) {
+    if (this.doc && this.doc.id < 0) this.doc._requestHydration?.();
+    this.onAnnotationsEdited?.(pageN);
+  }
+
+  /**
+   * Notify the registered listener that page `pageN`'s layout data tables changed.
+   * @param {number} pageN
+   */
+  layoutTablesEdited(pageN) {
+    this.onLayoutTablesEdited?.(pageN);
+  }
+
+  /**
+   * Rebuild page `n`'s highlight fill and line-markup layer from the per-word state on `_wordObjs[n]`.
+   * Consecutive words on a line sharing the same highlight are merged into one rectangle,
+   * so a multi-word highlight is one seamless band rather than a row of per-word rectangles.
+   * Underline/strikeout runs merge the same way, drawn as one continuous bar per run.
+   * @param {number} n
+   */
+  renderHighlights(n) {
+    if (this._highlightGroups[n]) {
+      for (const group of Object.values(this._highlightGroups[n])) group.replaceChildren();
+    }
+    this._highlightRectsByGroup[n] = new Map();
+    if (this.onAnnotationsRendered) this.onAnnotationsRendered(n);
+    const words = this._wordObjs[n];
+    if (!words || words.length === 0) return;
+
+    /** @type {Map<string, Array<UiOcrWord>>} */
+    const lineMap = new Map();
+    for (const kw of words) {
+      kw.highlightRectElem = null;
+      kw.markupRectElem = null;
+      const lineId = kw.word.line.id;
+      let lineArr = lineMap.get(lineId);
+      if (!lineArr) { lineArr = []; lineMap.set(lineId, lineArr); }
+      lineArr.push(kw);
+    }
+
+    // The last flushed run of each commented group, in reading order, marks where the group's comment mark goes.
+    /** @type {Map<string, {right: number, top: number, bottom: number, nextLeft: ?number, orientation: number, color: string}>} */
+    const markRuns = new Map();
+
+    for (const lineWords of lineMap.values()) {
+      lineWords.sort((a, b) => a.x() - b.x());
+
+      /** @type {?{key: string, color: string, opacity: number, groupId: ?string, words: Array<UiOcrWord>, left: number, right: number, top: number, bottom: number, orientation: number}} */
+      let run = null;
+      /** @param {?number} [nextLeft] Left edge of the word that ends the run on its line (null at line end). */
+      const flush = (nextLeft = null) => {
+        if (!run) return;
+        const group = this.getHighlightGroup(n, run.orientation);
+        const rect = document.createElement('div');
+        const r = parseInt(run.color.slice(1, 3), 16);
+        const g = parseInt(run.color.slice(3, 5), 16);
+        const b = parseInt(run.color.slice(5, 7), 16);
+        // The band's alpha lives in `opacity` via `--scribe-hl-o` (not in an rgba background), so the hover lift is one class toggle that scales it up without re-deriving the colour.
+        rect.className = 'scribe-hl-band';
+        rect.style.setProperty('--scribe-hl-o', `${run.opacity}`);
+        Object.assign(rect.style, {
+          position: 'absolute',
+          left: `${run.left}px`,
+          top: `${run.top}px`,
+          width: `${run.right - run.left}px`,
+          height: `${run.bottom - run.top}px`,
+          background: `rgb(${r}, ${g}, ${b})`,
+          pointerEvents: 'none',
+        });
+        group.appendChild(rect);
+        for (const rkw of run.words) rkw.highlightRectElem = rect;
+        if (run.groupId) {
+          const arr = this._highlightRectsByGroup[n].get(run.groupId);
+          if (arr) arr.push(rect); else this._highlightRectsByGroup[n].set(run.groupId, [rect]);
+          if (run.words[0].highlightComment) {
+            markRuns.set(run.groupId, {
+              right: run.right, top: run.top, bottom: run.bottom, nextLeft, orientation: run.orientation, color: run.color,
+            });
+          }
+        }
+        run = null;
+      };
+
+      /**
+       * @type {?{key: string, type: ('underline'|'strikeout'), color: string, opacity: number, groupId: ?string,
+       *   words: Array<UiOcrWord>, left: number, right: number, top: number, bottom: number, baseline: number, maxFs: number, orientation: number}}
+       */
+      let lineRun = null;
+      /** @param {?number} [nextLeft] Left edge of the word that ends the run on its line (null at line end). */
+      const flushLine = (nextLeft = null) => {
+        if (!lineRun) return;
+        const group = this.getHighlightGroup(n, lineRun.orientation);
+        const rect = document.createElement('div');
+        const r = parseInt(lineRun.color.slice(1, 3), 16);
+        const g = parseInt(lineRun.color.slice(3, 5), 16);
+        const b = parseInt(lineRun.color.slice(5, 7), 16);
+        // One continuous bar per run, spanning the word gaps like PDF /Underline and /StrikeOut, so no gap-splitting applies here.
+        const barHeight = Math.max(lineRun.maxFs * 0.06, 1);
+        const barCenter = lineRun.type === 'underline'
+          ? lineRun.baseline + lineRun.maxFs * 0.07
+          : lineRun.baseline - lineRun.maxFs * 0.25;
+        rect.className = 'scribe-hl-band';
+        rect.style.setProperty('--scribe-hl-o', `${lineRun.opacity}`);
+        Object.assign(rect.style, {
+          position: 'absolute',
+          left: `${lineRun.left}px`,
+          top: `${barCenter - barHeight / 2}px`,
+          width: `${lineRun.right - lineRun.left}px`,
+          height: `${barHeight}px`,
+          background: `rgb(${r}, ${g}, ${b})`,
+          pointerEvents: 'none',
+        });
+        group.appendChild(rect);
+        for (const rkw of lineRun.words) rkw.markupRectElem = rect;
+        if (lineRun.groupId) {
+          const arr = this._highlightRectsByGroup[n].get(lineRun.groupId);
+          if (arr) arr.push(rect); else this._highlightRectsByGroup[n].set(lineRun.groupId, [rect]);
+          if (lineRun.words[0].markupComment) {
+            // The word-box extent (not the thin bar's) centers the comment mark on the text like a highlight's.
+            markRuns.set(lineRun.groupId, {
+              right: lineRun.right, top: lineRun.top, bottom: lineRun.bottom, nextLeft, orientation: lineRun.orientation, color: lineRun.color,
+            });
+          }
+        }
+        lineRun = null;
+      };
+
+      for (const kw of lineWords) {
+        const left = kw.x() - (kw.word.visualCoords ? kw.leftSideBearing : 0);
+        const fs = kw.fontSize;
+        const wordBox = {
+          left,
+          right: left + kw.width(),
+          top: kw.y() - fs * 0.12,
+          bottom: kw.y() + fs * 0.72,
+        };
+
+        if (!kw.highlightColor) {
+          flush(left);
+        } else {
+          const key = `${kw.highlightColor}_${kw.highlightOpacity}_${kw.highlightGroupId || ''}`;
+          if (run && run.key === key) {
+            run.left = Math.min(run.left, wordBox.left);
+            run.right = Math.max(run.right, wordBox.right);
+            run.top = Math.min(run.top, wordBox.top);
+            run.bottom = Math.max(run.bottom, wordBox.bottom);
+            run.words.push(kw);
+          } else {
+            flush(left);
+            run = {
+              key, color: kw.highlightColor, opacity: kw.highlightOpacity, groupId: kw.highlightGroupId, words: [kw], orientation: kw.word.line.orientation, ...wordBox,
+            };
+          }
+        }
+
+        if (!kw.markupType || !kw.markupColor) {
+          flushLine(left);
+        } else {
+          const lineKey = `${kw.markupType}_${kw.markupColor}_${kw.markupOpacity}_${kw.markupGroupId || ''}`;
+          if (lineRun && lineRun.key === lineKey) {
+            lineRun.left = Math.min(lineRun.left, wordBox.left);
+            lineRun.right = Math.max(lineRun.right, wordBox.right);
+            lineRun.top = Math.min(lineRun.top, wordBox.top);
+            lineRun.bottom = Math.max(lineRun.bottom, wordBox.bottom);
+            lineRun.baseline = Math.max(lineRun.baseline, kw.y() + fs * 0.6);
+            lineRun.maxFs = Math.max(lineRun.maxFs, fs);
+            lineRun.words.push(kw);
+          } else {
+            flushLine(left);
+            lineRun = {
+              key: lineKey,
+              type: kw.markupType,
+              color: kw.markupColor,
+              opacity: kw.markupOpacity,
+              groupId: kw.markupGroupId,
+              words: [kw],
+              orientation: kw.word.line.orientation,
+              baseline: kw.y() + fs * 0.6,
+              maxFs: fs,
+              ...wordBox,
+            };
+          }
+        }
+      }
+      flush();
+      flushLine();
+    }
+
+    this._commentMarks[n] = [];
+    for (const [groupId, m] of markRuns) {
+      const mark = document.createElement('span');
+      mark.className = 'scribe-hl-cmark';
+      mark.dataset.groupId = groupId;
+      mark.tabIndex = 0;
+      mark.setAttribute('role', 'button');
+      mark.setAttribute('aria-label', 'Comment');
+      // The band renders this hue at reduced opacity, so the solid mark reads as its saturated form.
+      mark.style.color = m.color;
+      mark.innerHTML = COMMENT_MARK_SVG;
+      // Parented to the band's orientation group, so page rotation and zoom transforms apply to both alike.
+      this.getHighlightGroup(n, m.orientation).appendChild(mark);
+      this._commentMarks[n].push({
+        el: mark, right: m.right, top: m.top, bottom: m.bottom, nextLeft: m.nextLeft,
+      });
+    }
+    this._placeCommentMarks(n);
+  }
+
+  /**
+   * Position page `n`'s comment marks for the current zoom.
+   * Call again on every zoom change: the mark keeps a constant on-screen size, so whether it fits inline depends on the zoom.
+   * @param {number} n
+   */
+  _placeCommentMarks(n) {
+    const marks = this._commentMarks[n];
+    if (!marks || marks.length === 0) return;
+    const z = this.zoomLevel || 1;
+    const px = 14 / z;
+    for (const m of marks) {
+      // 3px screen gap after the band, and the mark must clear the next word by 2px screen.
+      const fits = m.nextLeft === null || m.nextLeft - m.right >= (3 + 14 + 2) / z;
+      if (fits) {
+        m.el.style.left = `${m.right + 3 / z}px`;
+        m.el.style.top = `${(m.top + m.bottom) / 2 - px / 2}px`;
+      } else {
+        m.el.style.left = `${m.right - px * 0.75}px`;
+        m.el.style.top = `${m.top - px * 0.85}px`;
+      }
+    }
+  }
+
+  /**
+   * Draw a paragraph/block outline.
+   */
+  // eslint-disable-next-line default-param-last
+  _addBlockOutline(n, box, angleAdj, index, label, orientation = 0, lines, type) {
+    const group = this.getTextGroup(n, orientation);
+
+    const PALETTE = ['#4363d8', '#f58231', '#42d4f4', '#9a6324', '#e6b800', '#000075', '#e67e22'];
+    const color = type === 'footnote' || type === 'endnote' ? '#911eb4'
+      : (type === 'header' || type === 'footer' || type === 'pagenum' || type === 'linenum') ? '#ff0000'
+        : type === 'title' ? '#0a9928'
+          : PALETTE[(index - 1) % PALETTE.length];
+    const TYPE_TAG = {
+      title: 'T', footnote: 'F', endnote: 'E', pagenum: 'P', header: 'H', footer: 'Fo', linenum: 'Ln', blockquote: 'Q', caption: 'C',
+    };
+
+    const sortedLines = (lines && lines.length > 0 ? lines.map((l) => l.bbox) : [box])
+      .slice()
+      .sort((a, b) => a.top - b.top);
+    const first = sortedLines[0];
+    const last = sortedLines[sortedLines.length - 1];
+    const topAlone = sortedLines.length === 1 || sortedLines[1].top >= first.bottom;
+    const bottomAlone = sortedLines.length === 1 || sortedLines[sortedLines.length - 2].bottom <= last.top;
+
+    const tlNotch = topAlone && first.left > box.left;
+    const trNotch = topAlone && first.right < box.right;
+    const blNotch = bottomAlone && last.left > box.left;
+    const brNotch = bottomAlone && last.right < box.right;
+
+    const ax = angleAdj.x;
+    const ay = angleAdj.y;
+    const points = [];
+    if (tlNotch) points.push(first.left + ax, box.top + ay);
+    else points.push(box.left + ax, box.top + ay);
+
+    if (trNotch) {
+      points.push(first.right + ax, box.top + ay);
+      points.push(first.right + ax, first.bottom + ay);
+      points.push(box.right + ax, first.bottom + ay);
+    } else {
+      points.push(box.right + ax, box.top + ay);
+    }
+
+    if (brNotch) {
+      points.push(box.right + ax, last.top + ay);
+      points.push(last.right + ax, last.top + ay);
+      points.push(last.right + ax, box.bottom + ay);
+    } else {
+      points.push(box.right + ax, box.bottom + ay);
+    }
+
+    if (blNotch) {
+      points.push(last.left + ax, box.bottom + ay);
+      points.push(last.left + ax, last.top + ay);
+      points.push(box.left + ax, last.top + ay);
+    } else {
+      points.push(box.left + ax, box.bottom + ay);
+    }
+
+    if (tlNotch) {
+      points.push(box.left + ax, first.bottom + ay);
+      points.push(first.left + ax, first.bottom + ay);
+    }
+
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    Object.assign(svg.style, {
+      position: 'absolute', left: '0', top: '0', width: '100%', height: '100%', overflow: 'visible', pointerEvents: 'none',
+    });
+    const pointPairs = [];
+    for (let i = 0; i < points.length; i += 2) pointPairs.push(`${points[i]},${points[i + 1]}`);
+    const poly = document.createElementNS(ns, 'polygon');
+    poly.setAttribute('points', pointPairs.join(' '));
+    poly.setAttribute('fill', 'none');
+    poly.setAttribute('stroke', color);
+    poly.setAttribute('stroke-width', '3');
+    // Keep the outline a constant device width under the zoom layer's transform, instead of scaling to sub-pixel.
+    poly.setAttribute('vector-effect', 'non-scaling-stroke');
+    svg.appendChild(poly);
+    group.appendChild(svg);
+
+    // Reading-order badge to the left of the block's top-left corner.
+    const indexStr = `${index}${TYPE_TAG[type] || ''}`;
+    const radius = 9;
+    const badge = document.createElement('div');
+    Object.assign(badge.style, {
+      position: 'absolute',
+      left: `${box.left + angleAdj.x - 4}px`,
+      top: `${box.top + angleAdj.y}px`,
+      transform: 'translateX(-100%)',
+      minWidth: `${2 * radius}px`,
+      height: `${2 * radius}px`,
+      padding: `0 ${Math.round(radius * 0.55)}px`,
+      boxSizing: 'border-box',
+      borderRadius: `${radius}px`,
+      background: color,
+      color: '#fff',
+      font: `bold ${radius * 1.2}px Arial`,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      pointerEvents: 'none',
+    });
+    badge.textContent = indexStr;
+    group.appendChild(badge);
+
+    if (label) {
+      const reason = document.createElement('div');
+      Object.assign(reason.style, {
+        position: 'absolute',
+        left: `${box.left + angleAdj.x}px`,
+        top: `${box.top + angleAdj.y}px`,
+        font: '12px Arial',
+        color,
+        whiteSpace: 'nowrap',
+        pointerEvents: 'none',
+      });
+      reason.textContent = label;
+      group.appendChild(reason);
+    }
+  }
+
+  /** Delete the currently selected word(s) from the document. */
+  deleteSelectedWord() { return deleteSelectedWord(this); }
+
+  /**
+   * Adjust the left or right edge of the selected word's bbox by `amount` pixels.
+   * @param {'left'|'right'} side
+   * @param {number} amount
+   */
+  modifySelectedWordBbox(side, amount) { return modifySelectedWordBbox(this, side, amount); }
+
+  /**
+   * Apply style changes to the currently selected words.
+   * @param {Object} style
+   * @param {string} [style.font]
+   * @param {number} [style.size]
+   * @param {boolean} [style.bold]
+   * @param {boolean} [style.italic]
+   * @param {boolean} [style.underline]
+   * @param {boolean} [style.smallCaps]
+   * @param {boolean} [style.sup]
+   */
+  modifySelectedWordStyle(style) { return modifySelectedWordStyle(this, style); }
+
+  /** Delete the currently selected layout data table. */
+  deleteSelectedLayoutDataTable() { return deleteSelectedLayoutDataTable(this); }
+
+  /** Delete the currently selected layout region(s). */
+  deleteSelectedLayoutRegion() { return deleteSelectedLayoutRegion(this); }
+
+  /**
+   * Apply a highlight color and opacity to the given words, creating or updating their annotation data.
+   * @param {Array<InstanceType<typeof UiOcrWord>>} words
+   * @param {string} color
+   * @param {number} opacity
+   * @param {('highlight'|'underline'|'strikeout')} [kind='highlight']
+   */
+  applyHighlight(words, color, opacity, kind = 'highlight') { return applyHighlight(this, words, color, opacity, kind); }
+
+  /**
+   * Remove highlights (or line markups) from the given words and drop their annotation data.
+   * @param {Array<InstanceType<typeof UiOcrWord>>} words
+   * @param {('highlight'|'line')} [kind='highlight']
+   */
+  removeHighlight(words, kind = 'highlight') { return removeHighlight(this, words, kind); }
+
+  /**
+   * Set the comment on the highlight (or line-markup) group containing the first selected word.
+   * @param {Array<InstanceType<typeof UiOcrWord>>} words
+   * @param {string} comment
+   * @param {('highlight'|'line')} [kind='highlight']
+   */
+  modifyHighlightComment(words, comment, kind = 'highlight') { return modifyHighlightComment(this, words, comment, kind); }
+
+  /** Redraw the dashed outline around the words in the currently selected highlight group. */
+  updateHighlightGroupOutline() { return updateHighlightGroupOutline(this); }
+
+  /**
+   * Tear down the viewer. Removes it from the global registry. Caller is responsible for the DOM.
+   */
+  destroy() {
+    unregisterViewer(this);
+    if (this._scrollGlide) {
+      cancelAnimationFrame(this._scrollGlide.raf);
+      this._scrollGlide = null;
+    }
+    this.stopAutoScroll(false);
+    this._linkConfirmHide(false);
+    this._endScrollTextHide();
+    this._selEngine?.uninstall?.();
+    this.textSel?.destroy();
+    this._clearPageDom();
+    if (this.scrollContainer && this.scrollContainer.parentNode) this.scrollContainer.parentNode.removeChild(this.scrollContainer);
+  }
+}
+
+// Static type/utility exports.
+// These are not per-viewer state. They're class references.
+ScribeViewer.UiText = UiText;
+ScribeViewer.UiOcrWord = UiOcrWord;
+ScribeViewer.UiLayout = UiLayout;
+ScribeViewer.ViewerImageCache = ViewerImageCache;
+ScribeViewer.search = search;
+ScribeViewer.layout = layout;
+ScribeViewer.getAllFileEntries = getAllFileEntries;
+
+// Backward-compatibility static facade.
+// Existing single-viewer applications call `ScribeViewer.X` (static). We preserve that surface
+// by routing it to a default instance. The default is the first instance constructed.
+// If no instance has been constructed yet, accessing the static API lazily creates one.
+// Multi-viewer applications should construct their own `new ScribeViewer()` instances and use
+// the instance API directly. Each instance is independent.
+
+function getDefault() {
+  return getDefaultViewer() || new ScribeViewer();
+}
+
+ScribeViewer.getDefault = getDefault;
+
+ScribeViewer.getAllViewers = getAllViewers;
+
+ScribeViewer.findViewerForTarget = findViewerForTarget;
+
+/** @returns {?ScribeViewer} */
+ScribeViewer.getActiveViewer = () => getActiveViewer() || getDefaultViewer();
+
+const _delegatedMethods = [
+  'init', 'displayPage', 'goToOutlineDest', 'rotatePage', 'renderWords',
+  'setInitialPositionZoom', 'getPageStop', 'calcPageLayout', 'setPagesPerRow', 'getViewportCenter',
+  'pan', 'zoom', 'resize', 'startDrag', 'executeDrag',
+  'stopDragPinch', 'executePinchTouch', 'createGroup', 'getTextGroup', 'setTextGroupRotation',
+  'getHighlightGroup', 'getSelectGroup', 'renderHighlights', 'getOverlayGroup', 'calcPage', 'calcSelectionImageCoords', 'getUiWords', 'getUiRegions',
+  'getWordsUnderTextSelection', 'clearTextSelection', 'hasTextSelection', 'ensureWordObjs',
+  'getUiDataColumns', 'getDataTables', 'getUiDataTables', 'destroyControls', 'destroyOverlay',
+  'destroyText', 'updateCurrentPage', 'setWordColorOpacity', 'deleteSelectedWord',
+  'modifySelectedWordBbox', 'modifySelectedWordStyle', 'deleteSelectedLayoutDataTable',
+  'deleteSelectedLayoutRegion', 'applyHighlight', 'removeHighlight', 'modifyHighlightComment',
+  'updateHighlightGroupOutline', 'setTextLayerVisible', 'setOverlayLayerVisible', 'setImageLayerVisible',
+  'clear', 'deletePages', 'movePages', 'pastePages', 'rotatePages',
+];
+for (const m of _delegatedMethods) {
+  ScribeViewer[m] = (...args) => /** @type {any} */ (getDefault())[m](...args);
+}
+
+const _delegatedFields = [
+  'elem', 'HTMLOverlayBackstopElem', 'textOverlayHidden', 'doc',
+  'displayPageCallback', 'onEditCallback', 'onPageEditCallback', 'scrollContainer',
+  'textGroupsRenderIndices', 'overlayGroupsRenderIndices', 'selectingRectangle', 'contextMenuWord',
+  'contextMenuPointer', 'selecting', 'enableCanvasSelection', 'enableHTMLOverlay', 'bbox',
+  'mode', 'drag', 'runSetInitial', 'state', 'opt', 'CanvasSelection', 'textSel', 'evalStats',
+  'interactionCallback', 'destroyControlsCallback', 'onSelectionChange',
+];
+for (const f of _delegatedFields) {
+  if (Object.prototype.hasOwnProperty.call(ScribeViewer, f)) continue;
+  Object.defineProperty(ScribeViewer, f, {
+    configurable: true,
+    get() { return /** @type {any} */ (getDefault())[f]; },
+    set(v) { /** @type {any} */ (getDefault())[f] = v; },
+  });
+}
+
+ScribeViewer.setWordColorOpacity = (...args) => getDefault().setWordColorOpacity(...args);
+ScribeViewer.compareGroundTruth = (...args) => /** @type {any} */ (getDefault())._compareGroundTruth(...args);
+ScribeViewer.renderCanvasWords = (page) => getDefault()._renderCanvasWords(page);

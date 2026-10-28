@@ -1,8 +1,3 @@
-import { opt } from '../containers/app.js';
-import {
-  layoutDataTables, layoutRegions, pageMetricsAll,
-} from '../containers/dataContainer.js';
-import { FontCont } from '../containers/fontContainer.js';
 import ocr from '../objects/ocrObjects.js';
 import { round6 } from '../utils/miscUtils.js';
 
@@ -10,21 +5,38 @@ import { round6 } from '../utils/miscUtils.js';
  *
  * @param {Object} params
  * @param {Array<OcrPage>} params.ocrData
+ * @param {?Array<number>} [params.pageArr=null] - Array of 0-based page indices to include. Overrides minValue/maxValue when provided.
  * @param {number} [params.minValue]
  * @param {number} [params.maxValue]
- */
-export function writeHocr({ ocrData, minValue, maxValue }) {
-  if (minValue === null || minValue === undefined) minValue = 0;
-  if (maxValue === null || maxValue === undefined || maxValue < 0) maxValue = ocrData.length - 1;
+ * @param {import('../containers/fontContainer.js').DocFonts} [params.docFonts] - Per-document fonts. Required.
+ * @param {{ pages: Array<LayoutPage> }} [params.layoutRegions] - This document's layout regions. Required.
+ * @param {Array<PageMetrics>} [params.pageMetrics] - This document's page metrics. Required.
+ * @param {string} [params.dataTablesSerialized] - This document's serialized layout data tables. Required.
+ * @param {?import('../containers/scribeDoc.js').ScribeDoc} [params.doc=null] - Owning document for progress reporting.
+\ */
+export function writeHocr({
+  ocrData, pageArr = null, minValue, maxValue,
+  docFonts, layoutRegions: layoutRegionsArg, pageMetrics, dataTablesSerialized, doc = null,
+}) {
+  const fonts = docFonts;
+  const layoutRegionsPages = layoutRegionsArg.pages;
+  const pageMetricsArr = pageMetrics;
+
+  if (!pageArr) {
+    if (minValue === null || minValue === undefined) minValue = 0;
+    if (maxValue === null || maxValue === undefined || maxValue < 0) maxValue = ocrData.length - 1;
+    pageArr = [];
+    for (let i = minValue; i <= maxValue; i++) pageArr.push(i);
+  }
 
   const meta = {
-    'font-metrics': FontCont.state.charMetrics,
-    'default-font': FontCont.state.defaultFontName,
-    'sans-font': FontCont.state.sansDefaultName,
-    'serif-font': FontCont.state.serifDefaultName,
-    'enable-opt': opt.enableOpt,
-    layout: layoutRegions.pages,
-    'layout-data-table': layoutDataTables.serialize(),
+    'font-metrics': fonts.state.charMetrics,
+    'default-font': fonts.state.defaultFontName,
+    'sans-font': fonts.state.sansDefaultName,
+    'serif-font': fonts.state.serifDefaultName,
+    'enable-opt': fonts.state.enableOpt,
+    layout: layoutRegionsPages,
+    'layout-data-table': dataTablesSerialized,
   };
 
   let hocrOut = String.raw`<?xml version="1.0" encoding="UTF-8"?>
@@ -43,23 +55,54 @@ export function writeHocr({ ocrData, minValue, maxValue }) {
 
   hocrOut += '\n\t<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>';
   hocrOut += '\n\t<meta name=\'ocr-system\' content=\'scribeocr\' />';
-  hocrOut += '\n\t<meta name=\'ocr-capabilities\' content=\'ocr_page ocr_carea ocr_par ocr_line ocrx_word ocrp_wconf ocrp_lang ocrp_dir ocrp_font ocrp_fsize\'/>';
+  hocrOut += '\n\t<meta name=\'ocr-capabilities\' content=\'ocr_page ocr_carea ocr_par ocr_line ocrx_word ocrp_wconf ocrp_lang ocrp_font ocrp_fsize\'/>';
   hocrOut += '\n</head>';
   hocrOut += '\n<body>';
 
-  for (let i = minValue; i <= maxValue; i++) {
+  for (const i of pageArr) {
     const pageObj = ocrData[i];
 
     // Handle case where ocrPage object does not exist.
     if (!pageObj) {
-      hocrOut += `\n\t<div class='ocr_page' title='bbox 0 0 ${pageMetricsAll[i].dims.width} ${pageMetricsAll[i].dims.height}'>`;
+      hocrOut += `\n\t<div class='ocr_page' title='bbox 0 0 ${pageMetricsArr[i].dims.width} ${pageMetricsArr[i].dims.height}'>`;
       hocrOut += '\n\t</div>';
       continue;
     }
 
     hocrOut += `\n\t<div class='ocr_page' title='bbox 0 0 ${pageObj.dims.width} ${pageObj.dims.height}'>`;
+
+    /** @type {?OcrPar} */
+    let parOpen = null;
+    let parCount = 0;
     for (const lineObj of pageObj.lines) {
-      hocrOut += `\n\t\t<span class='ocr_line' title="bbox ${lineObj.bbox.left} ${lineObj.bbox.top} ${lineObj.bbox.right} ${lineObj.bbox.bottom}`;
+      if (lineObj.words.length === 0) continue;
+      const par = lineObj.par;
+      if (par !== parOpen) {
+        if (parOpen) hocrOut += '\n\t\t\t</p>\n\t\t</div>';
+        parOpen = par;
+        if (par) {
+          parCount++;
+          const langCounts = new Map();
+          for (const parLine of par.lines) {
+            for (const wordObj of parLine.words) {
+              if (wordObj.lang) langCounts.set(wordObj.lang, (langCounts.get(wordObj.lang) || 0) + 1);
+            }
+          }
+          let parLang = null;
+          let parLangCount = 0;
+          for (const [lang, count] of langCounts) {
+            if (count > parLangCount) {
+              parLangCount = count;
+              parLang = lang;
+            }
+          }
+          const parBox = `bbox ${Math.round(par.bbox.left)} ${Math.round(par.bbox.top)} ${Math.round(par.bbox.right)} ${Math.round(par.bbox.bottom)}`;
+          hocrOut += `\n\t\t<div class='ocr_carea' id='block_${i + 1}_${parCount}' title='${parBox}'>`;
+          hocrOut += `\n\t\t\t<p class='ocr_par' id='par_${i + 1}_${parCount}'${parLang ? ` lang='${parLang}'` : ''} title='${parBox}'>`;
+        }
+      }
+      const indent = par ? '\t\t\t\t' : '\t\t';
+      hocrOut += `\n${indent}<span class='ocr_line' title="bbox ${lineObj.bbox.left} ${lineObj.bbox.top} ${lineObj.bbox.right} ${lineObj.bbox.bottom}`;
       hocrOut += `; baseline ${round6(lineObj.baseline[0])} ${Math.round(lineObj.baseline[1])}`;
 
       // These metrics are specific to ScribeOCR, and are different from the Tesseract HOCR output.
@@ -71,7 +114,7 @@ export function writeHocr({ ocrData, minValue, maxValue }) {
       if (lineObj.ascHeight) hocrOut += `; x_asc_height ${lineObj.ascHeight}`;
       hocrOut += '">';
       for (const wordObj of lineObj.words) {
-        hocrOut += `\n\t\t\t<span class='ocrx_word' id='${wordObj.id}' title='`;
+        hocrOut += `\n${indent}\t<span class='ocrx_word' id='${wordObj.id}' title='`;
         // The HOCR specification requires that the bounding box be rounded to the nearest integer, however the Scribe internal data structure does not.
         hocrOut += `bbox ${Math.round(wordObj.bbox.left)} ${Math.round(wordObj.bbox.top)} ${Math.round(wordObj.bbox.right)} ${Math.round(wordObj.bbox.bottom)}`;
         hocrOut += `;x_wconf ${wordObj.conf}`;
@@ -86,13 +129,9 @@ export function writeHocr({ ocrData, minValue, maxValue }) {
 
         hocrOut += "'";
 
-        // Tesseract HOCR specifies default language for a paragraph in the "ocr_par" element,
-        // however as ScribeOCR does not currently have a paragarph object, every word must have its language specified.
         if (wordObj.lang) hocrOut += ` lang='${wordObj.lang}'`;
 
-        // TODO: Why are we representing font family and style using the `style` HTML element here?
-        // This is not how Tesseract does things, and our own parsing script does not appear to be written to re-import it properly.
-        // Add "style" attribute (if applicable)
+        // The importer reads italic, bold and small caps from this attribute.
         if (wordObj.style.bold || wordObj.style.italic || wordObj.style.smallCaps || (wordObj.style.font && wordObj.style.font !== 'Default')) {
           hocrOut += ' style=\'';
 
@@ -117,7 +156,6 @@ export function writeHocr({ ocrData, minValue, maxValue }) {
           hocrOut += '>';
         }
 
-        // Add word text, along with any formatting that uses nested elements rather than attributes
         if (wordObj.style.sup) {
           hocrOut += `<sup>${ocr.escapeXml(wordObj.text)}</sup>`;
         } else if (wordObj.style.dropcap) {
@@ -127,11 +165,12 @@ export function writeHocr({ ocrData, minValue, maxValue }) {
         }
         hocrOut += '</span>';
       }
-      hocrOut += '\n\t\t</span>';
+      hocrOut += `\n${indent}</span>`;
     }
+    if (parOpen) hocrOut += '\n\t\t\t</p>\n\t\t</div>';
     hocrOut += '\n\t</div>';
 
-    opt.progressHandler({ n: i, type: 'export', info: { } });
+    doc?.progressHandler({ n: i, type: 'export', info: { } });
   }
 
   hocrOut += '\n</body>\n</html>';

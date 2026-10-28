@@ -1,8 +1,6 @@
-import { FontCont } from '../containers/fontContainer.js';
-import { opt } from '../containers/app.js';
+import { scribeDocDefaults } from '../containers/scribeDocDefaults.js';
 import { calcWordMetrics } from '../utils/fontUtils.js';
 import { assignParagraphs } from '../utils/reflowPars.js';
-import { pageMetricsAll } from '../containers/dataContainer.js';
 import ocr from '../objects/ocrObjects.js';
 
 const formatNum = (num) => (num.toFixed(5).replace(/\.?0+$/, ''));
@@ -18,7 +16,6 @@ const calcFontMetrics = (fontI, fontSize) => {
   const unitsPerEm = fontI.opentype.unitsPerEm;
 
   // Bit 7: Use_Typo_Metrics (1 = Yes)
-  // eslint-disable-next-line no-bitwise
   if (os2.fsSelection >> 7 & 1) {
     return {
       fontBoundingBoxAscent: Math.round(os2.sTypoAscender * (fontSize / unitsPerEm)),
@@ -54,20 +51,43 @@ const makeSmallCapsDivs = (text, fontSizeHTMLSmallCaps) => {
  * @param {Object} params
  * @param {Array<OcrPage>} params.ocrPages -
  * @param {Array<ImageWrapper>} [params.images] -
+ * @param {?Array<number>} [params.pageArr=null] - Array of 0-based page indices to include. Overrides minpage/maxpage when provided.
  * @param {number} [params.minpage=0] - The first page to include in the document.
  * @param {number} [params.maxpage=-1] - The last page to include in the document.
  * @param {boolean} [params.reflowText=false] - Remove line breaks within what appears to be the same paragraph.
  * @param {boolean} [params.removeMargins=false] - Remove the margins from the text.
  * @param {?Array<string>} [params.wordIds] - An array of word IDs to include in the document.
  *    If omitted, all words are included.
+ * @param {import('../containers/fontContainer.js').DocFonts} [params.docFonts] - Per-document fonts.
+ *    Required; no active-document fallback.
+ * @param {Array<PageMetrics>} [params.pageMetrics] - This document's page metrics. Required.
+ * @param {('invis'|'ebook'|'eval'|'proof'|'annot')} [params.displayMode] - Defaults to `scribeDocDefaults.displayMode`.
+ * @param {number} [params.confThreshHigh] - Defaults to `scribeDocDefaults.confThreshHigh`.
+ * @param {number} [params.confThreshMed] - Defaults to `scribeDocDefaults.confThreshMed`.
+ * @param {number} [params.overlayOpacity] - Defaults to `scribeDocDefaults.overlayOpacity`.
+ * @param {boolean} [params.kerning] - Defaults to `scribeDocDefaults.kerning`.
+ * @param {boolean} [params.embedFonts] - Embed fonts inline as base64 `data:` URIs instead of referencing the CDN.
+ *    Defaults to `scribeDocDefaults.embedFonts`.
+ * @param {?import('../containers/scribeDoc.js').ScribeDoc} [params.doc=null] - Owning document for
+ *    progress reporting.
  */
 export function writeHtml({
-  ocrPages, images, minpage = 0, maxpage = -1, reflowText = false, removeMargins = false, wordIds = null,
+  ocrPages, images, pageArr = null, minpage = 0, maxpage = -1,
+  reflowText = false, removeMargins = false, wordIds = null, docFonts, pageMetrics,
+  displayMode = scribeDocDefaults.displayMode,
+  confThreshHigh = scribeDocDefaults.confThreshHigh,
+  confThreshMed = scribeDocDefaults.confThreshMed,
+  overlayOpacity = scribeDocDefaults.overlayOpacity,
+  kerning = scribeDocDefaults.kerning,
+  embedFonts = scribeDocDefaults.embedFonts,
+  doc = null,
 }) {
   const fontsUsed = new Set();
+  const fonts = docFonts;
+  const pageMetricsArr = pageMetrics;
 
-  const enableOptSaved = FontCont.state.enableOpt;
-  FontCont.state.enableOpt = false;
+  const enableOptSaved = fonts.state.enableOpt;
+  fonts.state.enableOpt = false;
 
   if (images && images.length === 0) images = undefined;
 
@@ -76,7 +96,11 @@ export function writeHtml({
 
   let bodyStr = '<body>\n';
 
-  if (maxpage === -1) maxpage = ocrPages.length - 1;
+  if (!pageArr) {
+    if (maxpage === -1) maxpage = ocrPages.length - 1;
+    pageArr = [];
+    for (let i = minpage; i <= maxpage; i++) pageArr.push(i);
+  }
 
   let newLine = false;
 
@@ -104,7 +128,7 @@ export function writeHtml({
 
   let top = 0;
 
-  for (let g = minpage; g <= maxpage; g++) {
+  for (const g of pageArr) {
     // TODO: change this when an image is included.
     if (!ocrPages[g] || ocrPages[g].lines.length === 0) continue;
 
@@ -128,20 +152,17 @@ export function writeHtml({
 
     const imageObj = images ? images[g] : null;
     if (imageObj) {
-      bodyStr += `  <img class="scribe-image" src="${imageObj.src}">\n`;
+      // Materialize `src` in case this is a viewer-rendered bitmap-backed wrapper (no-op otherwise).
+      bodyStr += `  <img class="scribe-image" src="${imageObj.ensureSrc()}">\n`;
     }
 
     if (removeMargins) {
-      top += Math.min((maxBottom - minTop) + 200, pageMetricsAll[g].dims.height + 10);
+      top += Math.min((maxBottom - minTop) + 200, pageMetricsArr[g].dims.height + 10);
     } else {
-      top += pageMetricsAll[g].dims.height + 10;
+      top += pageMetricsArr[g].dims.height + 10;
     }
 
-    // Do not overwrite paragraphs from Abbyy or Textract.
-    if (reflowText && (!pageObj.textSource || !['textract', 'abbyy'].includes(pageObj.textSource))) {
-      const angle = pageMetricsAll[g].angle || 0;
-      assignParagraphs(pageObj, angle);
-    }
+    if (reflowText && pageObj.pars.length === 0) assignParagraphs(pageObj, pageMetricsArr[g].angle || 0);
 
     let parCurrent = pageObj.lines[0].par;
     let wordObjPrev = /** @type {?OcrWord} */ (null);
@@ -163,7 +184,7 @@ export function writeHtml({
 
       for (let i = 0; i < lineObj.words.length; i++) {
         const wordObj = lineObj.words[i];
-        if (!wordObj) continue;
+        if (!wordObj || !wordObj.text) continue;
 
         if (wordIds && !wordIds.includes(wordObj.id)) continue;
 
@@ -176,7 +197,7 @@ export function writeHtml({
 
           const {
             charSpacing, leftSideBearing, rightSideBearing, fontSize, charArr, advanceArr, kerningArr, font,
-          } = calcWordMetrics(wordObj);
+          } = calcWordMetrics(wordObj, docFonts);
 
           activeLine.y1 = wordObj.line.bbox.bottom + wordObj.line.baseline[1] - minTop;
 
@@ -191,7 +212,7 @@ export function writeHtml({
 
         const {
           charSpacing, leftSideBearing, rightSideBearing, fontSize, charArr, advanceArr, kerningArr, font,
-        } = calcWordMetrics(wordObj);
+        } = calcWordMetrics(wordObj, docFonts);
 
         fontsUsed.add(font);
 
@@ -224,8 +245,8 @@ export function writeHtml({
           styleStr += `transform:rotate(${angle}deg);`;
         }
 
-        const { fill, opacity } = ocr.getWordFillOpacity(wordObj, opt.displayMode,
-          opt.confThreshMed, opt.confThreshHigh, opt.overlayOpacity);
+        const { fill, opacity } = ocr.getWordFillOpacity(wordObj, displayMode,
+          confThreshMed, confThreshHigh, overlayOpacity);
 
         // Text with opacity 0 is not selectable, so we make it transparent instead.
         if (opacity === 0) {
@@ -245,7 +266,15 @@ export function writeHtml({
           styleStr += 'text-transform:uppercase;';
           innerHTML = makeSmallCapsDivs(wordStr, fontSizeHTMLSmallCaps);
         } else {
-          innerHTML = wordStr;
+          const styleSegments = ocr.getWordStyleSegments(wordObj);
+          if (styleSegments) {
+            innerHTML = styleSegments.map((segment) => {
+              const fontSegment = docFonts.getFont(segment.style, wordObj.lang);
+              return `<span style="font-style:${fontSegment.fontFaceStyle};font-weight:${fontSegment.fontFaceWeight};">${wordStr.slice(segment.start, segment.end)}</span>`;
+            }).join('');
+          } else {
+            innerHTML = wordStr;
+          }
         }
 
         let leftPad = 0;
@@ -333,14 +362,14 @@ export function writeHtml({
     addLine();
     bodyStr += '  </div>\n';
 
-    opt.progressHandler({ n: g, type: 'export', info: { } });
+    doc?.progressHandler({ n: g, type: 'export', info: { } });
   }
 
   let styleStr = '<style>\n  .scribe-word {\n';
 
   styleStr += '    z-index:1;\n';
   styleStr += '    white-space:nowrap;\n';
-  if (opt.kerning) {
+  if (kerning) {
     styleStr += '    font-kerning:normal;\n';
   } else {
     styleStr += '    font-kerning:none;\n';
@@ -364,24 +393,45 @@ export function writeHtml({
   styleStr += '  }\n';
 
   for (const fontI of fontsUsed) {
-    const cdnPath = 'https://cdn.jsdelivr.net/npm/scribe.js-ocr@0.8.0/fonts/all/';
-    let styleTitleCase = 'Regular';
-    if (fontI.style === 'italic') {
-      styleTitleCase = 'Italic';
-    } else if (fontI.style === 'bold') {
-      styleTitleCase = 'Bold';
-    } else if (fontI.style === 'boldItalic') {
-      styleTitleCase = 'BoldItalic';
-    }
+    let fontSrc;
+    if (embedFonts) {
+      // Embed the font inline as a base64 data URI so the file is self-contained and opens offline / from `file://` without the CDN.
+      const fontBytes = new Uint8Array(fontI.src);
+      const isWoff = fontBytes[0] === 0x77 && fontBytes[1] === 0x4F
+        && fontBytes[2] === 0x46 && fontBytes[3] === 0x46; // 'wOFF'
+      const fontMime = isWoff ? 'font/woff' : 'font/ttf';
 
-    const fontName = `${fontI.family}-${styleTitleCase}.woff`;
-    const fontPath = cdnPath + fontName;
+      let fontBase64;
+      if (typeof Buffer !== 'undefined') {
+        fontBase64 = Buffer.from(fontBytes.buffer, fontBytes.byteOffset, fontBytes.byteLength).toString('base64');
+      } else {
+        let binary = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < fontBytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, fontBytes.subarray(i, i + chunkSize));
+        }
+        fontBase64 = btoa(binary);
+      }
+
+      fontSrc = `url('data:${fontMime};base64,${fontBase64}')`;
+    } else {
+      const cdnPath = 'https://cdn.jsdelivr.net/npm/scribe.js-ocr@0.8.0/fonts/all/';
+      let styleTitleCase = 'Regular';
+      if (fontI.style === 'italic') {
+        styleTitleCase = 'Italic';
+      } else if (fontI.style === 'bold') {
+        styleTitleCase = 'Bold';
+      } else if (fontI.style === 'boldItalic') {
+        styleTitleCase = 'BoldItalic';
+      }
+      fontSrc = `url('${cdnPath}${fontI.family}-${styleTitleCase}.woff')`;
+    }
 
     styleStr += `  @font-face {
     font-family: '${fontI.fontFaceName}';
     font-style: ${fontI.fontFaceStyle};
     font-weight: ${fontI.fontFaceWeight};
-    src: url('${fontPath}');
+    src: ${fontSrc};
   }\n`;
   }
 
@@ -393,7 +443,7 @@ export function writeHtml({
 
   const htmlStr = `<!doctype html>\n<html>\n<head>\n${metaStr}${styleStr}</head>\n${bodyStr}</html>`;
 
-  FontCont.state.enableOpt = enableOptSaved;
+  fonts.state.enableOpt = enableOptSaved;
 
   return htmlStr;
 }

@@ -1,14 +1,9 @@
 import { OEM, PSM } from './constants.js';
+import { base64ToBytes } from '../js/utils/imageUtils.js';
 
 const loadImage = async (image) => {
-  let data = image;
-  if (typeof image === 'string') {
-    data = atob(image.split(',')[1])
-      .split('')
-      .map((c) => c.charCodeAt(0));
-  } else if (image instanceof Blob) {
-    data = await new Response(image).arrayBuffer();
-  }
+  if (typeof image === 'string') return base64ToBytes(image);
+  const data = image instanceof Blob ? await new Response(image).arrayBuffer() : image;
   return new Uint8Array(data);
 };
 
@@ -17,46 +12,6 @@ const loadImage = async (image) => {
 /** @typedef {TessOutputFormats} OutputFormats */
 /** @typedef {TessRecognizeResult} RecognizeResult */
 /** @typedef {TessPage} Page */
-
-const circularize = (page) => {
-  const blocks = [];
-  const paragraphs = [];
-  const lines = [];
-  const words = [];
-  const symbols = [];
-
-  if (page.blocks) {
-    page.blocks.forEach((block) => {
-      block.paragraphs.forEach((paragraph) => {
-        paragraph.lines.forEach((line) => {
-          line.words.forEach((word) => {
-            word.symbols.forEach((sym) => {
-              symbols.push({
-                ...sym, page, block, paragraph, line, word,
-              });
-            });
-            words.push({
-              ...word, page, block, paragraph, line,
-            });
-          });
-          lines.push({
-            ...line, page, block, paragraph,
-          });
-        });
-        paragraphs.push({
-          ...paragraph, page, block,
-        });
-      });
-      blocks.push({
-        ...block, page,
-      });
-    });
-  }
-
-  return {
-    ...page, blocks, paragraphs, lines, words, symbols,
-  };
-};
 
 export class TessWorker {
   static #workerCounter = 0;
@@ -78,8 +33,6 @@ export class TessWorker {
   #currentOem;
 
   #currentConfig;
-
-  #lstmOnlyCore;
 
   #options;
 
@@ -106,7 +59,6 @@ export class TessWorker {
     this.#currentLangs = typeof langs === 'string' ? langs.split('+') : langs;
     this.#currentOem = oem;
     this.#currentConfig = config;
-    this.#lstmOnlyCore = [OEM.DEFAULT, OEM.LSTM_ONLY].includes(oem) && !options.legacyCore;
 
     TessWorker.#workerCounter += 1;
 
@@ -177,19 +129,18 @@ export class TessWorker {
     const promiseId = `${action}-${jobId}`;
 
     if (status === 'resolve') {
-      let d = responseData;
-      if (action === 'recognize') {
-        d = circularize(responseData);
-      }
-      this.#promises[promiseId].resolve({ jobId, data: d });
+      this.#promises[promiseId].resolve({ jobId, data: responseData });
       delete this.#promises[promiseId];
     } else if (status === 'reject') {
-      this.#promises[promiseId].reject(responseData);
+      const pending = this.#promises[promiseId];
       delete this.#promises[promiseId];
+      if (pending) pending.reject(responseData);
       if (action === 'load') workerResReject(responseData);
       if (this.#errorHandler) {
         this.#errorHandler(responseData);
-      } else {
+      } else if (!pending) {
+        // In Node a throw here is an uncaught exception that kills the thread hosting this worker, so a rejection already delivered above is not thrown as well.
+        // An error nobody awaits is still thrown, so it is not lost.
         throw Error(responseData);
       }
     } else if (status === 'progress') {
@@ -215,36 +166,9 @@ export class TessWorker {
     });
   }
 
-  /**
-   * @returns {[Promise<RecognizeResult>, Promise<RecognizeResult>]}
-   */
-  #startJob2(action, payload, jobId) {
-    const id = jobId ?? `Job-${TessWorker.#jobCounter++}-${Math.random().toString(16).slice(3, 8)}`;
-    /** @type {Promise<RecognizeResult>} */
-    const promiseB = new Promise((resolve, reject) => {
-      const promiseId = `${action}-${id}b`;
-      this.#promises[promiseId] = { resolve, reject };
-    });
-
-    /** @type {Promise<RecognizeResult>} */
-    const promiseA = new Promise((resolve, reject) => {
-      const promiseId = `${action}-${id}`;
-      this.#promises[promiseId] = { resolve, reject };
-      this.#send({
-        workerId: this.#id,
-        jobId: id,
-        action,
-        payload,
-      });
-    });
-
-    return ([promiseA, promiseB]);
-  }
-
   #loadInternal(jobId) {
     return this.#startJob('load', {
       options: {
-        lstmOnly: this.#lstmOnlyCore,
         vanillaEngine: this.#options.vanillaEngine,
         logging: this.#options.logging,
       },
@@ -271,10 +195,6 @@ export class TessWorker {
   }
 
   reinitialize(langs = 'eng', oem, config, jobId) {
-    if (this.#lstmOnlyCore && [OEM.TESSERACT_ONLY, OEM.TESSERACT_LSTM_COMBINED].includes(oem)) {
-      throw Error('Legacy model requested but code missing.');
-    }
-
     const _oem = oem || this.#currentOem;
     this.#currentOem = _oem;
 
@@ -283,11 +203,14 @@ export class TessWorker {
 
     const langsArr = typeof langs === 'string' ? langs.split('+') : langs;
     const _langs = langsArr.filter((x) => !this.#currentLangs.includes(x));
-    this.#currentLangs.push(..._langs);
 
     if (_langs.length > 0) {
+      // A language counts as loaded only once its data is in, so a load that failed is retried next time rather than skipped.
       return this.#loadLanguageInternal(_langs, jobId)
-        .then(() => this.#initializeInternal(langs, _oem, _config, jobId));
+        .then(() => {
+          this.#currentLangs.push(..._langs);
+          return this.#initializeInternal(langs, _oem, _config, jobId);
+        });
     }
 
     return this.#initializeInternal(langs, _oem, _config, jobId);
@@ -295,6 +218,14 @@ export class TessWorker {
 
   setParameters(params = {}, jobId) {
     return this.#startJob('setParameters', { params }, jobId);
+  }
+
+  /**
+   * Reset what the engine accumulated from the pages it recognized.
+   * Parameters, language and the loaded image are untouched.
+   */
+  resetState(jobId) {
+    return this.#startJob('resetState', {}, jobId);
   }
 
   /**
@@ -308,19 +239,6 @@ export class TessWorker {
     blocks: true, text: true,
   }, jobId) {
     return this.#startJob('recognize', { image: await loadImage(image), options: opts, output }, jobId);
-  }
-
-  /**
-   * @param {ImageLike} image
-   * @param {Partial<RecognizeOptions>} opts
-   * @param {Partial<OutputFormats>} output
-   * @param {string} [jobId]
-   * @returns {Promise<[Promise<RecognizeResult>, Promise<RecognizeResult>]>}
-   */
-  async recognize2(image, opts = {}, output = {
-    blocks: true, text: true,
-  }, jobId) {
-    return this.#startJob2('recognize2', { image: await loadImage(image), options: opts, output }, jobId);
   }
 
   async terminate() {

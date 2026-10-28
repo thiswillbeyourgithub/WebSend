@@ -1,0 +1,124 @@
+import { PdfCore } from '../pdf/pdfCore.js';
+
+const parentPort = typeof process === 'undefined' ? globalThis : (await import('node:worker_threads')).parentPort;
+
+const core = new PdfCore();
+
+/**
+ * Load PDF bytes, parse structure, and store for subsequent page operations.
+ * Called once per PDF on every worker in the pool.
+ * @param {{ pdfBytes: Uint8Array | ArrayBuffer }} args
+ */
+export async function loadPdfForParsing({ pdfBytes }) {
+  return core.load(pdfBytes);
+}
+
+/**
+ * Parse a single page for text extraction + type-detection scoring.
+ * @param {{ pageIndex: number, dpi: number }} args
+ */
+export async function parsePdfPage(args) {
+  return core.parsePage(args);
+}
+
+/**
+ * Render a single page to an image data URL, a JPEG/WebP blob, or a transferable ImageBitmap.
+ * @param {{ pageIndex: number, colorMode: string, dpi?: number, targetWidth?: number, outputFormat?: 'png'|'jpeg'|'webp'|'bitmap', quality?: number,
+ * edits?: ?RenderEdits }} args
+ */
+export async function renderPdfPage(args) {
+  return core.renderPage(args);
+}
+
+/**
+ * The font program the renderer draws a given embedded font with.
+ * @param {{ fontObjNum: number, pageIndex?: number }} args
+ */
+export async function getPdfFontBytes(args) {
+  return core.getFontBytes(args);
+}
+
+/** Every Type 3 font in the file with the outline hash of each glyph, keyed by character code. */
+export async function getPdfType3GlyphHashes() {
+  return core.getType3GlyphHashes();
+}
+
+/**
+ * The glyphs of a page's words as the content stream draws them.
+ * @param {{ pageIndex: number, dpi: number, records: ?Array<ContentEdit>, words: Array<TextEditWordSpec> }} args
+ */
+export async function getPdfLineState(args) {
+  return core.getLineState(args);
+}
+
+/**
+ * The glyphs of a line as a replacement would draw them, for the editor's preview.
+ * @param {{ pageIndex: number, dpi: number, records: ?Array<ContentEdit>, req: import('../pdf/textPatch.js').TextEditRequest }} args
+ */
+export async function previewPdfTextEdit(args) {
+  return core.previewTextEdit(args);
+}
+
+/**
+ * A deletion, style change or replacement of a line's words as content-stream patch records, verified against a re-parse.
+ * @param {{ pageIndex: number, dpi: number, records: ?Array<ContentEdit>, req: import('../pdf/textPatch.js').TextEditRequest, groupId?: string }} args
+ */
+export async function applyPdfTextEdit(args) {
+  return core.applyTextEdit(args);
+}
+
+/**
+ * The decoded bytes of an embedded file stream (a portfolio member or a plain attachment).
+ * @param {{ objNum: number }} args
+ */
+export async function getPdfEmbeddedFileBytes(args) {
+  return core.getEmbeddedFileBytes(args);
+}
+
+/**
+ * Release this worker's loaded PDF and its `_pdf_d${docId}_*` fonts.
+ */
+export async function unloadPdf() {
+  return core.unload();
+}
+
+if (parentPort) {
+  // Browser worker: `parentPort === globalThis` (postMessage + onmessage).
+  // Node worker_thread: `parentPort` is a `MessagePort` (on/postMessage).
+  // The union isn't callable under strict TS; cast to `any`.
+  /** @type {any} */
+  const port = parentPort;
+  const handleMessage = async (/** @type {any[]} */ data) => {
+    const func = data[0];
+    const args = data[1];
+    const id = data[2];
+
+    ({
+      loadPdfForParsing,
+      parsePdfPage,
+      renderPdfPage,
+      getPdfFontBytes,
+      getPdfType3GlyphHashes,
+      getPdfLineState,
+      previewPdfTextEdit,
+      applyPdfTextEdit,
+      getPdfEmbeddedFileBytes,
+      unloadPdf,
+    })[func](args)
+      .then((/** @type {any} */ x) => {
+        // Font and embedded-file bytes are per-call copies, so transferring them detaches nothing shared.
+        const transfer = (typeof ImageBitmap !== 'undefined' && x && x.bitmap instanceof ImageBitmap) ? [x.bitmap]
+          : (x && x.bytes instanceof ArrayBuffer ? [x.bytes] : []);
+        port.postMessage({ data: x, id, status: 'resolve' }, transfer);
+      })
+      .catch((/** @type {any} */ err) => port.postMessage({ data: err, id, status: 'reject' }));
+  };
+
+  if (typeof process === 'undefined') {
+    onmessage = (event) => handleMessage(event.data);
+  } else {
+    port.on('message', handleMessage);
+  }
+
+  port.postMessage({ data: 'ready', id: 0, status: 'resolve' });
+}

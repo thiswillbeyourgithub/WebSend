@@ -18,8 +18,19 @@ export async function initGeneralWorker() {
   }
 
   return new Promise((resolve, reject) => {
+    /** @type {?Error} */
+    let workerError = null;
+
+    // A dead worker never answers, so every pending promise must reject or callers hang forever.
     const errorHandler = (err) => {
       console.error(err);
+      const message = (err && typeof err === 'object' && 'message' in err && err.message) || 'General worker crashed.';
+      workerError = new Error(String(message));
+      workerError.name = 'WorkerCrashError';
+      for (const id of Object.keys(workerPromises)) {
+        workerPromises[id].reject(workerError);
+        delete workerPromises[id];
+      }
     };
 
     if (typeof process === 'undefined') {
@@ -64,32 +75,12 @@ export async function initGeneralWorker() {
      */
     function wrap(func) {
       return function (...args) {
+        if (workerError) return Promise.reject(workerError);
         return new Promise((innerResolve, innerReject) => {
           const id = promiseId++;
           workerPromises[id] = { resolve: innerResolve, reject: innerReject, func };
           worker.postMessage([func, args[0], id]);
         });
-      };
-    }
-
-    /**
-     * Similar to wrap, but handles two promises.
-     * @param {string} func The function name to call.
-     * @returns {Array} Returns two promises in an array.
-     */
-    function wrap2(func) {
-      return function (...args) {
-        const id = promiseId++;
-        const promiseB = new Promise((innerResolve, innerReject) => {
-          workerPromises[`${id}b`] = { resolve: innerResolve, reject: innerReject, func };
-        });
-
-        const promiseA = new Promise((innerResolve, innerReject) => {
-          workerPromises[id] = { resolve: innerResolve, reject: innerReject, func };
-          worker.postMessage([func, args[0], id]);
-        });
-
-        return [promiseA, promiseB];
       };
     }
 
@@ -103,6 +94,7 @@ export async function initGeneralWorker() {
     obj.convertPageGoogleVision = wrap('convertPageGoogleVision');
     obj.convertPageText = wrap('convertPageText');
     obj.convertDocDocx = wrap('convertDocDocx');
+    obj.convertDocMd = wrap('convertDocMd');
 
     obj.optimizeFont = wrap('optimizeFont');
 
@@ -112,18 +104,26 @@ export async function initGeneralWorker() {
     obj.compareOCRPageImp = wrap('compareOCRPageImp');
 
     obj.reinitialize = wrap('reinitialize');
-    obj.reinitialize2 = wrap('reinitialize2');
     obj.recognize = wrap('recognize');
     obj.recognizeAndConvert = wrap('recognizeAndConvert');
-    obj.recognizeAndConvert2 = wrap2('recognizeAndConvert2');
     obj.renderPageStaticImp = wrap('renderPageStaticImp');
 
     obj.loadFontsWorker = wrap('loadFontsWorker');
     obj.updateFontContWorker = wrap('updateFontContWorker');
+    obj.dropFontsWorker = wrap('dropFontsWorker');
 
-    obj.terminate = () => worker.terminate();
+    // A killed worker never answers, so teardown rejects outstanding calls too.
+    obj.terminate = () => {
+      workerError = new Error('General worker terminated.');
+      workerError.name = 'WorkerTerminatedError';
+      for (const id of Object.keys(workerPromises)) {
+        workerPromises[id].reject(workerError);
+        delete workerPromises[id];
+      }
+      return worker.terminate();
+    };
 
-    ready.then(() => resolve(obj));
+    ready.then(() => resolve(obj), reject);
   });
 }
 
@@ -141,11 +141,6 @@ export class gs {
 
   /** Whether built-in fonts have been loaded in workers. */
   static loadedBuiltInFontsRawWorker = false;
-
-  /** Whether optimized fonts have been loaded in workers. */
-  static loadedBuiltInFontsOptWorker = false;
-
-  static loadedBuiltInFontsDocWorker = false;
 
   /** @type {?GeneralScheduler} */
   // static scheduler = null;
@@ -231,6 +226,15 @@ export class gs {
   };
 
   /**
+   * @param {Parameters<typeof import('./import/convertDocMd.js').convertDocMd>[0]} args
+   * @returns {ReturnType<typeof import('./import/convertDocMd.js').convertDocMd>}
+   */
+  static convertDocMd = async (args) => {
+    await gs.getGeneralScheduler();
+    return gs.schedulerInner.addJob('convertDocMd', args);
+  };
+
+  /**
    * @param {Parameters<typeof import('./import/convertPageGoogleVision.js').convertPageGoogleVision>[0]} args
    * @returns {ReturnType<typeof import('./import/convertPageGoogleVision.js').convertPageGoogleVision>}
    */
@@ -279,13 +283,7 @@ export class gs {
    * @param {Parameters<typeof import('./worker/generalWorker.js').recognizeAndConvert>[0]} args
    * @returns {ReturnType<typeof import('./worker/generalWorker.js').recognizeAndConvert>}
    */
-  static recognizeAndConvert = async (args) => (await gs.schedulerInner.addJob('recognizeAndConvert', args));
-
-  /**
-   * @param {Parameters<typeof import('./worker/generalWorker.js').recognizeAndConvert2>[0]} args
-   * @returns {Promise<[ReturnType<typeof import('./worker/generalWorker.js').recognizeAndConvert>, ReturnType<typeof import('./worker/generalWorker.js').recognizeAndConvert>]>}
-   */
-  static recognizeAndConvert2 = async (args) => (await gs.schedulerInner.addJob('recognizeAndConvert2', args));
+  static recognizeAndConvert = async (args, signal = null) => (await gs.schedulerInner.addJob('recognizeAndConvert', args, false, signal));
 
   /**
    * @param {Parameters<typeof import('./worker/compareOCRModule.js').evalPageBase>[0]} args
@@ -364,18 +362,35 @@ export class gs {
 
     if (gs.schedulerReadyTesseract) await gs.schedulerReadyTesseract;
 
+    /** @type {(reason: any) => void} */
+    let rejectReady = () => {};
     gs.schedulerReadyTesseract = new Promise((resolve, reject) => {
       gs.#resReadyTesseract = resolve;
+      rejectReady = reject;
     });
 
     // Wait for the first worker to load.
     // A behavior (likely bug) was observed where, if the workers are loaded in parallel,
     // data will be loaded over network from all workers (rather than downloading once and caching).
     const worker0 = gs.schedulerInner.workers[0];
-    await worker0.reinitialize({ langs, vanillaMode, config });
+    try {
+      await worker0.reinitialize({
+        langs, vanillaMode, config, langPath: opt.langPath,
+      });
+    } catch (err) {
+      // A failed load settles and drops the ready promise, so the next run retries instead of waiting on it forever.
+      const failed = gs.schedulerReadyTesseract;
+      gs.schedulerReadyTesseract = null;
+      gs.#resReadyTesseract = null;
+      rejectReady(err);
+      failed.catch(() => {});
+      throw err;
+    }
 
     if (gs.schedulerInner.workers.length > 0) {
-      const resArr = gs.schedulerInner.workers.slice(1).map((x) => x.reinitialize({ langs, vanillaMode, config }));
+      const resArr = gs.schedulerInner.workers.slice(1).map((x) => x.reinitialize({
+        langs, vanillaMode, config, langPath: opt.langPath,
+      }));
       await Promise.allSettled(resArr);
     }
     // @ts-ignore
@@ -396,17 +411,12 @@ export class gs {
     return gs.schedulerReady;
   };
 
-  static clear = () => {
-    gs.loadedBuiltInFontsOptWorker = false;
-  };
-
   static terminate = async () => {
-    gs.clear();
     // This function can be run while the scheduler is still initializing.
     // This happens when we pre-load the scheduler, but then terminate before it finishes loading,
     // and it is never actually used.
     await gs.schedulerReady;
-    await gs.schedulerInner.terminate();
+    if (gs.schedulerInner) await gs.schedulerInner.terminate();
     gs.schedulerInner = null;
     gs.schedulerReady = null;
     gs.#resReadyTesseract = null;

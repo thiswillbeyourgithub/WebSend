@@ -1,6 +1,5 @@
 // Disabling eslint rules that would increase differences between Java/JavaScript versions.
 /* eslint-disable no-param-reassign */
-const browserMode = typeof process === 'undefined';
 
 export class SVImageHandler {
   /**
@@ -17,8 +16,8 @@ export class SVImageHandler {
   }
 
   /**
-  * @param {string} imgStr
-  */
+   * @param {string} imgStr
+   */
   static imageStrToBuffer(imgStr) {
     const imageBuffer = Buffer.from(imgStr, 'base64');
 
@@ -26,25 +25,22 @@ export class SVImageHandler {
   }
 
   /**
-   * Handles various image formats, always returns a ImageBitmap.
+   * Decode base64 image bytes to a drawable. Browser returns an ImageBitmap;
+   * Node returns an `@scribe.js/canvas` Image — both are accepted by
+   * `ctx.drawImage` on their respective canvas contexts.
    *
    * @param {string} img
-   * @param {import('canvaskit-wasm').CanvasKit} [CanvasKit] - CanvasKit module. Must be defined if running in Node.js.
    */
-  static async readImage(img, CanvasKit) {
+  static async readImage(img) {
     if (img === undefined) throw new Error('Input is undefined');
     if (img === null) throw new Error('Input is null');
 
-    if (browserMode) {
-      const imgBlob = this.imageStrToBlob(img);
-      const imgBit = await createImageBitmap(imgBlob);
-      return imgBit;
+    if (typeof process !== 'undefined') {
+      const { loadImage } = await import('@scribe.js/canvas');
+      return loadImage(this.imageStrToBuffer(img));
     }
 
-    if (CanvasKit === undefined) throw new Error('CanvasKit module must be provided in environments that do not support OffscreenCanvas natively (i.e. Node.js).');
-
-    const imgBuffer = this.imageStrToBuffer(img);
-    const imgBit = CanvasKit.MakeImageFromEncoded(imgBuffer);
-    return imgBit;
+    const imgBlob = this.imageStrToBlob(img);
+    return createImageBitmap(imgBlob);
   }
 }

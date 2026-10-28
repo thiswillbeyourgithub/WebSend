@@ -1,0 +1,4278 @@
+import ocr, { parIsFurniture } from '../objects/ocrObjects.js';
+import {
+  calcBboxUnion, calcLang, cleanFamilyName, mean50, round3, round6,
+} from '../utils/miscUtils.js';
+import {
+  findXrefOffset, parseXref, getPageObjects, getPageContentStream, getPageContentStreams, findFormXObjects, parseFormBBox, parseFormMatrix, findRootObjNum,
+} from './parsePdfUtils.js';
+import { resolveItemDest, buildNameDests, setDestYFrac } from './parseOutline.js';
+import {
+  bytesToLatin1, extractDict, decodePdfName, matMul, decodeTextCodes, resolveNumValue, findTopLevelKeyIndex,
+} from './pdfPrimitives.js';
+import { formatPdfNumber, serializeContentToken, tokenizeContentStream } from './contentStream.js';
+import { applyTextPatchRecords, patchPageContents } from './textPatch.js';
+import { isFullPageImage } from './ocrPageSelection.js';
+import { layoutFieldValue } from './formFieldLayout.js';
+import { ObjectCache } from './objectCache.js';
+
+import { parsePageFonts, glyphInkBox } from './fonts/parsePdfFonts.js';
+import { parsePagePaths } from './parsePdfPaths.js';
+import { detectTableRegions } from './detectPdfTables.js';
+import {
+  extractPdfAnnotations, pdfHighlightToAnnotation, pdfFreeTextToAnnotation, pdfTextAnnotToAnnotation, pdfShapeToAnnotation, pdfRedactToAnnotations,
+} from './parsePdfAnnots.js';
+import { cmykToRgb, parseTintColorSpace, tintComponentsToRGB } from './pdfColorFunctions.js';
+import { assignParagraphs } from '../utils/reflowPars.js';
+import { analyzeLayout } from '../import/analyzeLayout.js';
+import { assignPageLineNums } from '../import/assignPageLineNums.js';
+import { buildStructElemMap, resolveStructElems, docAuthoredByWord } from './structTree.js';
+import { buildOutlineHeadingIndex } from './outlineIndex.js';
+
+/** @typedef {import('./parsePdfUtils.js').PDFToken} PDFToken */
+/** @typedef {import('../objects/ocrObjects.js').OcrPage} OcrPage */
+import {
+  LayoutDataTable, LayoutDataColumn, LayoutDataTablePage, calcTableBbox,
+} from '../objects/layoutObjects.js';
+import { extractTextFromTables } from '../extractTables.js';
+import { substituteFaceResourceEntries } from './substituteFaces.js';
+
+// Above this size a page skips path parsing, which disables table detection, underline detection, and the path-edit inventory (the page reports path-ineligible).
+// Path rendering is unaffected.
+const GRAPHICS_HEAVY_STREAM_BYTES = 2_000_000;
+
+// A glyph-op map tracks clips, so it needs the path and clip operators textOnly drops.
+/**
+ * @param {string} streamText
+ * @param {?GlyphOpMap} glyphOpMap
+ */
+const textPassTokenizerOpts = (streamText, glyphOpMap) => (!glyphOpMap && streamText.length > GRAPHICS_HEAVY_STREAM_BYTES ? { textOnly: true } : null);
+
+// A filter miss means the exact map or ring lookup behind it would also miss.
+// A filter hit can be a false positive, so it must fall through to that lookup.
+const DEDUP_FILTER_BITS = 20;
+const DEDUP_FILTER_MASK = (1 << DEDUP_FILTER_BITS) - 1;
+class PresenceFilter {
+  constructor() {
+    this.slots = new Uint16Array(1 << DEDUP_FILTER_BITS);
+    this.gen = 0;
+  }
+
+  next() {
+    this.gen++;
+    if (this.gen > 65535) { this.slots.fill(0); this.gen = 1; }
+  }
+
+  /** @param {number} h */
+  has(h) { return this.slots[h] === this.gen; }
+
+  /** @param {number} h */
+  add(h) { this.slots[h] = this.gen; }
+}
+/** @type {?PresenceFilter} */
+let dedupBucketFilter = null;
+/** @type {?PresenceFilter} */
+let dedupTmFilter = null;
+const dedupHash = (a, b, c) => (Math.imul(a, 73856093) ^ Math.imul(b, 19349663) ^ Math.imul(c, 83492791)) & DEDUP_FILTER_MASK;
+const SAME_TM_LOOKBACK = 500;
+const sameTmRing = new Float64Array(SAME_TM_LOOKBACK);
+let anchorBaselineScratch = new Float64Array(512);
+
+// Glyphs of one font share these fontInfo objects, so never mutate a glyph's fontInfo.
+/** @type {WeakMap<object, Array<object|undefined>>} */
+const fontInfoVariants = new WeakMap();
+/**
+ * @param {any} font
+ * @param {boolean} boldExtra
+ * @param {boolean} italicExtra
+ */
+function fontInfoFor(font, boldExtra, italicExtra) {
+  const build = () => ({
+    baseName: font.baseName,
+    bold: font.bold || boldExtra,
+    italic: font.italic || italicExtra,
+    smallCaps: font.smallCaps,
+    familyName: font.familyName,
+    ascent: font.ascent,
+    descent: font.descent,
+  });
+  if (!font || typeof font !== 'object') return build();
+  let variants = fontInfoVariants.get(font);
+  if (!variants) { variants = [undefined, undefined, undefined, undefined]; fontInfoVariants.set(font, variants); }
+  const slot = (boldExtra ? 2 : 0) + (italicExtra ? 1 : 0);
+  let info = variants[slot];
+  if (!info) { info = build(); variants[slot] = info; }
+  return info;
+}
+
+/**
+ * Empty a reusable operand stack in place.
+ * Use this instead of `stack.length = 0`, which makes V8 drop the backing store and reallocate it on the next push.
+ * @param {Array<any>} stack
+ */
+function clearStack(stack) {
+  while (stack.length > 0) stack.pop();
+}
+
+// A page whose grouped path placements exceed this cap reports path-ineligible instead of exposing a partial inventory.
+// Designed reports measure ~650 placements per page and chart pages ~1,250, so real documents fit under it.
+const PATH_PLACEMENT_CAP = 2000;
+
+// Inline and illustrative marked-content tags (/Span, /Figure, /Artifact) are excluded: they do not mark paragraph boundaries.
+const STRUCTURAL_MC_TAGS = new Set(['P', 'H', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LBody', 'Lbl', 'LI', 'Title', 'Caption', 'BlockQuote', 'Note', 'TOCI', 'Reference', 'Quote', 'Code']);
+
+/** Min height, in pt, for a vector path or image strip to count as glyph-like. */
+const PATH_TEXT_H_MIN = 3;
+/** Max height, in pt, for a vector path or image strip to count as glyph-like. */
+const PATH_TEXT_H_MAX = 80;
+
+/**
+ * Normalize a PDF color to [r,g,b] in 0-1 for cross-color-space comparison.
+ * @param {number[]} c
+ */
+export function colorToRgb(c) {
+  if (c.length === 1) return [c[0], c[0], c[0]];
+  if (c.length === 3) return [c[0], c[1], c[2]];
+  if (c.length === 4) {
+    const [r, g, b] = cmykToRgb(c[0], c[1], c[2], c[3]);
+    return [r / 255, g / 255, b / 255];
+  }
+  return null;
+}
+
+/**
+ * Format an [r,g,b] (0..1) tuple as a lowercase '#rrggbb' hex string.
+ * @param {number[]} rgb
+ */
+export function rgbToHex(rgb) {
+  /** @param {number} x */
+  const clamp = (x) => Math.max(0, Math.min(255, Math.round(x * 255)));
+  /** @param {number} x */
+  const hex = (x) => clamp(x).toString(16).padStart(2, '0');
+  return `#${hex(rgb[0])}${hex(rgb[1])}${hex(rgb[2])}`;
+}
+
+/**
+ * Parse the ExtGState dictionary from a page (or Form XObject) /Resources entry,
+ * returning a map of GS name → { fillAlpha }.
+ * @param {string} containerObjText
+ * @param {ObjectCache} objCache
+ */
+function parseFillAlphaExtGStates(containerObjText, objCache) {
+  /** @type {Map<string, { fillAlpha: ?number }>} */
+  const states = new Map();
+
+  let resourcesText = containerObjText;
+  const resRefMatch = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(containerObjText);
+  if (resRefMatch) {
+    const resObj = objCache.getObjectText(Number(resRefMatch[1]));
+    if (resObj) resourcesText = resObj;
+  }
+
+  const gsStart = resourcesText.indexOf('/ExtGState');
+  if (gsStart === -1) return states;
+
+  let gsDictText;
+  const afterGs = resourcesText.substring(gsStart + 10).trim();
+  if (afterGs.startsWith('<<')) {
+    gsDictText = extractDict(resourcesText, gsStart + 10 + resourcesText.substring(gsStart + 10).indexOf('<<'));
+  } else {
+    const gsRefMatch = /^(\d+)\s+\d+\s+R/.exec(afterGs);
+    if (gsRefMatch) {
+      const gsObj = objCache.getObjectText(Number(gsRefMatch[1]));
+      if (gsObj) gsDictText = gsObj;
+    }
+  }
+  if (!gsDictText) return states;
+
+  let i = 2;
+  while (i < gsDictText.length) {
+    if (gsDictText[i] !== '/') { i++; continue; }
+    let j = i + 1;
+    while (j < gsDictText.length && !/[\s/<>[\]]/.test(gsDictText[j])) j++;
+    const gsName = gsDictText.substring(i + 1, j);
+    while (j < gsDictText.length && /\s/.test(gsDictText[j])) j++;
+    let gsBody;
+    if (gsDictText.startsWith('<<', j)) {
+      gsBody = extractDict(gsDictText, j);
+      i = j + gsBody.length;
+    } else {
+      const refMatch = /^(\d+)\s+\d+\s+R/.exec(gsDictText.substring(j));
+      if (refMatch) {
+        const refObj = objCache.getObjectText(Number(refMatch[1]));
+        gsBody = refObj || '';
+        i = j + refMatch[0].length;
+      } else {
+        i = j + 1;
+        continue;
+      }
+    }
+    const ca = resolveNumValue(gsBody, 'ca', objCache, Number.NaN);
+    states.set(gsName, { fillAlpha: Number.isNaN(ca) ? null : ca });
+  }
+  return states;
+}
+
+const SYMBOL_FONT_RE = /^(?:Webdings|Wingdings|ZapfDingbats|Dingbats|Symbol|SymbolMT|Quivira)(?:[-\s].*)?$/i;
+
+/**
+ * @param {{ familyName?: string, symbolicFlag?: boolean } | null | undefined} fontInfo
+ */
+function isSymbolFont(fontInfo) {
+  if (!fontInfo) return false;
+  return SYMBOL_FONT_RE.test(fontInfo.familyName || '');
+}
+
+const SYMBOL_CHAR_RE = /[•‣⁃∙─-➿]/;
+
+function isSymbolChar(text = '') {
+  return text.length > 0 && SYMBOL_CHAR_RE.test(text);
+}
+
+// Fonts used essentially only for mathematics: TeX Computer Modern and Latin Modern math faces, the AMS, Euler, and formal-script alphabets, MathTime, MathJax, and OpenType "...Math" families.
+// Text Computer Modern faces (CMR, CMBX, CMTI) are deliberately not matched: they set ordinary TeX prose, which must not read as math.
+// baseName is already subset-prefix-stripped upstream, so the anchored test works.
+const MATH_FONT_RE = /^(?:CM(?:MI|SY|EX)|lm(?:mi|sy|ex)|MS[AB]M|EUF[MB]|EUS[MB]|RSFS|MT(?:MI|SY|EX))|MathJax|[A-Za-z]*Math\b/i;
+
+// Unicode near-exclusive to mathematics: the Mathematical Operators, Miscellaneous Mathematical Symbols-A/B, and Supplemental Operators blocks, the math alphanumerics, and math letterlike symbols.
+// Prose-common symbols (plus-minus, degree, section, dashes, primes) and Greek are deliberately excluded, since both are routine in ordinary text.
+const MATH_CHAR_RE = /[ℂℏℑℕ℘ℚℜℝℤℵ∀-⋿⟀-⟯⦀-⧿⨀-⫿\u{1D400}-\u{1D7FF}]/u;
+
+/** @type {WeakMap<object, boolean>} */
+const mathFontCache = new WeakMap();
+/** @type {WeakMap<object, boolean>} */
+const symbolFontCache = new WeakMap();
+
+/** @param {PositionedChar} ch */
+function isMathFontChar(ch) {
+  const font = ch._font;
+  if (!font || typeof font !== 'object') return MATH_FONT_RE.test(ch.fontInfo.baseName || '');
+  let hit = mathFontCache.get(font);
+  if (hit === undefined) {
+    hit = MATH_FONT_RE.test(ch.fontInfo.baseName || '');
+    mathFontCache.set(font, hit);
+  }
+  return hit;
+}
+
+/** @param {PositionedChar} ch */
+function isSymbolFontChar(ch) {
+  const font = ch._font;
+  if (!font || typeof font !== 'object') return isSymbolFont(ch.fontInfo);
+  let hit = symbolFontCache.get(font);
+  if (hit === undefined) {
+    hit = isSymbolFont(ch.fontInfo);
+    symbolFontCache.set(font, hit);
+  }
+  return hit;
+}
+
+/**
+ * @param {string} text
+ */
+function isRadicalText(text) {
+  if (text.length !== 1) return false;
+  const cc = text.charCodeAt(0);
+  return cc === 0x221A || cc === 0x221B || cc === 0x221C;
+}
+
+const BULLET_CHAR_RE = /[·•‣⁃∙■-◿・]/;
+
+function isBulletChar(text = '') {
+  return text.length > 0 && BULLET_CHAR_RE.test(text);
+}
+
+/**
+ * @param {Array<PDFToken>} tokens
+ * @param {Map<string, { objNum: number }>} formXObjects
+ * @param {number[]} initialCtm
+ * @param {{ tc: number, tw: number, tl: number, tz: number, trise: number, artifact?: boolean }} [initialTextState]
+ */
+function findDoOperators(tokens, formXObjects, initialCtm, initialTextState) {
+  const doOps = [];
+  let ctm = initialCtm.slice();
+  const ctmStack = [];
+  const operandStack = [];
+  let tc = initialTextState ? initialTextState.tc : 0;
+  let tw = initialTextState ? initialTextState.tw : 0;
+  let tl = initialTextState ? initialTextState.tl : 0;
+  let tz = initialTextState ? initialTextState.tz : 100;
+  let trise = initialTextState ? initialTextState.trise : 0;
+  // Track /Artifact marked-content spans so a Form XObject invoked inside one inherits the furniture flag (matching executeTextOperators).
+  /** @type {Array<boolean>} */
+  const mcStack = [];
+  let artifactDepth = (initialTextState && initialTextState.artifact) ? 1 : 0;
+  /** @type {Array<{ ctm: number[], tc: number, tw: number, tl: number, tz: number, trise: number }>} */
+  const gsStack = [];
+
+  // for...of can allocate an iterator result object per token, which adds up on pages with millions of tokens.
+  for (let ti = 0; ti < tokens.length; ti++) {
+    const tok = tokens[ti];
+    if (tok.type !== 'operator') {
+      operandStack.push(tok);
+      continue;
+    }
+    switch (tok.value) {
+      case 'BDC':
+      case 'BMC': {
+        const tagTok = operandStack[0];
+        const isArtifact = !!(tagTok && tagTok.type === 'name' && tagTok.value === 'Artifact');
+        mcStack.push(isArtifact);
+        if (isArtifact) artifactDepth++;
+        break;
+      }
+      case 'EMC': {
+        const wasArtifact = mcStack.pop();
+        if (wasArtifact && artifactDepth > 0) artifactDepth--;
+        break;
+      }
+      case 'q':
+        ctmStack.push(ctm.slice());
+        gsStack.push({
+          ctm: ctm.slice(), tc, tw, tl, tz, trise,
+        });
+        break;
+      case 'Q':
+        if (ctmStack.length > 0) ctm = ctmStack.pop();
+        if (gsStack.length > 0) {
+          const saved = /** @type {NonNullable<ReturnType<typeof gsStack.pop>>} */ (gsStack.pop());
+          tc = saved.tc; tw = saved.tw; tl = saved.tl; tz = saved.tz; trise = saved.trise;
+        }
+        break;
+      case 'cm':
+        if (operandStack.length >= 6) {
+          const n = operandStack.length;
+          ctm = matMul([operandStack[n - 6].value, operandStack[n - 5].value, operandStack[n - 4].value, operandStack[n - 3].value, operandStack[n - 2].value, operandStack[n - 1].value], ctm);
+        }
+        break;
+      case 'Tc':
+        if (operandStack.length >= 1) tc = operandStack[operandStack.length - 1].value;
+        break;
+      case 'Tw':
+        if (operandStack.length >= 1) tw = operandStack[operandStack.length - 1].value;
+        break;
+      case 'TL':
+        if (operandStack.length >= 1) tl = operandStack[operandStack.length - 1].value;
+        break;
+      case 'Tz':
+        if (operandStack.length >= 1) tz = operandStack[operandStack.length - 1].value;
+        break;
+      case 'Ts':
+        if (operandStack.length >= 1) trise = operandStack[operandStack.length - 1].value;
+        break;
+      case 'TD':
+        // TD also sets leading: -ty.
+        if (operandStack.length >= 2) tl = -operandStack[operandStack.length - 1].value;
+        break;
+      case 'Do':
+        if (operandStack.length >= 1) {
+          const name = operandStack[operandStack.length - 1].value;
+          if (formXObjects.has(name)) {
+            doOps.push({
+              name,
+              ctm: ctm.slice(),
+              textState: {
+                tc, tw, tl, tz, trise, artifact: artifactDepth > 0,
+              },
+            });
+          }
+        }
+        break;
+      default:
+        break;
+    }
+    clearStack(operandStack);
+  }
+
+  return doOps;
+}
+
+/**
+ * Parse the Separation/DeviceN color space entries of a page or Form XObject /Resources dict.
+ * These are the spaces a text fill color can select via `cs` + `scn`.
+ * @param {string} containerObjText
+ * @param {ObjectCache} objCache
+ * @returns {Map<string, {nInputs: number, tint: object}>}
+ */
+function parseTextColorSpaces(containerObjText, objCache) {
+  const map = new Map();
+  let resourcesText = null;
+  const resRefMatch = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(containerObjText);
+  if (resRefMatch) {
+    resourcesText = objCache.getObjectText(Number(resRefMatch[1])) || null;
+  } else {
+    const resIdx = containerObjText.indexOf('/Resources');
+    if (resIdx !== -1) {
+      const dictStart = containerObjText.indexOf('<<', resIdx);
+      if (dictStart !== -1) resourcesText = extractDict(containerObjText, dictStart);
+    }
+  }
+  if (!resourcesText) return map;
+  // Nested Shading/Pattern dicts carry their own /ColorSpace keys.
+  const resBody = resourcesText.startsWith('<<') ? resourcesText.slice(2) : resourcesText;
+  const csIdx = findTopLevelKeyIndex(resBody, '/ColorSpace');
+  if (csIdx === -1) return map;
+  let csDictText = null;
+  const afterCs = resBody.substring(csIdx + 11).trim();
+  if (afterCs.startsWith('<<')) {
+    csDictText = extractDict(resBody, csIdx + 11 + resBody.substring(csIdx + 11).indexOf('<<'));
+  } else {
+    const refMatch = /^(\d+)\s+\d+\s+R/.exec(afterCs);
+    if (refMatch) csDictText = objCache.getObjectText(Number(refMatch[1]));
+  }
+  if (!csDictText) return map;
+  /** @param {string} name @param {?string} csText */
+  const addEntry = (name, csText) => {
+    if (!csText || !/\/(Separation|DeviceN)\b/.test(csText)) return;
+    const tint = parseTintColorSpace(csText, objCache);
+    if (tint && tint.tintFn) map.set(name, { nInputs: tint.nInputs, tint });
+  };
+  for (const m of csDictText.matchAll(/\/([^\s/<>[\]]+)\s+(\d+)\s+\d+\s+R/g)) {
+    addEntry(m[1], objCache.getObjectText(Number(m[2])));
+  }
+  // A Separation/DeviceN array nests its alternate space, as in `[/Separation /Black [/ICCBased 27 0 R] 28 0 R]`, so the entry runs to the balanced close bracket.
+  // Stopping at the first one drops the tint function that follows it.
+  for (const m of csDictText.matchAll(/\/([^\s/<>[\]]+)\s*\[/g)) {
+    const arrStart = m.index + m[0].length - 1;
+    let depth = 0;
+    let arrEnd = -1;
+    for (let i = arrStart; i < csDictText.length; i++) {
+      if (csDictText[i] === '[') depth++;
+      else if (csDictText[i] === ']') {
+        depth--;
+        if (depth === 0) {
+          arrEnd = i + 1;
+          break;
+        }
+      }
+    }
+    if (arrEnd > 0) addEntry(m[1], csDictText.substring(arrStart, arrEnd));
+  }
+  return map;
+}
+
+/**
+ * The bounds of a rectangle after a matrix maps its corners, as `[x0, y0, x1, y1]`.
+ * @param {number[]} rect - `[x0, y0, x1, y1]`
+ * @param {number[]} m
+ * @returns {number[]}
+ */
+function transformedRectBounds(rect, m) {
+  const xs = [];
+  const ys = [];
+  for (const [x, y] of [[rect[0], rect[1]], [rect[2], rect[1]], [rect[2], rect[3]], [rect[0], rect[3]]]) {
+    xs.push(m[0] * x + m[2] * y + m[4]);
+    ys.push(m[1] * x + m[3] * y + m[5]);
+  }
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+/**
+ * The intersection of two regions, where null stands for no bound.
+ * @param {?number[]} a
+ * @param {?number[]} b
+ * @returns {?number[]}
+ */
+function intersectRects(a, b) {
+  if (!a) return b ? b.slice() : null;
+  if (!b) return a.slice();
+  return [Math.max(a[0], b[0]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.min(a[3], b[3])];
+}
+
+/**
+ * Recursively extract text from Form XObjects referenced by Do operators.
+ * @param {string} containerObjText
+ * @param {Array<PDFToken>} containerTokens
+ * @param {Map} parentFonts
+ * @param {number} scale
+ * @param {number} pageHeightPts
+ * @param {number[]} containerCtm
+ * @param {ObjectCache} objCache
+ * @param {Set<number>} visited
+ * @param {Map<string, { fillAlpha: ?number }>} [parentExtGStates]
+ * @param {{ tc: number, tw: number, tl: number, tz: number, trise: number }} [parentTextState]
+ * @param {Map<string, {nInputs: number, tint: object}>} [parentColorSpaces]
+ * @param {?GlyphOpMap} [glyphOpMap]
+ * @param {?Array<ContentEdit>} [records] - The page's edit records.
+ * @param {string} [pathPrefix] - The name path of the enclosing form plus a slash, empty at page level.
+ * @param {?Array<{ name: string, visible: ?number[] }>} [containerDos] - With a glyph-op map, the container's `Do` operators in stream order with the region visible at each.
+ */
+function extractFormXObjectText(containerObjText, containerTokens, parentFonts, scale, pageHeightPts, containerCtm,
+  objCache, visited, parentExtGStates, parentTextState, parentColorSpaces, glyphOpMap = null, records = null, pathPrefix = '', containerDos = null) {
+  const chars = [];
+  const formXObjects = findFormXObjects(containerObjText, objCache);
+  if (formXObjects.size === 0) return chars;
+
+  const doOps = findDoOperators(containerTokens, formXObjects, containerCtm, parentTextState);
+  // Both walks list the container's Do operators in stream order, so each form's visible region is the next record of its name.
+  let doCursor = 0;
+  for (const doOp of doOps) {
+    /** @type {?number[]} */
+    let visibleAtDo = null;
+    if (containerDos) {
+      while (doCursor < containerDos.length && containerDos[doCursor].name !== doOp.name) doCursor += 1;
+      if (doCursor < containerDos.length) visibleAtDo = containerDos[doCursor].visible;
+      doCursor += 1;
+    }
+    const form = formXObjects.get(doOp.name);
+    if (visited.has(form.objNum)) continue;
+    visited.add(form.objNum);
+
+    const formObjText = objCache.getObjectText(form.objNum);
+    if (!formObjText) continue;
+    const formBytes = objCache.getStreamBytes(form.objNum);
+    if (!formBytes) continue;
+    const formPath = `${pathPrefix}${doOp.name}`;
+    const formStream = { kind: /** @type {'form'} */ ('form'), path: formPath };
+    const formPatched = applyTextPatchRecords(bytesToLatin1(formBytes), records, formStream);
+    const formContentStream = formPatched.text;
+    const formFonts = parsePageFonts(formObjText, objCache);
+    const mergedFonts = new Map([...parentFonts, ...formFonts]);
+    const formExtGStates = parseFillAlphaExtGStates(formObjText, objCache);
+    const mergedExtGStates = formExtGStates.size > 0
+      ? new Map([...(parentExtGStates || []), ...formExtGStates])
+      : parentExtGStates;
+    const formColorSpaces = parseTextColorSpaces(formObjText, objCache);
+    const mergedColorSpaces = formColorSpaces.size > 0
+      ? new Map([...(parentColorSpaces || []), ...formColorSpaces])
+      : parentColorSpaces;
+    const formMatrix = parseFormMatrix(formObjText, objCache);
+    const formCtm = matMul(formMatrix, doOp.ctm);
+    const formTokens = tokenizeContentStream(formContentStream, textPassTokenizerOpts(formContentStream, glyphOpMap));
+    /** @type {?number[]} */
+    let formVisible = null;
+    if (glyphOpMap) {
+      const bbox = parseFormBBox(formObjText, objCache);
+      formVisible = bbox ? intersectRects(visibleAtDo, transformedRectBounds(bbox, formCtm)) : visibleAtDo;
+      glyphOpMap.stream = formStream;
+      glyphOpMap.streams.push({
+        stream: glyphOpMap.stream,
+        text: formContentStream,
+        tokens: formTokens,
+        segments: formPatched.segments,
+        fonts: mergedFonts,
+        extGStates: mergedExtGStates,
+        colorSpaces: mergedColorSpaces,
+        dos: [],
+      });
+    }
+    const formEntry = glyphOpMap ? glyphOpMap.streams[glyphOpMap.streams.length - 1] : null;
+    const formChars = executeTextOperators(
+      formTokens, mergedFonts, scale, pageHeightPts, formCtm, mergedExtGStates, doOp.textState, mergedColorSpaces, glyphOpMap, formVisible,
+    );
+    for (let ci = 0; ci < formChars.length; ci++) chars.push(formChars[ci]);
+
+    // Recurse into nested form XObjects within this form's content stream.
+    const nestedChars = extractFormXObjectText(
+      formObjText, formTokens, mergedFonts, scale, pageHeightPts, formCtm, objCache, visited, mergedExtGStates, doOp.textState, mergedColorSpaces,
+      glyphOpMap, records, `${formPath}/`, formEntry ? formEntry.dos : null,
+    );
+    for (let ci = 0; ci < nestedChars.length; ci++) chars.push(nestedChars[ci]);
+  }
+
+  return chars;
+}
+
+/**
+ * @typedef {{ printable: number, printableVis: number, pua: number, control: number, controlVis: number, visibleAll: number }} CharStats
+ */
+
+/**
+ * Categorize positioned characters for type-detection scoring.
+ * @param {Array<PositionedChar>} chars
+ * @returns {CharStats}
+ */
+function scorePageChars(chars) {
+  let printable = 0;
+  let printableVis = 0;
+  let pua = 0;
+  let control = 0;
+  let controlVis = 0;
+  let visibleAll = 0;
+  for (let chI = 0; chI < chars.length; chI++) {
+    const ch = chars[chI];
+    const codePoint = ch.text.codePointAt(0);
+    if (codePoint === undefined) continue;
+    if (codePoint >= 33 && codePoint <= 127) {
+      printable++;
+      if (!ch.invisible) { printableVis++; visibleAll++; }
+    } else if (codePoint >= 0xE000 && codePoint <= 0xF8FF) {
+      pua++;
+      if (!ch.invisible) visibleAll++;
+    } else if (codePoint >= 161) {
+      printable++;
+      if (!ch.invisible) { printableVis++; visibleAll++; }
+    } else if (codePoint < 32 || codePoint === 65533) {
+      control++;
+      if (!ch.invisible) { controlVis++; visibleAll++; }
+    }
+  }
+  return {
+    printable, printableVis, pua, control, controlVis, visibleAll,
+  };
+}
+
+/**
+ * Determine PDF type from per-page character statistics.
+ * @param {Array<{ invisibleTextChars: number, printableVis: number, control: number, controlVis: number }>} pageStats
+ * @param {number} pageCount
+ */
+export function determinePdfType(pageStats, pageCount) {
+  let letterCountTotal = 0;
+  let letterCountVis = 0;
+  let pageCountTotalText = 0;
+  let pageCountVisText = 0;
+  for (const s of pageStats) {
+    const printable = s.invisibleTextChars + s.printableVis;
+    const pageScoreTotal = printable - 5 * s.control;
+    const pageScoreVis = s.printableVis - 5 * s.controlVis;
+    letterCountTotal += pageScoreTotal;
+    letterCountVis += pageScoreVis;
+    if (pageScoreTotal >= 100) pageCountTotalText++;
+    if (pageScoreVis >= 100) pageCountVisText++;
+  }
+
+  /** @type {"image" | "text" | "ocr"} */
+  let type = 'image';
+  if (letterCountTotal >= pageCount * 100
+    && letterCountVis >= letterCountTotal * 0.9
+    && pageCountVisText >= pageCount / 2) {
+    type = 'text';
+  } else if (letterCountTotal >= pageCount * 100
+    && pageCountTotalText >= pageCount / 2) {
+    type = 'ocr';
+  }
+
+  return { type };
+}
+
+/**
+ * @typedef {Object} LinkDestInfo
+ * Document-level context for resolving an internal /Link annotation's destination to a page index.
+ * @property {Map<number, number>} objNumToIndex - Page object number to zero-based page index.
+ * @property {Array<{ objNum: number, mediaBox: number[], cropBox: number[]|null, rotate: number }>} pages - Page objects in document order.
+ * @property {?Map<string, string>} nameDests - Named-destination map, filled lazily on the first internal link and memoized across pages.
+ */
+
+const brokenFontCache = new WeakMap();
+const brokenToUnicodeFont = (f) => {
+  if (!f || !f.toUnicode || f.toUnicode.size === 0) return false;
+  const cached = brokenFontCache.get(f);
+  if (cached !== undefined) return cached;
+  const fillerHashes = new Set();
+  // Subset producers pad Type3 fonts by stamping one filler outline across many charCodes, so glyphs sharing an outline are skipped rather than counted as mappings.
+  if (f.type3) {
+    const enc = f.type3.encoding || {};
+    const glyphs = f.type3.glyphs || {};
+    const hashCount = new Map();
+    for (const [cc] of f.toUnicode) {
+      const g = glyphs[enc[cc]];
+      if (g && g.pathHash) hashCount.set(g.pathHash, (hashCount.get(g.pathHash) || 0) + 1);
+    }
+    for (const [hash, count] of hashCount) {
+      if (count >= 3) fillerHashes.add(hash);
+    }
+  }
+  let mapped = 0;
+  let broken = 0;
+  for (const [cc, str] of f.toUnicode) {
+    if (fillerHashes.size > 0) {
+      const g = f.type3.glyphs?.[f.type3.encoding?.[cc]];
+      if (g && g.pathHash && fillerHashes.has(g.pathHash)) continue;
+    }
+    mapped++;
+    if (!str) continue;
+    const cp = str.codePointAt(0);
+    if ((cp >= 0xE000 && cp <= 0xF8FF) || cp === 0xFFFD) broken++;
+  }
+  const isBroken = broken >= 3 && broken >= mapped * 0.5;
+  brokenFontCache.set(f, isBroken);
+  return isBroken;
+};
+
+/**
+ * Process a single PDF page: parse fonts, extract text, compute type-detection scores.
+ * @param {{ objText: string, mediaBox: number[], cropBox: number[]|null, rotate: number }} page
+ * @param {ObjectCache} objCache
+ * @param {number} n - Page index
+ * @param {number} dpi
+ * @param {Map<string, string>} [type3GlyphMappings] - See `extractPDFTextDirect`.
+ * @param {LinkDestInfo} [destInfo] - When present, internal /Link annotations are lifted.
+ *   Without it only URI links are captured.
+ * @param {?GlyphOpMap} [glyphOpMap] - When given, receives the page's streams, show operators, glyphs and words.
+ * @param {?Array<ContentEdit>} [records] - The page's edit records, whose text patches are applied to its streams before they are parsed.
+ */
+export function parseSinglePage(page, objCache, n, dpi, type3GlyphMappings, destInfo, glyphOpMap = null, records = null) {
+  const {
+    objText, mediaBox, cropBox, rotate,
+  } = page;
+  const effectiveBox = cropBox || mediaBox;
+  // Box corners may be stored in either order, so use absolute size and a lower-left origin.
+  const contentWidthPts = Math.abs(effectiveBox[2] - effectiveBox[0]);
+  const contentHeightPts = Math.abs(effectiveBox[3] - effectiveBox[1]);
+
+  // Baking the box origin into the CTM matches how the renderer handles CropBox offsets.
+  const boxOriginX = Math.min(effectiveBox[0], effectiveBox[2]);
+  const boxOriginY = Math.min(effectiveBox[1], effectiveBox[3]);
+  let initialCtm = [1, 0, 0, 1, -boxOriginX, -boxOriginY];
+  let visualWidthPts = contentWidthPts;
+  let visualHeightPts = contentHeightPts;
+  if (rotate === 90) {
+    initialCtm = [0, -1, 1, 0, -boxOriginY, contentWidthPts + boxOriginX];
+    visualWidthPts = contentHeightPts;
+    visualHeightPts = contentWidthPts;
+  } else if (rotate === 180) {
+    initialCtm = [-1, 0, 0, -1, contentWidthPts + boxOriginX, contentHeightPts + boxOriginY];
+  } else if (rotate === 270) {
+    initialCtm = [0, 1, -1, 0, contentHeightPts + boxOriginY, -boxOriginX];
+    visualWidthPts = contentHeightPts;
+    visualHeightPts = contentWidthPts;
+  }
+
+  // The width cap matches renderPdfPage.js and imageContainer.js.
+  // Without it, wide pages produce text positions in a larger coordinate space than the rendered image, misaligning the overlay.
+  const maxWidth = 3500;
+  const scale300 = dpi / 72;
+  const fullWidth = Math.round(visualWidthPts * scale300);
+  const scale = fullWidth > maxWidth ? maxWidth / visualWidthPts : scale300;
+
+  const pageWidth = Math.round(visualWidthPts * scale);
+  const pageHeight = Math.round(visualHeightPts * scale);
+
+  const fonts = parsePageFonts(objText, objCache, type3GlyphMappings);
+  // A patched stream can name a synthesized substitute face that the page's /Resources do not list.
+  const substituteEntries = substituteFaceResourceEntries(objCache, records);
+  if (substituteEntries) for (const [tag, f] of parsePageFonts(`<</Resources<</Font<<${substituteEntries}>>>>>>`, objCache, type3GlyphMappings)) fonts.set(tag, f);
+
+  const contentEntries = getPageContentStreams(objText, objCache);
+  const pagePatched = contentEntries && contentEntries.length > 0 ? patchPageContents(contentEntries, records) : null;
+  const contentStreamText = pagePatched ? pagePatched.text : null;
+  if (!contentStreamText) {
+    const pageObj = new ocr.OcrPage(n, { width: pageWidth, height: pageHeight });
+    const pageStats = {
+      largestImageFrac: 0,
+      invisibleTextChars: 0,
+      visibleChars: 0,
+      visibleReadableChars: 0,
+      printableVis: 0,
+      control: 0,
+      controlVis: 0,
+      pathTextCandidates: 0,
+      imageTextCandidates: 0,
+      longestBrokenRun: 0,
+      pageSize: [Math.round(visualWidthPts), Math.round(visualHeightPts)],
+    };
+    return {
+      pageObj, langSet: new Set(), fontSet: new Set(), dataTablePage: new LayoutDataTablePage(n), pageStats,
+    };
+  }
+
+  const tokens = tokenizeContentStream(contentStreamText, textPassTokenizerOpts(contentStreamText, glyphOpMap));
+  const extGStates = parseFillAlphaExtGStates(objText, objCache);
+  const textColorSpaces = parseTextColorSpaces(objText, objCache);
+  if (glyphOpMap) {
+    glyphOpMap.stream = { kind: 'page' };
+    glyphOpMap.pageHeightPts = visualHeightPts;
+    glyphOpMap.scale = scale;
+    glyphOpMap.streams.push({
+      stream: glyphOpMap.stream,
+      text: contentStreamText,
+      tokens,
+      segments: pagePatched.segments,
+      fonts,
+      extGStates,
+      colorSpaces: textColorSpaces,
+      dos: [],
+    });
+  }
+  let chars = executeTextOperators(tokens, fonts, scale, visualHeightPts, initialCtm, extGStates, undefined, textColorSpaces, glyphOpMap,
+    glyphOpMap ? [0, 0, visualWidthPts, visualHeightPts] : null);
+
+  const formChars = extractFormXObjectText(
+    objText, tokens, fonts, scale, visualHeightPts, initialCtm, objCache, new Set(), extGStates, undefined, textColorSpaces, glyphOpMap, records, '',
+    glyphOpMap ? glyphOpMap.streams[0].dos : null,
+  );
+  for (let ci = 0; ci < formChars.length; ci++) chars.push(formChars[ci]);
+
+  // Producers place slug metadata outside the CropBox, which must not reach the extracted text.
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const ch = chars[i];
+    const margin = ch.fontSize || 0;
+    if (ch.x + margin < 0 || ch.x > pageWidth + margin
+        || ch.y + margin < 0 || ch.y > pageHeight + margin) {
+      chars.splice(i, 1);
+    }
+  }
+
+  // The dedup bucket scales with font size because narrow adjacent chars can sit less than 1 unit apart.
+  // A 3x3 neighborhood check catches positions that straddle a bucket boundary.
+  // The (x, y) bucket packs into one integer Map key rather than a per-char string, avoiding that allocation.
+  const DEDUP_COORD_OFF = 33554432; // 2^25, biases bucket indices non-negative and sits above any index the 0.25 minimum bucket size can produce
+  const DEDUP_COORD_MUL = 67108864; // 2^26, spaces the x bucket above the y bucket so the two never overlap
+  /** @type {Map<number, PositionedChar | PositionedChar[]>} */
+  const seenByBucket = new Map();
+  if (!dedupBucketFilter) dedupBucketFilter = new PresenceFilter();
+  const bucketFilter = dedupBucketFilter;
+  bucketFilter.next();
+  const dedupedChars = [];
+  const classOf = (/** @type {PositionedChar} */ g) => Math.round(g.fontSize * 10) * 4 + (g.fontInfo.bold ? 2 : 0) + (g.fontInfo.italic ? 1 : 0);
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const flagsSize = classOf(ch);
+    const bucketSize = Math.max(0.25, ch.fontSize * 0.05);
+    const xb = Math.round(ch.x / bucketSize);
+    const yb = Math.round(ch.y / bucketSize);
+    let occupied = false;
+    for (let dx = -1; dx <= 1 && !occupied; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        if (bucketFilter.has(dedupHash(xb + dx, yb + dy, 0))) { occupied = true; break; }
+      }
+    }
+    /** @type {?PositionedChar} */
+    let dupOf = null;
+    if (occupied) {
+      for (let dx = -1; dx <= 1 && !dupOf; dx++) {
+        for (let dy = -1; dy <= 1 && !dupOf; dy++) {
+          const placed = seenByBucket.get((xb + dx + DEDUP_COORD_OFF) * DEDUP_COORD_MUL + (yb + dy + DEDUP_COORD_OFF));
+          if (!placed) continue;
+          if (Array.isArray(placed)) {
+            for (let k = 0; k < placed.length; k++) {
+              const g = placed[k];
+              if (g.text === ch.text && g.fontInfo.familyName === ch.fontInfo.familyName && classOf(g) === flagsSize) { dupOf = g; break; }
+            }
+          } else if (placed.text === ch.text && placed.fontInfo.familyName === ch.fontInfo.familyName && classOf(placed) === flagsSize) {
+            dupOf = placed;
+          }
+        }
+      }
+    }
+    if (dupOf) continue;
+    const bucketKey = (xb + DEDUP_COORD_OFF) * DEDUP_COORD_MUL + (yb + DEDUP_COORD_OFF);
+    const placed = seenByBucket.get(bucketKey);
+    if (!placed) seenByBucket.set(bucketKey, ch);
+    else if (Array.isArray(placed)) placed.push(ch);
+    else seenByBucket.set(bucketKey, [placed, ch]);
+    bucketFilter.add(dedupHash(xb, yb, 0));
+    dedupedChars.push(ch);
+  }
+  chars = dedupedChars;
+
+  const charStats = scorePageChars(chars);
+
+  // bodyReadableChars excludes the top/bottom 10% header/footer band to avoid counting header/footer text added in processing.
+  let longestBrokenRun = 0;
+  let brokenRun = 0;
+  let printableVisNonBroken = 0;
+  let bodyReadableChars = 0;
+  const bodyTop = pageHeight * 0.1;
+  const bodyBottom = pageHeight * 0.9;
+  let mathFontGlyphs = 0;
+  let mathCharGlyphs = 0;
+  for (let chI = 0; chI < chars.length; chI++) {
+    const ch = chars[chI];
+    if (brokenToUnicodeFont(ch._font)) {
+      brokenRun++;
+      if (brokenRun > longestBrokenRun) longestBrokenRun = brokenRun;
+      continue;
+    }
+    brokenRun = 0;
+    if (ch.invisible) continue;
+    const cp = ch.text.codePointAt(0);
+    if (cp === undefined) continue;
+    if (isMathFontChar(ch)) mathFontGlyphs++;
+    if (MATH_CHAR_RE.test(ch.text)) mathCharGlyphs++;
+    if (!((cp >= 33 && cp <= 127) || (cp >= 161 && !(cp >= 0xE000 && cp <= 0xF8FF)))) continue;
+    printableVisNonBroken++;
+    if (ch.y >= bodyTop && ch.y <= bodyBottom) bodyReadableChars++;
+  }
+
+  // A false positive relaxes line grouping on a prose page, which merges headings, URLs, and table cells into neighboring lines.
+  const pageHasMath = mathFontGlyphs >= 8
+    || (mathCharGlyphs >= 6 && mathCharGlyphs >= printableVisNonBroken * 0.0008);
+
+  const graphicsHeavy = contentStreamText.length > GRAPHICS_HEAVY_STREAM_BYTES;
+  /** @type {Array<{left: number, bottom: number, right: number, top: number}>} */
+  const imagePlacements = [];
+  /** @type {Array<{left: number, bottom: number, right: number, top: number, paint: 'f'|'s'|'fs', commands: number}>} */
+  const pathPlacements = [];
+  const paths = graphicsHeavy
+    ? []
+    : parsePagePaths(objText, objCache, tokens, { imagePlacements, pathPlacements, initialCtm });
+  // parsePagePaths applies initialCtm only to the placements it collects, so the returned commands are still in raw user space.
+  // Consumers subtract the box origin themselves, so it is added back here.
+  if (rotate === 90 || rotate === 180 || rotate === 270) {
+    const [a, b, c, d, e, f] = initialCtm;
+    for (let pathI = 0; pathI < paths.length; pathI++) {
+      const path = paths[pathI];
+      for (let cmdI = 0; cmdI < path.commands.length; cmdI++) {
+        const cmd = path.commands[cmdI];
+        if (cmd.type === 'Z') continue;
+        if (cmd.type === 'C') {
+          const x1 = a * cmd.x1 + c * cmd.y1 + e + boxOriginX;
+          cmd.y1 = b * cmd.x1 + d * cmd.y1 + f + boxOriginY;
+          cmd.x1 = x1;
+          const x2 = a * cmd.x2 + c * cmd.y2 + e + boxOriginX;
+          cmd.y2 = b * cmd.x2 + d * cmd.y2 + f + boxOriginY;
+          cmd.x2 = x2;
+        }
+        const x = a * cmd.x + c * cmd.y + e + boxOriginX;
+        cmd.y = b * cmd.x + d * cmd.y + f + boxOriginY;
+        cmd.x = x;
+      }
+    }
+  }
+  if (graphicsHeavy) {
+    // Heavy streams skip path extraction (cost), but image placements must still be collected:
+    // a scanned page must not lose its full-page-image classification (largestImageFrac).
+    let ctmH = initialCtm.slice();
+    const ctmStackH = [];
+    const numsH = [];
+    /** @type {Map<string, number>} */
+    const imageObjNumsH = new Map();
+    findFormXObjects(objText, objCache, imageObjNumsH);
+    let lastNameH = null;
+    for (let ti = 0; ti < tokens.length; ti++) {
+      const t = tokens[ti];
+      if (t.type === 'number') { numsH.push(t.value); continue; }
+      if (t.type === 'name') { lastNameH = t.value; clearStack(numsH); continue; }
+      if (t.type === 'inlineImage' || (t.type === 'operator' && t.value === 'Do')) {
+        const corners = [
+          [ctmH[4], ctmH[5]],
+          [ctmH[0] + ctmH[4], ctmH[1] + ctmH[5]],
+          [ctmH[2] + ctmH[4], ctmH[3] + ctmH[5]],
+          [ctmH[0] + ctmH[2] + ctmH[4], ctmH[1] + ctmH[3] + ctmH[5]],
+        ];
+        let minX = Infinity; let maxX = -Infinity;
+        let minY = Infinity; let maxY = -Infinity;
+        for (const [px, py] of corners) {
+          if (px < minX) minX = px;
+          if (px > maxX) maxX = px;
+          if (py < minY) minY = py;
+          if (py > maxY) maxY = py;
+        }
+        const placementH = {
+          left: minX, bottom: minY, right: maxX, top: maxY,
+        };
+        if (t.type === 'operator' && lastNameH !== null && imageObjNumsH.has(lastNameH)) placementH.objNum = imageObjNumsH.get(lastNameH);
+        imagePlacements.push(placementH);
+        lastNameH = null;
+        clearStack(numsH);
+        continue;
+      }
+      if (t.type !== 'operator') { lastNameH = null; clearStack(numsH); continue; }
+      if (t.value === 'q') ctmStackH.push(ctmH.slice());
+      else if (t.value === 'Q') { if (ctmStackH.length > 0) ctmH = ctmStackH.pop(); } else if (t.value === 'cm' && numsH.length >= 6) {
+        const nh = numsH.length;
+        const a = numsH[nh - 6]; const b = numsH[nh - 5];
+        const c = numsH[nh - 4]; const d = numsH[nh - 3];
+        const e = numsH[nh - 2]; const fv = numsH[nh - 1];
+        ctmH = [
+          a * ctmH[0] + b * ctmH[2], a * ctmH[1] + b * ctmH[3],
+          c * ctmH[0] + d * ctmH[2], c * ctmH[1] + d * ctmH[3],
+          e * ctmH[0] + fv * ctmH[2] + ctmH[4], e * ctmH[1] + fv * ctmH[3] + ctmH[5],
+        ];
+      }
+      lastNameH = null;
+      clearStack(numsH);
+    }
+  }
+
+  // Reassemble band-sliced images before classifying: producers often draw one picture as dozens of contiguous horizontal strips.
+  /** @type {Array<{left: number, bottom: number, right: number, top: number, sites: Array<{left: number, bottom: number, right: number, top: number, objNum?: number}>}>} */
+  const mergedPlacements = [];
+  const placementCols = new Map();
+  for (const p of imagePlacements) {
+    const key = `${Math.round(p.left * 2)}_${Math.round((p.right - p.left) * 2)}`;
+    if (!placementCols.has(key)) placementCols.set(key, []);
+    placementCols.get(key).push(p);
+  }
+  const placementSite = (p) => {
+    const site = {
+      left: p.left, bottom: p.bottom, right: p.right, top: p.top,
+    };
+    if (p.objNum !== undefined) site.objNum = p.objNum;
+    return site;
+  };
+  const mergedFrom = (p) => ({
+    left: p.left, bottom: p.bottom, right: p.right, top: p.top, sites: [placementSite(p)],
+  });
+  for (const group of placementCols.values()) {
+    group.sort((a, b) => b.top - a.top);
+    let cur = mergedFrom(group[0]);
+    for (let gi = 1; gi < group.length; gi++) {
+      const nxt = group[gi];
+      if (cur.bottom - nxt.top <= 1.5) {
+        if (nxt.bottom < cur.bottom) cur.bottom = nxt.bottom;
+        cur.sites.push(placementSite(nxt));
+      } else {
+        mergedPlacements.push(cur);
+        cur = mergedFrom(nxt);
+      }
+    }
+    mergedPlacements.push(cur);
+  }
+
+  // Criterion 1: largest image placement as a fraction of the page area.
+  const pageAreaPts = visualWidthPts * visualHeightPts;
+  let largestImageFrac = 0;
+  for (const p of mergedPlacements) {
+    const frac = Math.abs((p.right - p.left) * (p.top - p.bottom)) / pageAreaPts;
+    if (frac > largestImageFrac) largestImageFrac = frac;
+  }
+  largestImageFrac = Math.round(largestImageFrac * 10000) / 10000;
+
+  // Criterion 1b: line-shaped image placements. These are text rendered as raster images interleaved with content
+  // (e.g. full paragraph lines as images, each ~14pt tall and hundreds of points wide).
+  // No single such strip covers a meaningful page fraction, so count placements whose height sits in the glyph band and whose aspect is wide like a text line.
+  // Icons and photos fail the aspect test, full-page scans fail the height band.
+  let imageTextCandidates = 0;
+  for (const p of mergedPlacements) {
+    const w = Math.abs(p.right - p.left);
+    const h = Math.abs(p.top - p.bottom);
+    if (!(h >= PATH_TEXT_H_MIN && h <= PATH_TEXT_H_MAX)) continue;
+    if (w < h * 4) continue;
+    // A line-shaped image only represents MISSING text when the native layer does not already cover it
+    // (diagram labels drawn as image-over-native-text are extractable without OCR).
+    const pxLeft = p.left * scale;
+    const pxRight = p.right * scale;
+    const pxTop = (visualHeightPts - p.top) * scale;
+    const pxBottom = (visualHeightPts - p.bottom) * scale;
+    let coveredWidth = 0;
+    for (let chI = 0; chI < chars.length; chI++) {
+      const ch = chars[chI];
+      const cx = ch.x + ch.width / 2;
+      if (cx < pxLeft || cx > pxRight) continue;
+      // Approximate glyph box from the baseline: ascent above, ~20% below.
+      const chTop = ch.y - ch.fontSize * 0.8;
+      const chBottom = ch.y + ch.fontSize * 0.2;
+      const overlap = Math.min(chBottom, pxBottom) - Math.max(chTop, pxTop);
+      if (overlap < (chBottom - chTop) * 0.5) continue;
+      coveredWidth += ch.width;
+    }
+    if (coveredWidth >= (pxRight - pxLeft) * 0.3) continue;
+    imageTextCandidates++;
+  }
+
+  // Criterion 2: filled, non-rectangular, glyph-height vector paths.
+  // Perfect rectangles (layout rules, table borders, fill boxes) are excluded.
+  let pathTextCandidates = 0;
+  for (let pathI = 0; pathI < paths.length; pathI++) {
+    const path = paths[pathI];
+    if (!path.fill) continue;
+    let minX = Infinity; let maxX = -Infinity;
+    let minY = Infinity; let maxY = -Infinity;
+    let hasCurve = false;
+    for (let cmdI = 0; cmdI < path.commands.length; cmdI++) {
+      const cmd = path.commands[cmdI];
+      if (cmd.type === 'C') {
+        hasCurve = true;
+        if (cmd.x1 < minX) minX = cmd.x1; if (cmd.x1 > maxX) maxX = cmd.x1;
+        if (cmd.y1 < minY) minY = cmd.y1; if (cmd.y1 > maxY) maxY = cmd.y1;
+        if (cmd.x2 < minX) minX = cmd.x2; if (cmd.x2 > maxX) maxX = cmd.x2;
+        if (cmd.y2 < minY) minY = cmd.y2; if (cmd.y2 > maxY) maxY = cmd.y2;
+      }
+      if (cmd.type === 'M' || cmd.type === 'L' || cmd.type === 'C') {
+        if (cmd.x < minX) minX = cmd.x; if (cmd.x > maxX) maxX = cmd.x;
+        if (cmd.y < minY) minY = cmd.y; if (cmd.y > maxY) maxY = cmd.y;
+      }
+    }
+    const h = maxY - minY;
+    if (!(h >= PATH_TEXT_H_MIN && h <= PATH_TEXT_H_MAX)) continue;
+    let allRect = !hasCurve;
+    if (allRect) {
+      // Each subpath (split at M) must be a 4- or 5-point polygon with axis-parallel sides, the closing side included.
+      const cmds = path.commands;
+      let ptCount = 0; let firstX = 0; let firstY = 0; let prevX = 0; let prevY = 0;
+      for (let cmdI = 0; cmdI <= cmds.length; cmdI++) {
+        const cmd = cmdI < cmds.length ? cmds[cmdI] : null;
+        if ((cmd === null || cmd.type === 'M') && ptCount > 0) {
+          if (ptCount < 4 || ptCount > 5 || (Math.abs(firstX - prevX) > 0.01 && Math.abs(firstY - prevY) > 0.01)) { allRect = false; break; }
+          ptCount = 0;
+        }
+        if (cmd === null) break;
+        if (cmd.type !== 'M' && cmd.type !== 'L') continue;
+        if (ptCount > 0) {
+          if (Math.abs(cmd.x - prevX) > 0.01 && Math.abs(cmd.y - prevY) > 0.01) { allRect = false; break; }
+        } else { firstX = cmd.x; firstY = cmd.y; }
+        prevX = cmd.x; prevY = cmd.y;
+        ptCount++;
+      }
+    }
+    if (allRect) continue;
+    pathTextCandidates++;
+  }
+
+  const pageStats = {
+    largestImageFrac,
+    invisibleTextChars: charStats.printable - charStats.printableVis,
+    visibleChars: charStats.visibleAll,
+    visibleReadableChars: printableVisNonBroken,
+    bodyReadableChars,
+    printableVis: charStats.printableVis,
+    control: charStats.control,
+    controlVis: charStats.controlVis,
+    pathTextCandidates,
+    imageTextCandidates,
+    longestBrokenRun,
+    pageSize: [Math.round(visualWidthPts), Math.round(visualHeightPts)],
+  };
+  /** @type {Array<{left: number, right: number, y: number, color: number[], isUnderline?: boolean}>} */
+  const underlineRects = [];
+  // Small squares drawn as paths are raw material for fillable-area detection, collected here because this loop already walks and rect-classifies every subpath.
+  // The context gates that separate a form checkbox from chart and table furniture live in the detector, not here.
+  /** @type {Array<{left: number, top: number, right: number, bottom: number, stroke: boolean}>} */
+  const fillSquares = [];
+  // Ink that can sit inside or over a checkbox, so detection can withhold boxes that are already marked.
+  // Thin long lines (rules, table borders) are excluded, since crossing a box is not marking it.
+  /** @type {Array<{left: number, top: number, right: number, bottom: number}>} */
+  const fillMarks = [];
+  // Overflowing the mark cap is itself a signal: a page with hundreds of ink marks is dense vector art, where a drawn square is furniture rather than a form checkbox.
+  let fillMarksOverflow = false;
+  const pushFillMark = (x0, y0, x1, y1) => {
+    const mw = x1 - x0;
+    const mh = y1 - y0;
+    if (!(mw > 0.2) || !(mh > 0.2) || mw > 50 || mh > 50) return;
+    if (Math.min(mw, mh) < 1.5 && Math.max(mw, mh) > 10) return;
+    if (fillMarks.length >= 500) {
+      fillMarksOverflow = true;
+      return;
+    }
+    fillMarks.push({
+      left: (x0 - boxOriginX) * scale,
+      top: (visualHeightPts - (y1 - boxOriginY)) * scale,
+      right: (x1 - boxOriginX) * scale,
+      bottom: (visualHeightPts - (y0 - boxOriginY)) * scale,
+    });
+  };
+  for (let pathI = 0; pathI < paths.length; pathI++) {
+    const path = paths[pathI];
+    if (!path.fill && !path.stroke) continue;
+    const lineColor = path.stroke ? path.strokeColor : path.fillColor;
+    const fc = path.fill ? path.fillColor : null;
+    // A dark or colored fill can never read as an empty checkbox; it is ink that can mark one.
+    // Value semantics differ by color space: gray/RGB are brightness (1 = white), while CMYK and named-space tints are coverage (1 = full ink).
+    // Lab-style triples carry lightness 0-100 in the first component.
+    let inkFill = false;
+    if (fc) {
+      const cs = path.fillColorSpace || '';
+      if (fc.length === 4) inkFill = Math.max(...fc) > 0.15;
+      else if (fc.length === 1) inkFill = cs === 'gray' ? fc[0] < 0.85 : fc[0] > 0.15;
+      else if (fc.length === 3) inkFill = fc.some((v) => v > 1.5) ? fc[0] < 85 : Math.min(...fc) < 0.85;
+    }
+    const drawsInk = !!path.stroke || inkFill;
+    let minX = Infinity; let maxX = -Infinity;
+    let minY = Infinity; let maxY = -Infinity;
+    let hasCurve = false;
+    // Full extents (curve endpoints and controls included) for the ink-mark bbox.
+    // The thin-bar separator test below keeps its M/L-only extents.
+    let fMinX = Infinity; let fMaxX = -Infinity;
+    let fMinY = Infinity; let fMaxY = -Infinity;
+    for (let cmdI = 0; cmdI < path.commands.length; cmdI++) {
+      const cmd = path.commands[cmdI];
+      if (cmd.type === 'C') {
+        hasCurve = true;
+        if (cmd.x1 < fMinX) fMinX = cmd.x1; if (cmd.x1 > fMaxX) fMaxX = cmd.x1;
+        if (cmd.y1 < fMinY) fMinY = cmd.y1; if (cmd.y1 > fMaxY) fMaxY = cmd.y1;
+        if (cmd.x2 < fMinX) fMinX = cmd.x2; if (cmd.x2 > fMaxX) fMaxX = cmd.x2;
+        if (cmd.y2 < fMinY) fMinY = cmd.y2; if (cmd.y2 > fMaxY) fMaxY = cmd.y2;
+        if (cmd.x < fMinX) fMinX = cmd.x; if (cmd.x > fMaxX) fMaxX = cmd.x;
+        if (cmd.y < fMinY) fMinY = cmd.y; if (cmd.y > fMaxY) fMaxY = cmd.y;
+      }
+      if (cmd.type === 'M' || cmd.type === 'L') {
+        if (cmd.x < minX) minX = cmd.x;
+        if (cmd.x > maxX) maxX = cmd.x;
+        if (cmd.y < minY) minY = cmd.y;
+        if (cmd.y > maxY) maxY = cmd.y;
+        if (cmd.x < fMinX) fMinX = cmd.x;
+        if (cmd.x > fMaxX) fMaxX = cmd.x;
+        if (cmd.y < fMinY) fMinY = cmd.y;
+        if (cmd.y > fMaxY) fMaxY = cmd.y;
+      }
+    }
+    const w = maxX - minX;
+    const h = maxY - minY;
+    if (h < 2 && w > 10) {
+      underlineRects.push({
+        left: (minX - boxOriginX) * scale,
+        right: (maxX - boxOriginX) * scale,
+        y: (visualHeightPts - (maxY - boxOriginY)) * scale,
+        color: lineColor,
+      });
+      continue;
+    }
+    // A drawn separator can pack several thin bars into one filled path (a decorative double rule) whose combined bbox is too tall to pass the test above.
+    // Mine the subpaths for thin, wide bars, but only when the path is curve-free and every subpath is an axis-aligned rectangle.
+    // A glyph, chart, or logo has curves or non-orthogonal edges, so this never pulls a thin sliver out of one.
+    if (hasCurve) {
+      // A curved painted path at mark size is a drawn check, dot, or ring.
+      if (drawsInk) pushFillMark(fMinX, fMinY, fMaxX, fMaxY);
+      continue;
+    }
+    const cmds = path.commands;
+    let open = false; let ptCount = 0; let diag = false;
+    let firstX = 0; let firstY = 0; let prevX = 0; let prevY = 0;
+    let sMinX = Infinity; let sMaxX = -Infinity; let sMinY = Infinity; let sMaxY = -Infinity;
+    for (let cmdI = 0; cmdI <= cmds.length; cmdI++) {
+      const cmd = cmdI < cmds.length ? cmds[cmdI] : null;
+      if (cmd !== null && cmd.type === 'L') {
+        if (!open) continue;
+        if (Math.abs(cmd.x - prevX) > 0.01 && Math.abs(cmd.y - prevY) > 0.01) diag = true;
+        prevX = cmd.x; prevY = cmd.y; ptCount++;
+        if (cmd.x < sMinX) sMinX = cmd.x; if (cmd.x > sMaxX) sMaxX = cmd.x;
+        if (cmd.y < sMinY) sMinY = cmd.y; if (cmd.y > sMaxY) sMaxY = cmd.y;
+        continue;
+      }
+      if (cmd !== null && cmd.type !== 'M') continue;
+      if (open) {
+        const rect = ptCount >= 4 && ptCount <= 5 && !diag && !(Math.abs(firstX - prevX) > 0.01 && Math.abs(firstY - prevY) > 0.01);
+        if (!rect) {
+          // Bare line and polyline subpaths are the check and X strokes themselves.
+          if (drawsInk) pushFillMark(sMinX, sMinY, sMaxX, sMaxY);
+        } else {
+          const sw = sMaxX - sMinX;
+          const sh = sMaxY - sMinY;
+          if (sh < 2 && sw > 10) {
+            underlineRects.push({
+              left: (sMinX - boxOriginX) * scale,
+              right: (sMaxX - boxOriginX) * scale,
+              y: (visualHeightPts - (sMaxY - boxOriginY)) * scale,
+              color: lineColor,
+            });
+          } else if (sw >= 5 && sw <= 24 && sh >= 5 && sh <= 24 && sw / sh > 0.7 && sw / sh < 1.43
+            && fillSquares.length < 200 && !inkFill) {
+            fillSquares.push({
+              left: (sMinX - boxOriginX) * scale,
+              top: (visualHeightPts - (sMaxY - boxOriginY)) * scale,
+              right: (sMaxX - boxOriginX) * scale,
+              bottom: (visualHeightPts - (sMinY - boxOriginY)) * scale,
+              stroke: !!path.stroke,
+            });
+          } else if (inkFill) {
+            // A colored filled rectangle can cover a stroked twin that did qualify as a candidate.
+            pushFillMark(sMinX, sMinY, sMaxX, sMaxY);
+          }
+        }
+      }
+      if (cmd === null) break;
+      open = true; ptCount = 1; diag = false;
+      firstX = cmd.x; prevX = cmd.x; sMinX = cmd.x; sMaxX = cmd.x;
+      firstY = cmd.y; prevY = cmd.y; sMinY = cmd.y; sMaxY = cmd.y;
+    }
+  }
+  // Producers draw one visible checkbox as a white-filled path plus a stroked path with identical geometry.
+  // Collapsing those pairs keeps one drawn box to one candidate.
+  const squaresByKey = new Map();
+  for (const sq of fillSquares) {
+    const key = `${Math.round(sq.left)},${Math.round(sq.top)},${Math.round(sq.right)},${Math.round(sq.bottom)}`;
+    const prev = squaresByKey.get(key);
+    if (prev) prev.stroke = prev.stroke || sq.stroke;
+    else squaresByKey.set(key, sq);
+  }
+  const fillSquaresDeduped = [...squaresByKey.values()];
+
+  // Image placements in the same page-pixel space, so detection can withhold a box whose interior is painted by a raster.
+  /** @type {Array<{left: number, top: number, right: number, bottom: number, sites: Array<{left: number, top: number, right: number, bottom: number, objNum?: number}>}>} */
+  const fillImages = [];
+  // Both collectors bake `initialCtm` into the placements, so subtracting the box origin again here would double-shift them.
+  const placementToPagePx = (p) => ({
+    left: p.left * scale,
+    top: (visualHeightPts - p.top) * scale,
+    right: p.right * scale,
+    bottom: (visualHeightPts - p.bottom) * scale,
+  });
+  for (const p of mergedPlacements) {
+    if (fillImages.length >= 100) break;
+    const entry = placementToPagePx(p);
+    entry.sites = p.sites.map((s) => {
+      const site = placementToPagePx(s);
+      if (s.objNum !== undefined) site.objNum = s.objNum;
+      return site;
+    });
+    fillImages.push(entry);
+  }
+
+  // Co-extent paint ops group into one placement holding a site per op, so one visible mark is one selectable entry.
+  /** @type {Array<{left: number, top: number, right: number, bottom: number, sites: Array<{left: number, top: number, right: number, bottom: number, paint: 'f'|'s'|'fs', commands: number}>}>} */
+  let fillPaths = [];
+  const fillPathsByKey = new Map();
+  for (const p of pathPlacements) {
+    const site = placementToPagePx(p);
+    site.paint = p.paint;
+    site.commands = p.commands;
+    const key = `${Math.round(site.left)},${Math.round(site.top)},${Math.round(site.right)},${Math.round(site.bottom)}`;
+    const prev = fillPathsByKey.get(key);
+    if (prev) {
+      prev.sites.push(site);
+    } else {
+      const entry = {
+        left: site.left, top: site.top, right: site.right, bottom: site.bottom, sites: [site],
+      };
+      fillPathsByKey.set(key, entry);
+      fillPaths.push(entry);
+    }
+  }
+  let fillPathsIneligible = graphicsHeavy;
+  if (fillPaths.length > PATH_PLACEMENT_CAP) {
+    fillPaths = [];
+    fillPathsIneligible = true;
+  }
+
+  const {
+    pageObj, langSet, fontSet, wordSignals, nativeText, dataTablePage, provisionalTables, fillGlyphBoxes,
+  } = groupCharsIntoPage(chars, n, pageWidth, pageHeight, underlineRects, paths, scale, visualHeightPts, boxOriginX, boxOriginY, pageHasMath, glyphOpMap);
+
+  // Carry the page's thin horizontal rules (same scaled top-left space as line bboxes) onto the page so analyzeLayout can split paragraphs at a drawn separator rule.
+  // Rects consumed as text underlines are excluded: on a page where every line carries a hyperlink underline, treating them as separators would shatter each paragraph into single lines.
+  pageObj.rules = underlineRects.filter((r) => !r.isUnderline).map((r) => ({ y: r.y, left: r.left, right: r.right }));
+
+  const {
+    highlights: highlightsRaw, freeTexts: freeTextsRaw, textAnnots: textAnnotsRaw, shapes: shapesRaw, redacts: redactsRaw, links: linksRaw, widgets: widgetsRaw,
+  } = extractPdfAnnotations(objCache, objText);
+
+  const mapPoint = (x, y) => {
+    const cx = initialCtm[0] * x + initialCtm[2] * y + initialCtm[4];
+    const cy = initialCtm[1] * x + initialCtm[3] * y + initialCtm[5];
+    return { x: cx * scale, y: (visualHeightPts - cy) * scale };
+  };
+
+  // URLs also mark the words their rect covers, so text consumers (e.g. the citation-leading exemption in analyzeLayout) can see the hyperlink.
+  // Internal links never touch words, since a word-level link marker would trip that same exemption on link-dense TOC pages.
+  // A link that resolves to neither a URL nor a destination (exotic action, dangling dest) stays passthrough, so its source object survives export verbatim.
+  /** @type {AnnotationLink[]} */
+  const linkAnnots = [];
+  if (linksRaw.length > 0) {
+    /** @type {Array<{left: number, top: number, right: number, bottom: number, uri: string}>} */
+    const uriBoxes = [];
+    for (const l of linksRaw) {
+      const p1 = mapPoint(l.rect[0], l.rect[1]);
+      const p2 = mapPoint(l.rect[2], l.rect[3]);
+      const bbox = {
+        left: Math.min(p1.x, p2.x), top: Math.min(p1.y, p2.y), right: Math.max(p1.x, p2.x), bottom: Math.max(p1.y, p2.y),
+      };
+      if (l.uri) {
+        linkAnnots.push({ type: 'link', bbox, uri: l.uri });
+        uriBoxes.push({ ...bbox, uri: l.uri });
+      } else if (l.annotText && destInfo) {
+        if (!destInfo.nameDests) {
+          const catalogObjNum = findRootObjNum(objCache.pdfBytes);
+          const catalogText = (catalogObjNum && objCache.getObjectText(catalogObjNum)) || '';
+          destInfo.nameDests = buildNameDests(objCache, catalogText);
+        }
+        const { dest } = resolveItemDest(l.annotText, destInfo.nameDests, destInfo.objNumToIndex, objCache);
+        if (dest) {
+          setDestYFrac(dest, destInfo.pages[dest.pageIndex]);
+          linkAnnots.push({ type: 'link', bbox, dest });
+        }
+      }
+    }
+    if (uriBoxes.length > 0) {
+      for (const line of pageObj.lines) {
+        for (const word of line.words) {
+          const cx = (word.bbox.left + word.bbox.right) / 2;
+          const cy = (word.bbox.top + word.bbox.bottom) / 2;
+          const hit = uriBoxes.find((b) => cx >= b.left && cx <= b.right && cy >= b.top && cy <= b.bottom);
+          if (hit) word.style.link = hit.uri;
+        }
+      }
+    }
+  }
+  /** @type {Annotation[]} */
+  const annotations = highlightsRaw.map((raw) => pdfHighlightToAnnotation(raw, {
+    scale,
+    visualHeightPts,
+    initialCtm,
+    groupId: `_pdf_p${n}_a${raw.objNum}`,
+  }));
+  for (const raw of freeTextsRaw) {
+    annotations.push(pdfFreeTextToAnnotation(raw, { scale, visualHeightPts, initialCtm }));
+  }
+  for (const raw of textAnnotsRaw) {
+    annotations.push(pdfTextAnnotToAnnotation(raw, { scale, visualHeightPts, initialCtm }));
+  }
+  for (const raw of shapesRaw) {
+    annotations.push(pdfShapeToAnnotation(raw, { scale, visualHeightPts, initialCtm }));
+  }
+  // A source /Redact is a pending redaction from another tool, lifted into marks so apply-at-export honors it.
+  for (const raw of redactsRaw) {
+    annotations.push(...pdfRedactToAnnotations(raw, {
+      scale, visualHeightPts, initialCtm, groupId: `_pdf_p${n}_a${raw.objNum}`,
+    }));
+  }
+
+  annotations.push(...linkAnnots);
+
+  let fieldIdx = 0;
+  for (const w of widgetsRaw) {
+    const p1 = mapPoint(w.rect[0], w.rect[1]);
+    const p2 = mapPoint(w.rect[2], w.rect[3]);
+    const bbox = {
+      left: Math.round(Math.min(p1.x, p2.x)), top: Math.round(Math.min(p1.y, p2.y)), right: Math.round(Math.max(p1.x, p2.x)), bottom: Math.round(Math.max(p1.y, p2.y)),
+    };
+    /** @type {AnnotationField['fieldType']} */
+    let fieldType = 'text';
+    if (w.ft === 'Ch') fieldType = 'choice';
+    else if (w.ft === 'Sig') fieldType = 'signature';
+    else if (w.ft === 'Btn') {
+      if (w.ff & 0x10000) fieldType = 'button';
+      else if (w.ff & 0x8000) fieldType = 'radio';
+      else fieldType = 'checkbox';
+    }
+    /** @type {AnnotationField} */
+    const field = {
+      type: 'field', fieldType, name: w.name, bbox, value: w.value, srcRef: w.objNum,
+    };
+    if (w.ff & 1) field.readOnly = true;
+    if (w.ff & 2) field.required = true;
+    if (w.ft === 'Tx' && (w.ff & 0x1000)) field.multiline = true;
+    if (w.ft === 'Tx' && (w.ff & 0x1000000)) field.comb = true;
+    if (field.comb && w.maxLen) field.maxLen = w.maxLen;
+    if (w.signed) field.signed = true;
+    if ((w.flags & 2) || (w.flags & 32)) field.hidden = true;
+    if (w.quadding) field.quadding = w.quadding;
+    if (w.da) field.da = w.da;
+    if (w.onState != null && (fieldType === 'checkbox' || fieldType === 'radio')) field.onState = w.onState;
+    if (w.options != null && fieldType === 'choice') field.options = w.options;
+    annotations.push(field);
+
+    if ((w.flags & 2) || (w.flags & 32)) continue;
+    if (!(w.ft === 'Tx' || w.ft === 'Ch') || !w.value || w.value.trim().length === 0) continue;
+    const rectW = Math.abs(w.rect[2] - w.rect[0]);
+    const rectH = Math.abs(w.rect[3] - w.rect[1]);
+    if (rectW <= 0 || rectH <= 0) continue;
+    const llx = Math.min(w.rect[0], w.rect[2]);
+    const lly = Math.min(w.rect[1], w.rect[3]);
+    const layout = layoutFieldValue(w.value, rectW, rectH, {
+      multiline: !!field.multiline, comb: !!field.comb, maxLen: w.maxLen, quadding: w.quadding, da: w.da,
+    });
+    fieldIdx++;
+    const asc = layout.fontSize * 0.8;
+    const desc = layout.fontSize * 0.2;
+    let liftLineIdx = 0;
+    for (const ll of layout.lines) {
+      if (ll.words.length === 0) continue;
+      liftLineIdx++;
+      const wordSpecs = ll.words.map((lw) => {
+        const pa = mapPoint(llx + lw.x0, lly + ll.y + asc);
+        const pb = mapPoint(llx + lw.x1, lly + ll.y - desc);
+        return {
+          text: lw.text,
+          bbox: {
+            left: Math.round(Math.min(pa.x, pb.x)), top: Math.round(Math.min(pa.y, pb.y)), right: Math.round(Math.max(pa.x, pb.x)), bottom: Math.round(Math.max(pa.y, pb.y)),
+          },
+        };
+      });
+      const lineBbox = {
+        left: Math.min(...wordSpecs.map((s) => s.bbox.left)),
+        top: Math.min(...wordSpecs.map((s) => s.bbox.top)),
+        right: Math.max(...wordSpecs.map((s) => s.bbox.right)),
+        bottom: Math.max(...wordSpecs.map((s) => s.bbox.bottom)),
+      };
+      const baseP = mapPoint(llx + ll.x, lly + ll.y);
+      const lineObj = new ocr.OcrLine(pageObj, lineBbox, [0, Math.round(baseP.y) - lineBbox.bottom], asc * scale, null);
+      for (let wi = 0; wi < wordSpecs.length; wi++) {
+        const wordID = `word_${n + 1}_f${fieldIdx}_${liftLineIdx}_${wi + 1}`;
+        const wordObj = new ocr.OcrWord(lineObj, wordID, wordSpecs[wi].text, wordSpecs[wi].bbox);
+        wordObj.conf = 100;
+        wordObj.visualCoords = false;
+        wordObj.lang = calcLang(wordSpecs[wi].text);
+        langSet.add(wordObj.lang);
+        wordObj.style.font = 'Helvetica';
+        wordObj.style.size = round3(layout.fontSize * scale);
+        lineObj.words.push(wordObj);
+      }
+      // Field values count toward the document's text-native vs. image-based verdict, so a form with no other text can still classify as text-native.
+      pageStats.printableVis += wordSpecs.reduce((acc, s) => acc + s.text.length, 0);
+      const insertAt = pageObj.lines.findIndex((l) => l.bbox.top > lineBbox.top);
+      if (insertAt === -1) pageObj.lines.push(lineObj);
+      else pageObj.lines.splice(insertAt, 0, lineObj);
+    }
+  }
+
+  return {
+    pageObj,
+    langSet,
+    fontSet,
+    wordSignals,
+    nativeText,
+    dataTablePage,
+    provisionalTables,
+    pageStats,
+    annotations,
+    fillSquares: fillSquaresDeduped,
+    fillMarks,
+    fillMarksOverflow,
+    fillImages,
+    fillPaths,
+    fillPathsIneligible,
+    fillGlyphBoxes,
+  };
+}
+
+/**
+ * Promote provisional open-top continuation grids, in place, then link tables that continue across page breaks.
+ * A provisional grid becomes a real table when the previous page holds a grid-strong table with the same column separators.
+ * Pages promote in order, so a promoted table anchors the next page's continuation.
+ * A boundary either links silently, becomes a returned suggestion for the user to confirm, or is left alone.
+ * @param {Array<{pageObj: OcrPage, dataTablePage?: LayoutDataTablePage, provisionalTables?: Array<import('./detectPdfTables.js').DetectedTable>}|null>} results - parsed pages (index = page index).
+ * @returns {Array<{n: number, prevN: number, tableId: string, prevTableId: string, reason: string}>} suggested links (the continuation fragment is `tableId` on page `n`).
+ */
+export function promoteContinuationTables(results) {
+  for (let i = 1; i < results.length; i++) {
+    const r = results[i];
+    if (!r || !r.pageObj || !r.dataTablePage || !r.provisionalTables?.length) continue;
+    const prev = results[i - 1];
+    if (!prev || !prev.dataTablePage) continue;
+    for (const dt of r.provisionalTables) {
+      const xs = [dt.bbox.left, ...dt.colSeparators, dt.bbox.right];
+      const anchored = prev.dataTablePage.tables.some((pt) => {
+        if (pt.detectionMethod !== 'grid-strong' || pt.boxes.length !== xs.length - 1) return false;
+        const prevXs = [...pt.boxes.map((b) => b.coords.left), pt.boxes[pt.boxes.length - 1].coords.right];
+        return prevXs.every((x, xi) => Math.abs(x - xs[xi]) < 10);
+      });
+      if (!anchored) continue;
+      // The promoted grid replaces text-derived tables covering its region; an overlapping real grid means the region is claimed and the provisional stays out.
+      const overlapsEnough = (pt) => {
+        let l = Infinity; let t = Infinity; let rt = -Infinity; let b = -Infinity;
+        for (const col of pt.boxes) {
+          const c = col.coords;
+          if (c.left < l) l = c.left;
+          if (c.top < t) t = c.top;
+          if (c.right > rt) rt = c.right;
+          if (c.bottom > b) b = c.bottom;
+        }
+        const ix = Math.min(rt, dt.bbox.right) - Math.max(l, dt.bbox.left);
+        const iy = Math.min(b, dt.bbox.bottom) - Math.max(t, dt.bbox.top);
+        if (ix <= 0 || iy <= 0) return false;
+        const minArea = Math.min((rt - l) * (b - t), (dt.bbox.right - dt.bbox.left) * (dt.bbox.bottom - dt.bbox.top));
+        return (ix * iy) / minArea > 0.3;
+      };
+      const tables = r.dataTablePage.tables;
+      if (tables.some((pt) => pt.detectionMethod === 'grid-strong' && overlapsEnough(pt))) continue;
+      for (let ti = tables.length - 1; ti >= 0; ti--) {
+        if (overlapsEnough(tables[ti])) tables.splice(ti, 1);
+      }
+      tables.push(convertDetectedTable(dt, r.dataTablePage, r.pageObj));
+    }
+  }
+
+  /** @type {Array<{n: number, prevN: number, tableId: string, prevTableId: string, reason: string}>} */
+  const suggestions = [];
+  const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const CONT_RE = /\bcont(?:inued|'?d)\b|\(\s*cont/i;
+  // Continuation captions repeat the previous title with wording like "(continued)", so titles compare with that wording removed.
+  const stripCont = (s) => norm(s).replace(/[([]\s*cont(?:inued|'?d)?\.?\s*[)\]]/g, '').replace(/\bcontinued\b/g, '').replace(/\s+/g, ' ')
+    .trim();
+  const lineText = (ln) => ln.words.map((w) => w.text).join(' ');
+  const tableXs = (t) => {
+    const xs = t.boxes.map((b) => b.coords.left).sort((a, b) => a - b);
+    xs.push(Math.max(...t.boxes.map((b) => b.coords.right)));
+    return xs;
+  };
+  /** @type {Map<LayoutDataTable, ?string>} */
+  const row0Cache = new Map();
+  const row0Text = (pageObj, t) => {
+    if (row0Cache.has(t)) return row0Cache.get(t) ?? null;
+    const rows = extractTextFromTables(pageObj, /** @type {LayoutDataTablePage} */ ({ tables: [t] }), { maxRows: 1 })[0]?.rows;
+    const text = rows?.length ? norm(rows[0].join(' ')) : null;
+    row0Cache.set(t, text);
+    return text;
+  };
+  /** @type {?{headerRow: ?string, title: ?string}} */
+  let chain = null;
+  /** @type {?LayoutDataTable} */
+  let prevLinked = null;
+  for (let i = 1; i < results.length; i++) {
+    const A = results[i - 1]; const B = results[i];
+    const tablesA = A?.dataTablePage?.tables; const tablesB = B?.dataTablePage?.tables;
+    if (!A?.pageObj || !B?.pageObj || !tablesA?.length || !tablesB?.length) { chain = null; prevLinked = null; continue; }
+    const TA = tablesA.reduce((m, t) => (calcTableBbox(t).bottom > calcTableBbox(m).bottom ? t : m));
+    const TB = tablesB.reduce((m, t) => (calcTableBbox(t).top < calcTableBbox(m).top ? t : m));
+    // Chain state carries only while the same table keeps continuing.
+    // A later table on the previous page taking over as the bottom fragment means the chain ended.
+    if (chain && TA !== prevLinked) chain = null;
+    prevLinked = null;
+    const bbA = calcTableBbox(TA); const bbB = calcTableBbox(TB);
+    const hA = A.pageObj.dims.height; const hB = B.pageObj.dims.height;
+
+    // Books mirror recto and verso margins, so columns are compared after removing the median offset rather than at absolute positions.
+    const xsA = tableXs(TA); const xsB = tableXs(TB);
+    let residual = Infinity;
+    if (xsA.length === xsB.length && xsA.length >= 2) {
+      const deltas = xsA.map((x, k) => xsB[k] - x).sort((a, b) => a - b);
+      const off = deltas[Math.floor(deltas.length / 2)];
+      residual = Math.max(...deltas.map((d) => Math.abs(d - off)));
+    }
+    // Text-detected columns jitter across pages, so bare geometry is held tighter than a boundary backed by a repeated header row.
+    if (residual > 30) { chain = null; continue; }
+
+    // Real content between the fragments breaks the chain.
+    // Page furniture, the extreme margin bands, and "continued" wording do not, the last being evidence for the link rather than content.
+    let tailBlock = false;
+    let contWordingTail = false;
+    for (const ln of A.pageObj.lines) {
+      if (ln.bbox.top <= bbA.bottom + 4) continue;
+      if (parIsFurniture(ln.par) || ln.bbox.top > hA * 0.915) continue;
+      const raw = lineText(ln);
+      if (CONT_RE.test(raw)) { contWordingTail = true; if (!stripCont(raw)) continue; }
+      tailBlock = true; break;
+    }
+    const chainTitle = chain ? chain.title : (TA.title ? stripCont(TA.title.text) : null);
+    // Continuation pages repeat the heading block above the table, so a line above the candidate blocks only when the previous fragment's page lacks the same text above its own.
+    const echoSet = new Set();
+    if (chainTitle) echoSet.add(chainTitle);
+    for (const ln of A.pageObj.lines) {
+      if (ln.bbox.bottom > bbA.top || ln.bbox.bottom < bbA.top - hA * 0.12) continue;
+      const nt = stripCont(lineText(ln));
+      if (nt) echoSet.add(nt);
+    }
+    let contWording = contWordingTail || !!(TB.title && CONT_RE.test(TB.title.text));
+    let headBlock = false;
+    for (const ln of B.pageObj.lines) {
+      if (ln.bbox.bottom >= bbB.top - 4) continue;
+      if (parIsFurniture(ln.par) || ln.bbox.bottom < hB * 0.085) continue;
+      if (TB.title && ln.bbox.top < TB.title.bbox.bottom && ln.bbox.bottom > TB.title.bbox.top) continue;
+      const raw = lineText(ln);
+      if (CONT_RE.test(raw)) { contWording = true; if (!stripCont(raw)) continue; }
+      if (echoSet.has(stripCont(raw))) continue;
+      headBlock = true; break;
+    }
+    if (tailBlock || headBlock) { chain = null; continue; }
+
+    // A fresh independent caption on the continuation candidate means a different table.
+    const tbTitle = TB.title ? stripCont(TB.title.text) : null;
+    const titleDiff = tbTitle !== null && (chainTitle !== null
+      ? tbTitle !== chainTitle
+      : !CONT_RE.test(TB.title.text));
+    if (titleDiff) { chain = null; continue; }
+
+    const headerRow = chain ? chain.headerRow : row0Text(A.pageObj, TA);
+    const rowB0 = row0Text(B.pageObj, TB);
+    const repeatedHeader = !!headerRow && headerRow.length >= 6 && headerRow === rowB0;
+    // Silent linking takes explicit "continued" wording plus tight geometry and a first fragment that actually ran out of page.
+    // A repeated header row must not promote a boundary to a silent link, however tight its geometry.
+    // Sibling tables that repeat one header down a section (per-period statements, per-section spec tables) are the largest source of wrong links, and they clear every other test here.
+    if (contWording && residual <= 8 && bbA.bottom >= hA * 0.72) {
+      TB.continuesPrev = true;
+      chain = { headerRow, title: chainTitle ?? tbTitle };
+      prevLinked = TB;
+    } else if (repeatedHeader || residual <= 15) {
+      suggestions.push({
+        n: i, prevN: i - 1, tableId: TB.id, prevTableId: TA.id, reason: repeatedHeader ? 'repeated header' : 'columns align',
+      });
+      chain = null;
+    } else {
+      chain = null;
+    }
+  }
+  return suggestions;
+}
+
+/**
+ * Apply the document-level paragraph/layout pass (struct-element and outline stamping, then cross-page layout analysis) to a set of already-parsed pages, in place.
+ * This is the single paragraph detector for native-text PDFs: the direct extraction path and the production worker path both call it, so both yield identical paragraphs.
+ * Best-effort: structural inputs are opportunistic, and pages with no lines are skipped.
+ *
+ * @param {ObjectCache} objCache
+ * @param {Uint8Array} pdfBytes
+ * @param {Array<{objNum: number, objText: string}>} pages - page objects (index = page index).
+ * @param {Array<{pageObj: OcrPage, wordSignals?: Map<OcrWord, PdfWordSignal>, dataTablePage?: LayoutDataTablePage}|null>} results - parsed pages (index = page index).
+ * @param {"image"|"text"|"ocr"} [pdfType] - document text-quality class, used to disable the footnote subsystem on scanned line-numbered transcripts.
+ *   Computed by the caller because some callers' results lack the char scores needed to derive it here.
+ */
+export function applyDocParagraphLayout(objCache, pdfBytes, pages, results, pdfType = 'text') {
+  try {
+    const elemMap = buildStructElemMap(objCache, pdfBytes, pages);
+    if (elemMap) resolveStructElems(results, elemMap);
+  } catch { /* */ }
+
+  // The per-page signal maps merge into one doc-level map because analyzeLayout sees a filtered page array that no longer aligns with `results` by index.
+  /** @type {Map<OcrWord, PdfWordSignal>} */
+  const wordSignals = new Map();
+  for (const r of results) {
+    if (!r || !r.wordSignals) continue;
+    for (const [word, sig] of r.wordSignals) wordSignals.set(word, sig);
+  }
+
+  /** @type {Map<OcrPage, Set<string>>} */
+  const outlineHeadings = new Map();
+  try {
+    const headingIndex = buildOutlineHeadingIndex(objCache, pdfBytes, pages);
+    if (headingIndex) {
+      for (const [idx, set] of headingIndex) {
+        const r = results[idx];
+        if (r && r.pageObj) outlineHeadings.set(r.pageObj, set);
+      }
+    }
+  } catch { /* outlines are opportunistic; never let them break text extraction */ }
+
+  // Microsoft Word emits one struct element per paragraph, so on Word-authored docs analyzeLayout can treat element boundaries as paragraph boundaries outright.
+  let elementFaithful = false;
+  try { elementFaithful = docAuthoredByWord(objCache, pdfBytes); } catch { /* best-effort */ }
+  // Stamp each page with its detected data-table regions so analyzeLayout can suppress the lone-number and line-number-column furniture rules inside a table.
+  // A table's lone-integer cells are otherwise indistinguishable from page numbers and pleading line numbers, and would be dropped on export.
+  for (const r of results) {
+    if (!r || !r.pageObj || !r.dataTablePage) continue;
+    r.pageObj.tableBoxes = r.dataTablePage.tables.map((tbl) => {
+      let left = Infinity; let top = Infinity; let right = -Infinity; let bottom = -Infinity;
+      for (const col of tbl.boxes) {
+        const c = col.coords;
+        if (c.left < left) left = c.left;
+        if (c.top < top) top = c.top;
+        if (c.right > right) right = c.right;
+        if (c.bottom > bottom) bottom = c.bottom;
+      }
+      if (!(right > left)) return null;
+      // Trust a table as a furniture-suppression region only when its content is predominantly numeric, i.e. a genuine data table.
+      // A deposition or pleading transcript is also detected as a columnar table, but its line-number margin and page numbers are real furniture that must stay eligible for those rules.
+      let numeric = 0; let total = 0;
+      for (const line of r.pageObj.lines) {
+        for (const w of line.words) {
+          const cx = (w.bbox.left + w.bbox.right) / 2; const cy = (w.bbox.top + w.bbox.bottom) / 2;
+          if (cx < left || cx > right || cy < top || cy > bottom) continue;
+          total++;
+          const wt = w.text.trim();
+          if (/\d/.test(wt) && /^[\d.,%()$/-]+$/.test(wt)) numeric++;
+        }
+      }
+      if (total < 6 || numeric / total < 0.5) return null;
+      return {
+        left, top, right, bottom,
+      };
+    }).filter((b) => b !== null);
+  }
+  // analyzeLayout assigns paragraphs and roles across all pages at once, overwriting the per-page assignParagraphs result.
+  const kept = results.filter((r) => r && r.pageObj && r.pageObj.lines.length > 0);
+  const docPages = kept.map((r) => r.pageObj);
+  if (docPages.length > 0) {
+    analyzeLayout(docPages, {
+      elementFaithful, pdfType, wordSignals: wordSignals.size ? wordSignals : null, outlineHeadings,
+      fullPageImagePages: kept.map((r) => (r.pageStats ? isFullPageImage(r.pageStats) : false)),
+    });
+  }
+}
+
+/**
+ * Extract text content directly from PDF raw bytes into OcrPage objects.
+ * @param {Uint8Array} pdfBytes
+ * @param {{ dpi?: number, pageIndices?: number[], type3GlyphMappings?: Map<string, string> }} [options]
+ *   `type3GlyphMappings` is a Type3 ToUnicode override keyed by the path-content hash
+ *   from `extractType3DistinctGlyphs`. Fills only-missing entries (existing /ToUnicode wins).
+ *   Values are arbitrary strings, so a ligature glyph can map to e.g. "fi".
+ */
+export function extractPDFTextDirect(pdfBytes, options = {}) {
+  const dpi = options.dpi || 300;
+  const pageIndices = options.pageIndices || null;
+  const type3GlyphMappings = options.type3GlyphMappings;
+
+  const xrefOffset = findXrefOffset(pdfBytes);
+  const xrefEntries = parseXref(pdfBytes, xrefOffset);
+  const objCache = new ObjectCache(pdfBytes, xrefEntries);
+
+  const pages = getPageObjects(objCache);
+  /** @type {LinkDestInfo} */
+  const destInfo = { objNumToIndex: new Map(pages.map((p, i) => [p.objNum, i])), pages, nameDests: null };
+  const results = [];
+
+  if (pageIndices) {
+    const pageSet = new Set(pageIndices);
+    for (let n = 0; n < pages.length; n++) {
+      if (pageSet.has(n)) {
+        results.push(parseSinglePage(pages[n], objCache, n, dpi, type3GlyphMappings, destInfo));
+      } else {
+        results.push(null);
+      }
+    }
+  } else {
+    for (let n = 0; n < pages.length; n++) {
+      results.push(parseSinglePage(pages[n], objCache, n, dpi, type3GlyphMappings, destInfo));
+    }
+  }
+
+  results.tableLinkSuggestions = promoteContinuationTables(results);
+
+  let pdfType = 'text';
+  try { pdfType = determinePdfType(results.map((r) => r && r.pageStats).filter(Boolean), results.length).type; } catch { /*  */ }
+  applyDocParagraphLayout(objCache, pdfBytes, pages, results, pdfType);
+  assignPageLineNums(results.map((r) => (r ? r.pageObj : null)));
+
+  return results;
+}
+
+/**
+ * Detect PDF type (text-native, OCR, or image) by counting visible vs invisible characters.
+ * @param {Uint8Array} pdfBytes
+ */
+export function detectPdfType(pdfBytes) {
+  const xrefOffset = findXrefOffset(pdfBytes);
+  const xrefEntries = parseXref(pdfBytes, xrefOffset);
+  const objCache = new ObjectCache(pdfBytes, xrefEntries);
+
+  const pages = getPageObjects(objCache);
+  const pageStats = [];
+
+  for (let n = 0; n < pages.length; n++) {
+    const { objText, mediaBox } = pages[n];
+    const fonts = parsePageFonts(objText, objCache);
+    const contentStreamText = getPageContentStream(objText, objCache);
+    if (!contentStreamText) continue;
+
+    const pageHeightPts = Math.abs(mediaBox[3] - mediaBox[1]);
+    const tokens = tokenizeContentStream(contentStreamText);
+    // Without ExtGStates, text hidden by zero fill alpha counts as visible and skews the verdict.
+    const extGStates = parseFillAlphaExtGStates(objText, objCache);
+    const chars = executeTextOperators(tokens, fonts, 1, pageHeightPts, undefined, extGStates);
+
+    // Also count text inside Form XObjects: a document whose entire text layer lives there would otherwise misclassify as image-based.
+    // Only character counts feed determinePdfType, not positions, so the geometry args here are trivial (identity CTM, scale 1).
+    const formChars = extractFormXObjectText(
+      objText, tokens, fonts, 1, pageHeightPts, [1, 0, 0, 1, 0, 0], objCache, new Set(), extGStates,
+    );
+    for (let ci = 0; ci < formChars.length; ci++) chars.push(formChars[ci]);
+
+    const cs = scorePageChars(chars);
+    pageStats.push({
+      invisibleTextChars: cs.printable - cs.printableVis,
+      printableVis: cs.printableVis,
+      control: cs.control,
+      controlVis: cs.controlVis,
+    });
+  }
+
+  return determinePdfType(pageStats, pages.length);
+}
+
+/**
+ * @typedef {{
+ *   text: string, x: number, y: number, width: number, fontSize: number,
+ *   fontInfo: { baseName: string, bold: boolean, italic: boolean, smallCaps: boolean,
+ *     familyName: string, ascent: number, descent: number },
+ *   _font?: any,
+ *   superior?: boolean,
+ *   skew?: number,
+ *   stretch?: number,
+ *   invisible: boolean,
+ *   orientation: number,
+ *   dirX: number, dirY: number,
+ *   textColor?: number[],
+ *   alpha?: number,
+ *   renderMode?: number,
+ *   strokeWidthPx?: number,
+ *   strokeColor?: number[],
+ *   artifact?: boolean,
+ *   structTag?: string,
+ *   mcid?: (number|null),
+ *   _perpDist?: number,
+ *   _src?: { op: number, elem: number, byte: number, nBytes: number, advPx: number, space: boolean, tx: number, ty: number, adv: number }
+ * }} PositionedChar
+ */
+
+/**
+ * A font of a page's resources as parsePageFonts builds it.
+ * Only the fields that text edits read are listed.
+ * @typedef {{
+ *   fontObjNum: ?number,
+ *   baseName: string,
+ *   familyName: string,
+ *   toUnicode: Map<number, string>,
+ *   encodingUnicode: Map<number, string>,
+ *   widths: Map<number, number>,
+ *   widthsUnreliable: boolean,
+ *   defaultWidth: number,
+ *   ascent: number,
+ *   descent: number,
+ *   bold: boolean,
+ *   italic: boolean,
+ *   type0: ?object,
+ *   type3: ?object,
+ *   isCIDFont: boolean,
+ *   validCIDs: ?Set<number>,
+ *   charCodeToCID: ?Map<number, number>,
+ *   codespaceRanges: ?Array<{ bytes: number, low: number, high: number }>,
+ *   verticalMode: boolean
+ * }} PageFont
+ */
+
+/**
+ * @typedef {{
+ *   stream: TextPatchStream,
+ *   streamIdx: number,
+ *   tokIdx: number,
+ *   start: number,
+ *   end: number,
+ *   op: string,
+ *   tm: number[], tlm: number[], ctm: number[],
+ *   tc: number, tw: number, tz: number, tl: number, trise: number, tr: number,
+ *   fontTag: ?string, fontObjNum: ?number, fontSize: number, font: ?PageFont,
+ *   textColor: number[], strokeColor: number[], lineWidth: number, fillAlpha: number,
+ *   fillColorSrc: string, strokeColorSrc: string,
+ *   tmAfter: number[], tlmAfter: number[],
+ *   visible: ?number[]
+ * }} ShowOp
+ *   One show operator as the executor ran it.
+ *   `start` and `end` span its operands and operator in its stream.
+ *   `fillColorSrc` and `strokeColorSrc` are the content-stream operators that set its fill and stroke colors.
+ *   `visible` is the region the operator paints into, in the page frame.
+ *   It is the page box cut down by the clips and form boxes in force.
+ *   A non-rectangular clip counts as its bounding box, so the region is never smaller than what the page shows.
+ */
+
+/**
+ * @typedef {{
+ *   stream: TextPatchStream,
+ *   streams: Array<{ stream: TextPatchStream, text: string, tokens: Array<PDFToken>, segments: Array<import('./textPatch.js').PatchSegment>,
+ *     fonts: Map<string, PageFont>, extGStates: Map<string, { fillAlpha: ?number }>, colorSpaces: Map<string, {nInputs: number, tint: object}>,
+ *     dos: Array<{ name: string, visible: ?number[] }> }>,
+ *   ops: Array<ShowOp>,
+ *   words: Map<string, Array<PositionedChar>>,
+ *   glyphs: Array<PositionedChar>,
+ *   pageHeightPts: number,
+ *   scale: number
+ * }} GlyphOpMap
+ *   Maps each glyph a page's streams drew to the show op and the bytes that drew it, and carries the ops' state and the streams they index.
+ *   `glyphs` lists every glyph the streams drew, in stream order and each once, before the parse merged duplicates.
+ *   `words` maps each word to the glyphs that survived the merge.
+ *   Each stream keeps the resource maps its operators ran with, so one of them can run again in a rewritten form.
+ */
+
+/**
+ * Run a rewritten show operator under the state its original ran in.
+ * The chars come out in the map's page-pixel frame, as the parser would place them once the rewrite is in the stream.
+ * @param {GlyphOpMap} glyphOpMap
+ * @param {ShowOp} op - The operator the rewrite replaces.
+ * @param {string} text - The content-stream text that replaces the operator.
+ * @param {Map<string, PageFont>} extraFonts - Faces the rewrite names that the stream's resources do not list.
+ * @param {number} scale - Page pixels per point, as the map was parsed at.
+ * @returns {{ chars: Array<PositionedChar>, ops: Array<ShowOp> }} The chars, each stamped with its place in one of `ops`, which carry the original's visible region.
+ */
+export function executeRewrittenOperator(glyphOpMap, op, text, extraFonts, scale) {
+  const stream = glyphOpMap.streams[op.streamIdx];
+  /** @type {GlyphOpMap} */
+  const run = {
+    stream: op.stream, streams: [{ ...stream, dos: [] }], ops: [], words: new Map(), glyphs: [], pageHeightPts: glyphOpMap.pageHeightPts,
+  };
+  const fonts = extraFonts.size > 0 ? new Map([...stream.fonts, ...extraFonts]) : stream.fonts;
+  const extGStates = new Map(stream.extGStates);
+  extGStates.set('GSpreview', { fillAlpha: op.fillAlpha });
+  // The line-advancing forms move the line matrix before drawing, so they start from the line matrix and its leading.
+  const lineOp = op.op === "'" || op.op === '"';
+  const preamble = [
+    'BT',
+    `${(lineOp ? op.tlm : op.tm).map(formatPdfNumber).join(' ')} Tm`,
+    lineOp ? `${formatPdfNumber(op.tl)} TL` : '',
+    `${formatPdfNumber(op.tc)} Tc ${formatPdfNumber(op.tw)} Tw ${formatPdfNumber(op.tz)} Tz ${formatPdfNumber(op.trise)} Ts ${op.tr} Tr`,
+    op.fontTag ? `/${op.fontTag} ${formatPdfNumber(op.fontSize)} Tf` : '',
+    op.fillColorSrc,
+    op.strokeColorSrc,
+    `${formatPdfNumber(op.lineWidth)} w /GSpreview gs`,
+  ].join('\n');
+  const tokens = tokenizeContentStream(`${preamble}\n${text}\nET`);
+  const chars = executeTextOperators(tokens, fonts, scale, glyphOpMap.pageHeightPts, op.ctm, extGStates, undefined, stream.colorSpaces, run, op.visible);
+  return { chars, ops: run.ops };
+}
+
+/**
+ * Execute text operators from tokenized content stream and extract positioned characters.
+ * @param {Array<PDFToken>} tokens
+ * @param {Map<string, object>} fonts
+ * @param {number} scale - DPI scale factor (dpi/72)
+ * @param {number} pageHeightPts - visual page height in PDF points (after /Rotate)
+ * @param {number[]} [initialCtm] - initial CTM incorporating /Rotate transform
+ * @param {Map<string, { fillAlpha: ?number }>} [extGStates]
+ * @param {{ tc: number, tw: number, tl: number, tz: number, trise: number, artifact?: boolean }} [inheritedTextState] - Text state inherited at Form XObject `Do` call time
+ * @param {Map<string, {nInputs: number, tint: object}>} [colorSpaces] - Separation/DeviceN color spaces from /Resources
+ * @param {?GlyphOpMap} [glyphOpMap] - When given, every show operator is recorded with the text state it ran in, and every emitted character is stamped with its place in that operator.
+ * @param {?number[]} [initialVisible] - With a glyph-op map, the region visible when the stream starts, in the page frame.
+ * @returns {Array<PositionedChar>}
+ */
+function executeTextOperators(tokens, fonts, scale, pageHeightPts, initialCtm, extGStates, inheritedTextState, colorSpaces, glyphOpMap = null, initialVisible = null) {
+  const chars = /** @type {Array<PositionedChar>} */ ([]);
+  const streamIdx = glyphOpMap ? glyphOpMap.streams.length - 1 : -1;
+  // The visible region and the path under construction, kept only for a glyph-op map, so an edit can tell a glyph it would push out of view.
+  /** @type {?number[]} */
+  let visible = initialVisible ? initialVisible.slice() : null;
+  /** @type {?number[]} */
+  let path = null;
+  let pendingClip = false;
+  const addPathPoint = (/** @type {number} */ x, /** @type {number} */ y) => {
+    const px = ctm[0] * x + ctm[2] * y + ctm[4];
+    const py = ctm[1] * x + ctm[3] * y + ctm[5];
+    if (!path) path = [px, py, px, py];
+    else {
+      path[0] = Math.min(path[0], px);
+      path[1] = Math.min(path[1], py);
+      path[2] = Math.max(path[2], px);
+      path[3] = Math.max(path[3], py);
+    }
+  };
+  /** @type {?string} */
+  let currentFontTag = null;
+
+  // Graphics state
+  let ctm = initialCtm ? initialCtm.slice() : [1, 0, 0, 1, 0, 0]; // current transformation matrix
+  let tr = 0; // text rendering mode (0-7; mode 3 = invisible)
+  /** @type {number[]} */
+  let textColor = [0]; // current non-stroking (fill) color — default black
+  let fillTintCS = null;
+  let fillAlpha = 1; // current non-stroking alpha (from ExtGState /ca via `gs`)
+  /** @type {number[]} */
+  let strokeColor = [0];
+  let strokeTintCS = null;
+  let lineWidth = 1;
+  // The operators that last set each color, kept only for a glyph-op map, so an edit can restore the page's ink after its own.
+  let fillColorSrc = '0 g';
+  let strokeColorSrc = '0 G';
+  let fillCsSrc = '';
+  let strokeCsSrc = '';
+  /**
+   * @type {Array<{ ctm: number[], tr: number, tc: number, tw: number, tz: number, tl: number, trise: number,
+   *   fontSize: number, currentFont: any, currentFontTag: ?string, textColor: number[], fillAlpha: number, fillTintCS: ?{nInputs: number, tint: object},
+   *   strokeColor: number[], strokeTintCS: ?{nInputs: number, tint: object}, lineWidth: number,
+   *   fillColorSrc: string, strokeColorSrc: string, fillCsSrc: string, strokeCsSrc: string, visible: ?number[] }>}
+   */
+  const gsStack = [];
+
+  let tm = [1, 0, 0, 1, 0, 0]; // text matrix
+  let tlm = [1, 0, 0, 1, 0, 0]; // text line matrix
+  let currentFont = null;
+  let fontSize = 12;
+  let tc = inheritedTextState ? inheritedTextState.tc : 0;
+  let tw = inheritedTextState ? inheritedTextState.tw : 0;
+  let tz = inheritedTextState ? inheritedTextState.tz : 100;
+  let tl = inheritedTextState ? inheritedTextState.tl : 0;
+  let trise = inheritedTextState ? inheritedTextState.trise : 0;
+
+  /** @type {Array<any>} */
+  const operandStack = [];
+
+  // The PDF spec defines /Artifact marked content as non-content furniture (running heads, page numbers, line numbers), letting tagged docs identify furniture authoritatively instead of by geometry.
+  // inheritedTextState.artifact carries the flag into Form XObjects.
+  /** @type {Array<{tag: string, mcid: (number|null), art: boolean}>} */
+  const mcStack = [];
+  let artifactDepth = (inheritedTextState && inheritedTextState.artifact) ? 1 : 0;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+
+    if (tok.type !== 'operator') {
+      operandStack.push(tok);
+      continue;
+    }
+
+    const op = tok.value;
+    const charsBeforeOp = chars.length;
+
+    switch (op) {
+      // Graphics state operators
+      case 'q':
+        gsStack.push({
+          ctm: ctm.slice(),
+          tr,
+          tc,
+          tw,
+          tz,
+          tl,
+          trise,
+          fontSize,
+          currentFont,
+          currentFontTag,
+          textColor: textColor.slice(),
+          fillAlpha,
+          fillTintCS,
+          strokeColor: strokeColor.slice(),
+          strokeTintCS,
+          lineWidth,
+          fillColorSrc,
+          strokeColorSrc,
+          fillCsSrc,
+          strokeCsSrc,
+          visible: visible ? visible.slice() : null,
+        });
+        clearStack(operandStack);
+        break;
+
+      case 'Q':
+        if (gsStack.length > 0) {
+          const saved = /** @type {NonNullable<ReturnType<typeof gsStack.pop>>} */ (gsStack.pop());
+          ctm = saved.ctm;
+          tr = saved.tr;
+          tc = saved.tc;
+          tw = saved.tw;
+          tz = saved.tz;
+          tl = saved.tl;
+          trise = saved.trise;
+          fontSize = saved.fontSize;
+          currentFont = saved.currentFont;
+          currentFontTag = saved.currentFontTag;
+          textColor = saved.textColor;
+          fillAlpha = saved.fillAlpha;
+          fillTintCS = saved.fillTintCS;
+          strokeColor = saved.strokeColor;
+          strokeTintCS = saved.strokeTintCS;
+          lineWidth = saved.lineWidth;
+          fillColorSrc = saved.fillColorSrc;
+          strokeColorSrc = saved.strokeColorSrc;
+          fillCsSrc = saved.fillCsSrc;
+          strokeCsSrc = saved.strokeCsSrc;
+          visible = saved.visible;
+        }
+        clearStack(operandStack);
+        break;
+
+      case 'cm': {
+        if (operandStack.length >= 6) {
+          const n = operandStack.length;
+          ctm = matMul([operandStack[n - 6].value, operandStack[n - 5].value, operandStack[n - 4].value, operandStack[n - 3].value, operandStack[n - 2].value, operandStack[n - 1].value], ctm);
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      // Text object operators
+      case 'BT':
+        tm = [1, 0, 0, 1, 0, 0];
+        tlm = [1, 0, 0, 1, 0, 0];
+        clearStack(operandStack);
+        break;
+
+      case 'ET':
+        clearStack(operandStack);
+        break;
+
+      case 'BDC':
+      case 'BMC': {
+        const tagTok = operandStack[0];
+        const tag = (tagTok && tagTok.type === 'name') ? tagTok.value : '';
+        const propsTok = operandStack[1];
+        let mcid = null;
+        if (propsTok && propsTok.type === 'dict' && typeof propsTok.value === 'string') {
+          const mm = /\/MCID\s+(\d+)/.exec(propsTok.value);
+          if (mm) mcid = parseInt(mm[1], 10);
+        }
+        const art = tag === 'Artifact';
+        mcStack.push({ tag, mcid, art });
+        if (art) artifactDepth++;
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'EMC': {
+        const popped = mcStack.pop();
+        if (popped && popped.art && artifactDepth > 0) artifactDepth--;
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'Tf': {
+        const size = operandStack.length >= 2 ? operandStack[operandStack.length - 1] : null;
+        const name = operandStack.length >= 2 ? operandStack[operandStack.length - 2] : null;
+        if (name && name.type === 'name' && size && size.type === 'number') {
+          currentFontTag = decodePdfName(name.value);
+          currentFont = fonts.get(currentFontTag) || null;
+          // Preserve the sign: PDFlib emits a negative font size with a Y-flip CTM and negative Tz that compose to a positive overall scale.
+          // Taking abs() here flips the sign of the glyph advances and reverses the glyph order within each line.
+          fontSize = size.value;
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'Tc':
+        if (operandStack.length >= 1) tc = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'Tw':
+        if (operandStack.length >= 1) tw = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'Tz':
+        if (operandStack.length >= 1) tz = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'TL':
+        if (operandStack.length >= 1) tl = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'Tr':
+        if (operandStack.length >= 1) tr = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'Ts':
+        if (operandStack.length >= 1) trise = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      case 'Tm': {
+        if (operandStack.length >= 6) {
+          const n = operandStack.length;
+          tm = [operandStack[n - 6].value, operandStack[n - 5].value, operandStack[n - 4].value, operandStack[n - 3].value, operandStack[n - 2].value, operandStack[n - 1].value];
+          tlm = tm.slice();
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'Td': {
+        if (operandStack.length >= 2) {
+          const tx = operandStack[operandStack.length - 2].value;
+          const ty = operandStack[operandStack.length - 1].value;
+          tlm = [tlm[0], tlm[1], tlm[2], tlm[3],
+            tx * tlm[0] + ty * tlm[2] + tlm[4],
+            tx * tlm[1] + ty * tlm[3] + tlm[5]];
+          tm = tlm.slice();
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'TD': {
+        if (operandStack.length >= 2) {
+          const tx = operandStack[operandStack.length - 2].value;
+          const ty = operandStack[operandStack.length - 1].value;
+          tl = -ty;
+          tlm = [tlm[0], tlm[1], tlm[2], tlm[3],
+            tx * tlm[0] + ty * tlm[2] + tlm[4],
+            tx * tlm[1] + ty * tlm[3] + tlm[5]];
+          tm = tlm.slice();
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'T*': {
+        const tx = 0;
+        const ty = -tl;
+        tlm = [tlm[0], tlm[1], tlm[2], tlm[3],
+          tx * tlm[0] + ty * tlm[2] + tlm[4],
+          tx * tlm[1] + ty * tlm[3] + tlm[5]];
+        tm = tlm.slice();
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'Tj':
+      case 'TJ':
+      case "'":
+      case '"': {
+        // The show op records the state the operator starts in, before the line-advancing forms move to the next line.
+        /** @type {?ShowOp} */
+        const showOp = glyphOpMap ? {
+          stream: glyphOpMap.stream,
+          streamIdx,
+          tokIdx: i,
+          start: operandStack.length > 0 && typeof operandStack[0].start === 'number' ? operandStack[0].start : tok.start,
+          end: tok.start + op.length,
+          op,
+          tm: tm.slice(),
+          tlm: tlm.slice(),
+          ctm: ctm.slice(),
+          tc,
+          tw,
+          tz,
+          tl,
+          trise,
+          tr,
+          fontTag: currentFontTag,
+          fontObjNum: currentFont && Number.isFinite(currentFont.fontObjNum) ? currentFont.fontObjNum : null,
+          fontSize,
+          font: currentFont,
+          textColor: textColor.slice(),
+          strokeColor: strokeColor.slice(),
+          lineWidth,
+          fillAlpha,
+          fillColorSrc,
+          strokeColorSrc,
+          tmAfter: tm,
+          tlmAfter: tlm,
+          visible: visible ? visible.slice() : null,
+        } : null;
+        const opIdx = glyphOpMap ? glyphOpMap.ops.length : -1;
+        if (op === "'" || op === '"') {
+          if (op === '"' && operandStack.length >= 3) {
+            tw = operandStack[operandStack.length - 3].value;
+            tc = operandStack[operandStack.length - 2].value;
+            // The glyphs are drawn with the operands' spacing, so the show op records that instead of the spacing the operator starts in.
+            if (showOp) {
+              showOp.tc = tc;
+              showOp.tw = tw;
+            }
+          }
+          tlm = [tlm[0], tlm[1], tlm[2], tlm[3], -tl * tlm[2] + tlm[4], -tl * tlm[3] + tlm[5]];
+          tm = tlm.slice();
+        }
+        if (operandStack.length >= 1 && currentFont) {
+          const operand = operandStack[operandStack.length - 1];
+          const elems = op === 'TJ' ? (operand.type === 'array' ? operand.value : []) : [operand];
+          for (let ei = 0; ei < elems.length; ei++) {
+            const elem = elems[ei];
+            if (elem.type === 'hexstring') {
+              showHexString(elem.value, currentFont, fontSize, tm, ctm, tc, tw, tz, tr, trise, chars, scale, pageHeightPts, opIdx, ei);
+            } else if (elem.type === 'string') {
+              showLiteralString(elem.value, currentFont, fontSize, tm, ctm, tc, tw, tz, tr, trise, chars, scale, pageHeightPts, opIdx, ei);
+            } else if (elem.type === 'number') {
+              const adjustment = elem.value / 1000 * fontSize * tz / 100;
+              tm[4] -= adjustment * tm[0];
+              tm[5] -= adjustment * tm[1];
+            }
+          }
+        }
+        if (showOp) {
+          showOp.tmAfter = tm.slice();
+          showOp.tlmAfter = tlm.slice();
+          glyphOpMap.ops.push(showOp);
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      // These operators also select a device color space, deselecting any named color space chosen by `cs`.
+      case 'g': case 'rg': case 'k':
+        textColor = operandStack.map((t) => t.value);
+        fillTintCS = null;
+        if (glyphOpMap) { fillColorSrc = `${operandStack.map(serializeContentToken).join(' ')} ${op}`; fillCsSrc = ''; }
+        clearStack(operandStack);
+        break;
+
+      case 'G': case 'RG': case 'K':
+        strokeColor = operandStack.map((t) => t.value);
+        strokeTintCS = null;
+        if (glyphOpMap) { strokeColorSrc = `${operandStack.map(serializeContentToken).join(' ')} ${op}`; strokeCsSrc = ''; }
+        clearStack(operandStack);
+        break;
+
+      case 'cs': {
+        const csName = operandStack.length >= 1 ? operandStack[operandStack.length - 1].value : '';
+        fillTintCS = (colorSpaces && colorSpaces.get(csName)) || null;
+        if (glyphOpMap) { fillCsSrc = `${operandStack.map(serializeContentToken).join(' ')} cs`; fillColorSrc = fillCsSrc; }
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'CS': {
+        const csName = operandStack.length >= 1 ? operandStack[operandStack.length - 1].value : '';
+        strokeTintCS = (colorSpaces && colorSpaces.get(csName)) || null;
+        if (glyphOpMap) { strokeCsSrc = `${operandStack.map(serializeContentToken).join(' ')} CS`; strokeColorSrc = strokeCsSrc; }
+        clearStack(operandStack);
+        break;
+      }
+
+      // Stored raw, a Separation/DeviceN component reads as gray and inverts the color (tint 1 = full ink, gray 1 = white).
+      case 'sc': case 'scn': {
+        let resolved = null;
+        if (fillTintCS) {
+          const comps = operandStack.map((t) => t.value).filter((v) => typeof v === 'number');
+          if (comps.length === fillTintCS.nInputs) {
+            const rgb = tintComponentsToRGB(fillTintCS.tint, comps);
+            if (rgb) resolved = [rgb[0] / 255, rgb[1] / 255, rgb[2] / 255];
+          }
+        }
+        textColor = resolved || operandStack.map((t) => t.value);
+        if (glyphOpMap) fillColorSrc = `${fillCsSrc ? `${fillCsSrc} ` : ''}${operandStack.map(serializeContentToken).join(' ')} ${op}`;
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'SC': case 'SCN': {
+        let resolved = null;
+        if (strokeTintCS) {
+          const comps = operandStack.map((t) => t.value).filter((v) => typeof v === 'number');
+          if (comps.length === strokeTintCS.nInputs) {
+            const rgb = tintComponentsToRGB(strokeTintCS.tint, comps);
+            if (rgb) resolved = [rgb[0] / 255, rgb[1] / 255, rgb[2] / 255];
+          }
+        }
+        strokeColor = resolved || operandStack.map((t) => t.value);
+        if (glyphOpMap) strokeColorSrc = `${strokeCsSrc ? `${strokeCsSrc} ` : ''}${operandStack.map(serializeContentToken).join(' ')} ${op}`;
+        clearStack(operandStack);
+        break;
+      }
+
+      case 'w':
+        if (operandStack.length >= 1) lineWidth = operandStack[operandStack.length - 1].value;
+        clearStack(operandStack);
+        break;
+
+      // Graphics state parameters (sets non-stroking alpha via /ca).
+      case 'gs': {
+        if (operandStack.length >= 1 && extGStates) {
+          const nameTok = operandStack[operandStack.length - 1];
+          if (nameTok && nameTok.type === 'name') {
+            const entry = extGStates.get(nameTok.value);
+            if (entry && entry.fillAlpha !== null && entry.fillAlpha !== undefined) {
+              fillAlpha = entry.fillAlpha;
+            }
+          }
+        }
+        clearStack(operandStack);
+        break;
+      }
+
+      // Path construction, clipping and Do, kept only for a glyph-op map.
+      // The region an operator paints into is the page box cut down by the clips in force.
+      case 'm': case 'l':
+        if (visible && operandStack.length >= 2) addPathPoint(operandStack[operandStack.length - 2].value, operandStack[operandStack.length - 1].value);
+        clearStack(operandStack);
+        break;
+      case 'c': case 'v': case 'y':
+        if (visible) for (let k = 0; k + 1 < operandStack.length; k += 2) addPathPoint(operandStack[k].value, operandStack[k + 1].value);
+        clearStack(operandStack);
+        break;
+      case 're':
+        if (visible && operandStack.length >= 4) {
+          const n = operandStack.length;
+          const x = operandStack[n - 4].value; const y = operandStack[n - 3].value; const w = operandStack[n - 2].value; const h = operandStack[n - 1].value;
+          addPathPoint(x, y);
+          addPathPoint(x + w, y);
+          addPathPoint(x + w, y + h);
+          addPathPoint(x, y + h);
+        }
+        clearStack(operandStack);
+        break;
+      case 'W': case 'W*':
+        pendingClip = true;
+        clearStack(operandStack);
+        break;
+      case 'n': case 'f': case 'F': case 'f*': case 'B': case 'B*': case 'b': case 'b*': case 'S': case 's':
+        if (pendingClip && visible) {
+          visible = path ? intersectRects(visible, path) : [0, 0, 0, 0];
+        }
+        pendingClip = false;
+        path = null;
+        clearStack(operandStack);
+        break;
+      case 'Do':
+        if (glyphOpMap && operandStack.length >= 1) glyphOpMap.streams[streamIdx].dos.push({ name: operandStack[operandStack.length - 1].value, visible: visible ? visible.slice() : null });
+        clearStack(operandStack);
+        break;
+
+      default:
+        clearStack(operandStack);
+        break;
+    }
+
+    // Tag newly-added chars with the current text color, alpha, artifact flag, and innermost structural tag/MCID.
+    if (op === 'Tj' || op === 'TJ' || op === "'" || op === '"') {
+      const inArtifact = artifactDepth > 0;
+      let structTag = null; let mcid = null;
+      for (let s = mcStack.length - 1; s >= 0; s--) {
+        if (STRUCTURAL_MC_TAGS.has(mcStack[s].tag)) { structTag = mcStack[s].tag; mcid = mcStack[s].mcid; break; }
+      }
+      // Faux-bold state: modes 1/2 stroke the glyph outlines with the pen in user space, so the effective width scales with the CTM, not the text matrix.
+      const stroked = tr === 1 || tr === 2;
+      const strokeWidthPx = stroked ? lineWidth * Math.sqrt(Math.abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) * scale : 0;
+      // Zero fill alpha paints nothing at a fill-only render mode, so it hides text the same way mode 3 does.
+      // The stroking modes (1/2/5/6) get their ink from the stroke, which fill alpha does not govern.
+      const fillHidden = fillAlpha === 0 && tr !== 1 && tr !== 2 && tr !== 5 && tr !== 6;
+      for (let ci = charsBeforeOp; ci < chars.length; ci++) {
+        chars[ci].textColor = textColor;
+        chars[ci].alpha = fillAlpha;
+        if (fillHidden) chars[ci].invisible = true;
+        if (stroked) {
+          chars[ci].renderMode = tr;
+          chars[ci].strokeWidthPx = strokeWidthPx;
+          chars[ci].strokeColor = strokeColor;
+        }
+        if (inArtifact) chars[ci].artifact = true;
+        if (structTag) { chars[ci].structTag = structTag; chars[ci].mcid = mcid; }
+        if (glyphOpMap) glyphOpMap.glyphs.push(chars[ci]);
+      }
+    }
+  }
+
+  return chars;
+}
+
+/**
+ * Decode a hex string operand and show its characters.
+ * @param {string} hex
+ * @param {object} font
+ * @param {number} fontSize
+ * @param {number[]} tm - text matrix (modified in place)
+ * @param {number[]} ctm - current transformation matrix
+ * @param {number} tc
+ * @param {number} tw
+ * @param {number} tz - horizontal scaling percentage (Tz, 100 = normal)
+ * @param {number} tr - text rendering mode
+ * @param {number} trise - text rise (unscaled text-space units)
+ * @param {Array<PositionedChar>} chars
+ * @param {number} scale
+ * @param {number} pageHeightPts - page height in PDF points
+ * @param {number} [opIdx] - Index of the show operator in the glyph-op map, or -1 without one.
+ * @param {number} [elemIdx] - Index of the string within a TJ array, 0 for the other show operators.
+ */
+function showHexString(hex, font, fontSize, tm, ctm, tc, tw, tz, tr, trise, chars, scale, pageHeightPts, opIdx = -1, elemIdx = 0) {
+  let str = '';
+  for (let i = 0; i + 1 <= hex.length; i += 2) {
+    str += String.fromCharCode(parseInt(hex.substring(i, i + 2), 16));
+  }
+  showLiteralString(str, font, fontSize, tm, ctm, tc, tw, tz, tr, trise, chars, scale, pageHeightPts, opIdx, elemIdx);
+}
+
+/**
+ * Decode literal string and show characters.
+ * @param {string} str
+ * @param {any} font
+ * @param {number} fontSize
+ * @param {number[]} tm
+ * @param {number[]} ctm
+ * @param {number} tc
+ * @param {number} tw
+ * @param {number} tz - horizontal scaling percentage (Tz, 100 = normal)
+ * @param {number} tr - text rendering mode
+ * @param {number} trise - text rise (unscaled text-space units)
+ * @param {Array<PositionedChar>} chars
+ * @param {number} scale
+ * @param {number} pageHeightPts
+ * @param {number} [opIdx] - Index of the show operator in the glyph-op map, or -1 without one.
+ * @param {number} [elemIdx] - Index of the string within a TJ array, 0 for the other show operators.
+ */
+function showLiteralString(str, font, fontSize, tm, ctm, tc, tw, tz, tr, trise, chars, scale, pageHeightPts, opIdx = -1, elemIdx = 0) {
+  const hScale = Math.hypot(tm[0] * ctm[0] + tm[1] * ctm[2], tm[0] * ctm[1] + tm[1] * ctm[3]);
+  // A faux-oblique shear lengthens the y axis without making the glyphs taller, so vScale is the y axis's extent perpendicular to the x axis.
+  const trmA = tm[0] * ctm[0] + tm[1] * ctm[2];
+  const trmB = tm[0] * ctm[1] + tm[1] * ctm[3];
+  const trmC = tm[2] * ctm[0] + tm[3] * ctm[2];
+  const trmD = tm[2] * ctm[1] + tm[3] * ctm[3];
+  const vScale = hScale > 0 ? Math.abs(trmA * trmD - trmB * trmC) / hScale : Math.hypot(trmC, trmD);
+  let byteOff = 0;
+
+  const dirX = tm[0] * ctm[0] + tm[1] * ctm[2];
+  const dirY = -(tm[0] * ctm[1] + tm[1] * ctm[3]);
+  const dirMag = Math.hypot(dirX, dirY);
+  let orientation = 0;
+  if (dirMag > 0.001) {
+    const ndx = dirX / dirMag;
+    const ndy = dirY / dirMag;
+    if (Math.abs(ndx) < 0.5 && ndy >= 0.5) orientation = 1;
+    else if (ndx <= -0.5 && Math.abs(ndy) < 0.5) orientation = 2;
+    else if (Math.abs(ndx) < 0.5 && ndy <= -0.5) orientation = 3;
+  }
+
+  // Type0/CID fonts typically use 2-byte encoding, but some CMaps define
+  // 1-byte or mixed-width codespace ranges (e.g. OneByteIdentityH).
+  const isCID = font.type0 || font.isCIDFont;
+  const csRanges = font.codespaceRanges;
+  for (const { charCode, numBytes } of decodeTextCodes(str, isCID ? csRanges : null, isCID ? 2 : 1)) {
+    const codeByte = byteOff;
+    byteOff += numBytes;
+    const toUnicodeValue = font.toUnicode.get(charCode);
+    const encodingValue = font.encodingUnicode?.get(charCode);
+    let unicode = toUnicodeValue || encodingValue;
+
+    // Broken ToUnicode maps can flip ASCII letter case while still mapping to the same underlying letter (e.g. E->e).
+    // For fonts flagged by parsePageFonts, prefer encodingUnicode's case for those one-letter conflicts.
+    if (font.preferEncodingCase
+      && toUnicodeValue
+      && encodingValue
+      && toUnicodeValue.length === 1
+      && encodingValue.length === 1
+      && /[A-Za-z]/.test(toUnicodeValue)
+      && /[A-Za-z]/.test(encodingValue)
+      && toUnicodeValue !== encodingValue
+      && toUnicodeValue.toLowerCase() === encodingValue.toLowerCase()) {
+      unicode = encodingValue;
+    }
+
+    let fallbackUsed = false;
+    if (!unicode) {
+      // CFF charset says this CID has no glyph — skip emission and advance.
+      if (isCID && font.validCIDs && !font.validCIDs.has(charCode)) continue;
+      unicode = String.fromCharCode(charCode);
+      fallbackUsed = true;
+    }
+    // Collapse any all-whitespace mapping to a single U+0020.
+    // Producers also pad a visible glyph's mapping with the break that followed it in their source, as in <0065000A> for a line-final "e".
+    // Spacing between words comes from glyph positions here, so that padding would only end up inside a word.
+    if (/^\s+$/.test(unicode)) unicode = ' ';
+    else unicode = unicode.replace(/^\s+|\s+$/g, '');
+    // A ToUnicode value of U+0000 declares that the glyph maps to no text, so it contributes no character while keeping its advance.
+    // Falling through to the charCode fallback would instead fabricate a plausible-wrong letter for CID fonts.
+    let dropNoTextMapping = false;
+    if (!fallbackUsed && unicode.indexOf('\u0000') !== -1) {
+      unicode = unicode.split('\u0000').join('');
+      dropNoTextMapping = unicode === '';
+    }
+    // A CID font's /W advances are keyed by CID, which equals the content-stream code only under Identity encoding, so a non-Identity CMap needs the lookup by mapped CID.
+    // Otherwise every code misses /W and falls to /DW, which some generators set to 0, collapsing every glyph advance to zero.
+    // Simple fonts have no charCodeToCID and keep the code-keyed lookup.
+    const widthKey = isCID && font.charCodeToCID ? (font.charCodeToCID.get(charCode) ?? charCode) : charCode;
+    const glyphWidth = (font.widths.get(widthKey) ?? font.defaultWidth) / 1000 * fontSize;
+    // For placeholder-d1 Type3 fonts, font.widths reports 1 em for every glyph.
+    // visualGlyphWidth is the path-derived right edge, used for the emitted rectangle only.
+    // Tm advance keeps glyphWidth so cursor positioning across glyphs is unchanged.
+    const visualWidthRaw = font.glyphVisualWidths?.get(charCode);
+    const visualGlyphWidth = visualWidthRaw !== undefined
+      ? visualWidthRaw / 1000 * fontSize
+      : glyphWidth;
+
+    // Drop fallback emissions of unmapped control-byte glyph codes.
+    const dropFallbackControl = fallbackUsed && !isCID && unicode.length === 1
+      && (unicode.charCodeAt(0) < 0x20 || unicode.charCodeAt(0) === 0x7F);
+
+    // Transform text position through CTM to get page-space coordinates.
+    const ox = tm[2] * trise + tm[4];
+    const oy = tm[3] * trise + tm[5];
+    const pageX = ctm[0] * ox + ctm[2] * oy + ctm[4];
+    const pageY = ctm[1] * ox + ctm[3] * oy + ctm[5];
+
+    const isWordSpace = numBytes === 1 && charCode === 0x20;
+    const advance = (glyphWidth + tc + (isWordSpace ? tw : 0)) * tz / 100;
+
+    if (!dropFallbackControl && !dropNoTextMapping) {
+      // Edit previews lean their glyphs by this ratio.
+      // The italic flag alone cannot reproduce the lean.
+      // Projecting the y axis onto the x axis keeps the ratio the same when the line is rotated.
+      const shearDen = tm[0] * tm[0] + tm[1] * tm[1];
+      const shearRaw = shearDen > 0 ? (tm[0] * tm[2] + tm[1] * tm[3]) / shearDen : 0;
+      const matrixShear = Math.abs(shearRaw) > 0.05 ? Math.round(shearRaw * 1e4) / 1e4 : 0;
+      // The drawn glyph is this many times its normal width at the emitted fontSize.
+      const matrixStretch = vScale > 0 ? Math.round(((hScale * tz) / (100 * vScale)) * 1e4) / 1e4 : 1;
+      // OpenType superior figures (InDesign's sups feature) draw the superscript entirely in glyph ink.
+      // The stream declares the surrounding size on the shared baseline, so glyph identity is the only superscript evidence.
+      const glyphName = font.charCodeToGlyphName ? font.charCodeToGlyphName.get(charCode) : undefined;
+      chars.push({
+        superior: glyphName !== undefined && /\.(superior|sups)$/.test(glyphName),
+        text: unicode,
+        x: pageX * scale,
+        y: (pageHeightPts - pageY) * scale,
+        width: Math.abs(visualGlyphWidth * tz / 100) * hScale * scale,
+        fontSize: Math.abs(fontSize * vScale * scale),
+        fontInfo: fontInfoFor(font, tr === 1 || tr === 2, matrixShear !== 0),
+        skew: matrixShear,
+        stretch: Math.abs(matrixStretch - 1) > 0.01 ? matrixStretch : 0,
+        _font: font,
+        _charCode: charCode,
+        invisible: tr === 3, // the per-op tag loop also sets this for zero-fill-alpha text
+        orientation,
+        dirX,
+        dirY,
+      });
+      if (opIdx >= 0) {
+        chars[chars.length - 1]._src = {
+          op: opIdx, elem: elemIdx, byte: codeByte, nBytes: numBytes, advPx: advance * hScale * scale, space: isWordSpace, tx: tm[4], ty: tm[5], adv: advance,
+        };
+      }
+    }
+
+    tm[4] += advance * tm[0];
+    tm[5] += advance * tm[1];
+  }
+}
+
+/**
+ * Convert one detected table into a LayoutDataTable attached to `dataTablePage`.
+ * Row bounds prefer exact drawn-rule bottoms, then disjoint row-band bottoms, then text bottoms.
+ * @param {import("./detectPdfTables.js").DetectedTable} dt
+ * @param {LayoutDataTablePage} dataTablePage
+ * @param {OcrPage} pageObj
+ */
+function convertDetectedTable(dt, dataTablePage, pageObj) {
+  const dataTable = new LayoutDataTable(dataTablePage);
+  // Build column bboxes from colSeparators, spanning the full table height.
+  const separators = [dt.bbox.left, ...dt.colSeparators, dt.bbox.right];
+  for (let i = 0; i < separators.length - 1; i++) {
+    const colBbox = {
+      left: separators[i], top: dt.bbox.top, right: separators[i + 1], bottom: dt.bbox.bottom,
+    };
+    dataTable.boxes.push(new LayoutDataColumn(colBbox, dataTable));
+  }
+  dataTable.detectionMethod = dt.detectionMethod || 'text';
+  dataTable.bandColor = dt.rowBandRegion?.bandColor ?? null;
+  dataTable.title = dt.title || null;
+  // Some candidates carry rows for only part of their final bbox, which would fuse everything above into one megarow.
+  if (dt.rows && dt.rows.length > 0) {
+    // A band overlapping another band is 2-D header geometry (a rowspan title, stacked colspan cells), not a row boundary.
+    const bands = dt.rowBandRegion ? dt.rowBandRegion.rowYs : null;
+    const bandUsable = bands ? bands.map((b, i) => bands.every((o, j) => j === i || o.bottom <= b.top + 1 || o.top >= b.bottom - 1)) : null;
+    let usedExact = false;
+    /** @type {number[]} */
+    const bottoms = [];
+    /** @type {number[]} */
+    const tops = [];
+    for (const row of dt.rows) {
+      const lineBottoms = row.lineIndices.map((li) => pageObj.lines[li].bbox.bottom).filter(Number.isFinite);
+      const lineTops = row.lineIndices.map((li) => pageObj.lines[li].bbox.top).filter(Number.isFinite);
+      if (lineTops.length > 0) tops.push(Math.min(...lineTops));
+      let bottom = lineBottoms.length > 0 ? Math.max(...lineBottoms) : NaN;
+      if (Number.isFinite(row.bottom)) {
+        bottom = /** @type {number} */ (row.bottom);
+        usedExact = true;
+      } else if (bands && bandUsable && lineTops.length > 0 && lineBottoms.length > 0) {
+        const mid = (Math.min(...lineTops) + Math.max(...lineBottoms)) / 2;
+        const bi = bands.findIndex((b) => mid >= b.top && mid <= b.bottom);
+        // The band bottom must clear the row's own text, or a mis-assigned band would draw a separator through it.
+        if (bi >= 0 && bandUsable[bi] && bands[bi].bottom >= bottom - 1) {
+          bottom = bands[bi].bottom;
+          usedExact = true;
+        }
+      }
+      if (Number.isFinite(bottom)) bottoms.push(bottom);
+    }
+    bottoms.sort((a, b) => a - b);
+    // Two text rows in one band are one visual row (a wrapped cell), so near-equal bottoms collapse.
+    const deduped = bottoms.filter((b, i) => i === 0 || b > bottoms[i - 1] + 1);
+    const rowSpan = deduped.length > 0 && tops.length > 0 ? deduped[deduped.length - 1] - Math.min(...tops) : 0;
+    if (deduped.length > 0 && (usedExact || rowSpan >= (dt.bbox.bottom - dt.bbox.top) * 0.8)) dataTable.rowBounds = deduped;
+  }
+  // A weak band frequently lands on a title line above the real header row, so deriving from one would wrongly zero the header.
+  // The band's own lines are usually absent from dt.rows, which is why they are counted off pageObj.lines here.
+  if (dt.headers && dt.headers.confidence === 'strong'
+      && Number.isFinite(dt.headers.bandTop) && Number.isFinite(dt.headers.bandBottom)) {
+    /** @type {number[]} */
+    const bandLineTops = [];
+    for (const line of pageObj.lines) {
+      const yC = (line.bbox.top + line.bbox.bottom) / 2;
+      if (yC <= dt.bbox.top || yC < dt.headers.bandTop - 2 || yC >= dt.headers.bandBottom - 2) continue;
+      if (line.bbox.right < dt.bbox.left || line.bbox.left > dt.bbox.right) continue;
+      if (!bandLineTops.some((t) => Math.abs(t - line.bbox.top) < 5)) bandLineTops.push(line.bbox.top);
+    }
+    if (bandLineTops.length > 0) {
+      if (dataTable.rowBounds) {
+        // A malformed candidate can carry row bounds above its own top, which would count phantom header rows.
+        const boundsInBand = dataTable.rowBounds.filter((b) => b > dt.bbox.top && b <= dt.headers.bandBottom + 2).length;
+        dataTable.headerRows = boundsInBand > 0 ? boundsInBand : 1;
+      } else {
+        dataTable.headerRows = Math.min(bandLineTops.length, 5);
+      }
+    } else if (['text', 'row-band'].includes(dt.detectionMethod || 'text') && !dt.splitTopLocked) {
+      // An empty strong band means the header-like cells sit above the refined top, leaving row 0 as data.
+      dataTable.headerRows = 0;
+    }
+  }
+  // The band scan only looks above the rows, so it never classifies row 0 itself, and its content has to decide.
+  // A first row carrying data values is the shape of a table continuing from a prior page, which has no header row at all.
+  if (dataTable.headerRows === null && dt.rows && dt.rows.length >= 2) {
+    const sortedRows = [...dt.rows].sort((a, b) => a.y - b.y);
+    const rowTokens = (row) => row.lineIndices.flatMap((li) => pageObj.lines[li].words.map((w) => w.text));
+    const isDataTok = (t) => /^[\d,$%.()+-]+$/.test(t) && /\d/.test(t) && !/^(?:19|20)\d\d$/.test(t);
+    const firstToks = rowTokens(sortedRows[0]);
+    const firstData = firstToks.filter(isDataTok).length;
+    const bodyRows = sortedRows.slice(1);
+    const bodyData = bodyRows.reduce((s, r) => s + rowTokens(r).filter(isDataTok).length, 0) / bodyRows.length;
+    if (firstData >= 2 || (firstData >= 1 && bodyData >= 1)) dataTable.headerRows = 0;
+    else if (firstData === 0 && firstToks.some((t) => /[A-Za-z]/.test(t))) dataTable.headerRows = 1;
+  }
+  return dataTable;
+}
+
+/**
+ * Group positioned characters into OcrPage with lines and words.
+ * @param {Array<PositionedChar>} chars
+ * @param {number} n - page number (0-indexed)
+ * @param {number} pageWidth - in pixels at target DPI
+ * @param {number} pageHeight - in pixels at target DPI
+ * @param {Array<{left: number, right: number, y: number, color?: number[], isUnderline?: boolean}>} [underlineRects] - thin horizontal rectangles to match against words as underlines.
+ *   Matched rects are flagged in place with `isUnderline`.
+ * @param {Array} [paths] - raw vector paths from parsePagePaths
+ * @param {number} [scale] - DPI scale factor
+ * @param {number} [visualHeightPts] - page height in points
+ * @param {number} [boxOriginX] - X origin of effective page box in points
+ * @param {number} [boxOriginY] - Y origin of effective page box in points
+ * @param {boolean} [pageHasMath] - page contains mathematics (enables the built-up-math line rule)
+ * @param {?GlyphOpMap} [glyphOpMap] - When given, receives each word's characters under the word's id.
+ */
+export function groupCharsIntoPage(
+  chars, n, pageWidth, pageHeight, underlineRects = [], paths = [], scale = 1, visualHeightPts = 0, boxOriginX = 0, boxOriginY = 0, pageHasMath = false, glyphOpMap = null,
+) {
+  const pageObj = new ocr.OcrPage(n, { width: pageWidth, height: pageHeight });
+  pageObj.textSource = 'pdf';
+  const langSet = new Set();
+  const fontSet = new Set();
+  /** @type {Map<OcrWord, PdfWordSignal>} */
+  const wordSignals = new Map();
+  /** @type {Record<string, NativeTextWord>} */
+  const nativeText = {};
+  // Drawn extents of lone symbol glyphs, so the fill detector can offer the box a reader sees rather than the font's em box.
+  /** @type {Array<{id: string, bbox: {left: number, top: number, right: number, bottom: number}}>} */
+  const fillGlyphBoxes = [];
+
+  if (chars.length === 0) {
+    return {
+      pageObj, langSet, fontSet, wordSignals, nativeText, dataTablePage: new LayoutDataTablePage(n), fillGlyphBoxes,
+    };
+  }
+
+  for (let chI = 0; chI < chars.length; chI++) {
+    const ch = chars[chI];
+    if (/^\s$/.test(ch.text)) ch.text = ' ';
+  }
+
+  // Dedupe glyphs double-rendered as a stroke pass plus a fill pass. Two shapes:
+  //   1. Identical Tm: the same Tj re-emitted at the same position (Tr 1 stroke, then Tr 0 fill).
+  //   2. Slightly-offset overlap: the same glyph drawn again 1-5 pt away for a fake-bold outline.
+  // Both copies are emitted adjacently, so a bounded lookback catches them.
+  chars = (() => {
+    const result = [];
+    const POS_OFF = 4194304; // 2^22, biases the rounded coordinates non-negative (above any |round(px*100)| on a real page)
+    const POS_MUL = 67108864; // 2^26, spaces the x field above the packed (y, orientation) so the fields never overlap
+    if (!dedupTmFilter) dedupTmFilter = new PresenceFilter();
+    const tmFilter = dedupTmFilter;
+    tmFilter.next();
+    for (let i = 0; i < chars.length; i++) {
+      const ch = chars[i];
+      const xr = Math.round(ch.x * 100);
+      const yr = Math.round(ch.y * 100);
+      const posNum = (xr + POS_OFF) * POS_MUL + (yr + POS_OFF) * 4 + ch.orientation;
+      const tmHash = dedupHash(xr, yr, ch.orientation);
+      let dupeIdx = -1;
+      let dupeKind = '';
+      if (tmFilter.has(tmHash)) {
+        for (let idx = result.length - 1; idx >= Math.max(0, result.length - SAME_TM_LOOKBACK); idx--) {
+          if (sameTmRing[idx % SAME_TM_LOOKBACK] !== posNum) continue;
+          const g = result[idx];
+          if (g.text === ch.text && g.fontInfo.baseName === ch.fontInfo.baseName) { dupeIdx = idx; dupeKind = 'sameTm'; break; }
+        }
+      }
+      if (dupeIdx < 0) {
+        for (let j = result.length - 1; j >= Math.max(0, result.length - 8); j--) {
+          const prev = result[j];
+          if (prev.text !== ch.text
+              || prev.fontInfo.baseName !== ch.fontInfo.baseName
+              || prev.orientation !== ch.orientation) continue;
+          if (Math.abs(prev.fontSize - ch.fontSize) < ch.fontSize * 0.05
+              && Math.abs(prev.y - ch.y) < ch.fontSize * 0.2) {
+            const xOverlap = Math.min(prev.x + prev.width, ch.x + ch.width)
+                           - Math.max(prev.x, ch.x);
+            const minWidth = Math.min(prev.width, ch.width);
+            if (xOverlap > 0 && minWidth > 0 && xOverlap / minWidth > 0.5) {
+              dupeIdx = j; dupeKind = 'overlap'; break;
+            }
+          }
+        }
+      }
+      if (dupeIdx >= 0) {
+        const prev = result[dupeIdx];
+        // fontInfo objects are shared per font, so copy rather than mutate.
+        if (ch.fontInfo.bold && !prev.fontInfo.bold) prev.fontInfo = { ...prev.fontInfo, bold: true };
+        if (!ch.invisible) prev.invisible = false;
+        // The stroke is emitted first at a wider, offset position and the fill drawn on top where the glyph visually belongs, so the later position is the correct one.
+        // Keeping the stroke's geometry would skew the x-gaps that word splitting reads later.
+        if (dupeKind === 'overlap') {
+          prev.x = ch.x;
+          prev.y = ch.y;
+          prev.width = ch.width;
+          prev.fontSize = ch.fontSize;
+        }
+        continue;
+      }
+      sameTmRing[result.length % SAME_TM_LOOKBACK] = posNum;
+      tmFilter.add(tmHash);
+      result.push(ch);
+    }
+    return result;
+  })();
+
+  // Orientations 1, 2 and 3 are quarter turns: text reads downward, leftward and upward on screen.
+  // Remapping them into a virtual horizontal system lets the line grouping and word splitting below assume horizontal text.
+  for (let chI = 0; chI < chars.length; chI++) {
+    const ch = chars[chI];
+    if (ch.orientation === 1) {
+      const vx = ch.y;
+      const vy = pageWidth - ch.x;
+      ch.x = vx;
+      ch.y = vy;
+    } else if (ch.orientation === 2) {
+      ch.x = pageWidth - ch.x;
+      ch.y = pageHeight - ch.y;
+    } else if (ch.orientation === 3) {
+      const vx = pageHeight - ch.y;
+      const vy = ch.x;
+      ch.x = vx;
+      ch.y = vy;
+    }
+  }
+
+  // Grouping on distance perpendicular to the average text direction keeps slightly rotated text from splitting one baseline across many lines.
+  let avgDirX = 0;
+  let avgDirY = 0;
+  let orient0Count = 0;
+  for (let chI = 0; chI < chars.length; chI++) {
+    const ch = chars[chI];
+    if (ch.orientation === 0) {
+      avgDirX += ch.dirX;
+      avgDirY += ch.dirY;
+      orient0Count++;
+    }
+  }
+  if (orient0Count > 0) {
+    const mag = Math.hypot(avgDirX, avgDirY);
+    if (mag > 0) { avgDirX /= mag; avgDirY /= mag; }
+  }
+  if (orient0Count === 0 || (avgDirX === 0 && avgDirY === 0)) {
+    avgDirX = 1; avgDirY = 0;
+  }
+
+  for (let chI = 0; chI < chars.length; chI++) {
+    const ch = chars[chI];
+    if (ch.orientation === 0) {
+      ch._perpDist = -ch.x * avgDirY + ch.y * avgDirX;
+    }
+  }
+
+  const lines = [];
+  let currentLine = [chars[0]];
+  // The anchor holds the baseline and size of the line's first full-size char, so a superscript sitting between two baselines cannot bridge them into one line.
+  let anchorY = chars[0]._perpDist ?? chars[0].y;
+  let anchorFontSize = chars[0].fontSize;
+  // Body band of the current line, for the no-overlap cut below: the baseline and size of the line's full-size text, promoted past any leading reduced-size marker.
+  // Kept separate from anchorY/anchorFontSize so the superscript and math rules that read the anchor are unaffected.
+  let lineBodyY = chars[0].text === ' ' ? null : (chars[0]._perpDist ?? chars[0].y);
+  let lineBodySize = chars[0].text === ' ' ? 0 : chars[0].fontSize;
+
+  for (let i = 1; i < chars.length; i++) {
+    const ch = chars[i];
+
+    // Without this cut, the orphan-merge pass below re-attaches the next char through the bridging space.
+    // The font-size gate is required because same-size y-jumps are routine in multi-column tables.
+    if (ch.text === ' ') {
+      let lastNonSpace = null;
+      for (let j = currentLine.length - 1; j >= 0; j--) {
+        if (currentLine[j].text !== ' ') { lastNonSpace = currentLine[j]; break; }
+      }
+      if (lastNonSpace) {
+        const spMaxFs = Math.max(ch.fontSize, lastNonSpace.fontSize);
+        const spFsChange = Math.abs(ch.fontSize - lastNonSpace.fontSize) > spMaxFs * 0.1;
+        const spYGap = Math.abs((ch._perpDist ?? ch.y) - (lastNonSpace._perpDist ?? lastNonSpace.y));
+        if (spFsChange) {
+          const spMinFs = Math.min(ch.fontSize, lastNonSpace.fontSize);
+          if (spYGap > spMaxFs * 0.7 || spYGap > spMinFs * 1.5) {
+            lines.push(currentLine);
+            currentLine = [ch];
+            anchorY = ch._perpDist ?? ch.y;
+            anchorFontSize = ch.fontSize;
+            lineBodyY = null;
+            lineBodySize = 0;
+            continue;
+          }
+        }
+      }
+      currentLine.push(ch);
+      continue;
+    }
+
+    // For comparison, use the last non-space char (spaces have unreliable font metrics).
+    let compPrev = chars[i - 1];
+    if (compPrev.text === ' ') {
+      for (let j = currentLine.length - 1; j >= 0; j--) {
+        if (currentLine[j].text !== ' ') {
+          compPrev = currentLine[j];
+          break;
+        }
+      }
+    }
+
+    const chY = ch._perpDist ?? ch.y;
+    const prevY = compPrev._perpDist ?? compPrev.y;
+    const yGap = Math.abs(chY - prevY);
+    const xGap = ch.x - (compPrev.x + compPrev.width);
+    // Type3 fonts with a non-standard FontMatrix (e.g. identity) can carry a Tf-derived fontSize far smaller than the glyphs' device-space size.
+    const chSize = Math.max(ch.fontSize, ch.width);
+    const prevSize = Math.max(compPrev.fontSize, compPrev.width);
+    const maxFont = Math.max(chSize, prevSize);
+    const minFont = Math.min(chSize, prevSize);
+    // The ratio compares Tf directly rather than the floored sizes, so natural advance variation ("i" vs "M") cannot read as a size change.
+    const fontRatio = ch.fontSize / compPrev.fontSize;
+    // Symbol glyphs set inline, such as Webdings arrows between words, can report a different orientation and font size while still belonging to the same visual line.
+    const symbolBoundary = isSymbolFontChar(ch)
+      || isSymbolFontChar(compPrev);
+    const inlineSymbolBoundary = symbolBoundary
+      && yGap < maxFont * 0.5
+      && xGap > -maxFont * 0.2
+      && xGap < maxFont;
+
+    // Inline mathematics sets a few glyphs off the main baseline within one visual line, so the y-jump cuts below would tear them onto their own line without these exemptions.
+    // The exemptions must stay narrow, since a general baseline-shift exemption merges headings, captions, and table cells into adjacent lines.
+    const reducedScript = ch.fontSize < anchorFontSize * 0.85
+      && chY - ch.fontSize * 0.8 < anchorY + anchorFontSize * 0.2
+      && chY + ch.fontSize * 0.2 > anchorY - anchorFontSize * 0.8;
+    const radicalRadicand = (isRadicalText(compPrev.text) || isRadicalText(ch.text))
+      && fontRatio > 0.8 && fontRatio < 1.25
+      && xGap > -maxFont * 0.2 && xGap < maxFont * 0.5
+      && yGap < maxFont * 1.1;
+    // builtUpMath: built-up expressions (a fraction under a radical, nested scripts) stack glyphs at several vertical offsets within one line, beyond what reducedScript tolerates.
+    // This broader exemption is safe only because pageHasMath gates it: on pages with no mathematics it is dead code and grouping is unchanged.
+    // The envelope is measured from anchorY rather than the previous char, which may itself be a displaced numerator or radicand.
+    const mathContext = pageHasMath && (isMathFontChar(ch)
+      || isMathFontChar(compPrev)
+      || isRadicalText(compPrev.text) || isRadicalText(ch.text)
+      || ch.fontSize < anchorFontSize * 0.85 || compPrev.fontSize < anchorFontSize * 0.85
+      || (fontRatio > 0.8 && fontRatio < 1.25 && Math.abs(chY - anchorY) < anchorFontSize * 0.35));
+    // 1.3 em covers built-up stacking yet stays below one line-pitch, so the first glyph of a true next line falls outside and still cuts.
+    const withinEnvelope = Math.abs(chY - anchorY) < anchorFontSize * 1.3;
+    // Horizontal continuity: a stacked script steps backward under the body glyph it modifies by up to ~1.5 body em, while a true line return travels many body em back to the margin and still cuts.
+    // The backward bound is in body em rather than maxFont: against a tiny script glyph a maxFont bound would sit inside the backward-x cut threshold and could never suppress that cut.
+    const horizontalContinuity = xGap > -anchorFontSize * 1.5 && xGap < maxFont * 4;
+    const builtUpMath = pageHasMath && mathContext && withinEnvelope && horizontalContinuity;
+
+    const inlineMath = reducedScript || radicalRadicand || builtUpMath;
+
+    // Leading reduced-size marker: a line opening with a smaller raised glyph, e.g. a footnote reference starting its own definition ("¹ The Debtors ..."), that resumes at full size on the same row.
+    // Without this the resume reads as a size-up plus baseline jump off the still-small anchor, and the marker is torn onto its own line.
+    const leadingMarker = anchorFontSize < ch.fontSize * 0.85
+      && xGap > -maxFont * 0.3 && xGap < maxFont * 0.8
+      && yGap < maxFont * 0.8;
+
+    let isCut = false;
+
+    if (ch.orientation !== compPrev.orientation && !inlineSymbolBoundary) isCut = true;
+
+    // No-overlap invariant: a reduced-size glyph whose baseline lies clearly outside the line's body band is on a different visual line and must cut, whatever the superscript rules below say.
+    // A true sub/superscript keeps a small offset that intersects the band.
+    // The classic catch is the next footnote's own number sitting in the inter-line gap below a short note like "Id.".
+    // Full-size glyphs are exempt since a slightly-low one still overlaps the band, and a full-size next line is already cut by the y-jump rule below.
+    // leadingMarker and builtUpMath are exempt because a resuming body line and stacked math legitimately place reduced glyphs outside the band.
+    else if (lineBodySize > 0 && !leadingMarker && !builtUpMath
+      && ch.fontSize < lineBodySize * 0.85
+      && (chY - lineBodyY > lineBodySize * 0.4 || chY - lineBodyY < -lineBodySize * 0.9)) isCut = true;
+
+    else if ((yGap > maxFont * 0.7 || yGap > minFont * 1.5) && !inlineMath && !leadingMarker) isCut = true;
+
+    else if (xGap < -maxFont * 2 && !builtUpMath) isCut = true;
+
+    else if (xGap > maxFont * 4) isCut = true;
+
+    // The x-proximity guard avoids false cuts from glyph-metric noise on adjacent chars.
+    // The y-threshold loosens past one full font size of x-gap, where sustained mid-line baseline drift is implausible.
+    else if (!inlineMath && !leadingMarker && fontRatio > 0.8 && fontRatio < 1.25
+      && (xGap < -maxFont * 0.1 || xGap > maxFont * 0.5 || yGap > minFont * 0.5)
+      && yGap > (xGap > maxFont ? minFont * 0.2 : minFont * 0.3)) isCut = true;
+
+    // builtUpMath is exempt because a built-up expression is itself a size change beside full-size body text, and this cut would tear it apart.
+    else if (!inlineSymbolBoundary && !builtUpMath
+      && yGap > minFont * 0.1 && (fontRatio > 1.75 || fontRatio < 1 / 1.75)
+      && (xGap < -maxFont * 0.1 || xGap > maxFont * 0.5)) isCut = true;
+
+    // A size change that persists for several chars is a line transition, not a one-off superscript.
+    else if (!inlineSymbolBoundary && !builtUpMath && yGap > minFont * 0.1 && (fontRatio < 0.8 || fontRatio > 1.25)) {
+      let persistCount = 0;
+      const targetSize = Math.min(ch.fontSize, compPrev.fontSize);
+      for (let j = i + 1; j < chars.length && persistCount < 3; j++) {
+        if (chars[j].text === ' ') continue;
+        if (Math.abs(chars[j].fontSize - targetSize) < targetSize * 0.15) persistCount++;
+        else break;
+      }
+      if (persistCount >= 3) isCut = true;
+    }
+
+    // Baseline drift: a same-size char whose baseline shifted from the anchor, bridged by an intervening superscript (e.g. a footnote marker between a table row and a wrapped cell's first line).
+    // Kept independent of the chain above so the persistent-size-change branch cannot swallow it.
+    // The size match is bidirectional: a line starting with a leading superscript followed by full-size text is promoting the anchor, not drifting from it.
+    // builtUpMath is exempt: a same-size radical or operator entering raised from prose is an inline-math excursion, not a drifted line.
+    if (!isCut && !builtUpMath
+      && ch.fontSize >= anchorFontSize * 0.8 && ch.fontSize <= anchorFontSize * 1.25
+      && Math.abs(chY - anchorY) > anchorFontSize * 0.3
+      && xGap > maxFont * 0.5) isCut = true;
+
+    if (isCut) {
+      lines.push(currentLine);
+      currentLine = [ch];
+      anchorY = chY;
+      anchorFontSize = ch.fontSize;
+      lineBodyY = chY;
+      lineBodySize = ch.fontSize;
+    } else {
+      currentLine.push(ch);
+      // On a math page a full-size glyph raised well above the anchor, e.g. a full-size citation marker ("spectrum⁶"), is positionally a superscript and must not promote the baseline.
+      // Promoting it would make the following baseline text read as drifted from the raised anchor and torn onto its own line.
+      if (ch.fontSize >= anchorFontSize * 0.8
+        && !(pageHasMath && chY < anchorY - anchorFontSize * 0.25)) {
+        anchorY = chY;
+      }
+      if (ch.text !== ' ' && (lineBodySize === 0 || ch.fontSize >= lineBodySize * 0.95)) {
+        lineBodySize = Math.max(lineBodySize, ch.fontSize);
+        lineBodyY = chY;
+      }
+    }
+  }
+  if (currentLine.length > 0) lines.push(currentLine);
+
+  // PDF generators sometimes emit characters far from their neighbors in stream order, creating spurious single-char lines.
+  // The orphan is inserted at its x-position in the target line so word splitting groups it with its spatial neighbor.
+  // Both merge cases require x-adjacency, so a line whose extent misses the orphan by more than the loosest per-char slack cannot contain a match and is skipped whole.
+  // A table page of single-digit cells makes thousands of lines orphans, and without the skip every one re-walks every char on the page.
+  const lineExtents = lines.map((lineChars) => {
+    let minX = Infinity;
+    let maxRight = -Infinity;
+    let maxFontSize = 0;
+    for (let chI = 0; chI < lineChars.length; chI++) {
+      const ch = lineChars[chI];
+      if (ch.x < minX) minX = ch.x;
+      const r = ch.x + ch.width;
+      if (r > maxRight) maxRight = r;
+      if (ch.fontSize > maxFontSize) maxFontSize = ch.fontSize;
+    }
+    return { minX, maxRight, maxFontSize };
+  });
+  for (let li = lines.length - 1; li >= 0; li--) {
+    if (lines[li].length !== 1) continue;
+    const orphan = lines[li][0];
+    const orphanRight = orphan.x + orphan.width;
+    const orphanTop = orphan.y - (orphan.fontInfo.ascent / 1000) * orphan.fontSize;
+    let merged = false;
+    for (let lj = 0; lj < lines.length && !merged; lj++) {
+      if (lj === li) continue;
+      const target = lines[lj];
+      const ext = lineExtents[lj];
+      const slack = Math.max(orphan.fontSize, ext.maxFontSize) * 0.1;
+      if (orphanRight < ext.minX - slack || orphan.x > ext.maxRight + slack) continue;
+      for (const ch of target) {
+        if (orphan.fontInfo.familyName !== ch.fontInfo.familyName) continue;
+        const chRight = ch.x + ch.width;
+        const maxFont = Math.max(orphan.fontSize, ch.fontSize);
+        const minFont = Math.min(orphan.fontSize, ch.fontSize);
+
+        const sameSize = Math.abs(orphan.fontSize - ch.fontSize) < maxFont * 0.1;
+        const xAdj = (orphanRight >= ch.x - maxFont * 0.1 && orphan.x <= chRight + maxFont * 0.1);
+
+        if (sameSize && xAdj && Math.abs(orphan.y - ch.y) < maxFont * 0.5) {
+          // Case (a): same-size punctuation.
+          let insertIdx = target.length;
+          for (let k = 0; k < target.length; k++) {
+            if (target[k].x > orphan.x) { insertIdx = k; break; }
+          }
+          target.splice(insertIdx, 0, orphan);
+          if (orphan.x < ext.minX) ext.minX = orphan.x;
+          if (orphanRight > ext.maxRight) ext.maxRight = orphanRight;
+          if (orphan.fontSize > ext.maxFontSize) ext.maxFontSize = orphan.fontSize;
+          lines.splice(li, 1);
+          lineExtents.splice(li, 1);
+          merged = true;
+          break;
+        }
+
+        if (!sameSize && orphan.fontSize > ch.fontSize * 2
+            && /[A-Z]/.test(orphan.text) && xAdj) {
+          // Case (b): drop cap — check top alignment.
+          const chTop = ch.y - (ch.fontInfo.ascent / 1000) * ch.fontSize;
+          if (Math.abs(orphanTop - chTop) < minFont * 0.25) {
+            let insertIdx = target.length;
+            for (let k = 0; k < target.length; k++) {
+              if (target[k].x > orphan.x) { insertIdx = k; break; }
+            }
+            target.splice(insertIdx, 0, orphan);
+            if (orphan.x < ext.minX) ext.minX = orphan.x;
+            if (orphanRight > ext.maxRight) ext.maxRight = orphanRight;
+            if (orphan.fontSize > ext.maxFontSize) ext.maxFontSize = orphan.fontSize;
+            lines.splice(li, 1);
+            lineExtents.splice(li, 1);
+            merged = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Merge line fragments split by an inline superscript's y-shift.
+  // The superscript-size check is what gates the merge, because a shared baseline and small gap alone would also merge unrelated column-aligned lines.
+  const lineAnchorOf = (lineChars) => {
+    let maxSize = 0;
+    let anchorFamily = null;
+    for (let chI = 0; chI < lineChars.length; chI++) {
+      const ch = lineChars[chI];
+      if (ch.text !== ' ' && ch.fontSize > maxSize) { maxSize = ch.fontSize; anchorFamily = ch.fontInfo.familyName; }
+    }
+    if (maxSize === 0) return null;
+    let nBase = 0;
+    let leftX = Infinity;
+    let rightX = -Infinity;
+    for (let chI = 0; chI < lineChars.length; chI++) {
+      const ch = lineChars[chI];
+      if (ch.text === ' ') continue;
+      if (ch.fontSize >= maxSize * 0.8) {
+        if (nBase === anchorBaselineScratch.length) { const grown = new Float64Array(nBase * 2); grown.set(anchorBaselineScratch); anchorBaselineScratch = grown; }
+        anchorBaselineScratch[nBase++] = ch._perpDist ?? ch.y;
+      }
+      if (ch.x < leftX) leftX = ch.x;
+      const r = ch.x + ch.width;
+      if (r > rightX) rightX = r;
+    }
+    if (nBase === 0) return null;
+    const ys = anchorBaselineScratch.subarray(0, nBase).sort();
+    return {
+      anchorFontSize: maxSize,
+      anchorFamily,
+      baselineY: ys[Math.floor(nBase / 2)],
+      leftX,
+      rightX,
+    };
+  };
+  const anchors = lines.map(lineAnchorOf);
+  for (let li = lines.length - 2; li >= 0; li--) {
+    const a = anchors[li];
+    const b = anchors[li + 1];
+    if (!a || !b) continue;
+    const anchorSize = Math.max(a.anchorFontSize, b.anchorFontSize);
+    const gap = b.leftX - a.rightX;
+    if (gap < -anchorSize * 0.1 || gap > anchorSize) continue;
+    // A sup-sized continuation reports its baselineY at the shifted superscript baseline, not the body baseline.
+    // The looser tolerance is confined to that geometry so a small sub-heading beside a heading with a real column gap is not merged into it.
+    const smallerIsA = a.anchorFontSize < b.anchorFontSize * 0.85;
+    const smallerIsB = b.anchorFontSize < a.anchorFontSize * 0.85;
+    const supContinuation = Math.abs(gap) < anchorSize * 0.1
+      && ((smallerIsA && a.baselineY < b.baselineY)
+        || (smallerIsB && b.baselineY < a.baselineY));
+    const baselineTol = supContinuation ? anchorSize * 0.5 : anchorSize * 0.25;
+    if (Math.abs(a.baselineY - b.baselineY) > baselineTol) continue;
+    let lastA = null;
+    for (let k = lines[li].length - 1; k >= 0; k--) {
+      if (lines[li][k].text !== ' ') { lastA = lines[li][k]; break; }
+    }
+    let firstB = null;
+    for (let k = 0; k < lines[li + 1].length; k++) {
+      if (lines[li + 1][k].text !== ' ') { firstB = lines[li + 1][k]; break; }
+    }
+    const supBoundary = (lastA && lastA.fontSize < anchorSize * 0.85)
+      || (firstB && firstB.fontSize < anchorSize * 0.85);
+    if (!supBoundary) continue;
+    lines[li] = [...lines[li], ...lines[li + 1]];
+    lines.splice(li + 1, 1);
+    anchors[li] = lineAnchorOf(lines[li]);
+    anchors.splice(li + 1, 1);
+  }
+
+  // The reattach pass below tests every candidate fragment against every other line, so it reads the anchors computed above.
+  // A page of numeric table cells makes thousands of lines candidates, and recomputing anchors per pair dominates the page's extraction cost.
+
+  // Reattach out-of-order inline reference markers to the line they belong to.
+  // Some generators (web print-to-PDF among them) emit a page's superscript markers, footnote numerals and reference symbols, as a trailing block at the end of the content stream.
+  // Each lands as its own reduced-size line in a band a full-size line already occupies, which the neighbor-only superscript merges above never reach, so it strands as a standalone paragraph.
+  // Only marker-shaped content is moved, so a genuinely separate reduced-size line is never absorbed.
+  const refMarker = /^[0-9,]+$|^[®*†‡§]+$/;
+  // The "FN"+number convention sets its in-text reference at full body size but raised, so the size-gated superscript merges above never claim it and it strands the same way.
+  const fnMarker = /^FN\d{1,3}$/;
+  for (let li = lines.length - 1; li >= 0; li--) {
+    const frag = lines[li].filter((c) => c.text !== ' ');
+    if (frag.length === 0 || frag.length > 6) continue;
+    const fragText = frag.map((c) => c.text).join('');
+    const isFnMarker = fnMarker.test(fragText);
+    if (!refMarker.test(fragText) && !isFnMarker) continue;
+    let fragSize = 0;
+    let fragFamily = null;
+    let fragLeft = Infinity;
+    let fragBaseline = 0;
+    for (const c of frag) {
+      if (c.fontSize > fragSize) { fragSize = c.fontSize; fragFamily = c.fontInfo.familyName; }
+      if (c.x < fragLeft) fragLeft = c.x;
+      fragBaseline = c._perpDist ?? c.y;
+    }
+    // Find the full-size line whose band this raised marker sits in and whose x-extent contains it.
+    let best = -1;
+    let bestDist = Infinity;
+    for (let lj = 0; lj < lines.length; lj++) {
+      if (lj === li) continue;
+      const host = anchors[lj];
+      if (!host) continue;
+      // The marker must be superscript-scaled for its host: reduced, but not below ~0.4x, since a body-size line number beside an oversized garbage line is not that line's superscript.
+      // It must also share the host's dominant text font.
+      // The FN convention is the exception: full body size, gated to near host size.
+      if (isFnMarker) {
+        if (fragSize < host.anchorFontSize * 0.7 || fragSize > host.anchorFontSize * 1.15) continue;
+      } else if (fragSize >= host.anchorFontSize * 0.85 || fragSize < host.anchorFontSize * 0.4) continue;
+      if (host.anchorFamily !== fragFamily) continue;
+      // Raised baseline: marker sits above the host baseline (y grows downward) by up to ~0.8 em.
+      const drop = host.baselineY - fragBaseline;
+      if (drop < -host.anchorFontSize * 0.1 || drop > host.anchorFontSize * 0.8) continue;
+      // x: marker starts within the host's extent, or as a trailing marker just past its right edge.
+      if (fragLeft < host.leftX - host.anchorFontSize * 0.5) continue;
+      if (fragLeft > host.rightX + host.anchorFontSize) continue;
+      if (Math.abs(drop) < bestDist) { bestDist = Math.abs(drop); best = lj; }
+    }
+    if (best < 0) continue;
+    const target = lines[best];
+    let insertIdx = target.length;
+    for (let k = 0; k < target.length; k++) {
+      if (target[k].x > fragLeft) { insertIdx = k; break; }
+    }
+    target.splice(insertIdx, 0, ...lines[li]);
+    anchors[best] = lineAnchorOf(target);
+    lines.splice(li, 1);
+    anchors.splice(li, 1);
+  }
+
+  // Some producers emit no space glyphs and justify so tightly that word gaps fall under the 0.15 em fallback, so whole sentences would extract as one token.
+  // For each such font on this page, find the empty band separating its intra-word gap cluster from its word-gap cluster and split at that per-font threshold instead.
+  // The guards are what keep kerned faces (small gaps forming a continuum, not two clusters) and letter-spaced faces (all gaps wide) at the 0.15 rule.
+  /** @type {Map<number|string, number>} */
+  const wordGapThresholds = new Map();
+  /** @type {Map<string, number>} */
+  const gapFamilyIds = new Map();
+  const keyOf = (/** @type {PositionedChar} */ c) => {
+    const fam = (c.fontInfo && c.fontInfo.familyName) || '?';
+    const sz = Math.round(c.fontSize);
+    if (Number.isNaN(sz)) return `${fam}|NaN`;
+    let id = gapFamilyIds.get(fam);
+    if (id === undefined) { id = gapFamilyIds.size; gapFamilyIds.set(fam, id); }
+    return id * 4294967296 + sz;
+  };
+  {
+    const fontStats = new Map();
+    for (const lineChars of lines) {
+      let prevNS = null;
+      for (let cI = 0; cI < lineChars.length; cI++) {
+        const c = lineChars[cI];
+        const k = keyOf(c);
+        let st = fontStats.get(k);
+        if (!st) { st = { chars: 0, spaces: 0, ratios: [] }; fontStats.set(k, st); }
+        st.chars++;
+        if (c.text === ' ') { st.spaces++; continue; }
+        if (prevNS && c.fontSize > 0
+          && prevNS.fontInfo.familyName === c.fontInfo.familyName) {
+          st.ratios.push((c.x - (prevNS.x + prevNS.width)) / c.fontSize);
+        }
+        prevNS = c;
+      }
+    }
+    for (const [k, st] of fontStats) {
+      // A font with real spaces already has its word boundaries, and its small gaps are kerning that must not be cut.
+      if (st.chars < 100 || st.spaces > 0 || st.ratios.length < 200) continue;
+      // The scan probes ~90 candidate bands, so the guards read a sorted copy with prefix sums rather than re-filtering the ratios each probe.
+      const a = st.ratios.slice().sort((p, q) => p - q);
+      const nR = a.length;
+      const prefix = new Float64Array(nR + 1);
+      for (let i = 0; i < nR; i++) prefix[i + 1] = prefix[i] + a[i];
+      const idxOf = (v) => {
+        let lo = 0;
+        let hi = nR;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (a[mid] < v) lo = mid + 1; else hi = mid; }
+        return lo;
+      };
+      let theta;
+      for (const w of [0.04, 0.03, 0.02]) {
+        for (let x = 0.02; x <= 0.16 && theta === undefined; x += 0.005) {
+          const iX = idxOf(x);
+          if ((idxOf(x + w) - iX) / nR >= 0.005) continue;
+          const iLo = idxOf(x + w);
+          const iHi = idxOf(0.45 + 1e-9);
+          const share = (iHi - iLo) / nR;
+          if (share < 0.03 || share > 0.40) continue;
+          if (iX / nR < 0.5) continue;
+          const aMean = (prefix[iHi] - prefix[iLo]) / (iHi - iLo);
+          if (aMean - x < 0.08) continue;
+          // A thin tail of kern or ligature gaps reaching into the window means the band cuts through real words, so the intra-word cluster must end well below it.
+          if (iX > 0 && a[Math.min(iX - 1, Math.floor(0.995 * iX))] > x - 0.015) continue;
+          theta = x + w / 2;
+        }
+        if (theta !== undefined) break;
+      }
+      if (theta !== undefined && theta < 0.15) wordGapThresholds.set(k, theta);
+    }
+    // Word gaps occur at word frequency and produce word-shaped pieces.
+    // Simulate each accepted threshold over its own font's runs; letter stubs mean it is cutting words, so the font reverts to 0.15.
+    if (wordGapThresholds.size > 0) {
+      const pieceStats = new Map();
+      for (const lineChars of lines) {
+        let prevNS = null;
+        let runKey = null;
+        let piece = 0;
+        const closePiece = (k) => {
+          if (piece === 0 || k === null) return;
+          let st = pieceStats.get(k);
+          if (!st) { st = { n: 0, len: 0, single: 0 }; pieceStats.set(k, st); }
+          st.n++;
+          st.len += piece;
+          if (piece === 1) st.single++;
+          piece = 0;
+        };
+        for (let cI = 0; cI < lineChars.length; cI++) {
+          const c = lineChars[cI];
+          if (c.text === ' ') { closePiece(runKey); prevNS = null; runKey = null; continue; }
+          const k = keyOf(c);
+          const th = wordGapThresholds.get(k);
+          if (th === undefined || (prevNS && prevNS.fontInfo.familyName !== c.fontInfo.familyName)) {
+            closePiece(runKey); prevNS = c; runKey = null; continue;
+          }
+          if (prevNS && c.fontSize > 0) {
+            const r = (c.x - (prevNS.x + prevNS.width)) / c.fontSize;
+            if (r > th) closePiece(k);
+          }
+          runKey = k;
+          if (/[A-Za-zÀ-ɏ]/.test(c.text)) piece++;
+          prevNS = c;
+        }
+        closePiece(runKey);
+      }
+      for (const [k, st] of pieceStats) {
+        if (st.n > 0 && (st.len / st.n < 3.2 || st.single / st.n > 0.2)) wordGapThresholds.delete(k);
+      }
+    }
+  }
+  // Combining and spacing-modifier marks are positioned with gaps that are accent placement, not word spacing, so a boundary touching one never splits under the per-font thresholds.
+  const WORDGAP_MARK_RE = /[\u0060\u00A8\u00B4\u02BB\u02BC\u02C6-\u02DF\u0300-\u036F]/;
+
+  for (const lineChars of lines) {
+    const wordsInitial = [];
+    let currentWord = [];
+    const adaptiveSplitAfter = new Set();
+    for (let i = 0; i < lineChars.length; i++) {
+      const ch = lineChars[i];
+      if (ch.text === ' ') {
+        // A space glyph can be TJ kerning rather than a real word gap.
+        if (currentWord.length > 0) {
+          let nextNonSpace = null;
+          for (let j = i + 1; j < lineChars.length; j++) {
+            if (lineChars[j].text !== ' ') {
+              nextNonSpace = lineChars[j];
+              break;
+            }
+          }
+          if (nextNonSpace) {
+            const prevCh = currentWord[currentWord.length - 1];
+            const visualGap = nextNonSpace.x - (prevCh.x + prevCh.width);
+            // The positive tolerance must stay far below the space-glyph advance, since justified text often shrinks real inter-word gaps to a fraction of it.
+            const adjacencyTol = prevCh.fontSize * 0.15;
+            const positiveTol = Math.max(prevCh.fontSize * 0.01, ch.width * 0.1);
+            const isKerningArtifact = visualGap >= -adjacencyTol && visualGap < positiveTol;
+            // A space after a comma is never dropped, since negative Tc routinely compresses that real space to visual adjacency.
+            if (isKerningArtifact && prevCh.text !== ',') {
+              continue;
+            }
+          }
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        }
+        continue;
+      }
+      if (currentWord.length > 0) {
+        const prevCh = currentWord[currentWord.length - 1];
+        const gap = ch.x - (prevCh.x + prevCh.width);
+        const fontSizeMin = Math.min(ch.fontSize, prevCh.fontSize);
+        // Sentence-terminal plus em-dash is a definitional break ("COMMITTEES.—The…"), not a closed compound ("respond—this").
+        if (ch.text === '—' && /[.!?]/.test(prevCh.text)) {
+          wordsInitial.push(currentWord);
+          wordsInitial.push([ch]);
+          currentWord = [];
+          continue;
+        }
+        // Same-family bullets share size/gap with the following glyph, so the family-change rule can't catch them.
+        if (currentWord.length === 1
+          && isBulletChar(prevCh.text)
+          && /[A-Za-z0-9]/.test(ch.text)) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+          currentWord.push(ch);
+          continue;
+        }
+        if ((ch.fontInfo.bold !== prevCh.fontInfo.bold
+          || ch.fontInfo.italic !== prevCh.fontInfo.italic)
+          && !(',.;:!?)]}”’'.includes(ch.text) && gap <= fontSizeMin * 0.15)
+          && !(('—–'.includes(ch.text) || '—–'.includes(prevCh.text)) && gap <= fontSizeMin * 0.15)) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Split at font family change.
+        // Skip when chars are visually adjacent (gap near zero), since typeset documents often use a different font for punctuation (e.g., a MinionPro comma between MyriadPro digits).
+        // Symbol fonts and symbol-block codepoints split regardless of gap: an icon or marker glued to text is still not part of the word.
+        } else if (ch.fontInfo.familyName !== prevCh.fontInfo.familyName
+          && (gap > fontSizeMin * 0.15
+            || isSymbolFontChar(ch)
+            || isSymbolFontChar(prevCh)
+            || isSymbolChar(ch.text)
+            || isSymbolChar(prevCh.text))) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Split after right double quote followed by a letter.
+        } else if (prevCh.text === '\u201D' && /[A-Za-z]/.test(ch.text)) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Split at forward x-gap (word spacing).
+        } else if (gap > ch.fontSize * 0.15) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Split at baseline (y-position) change — separates superscripts from adjacent text.
+        } else if (fontSizeMin > 0 && Math.abs(ch.y - prevCh.y) > fontSizeMin * 0.25) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Split at large backward x-jump: the chars are at different visual positions adjacent only in stream order (e.g., sidebar text followed by body text).
+        // ch.x < prevCh.x is required because an oversized advance width (e.g., a wide curly apostrophe U+2019) can put the next char's x inside the previous glyph's bbox with no real jump.
+        } else if (gap < -ch.fontSize * 0.5 && ch.x < prevCh.x) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Split where x goes backward and font size increases — new small caps title-case word.
+        } else if (gap < -fontSizeMin * 0.1 && fontSizeMin > 0 && ch.fontSize > prevCh.fontSize * 1.1) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Oversized ornamental glyph adjacent to body text: shares baseline and font family with its neighbors,
+        // and its wide bbox swallows the gap, so font-size mismatch is the only break signal.
+        } else if (fontSizeMin > 0 && Math.max(ch.fontSize, prevCh.fontSize) >= fontSizeMin * 2) {
+          wordsInitial.push(currentWord);
+          currentWord = [];
+        // Split before dot leaders: a non-period char followed by a run of 5+ periods.
+        } else if (ch.text === '.' && prevCh.text !== '.') {
+          let dotCount = 0;
+          for (let j = i; j < lineChars.length && lineChars[j].text === '.'; j++) dotCount++;
+          if (dotCount >= 5) {
+            wordsInitial.push(currentWord);
+            currentWord = [];
+          }
+        // Per-font word-gap threshold for zero-space fonts (derived above).
+        // Last in the ladder so it decides only boundaries no existing rule claims, which keeps every current split intact and makes the added splits cleanly removable by the backstop below.
+        // A split landing before a dash would cut inside a compound token, so those boundaries never split here.
+        } else if (wordGapThresholds.size > 0
+          && ch.fontInfo.familyName === prevCh.fontInfo.familyName
+          && !/[-\u2010\u2011\u2013\u2014]/.test(ch.text)
+          && !WORDGAP_MARK_RE.test(ch.text) && !WORDGAP_MARK_RE.test(prevCh.text)) {
+          const th = wordGapThresholds.get(keyOf(ch));
+          if (th !== undefined && gap > ch.fontSize * th) {
+            adaptiveSplitAfter.add(prevCh);
+            wordsInitial.push(currentWord);
+            currentWord = [];
+          }
+        }
+      }
+      currentWord.push(ch);
+    }
+    if (currentWord.length > 0) wordsInitial.push(currentWord);
+    // Word gaps cannot slice Latin text into single letters.
+    // A line whose adaptive splits leave it mostly one-letter tokens is letter-spaced or stretch-justified, so undo exactly those splits.
+    if (adaptiveSplitAfter.size > 0) {
+      let single = 0;
+      for (let wI = 0; wI < wordsInitial.length; wI++) {
+        const w = wordsInitial[wI];
+        if (w.length === 1 && /[A-Za-z]/.test(w[0].text)) single++;
+      }
+      if (single / wordsInitial.length > 0.4) {
+        for (let wi = wordsInitial.length - 2; wi >= 0; wi--) {
+          const w = wordsInitial[wi];
+          if (adaptiveSplitAfter.has(w[w.length - 1])) {
+            w.push(...wordsInitial[wi + 1]);
+            wordsInitial.splice(wi + 1, 1);
+          }
+        }
+      }
+    }
+
+    // Sort words by x-position of their first character so line reads left-to-right.
+    wordsInitial.sort((a, b) => a[0].x - b[0].x);
+
+    // Merge adjacent words that were split at a small caps boundary.
+    // A single uppercase char followed by an all-uppercase word at smaller font size,
+    // with the same font family and no baseline shift, is likely a single small-caps word.
+    const wordsMerged = [];
+    for (let wi = 0; wi < wordsInitial.length; wi++) {
+      const curr = wordsInitial[wi];
+      const next = wordsInitial[wi + 1];
+      if (curr.length === 1 && /[A-Z]/.test(curr[0].text) && next && next.length > 0
+        && /[A-Z]/.test(next[0].text)
+        && curr[0].fontInfo.familyName === next[0].fontInfo.familyName
+        && next[0].fontSize < curr[0].fontSize * 0.95
+        && Math.abs(next[0].y - curr[0].y) / Math.min(next[0].fontSize, curr[0].fontSize) < 0.15) {
+        // Only merge if the gap between the letter and the next word is small enough
+        // to be a small caps word (not a separate label like "A Reach," or "B Fork").
+        // Real small caps have the letter visually adjacent to the rest of the word.
+        const lastChar = curr[curr.length - 1];
+        const nextChar = next[0];
+        const gap = nextChar.x - (lastChar.x + lastChar.width);
+        if (gap <= nextChar.fontSize * 0.3) {
+          wordsMerged.push([...curr, ...next]);
+          wi++; // skip next
+        } else {
+          wordsMerged.push(curr);
+        }
+      } else {
+        wordsMerged.push(curr);
+      }
+    }
+
+    // CJK word splitting: each CJK character becomes its own word.
+    const wordsAfterCJK = [];
+    for (let wmI = 0; wmI < wordsMerged.length; wmI++) {
+      const wordChars = wordsMerged[wmI];
+      const wordText = wordChars.map((c) => c.text).join('');
+      if (calcLang(wordText) === 'chi_sim') {
+        const cjkLike = (/** @type {string} */ t) => {
+          const code = t.codePointAt(0) || 0;
+          return calcLang(t) === 'chi_sim'
+            || (code >= 0x3000 && code <= 0x30FF) // CJK symbols and punctuation, hiragana, katakana
+            || (code >= 0x31F0 && code <= 0x31FF) // katakana phonetic extensions
+            || (code >= 0x1100 && code <= 0x11FF) || (code >= 0x3130 && code <= 0x318F) || (code >= 0xAC00 && code <= 0xD7AF) // hangul
+            || (code >= 0xFF00 && code <= 0xFFEF); // halfwidth and fullwidth forms
+        };
+        let run = [];
+        for (let chI = 0; chI < wordChars.length; chI++) {
+          const ch = wordChars[chI];
+          if (cjkLike(ch.text)) {
+            if (run.length > 0) {
+              wordsAfterCJK.push(run);
+              run = [];
+            }
+            wordsAfterCJK.push([ch]);
+          } else {
+            run.push(ch);
+          }
+        }
+        if (run.length > 0) wordsAfterCJK.push(run);
+      } else {
+        wordsAfterCJK.push(wordChars);
+      }
+    }
+
+    if (wordsAfterCJK.length === 0) continue;
+
+    // Split words at superscript boundaries (baseline shift + font size change).
+    // Each entry in `words` is { chars, sup, smallCapsAlt, smallCapsAltTitleCase, smallCapsLargeFontSize }.
+    const words = [];
+    /** Baseline Y of the first non-superscript word, for bbox correction. */
+    let normalBaselineY = null;
+    /** Whether small caps (via font size reduction without baseline shift) is currently active. */
+    let smallCapsAltActive = false;
+
+    for (let wi = 0; wi < wordsAfterCJK.length; wi++) {
+      const wordChars = wordsAfterCJK[wi];
+      // Scan for baseline/size discontinuities within this word to detect superscript transitions.
+      const splitPoints = [];
+      for (let ci = 1; ci < wordChars.length; ci++) {
+        const prev = wordChars[ci - 1];
+        const curr = wordChars[ci];
+        const fontSizeMin = Math.min(prev.fontSize, curr.fontSize);
+        if (fontSizeMin === 0) continue;
+        const baselineDelta = (curr.y - prev.y) / fontSizeMin;
+        const sizeDelta = (curr.fontSize - prev.fontSize) / fontSizeMin;
+
+        // Superscript start: baseline goes up (positive in page coords means down, but y is inverted),
+        // size decreases. Superscript end: baseline goes back down, size increases.
+        if (Number.isFinite(baselineDelta) && Number.isFinite(sizeDelta)
+          && ((baselineDelta < -0.25 && sizeDelta < -0.05) || (baselineDelta > 0.25 && sizeDelta > 0.05))) {
+          splitPoints.push({ index: ci, sizeDelta });
+        } else if (!!prev.superior !== !!curr.superior) {
+          // A superior-glyph boundary carries no size or baseline delta, so segment supness resolves by the flag itself rather than the delta rules.
+          splitPoints.push({ index: ci, sizeDelta: 0, bySuperior: true });
+        } else if (ci === 1 && /[A-Z]/.test(prev.text) && curr.fontSize < prev.fontSize
+          && prev.fontSize > 0 && Math.abs(baselineDelta) < 0.1) {
+          // Fake small caps detection: font size decrease after first uppercase letter, no baseline shift.
+          // Mark and continue (don't split word).
+        }
+      }
+
+      // Split multiple footnote refs.  E.g. "(1)(3)" or "[1][2][3]".
+      let forceSupForSplits = false;
+      if (splitPoints.length === 0 && wordChars.length > 4) {
+        const wText = wordChars.map((/** @type {any} */ c) => c.text).join('');
+        let openClose = null;
+        if (/^(\(\d+\))+$/.test(wText)) openClose = ['(', ')'];
+        else if (/^(\[\d+\])+$/.test(wText)) openClose = ['[', ']'];
+        if (openClose) {
+          const [open, close] = openClose;
+          for (let ci = 1; ci < wordChars.length; ci++) {
+            if (wordChars[ci - 1].text === close && wordChars[ci].text === open) {
+              splitPoints.push({ index: ci, sizeDelta: 0 });
+            }
+          }
+          const wFontSize = wordChars[0].fontSize;
+          const prevNeighbor = wi > 0 ? wordsAfterCJK[wi - 1] : null;
+          const nextNeighbor = wi + 1 < wordsAfterCJK.length ? wordsAfterCJK[wi + 1] : null;
+          const prevFontSize = prevNeighbor && prevNeighbor.length > 0 ? prevNeighbor[0].fontSize : 0;
+          const nextFontSize = nextNeighbor && nextNeighbor.length > 0 ? nextNeighbor[0].fontSize : 0;
+          if ((prevFontSize > 0 && wFontSize < prevFontSize * 0.95)
+            || (nextFontSize > 0 && wFontSize < nextFontSize * 0.95)) {
+            forceSupForSplits = true;
+          }
+        }
+      }
+
+      if (splitPoints.length === 0) {
+        // A word set entirely in superior glyphs (a standalone note marker) is superscript with no boundary to detect.
+        words.push({
+          chars: wordChars, sup: wordChars.every((c) => c.superior), dropcap: false, smallCapsAlt: smallCapsAltActive, smallCapsAltTitleCase: false, smallCapsLargeFontSize: 0,
+        });
+      } else {
+        // Split at each superscript boundary.
+        let start = 0;
+        let prevWasSup = false;
+        for (const sp of splitPoints) {
+          if (sp.index > start) {
+            let supForSegment;
+            if (forceSupForSplits) {
+              supForSegment = true;
+            } else if (sp.bySuperior) {
+              supForSegment = !!wordChars[start].superior;
+            } else if (sp.sizeDelta > 0) {
+              supForSegment = prevWasSup;
+            } else {
+              supForSegment = sp.sizeDelta < 0;
+            }
+            words.push({
+              chars: wordChars.slice(start, sp.index), sup: supForSegment, dropcap: false, smallCapsAlt: false, smallCapsAltTitleCase: false, smallCapsLargeFontSize: 0,
+            });
+            if (!supForSegment && normalBaselineY === null) {
+              normalBaselineY = wordChars[start].y;
+            }
+            prevWasSup = supForSegment;
+          }
+          start = sp.index;
+          prevWasSup = sp.bySuperior ? !!wordChars[sp.index].superior : (forceSupForSplits ? true : sp.sizeDelta < 0);
+        }
+        // Remaining chars after last split point.
+        if (start < wordChars.length) {
+          words.push({
+            chars: wordChars.slice(start), sup: prevWasSup, dropcap: false, smallCapsAlt: false, smallCapsAltTitleCase: false, smallCapsLargeFontSize: 0,
+          });
+          if (!prevWasSup && normalBaselineY === null) {
+            normalBaselineY = wordChars[start].y;
+          }
+        }
+      }
+
+      // Track baseline of non-superscript words.
+      if (normalBaselineY === null && words.length > 0 && !words[words.length - 1].sup) {
+        normalBaselineY = words[words.length - 1].chars[0].y;
+      }
+    }
+
+    // A drop cap descends across several lines, so its baseline sits below the following word's.
+    for (let i = 0; i < words.length; i++) {
+      if (words[i].sup || words[i].chars.length !== 1) continue;
+      const nextIdx = i + 1;
+      if (nextIdx >= words.length || words[nextIdx].chars.length === 0) continue;
+      const dcFontSize = words[i].chars[0].fontSize;
+      const nextFontSize = words[nextIdx].chars[0].fontSize;
+      if (dcFontSize > nextFontSize * 2 && words[i].chars[0].y > words[nextIdx].chars[0].y) {
+        words[i].dropcap = true;
+      }
+    }
+
+    let supChanged = true;
+    while (supChanged) {
+      supChanged = false;
+      for (let i = 0; i < words.length; i++) {
+        if (words[i].sup || words[i].dropcap || words[i].chars.length === 0) continue;
+        if (words[i].chars.length > 4) {
+          const wText = words[i].chars.map((c) => c.text).join('');
+          if (!/^[([]\d+[)\]]$/.test(wText)) continue;
+        }
+        const wChars = words[i].chars;
+        const wFontSize = wChars.reduce((sum, c) => sum + c.fontSize, 0) / wChars.length;
+        const wBaseline = wChars.reduce((sum, c) => sum + c.y, 0) / wChars.length;
+
+        // Check if the next word continues at the same small size (size transition, not superscript).
+        let followIdx = i + 1;
+        while (followIdx < words.length && (words[followIdx].sup || words[followIdx].dropcap)) followIdx++;
+        let sizeTransition = false;
+        if (followIdx < words.length && words[followIdx].chars.length > 0) {
+          const followFontSize = words[followIdx].chars.reduce((sum, c) => sum + c.fontSize, 0) / words[followIdx].chars.length;
+          sizeTransition = Math.abs(wFontSize - followFontSize) < Math.max(wFontSize, followFontSize) * 0.1;
+        }
+
+        // Compare with the previous non-sup, non-dropcap word.
+        // Skip when the next word continues at the same small size (size transition, not superscript).
+        let prevIdx = i - 1;
+        while (prevIdx >= 0 && (words[prevIdx].sup || words[prevIdx].dropcap)) prevIdx--;
+        if (!sizeTransition && prevIdx >= 0 && words[prevIdx].chars.length > 0) {
+          const prevChars = words[prevIdx].chars;
+          const prevFontSize = prevChars.reduce((sum, c) => sum + c.fontSize, 0) / prevChars.length;
+          const prevBaseline = prevChars.reduce((sum, c) => sum + c.y, 0) / prevChars.length;
+          const fontSizeMin = Math.min(wFontSize, prevFontSize);
+          if (fontSizeMin > 0) {
+            const sizeDelta = (wFontSize - prevFontSize) / fontSizeMin;
+            const baselineDelta = (wBaseline - prevBaseline) / fontSizeMin;
+            if (sizeDelta < -0.05 && baselineDelta < -0.25) {
+              words[i].sup = true;
+              supChanged = true;
+              if (normalBaselineY === null) normalBaselineY = prevBaseline;
+              continue;
+            }
+            // A much smaller word still needs a raised baseline to count as a superscript.
+            // Without that guard, a glyph merely smaller than its neighbor but sitting on the baseline (or below it, like a subscript) would be wrongly flagged.
+            if (sizeDelta < -0.3 && baselineDelta < -0.05) {
+              words[i].sup = true;
+              supChanged = true;
+              if (normalBaselineY === null) normalBaselineY = prevBaseline;
+              continue;
+            }
+          }
+        }
+
+        // Compare with the next non-sup, non-dropcap word.
+        let nextNonSupIdx = i + 1;
+        while (nextNonSupIdx < words.length && (words[nextNonSupIdx].sup || words[nextNonSupIdx].dropcap)) nextNonSupIdx++;
+        if (nextNonSupIdx < words.length && words[nextNonSupIdx].chars.length > 0) {
+          const nextChars = words[nextNonSupIdx].chars;
+          const nextFontSize = nextChars.reduce((sum, c) => sum + c.fontSize, 0) / nextChars.length;
+          const nextBaseline = nextChars.reduce((sum, c) => sum + c.y, 0) / nextChars.length;
+          const fontSizeMin = Math.min(wFontSize, nextFontSize);
+          if (fontSizeMin > 0) {
+            const sizeDelta = (wFontSize - nextFontSize) / fontSizeMin;
+            const baselineDelta = (wBaseline - nextBaseline) / fontSizeMin;
+            if (sizeDelta < -0.05 && baselineDelta < -0.25) {
+              words[i].sup = true;
+              supChanged = true;
+              if (normalBaselineY === null) normalBaselineY = nextBaseline;
+              continue;
+            }
+            // See the prev-word branch above: a large size drop alone is not a superscript unless the baseline is also raised.
+            if (sizeDelta < -0.3 && baselineDelta < -0.05) {
+              words[i].sup = true;
+              supChanged = true;
+              if (normalBaselineY === null) normalBaselineY = nextBaseline;
+              continue;
+            }
+          }
+        }
+      }
+    }
+
+    // Recalculate normalBaselineY after word-level superscript detection.
+    // This prevents baseline from being set based on a line-leading superscript.
+    normalBaselineY = null;
+    for (let wI = 0; wI < words.length; wI++) {
+      const w = words[wI];
+      if (!w.sup && !w.dropcap && w.chars.length > 0) {
+        normalBaselineY = w.chars[0].y;
+        break;
+      }
+    }
+
+    // A full-size "FN"+number reference (the Westlaw footnote-marker convention) never drops in size, so the size-delta tests above miss it.
+    // The unambiguous "FN"+digits content plus a baseline raised above the line's normal baseline (y grows downward) marks it as a superscript reference.
+    if (normalBaselineY !== null) {
+      for (let wI = 0; wI < words.length; wI++) {
+        const w = words[wI];
+        if (w.sup || w.dropcap || w.chars.length === 0) continue;
+        if (!/^FN\d{1,3}$/.test(w.chars.map((c) => c.text).join(''))) continue;
+        if (w.chars[0].y < normalBaselineY - w.chars[0].fontSize * 0.2) w.sup = true;
+      }
+    }
+
+    // Detect fake small caps across word boundaries.
+    // Look for words with mixed font sizes where all alpha chars are uppercase.
+    // Chars at the smaller font size are "fake small caps" of their lowercase equivalents.
+    let smallCapsBaseFontSize = 0;
+    for (let i = 0; i < words.length; i++) {
+      if (words[i].sup) continue;
+      const wc = words[i].chars;
+      if (wc.length < 2) continue;
+      let maxFontSize = 0;
+      let minFontSize = Infinity;
+      for (let cI = 0; cI < wc.length; cI++) {
+        const c = wc[cI];
+        if (c.fontSize > maxFontSize) maxFontSize = c.fontSize;
+        if (c.fontSize < minFontSize) minFontSize = c.fontSize;
+      }
+      const hasMixedSizes = maxFontSize > 0 && minFontSize < maxFontSize * 0.95;
+      if (hasMixedSizes) {
+        const allText = wc.map((c) => c.text).join('');
+        if (!/[a-z]/.test(allText) && /[A-Z]/.test(allText)) {
+          const largeChar = wc.find((c) => c.fontSize >= maxFontSize * 0.95);
+          const smallChar = wc.find((c) => c.fontSize <= minFontSize * 1.05);
+          const baselineDelta = largeChar && smallChar ? Math.abs(smallChar.y - largeChar.y) / minFontSize : 0;
+          if (baselineDelta < 0.15) {
+            words[i].smallCapsAlt = true;
+            words[i].smallCapsLargeFontSize = maxFontSize;
+            const firstAlpha = wc.find((c) => /[A-Z]/.test(c.text));
+            if (firstAlpha && firstAlpha.fontSize >= maxFontSize * 0.95) {
+              words[i].smallCapsAltTitleCase = true;
+            }
+            smallCapsAltActive = true;
+            smallCapsBaseFontSize = maxFontSize;
+          }
+        }
+      } else if (smallCapsAltActive) {
+        const firstCharFontSize = wc[0].fontSize;
+        const secondCharFontSize = wc[1].fontSize;
+        const fontSizeMin = Math.min(firstCharFontSize, secondCharFontSize);
+        const sizeDelta = fontSizeMin > 0 ? (secondCharFontSize - firstCharFontSize) / fontSizeMin : 0;
+        if (Number.isFinite(sizeDelta) && sizeDelta > 0.05) {
+          smallCapsAltActive = false;
+        } else {
+          words[i].smallCapsAlt = true;
+          words[i].smallCapsLargeFontSize = smallCapsBaseFontSize;
+        }
+      }
+    }
+
+    // Compute line bbox from all non-superscript chars (or all chars if none are non-sup)
+    const allLineChars = [];
+    const nonSupChars = [];
+    for (let wI = 0; wI < words.length; wI++) {
+      const w = words[wI];
+      for (let cI = 0; cI < w.chars.length; cI++) {
+        const c = w.chars[cI];
+        allLineChars.push(c);
+        if (!w.sup) nonSupChars.push(c);
+      }
+    }
+    const bboxChars = nonSupChars.length > 0 ? nonSupChars : allLineChars;
+
+    let lineLeft = Infinity;
+    let lineRight = -Infinity;
+    let lineTop = Infinity;
+    let lineBottom = -Infinity;
+    for (let cI = 0; cI < bboxChars.length; cI++) {
+      const c = bboxChars[cI];
+      const l = Math.round(c.x);
+      const r = Math.round(c.x + c.width);
+      const t = Math.round(c.y - (c.fontInfo.ascent / 1000) * c.fontSize);
+      const b = Math.round(c.y - (c.fontInfo.descent / 1000) * c.fontSize);
+      if (l < lineLeft) lineLeft = l;
+      if (r > lineRight) lineRight = r;
+      if (t < lineTop) lineTop = t;
+      if (b > lineBottom) lineBottom = b;
+    }
+
+    // Baseline: use the first non-superscript word's baseline, or fall back to first char.
+    const baselineY = normalBaselineY ?? allLineChars[0].y;
+    const baselineOffset = Math.round(baselineY - lineBottom);
+    const ascHeight = (nonSupChars.length > 0 ? nonSupChars[0] : allLineChars[0]).fontSize * 0.6;
+
+    // Compute baseline slope from the text direction vector (more robust than char position delta).
+    // This matches mupdf stext which uses the dir attribute: slope = dir[1] for orientation 0.
+    let baselineSlope = 0;
+    const lineOrientation = allLineChars[0].orientation;
+    let sumDirX = 0;
+    let sumDirY = 0;
+    for (let cI = 0; cI < bboxChars.length; cI++) {
+      sumDirX += bboxChars[cI].dirX;
+      sumDirY += bboxChars[cI].dirY;
+    }
+    const lineDirMag = Math.hypot(sumDirX, sumDirY);
+    if (lineDirMag > 0) {
+      const ndx = sumDirX / lineDirMag;
+      const ndy = sumDirY / lineDirMag;
+      if (lineOrientation === 1) {
+        baselineSlope = round6(-ndx);
+      } else if (lineOrientation === 2) {
+        baselineSlope = round6(-ndy);
+      } else if (lineOrientation === 3) {
+        baselineSlope = round6(ndx);
+      } else if (Math.abs(ndx) > 0.01) {
+        // Orientation 0: slope = ndy (equivalent to mupdf dir[1] for unit direction vector).
+        // For small angles, ndy ≈ sin(θ) ≈ tan(θ), matching the asin() conversion to degrees.
+        baselineSlope = round6(ndy);
+      }
+    }
+
+    const lineBbox = {
+      left: lineLeft, top: lineTop, right: lineRight, bottom: lineBottom,
+    };
+    const lineObj = new ocr.OcrLine(pageObj, lineBbox, [baselineSlope, baselineOffset], ascHeight, null);
+
+    // Set orientation from the line's characters (all chars in a line have the same orientation
+    // due to the grouping constraint, so use the first char's orientation).
+    lineObj.orientation = lineOrientation;
+
+    // Build words
+    for (let wi = 0; wi < words.length; wi++) {
+      const wordChars = words[wi].chars;
+      const isSup = words[wi].sup;
+      const wordText = wordChars.map((c) => c.text).join('');
+      if (wordText.trim() === '') continue;
+
+      const wordLang = calcLang(wordText);
+      langSet.add(wordLang);
+
+      // Compute word bbox
+      const wordLeft = Math.round(wordChars[0].x);
+      const wordRight = Math.round(wordChars[wordChars.length - 1].x + wordChars[wordChars.length - 1].width);
+      const wordTop = wordChars.reduce((m, c) => Math.min(m, Math.round(c.y - (c.fontInfo.ascent / 1000) * c.fontSize)), Infinity);
+      const wordBottom = wordChars.reduce((m, c) => Math.max(m, Math.round(c.y - (c.fontInfo.descent / 1000) * c.fontSize)), -Infinity);
+
+      const wordBbox = {
+        left: wordLeft, top: wordTop, right: wordRight, bottom: wordBottom,
+      };
+
+      const wordID = `word_${n + 1}_${pageObj.lines.length + 1}_${wi + 1}`;
+      if (glyphOpMap) glyphOpMap.words.set(wordID, wordChars);
+
+      // Where a lone symbol glyph is actually drawn, for the fill detector's checkbox arm.
+      // The bbox above is the descriptor's em box, which for symbol fonts describes the Latin face they were cut from, so a checkbox glyph's square can sit a quarter of its height below it.
+      // Latin codepoints are skipped because no box glyph is one, and measuring every "a" and "1" would mean parsing outlines for every text font in the document.
+      if (wordChars.length === 1 && !wordChars[0].orientation && wordText.codePointAt(0) > 0xFF) {
+        const glyphChar = wordChars[0];
+        const ink = glyphChar._font ? glyphInkBox(glyphChar._font, glyphChar._charCode) : null;
+        if (ink) {
+          fillGlyphBoxes.push({
+            id: wordID,
+            bbox: {
+              left: Math.round(glyphChar.x + ink.left * glyphChar.fontSize),
+              top: Math.round(glyphChar.y - ink.yMax * glyphChar.fontSize),
+              right: Math.round(glyphChar.x + ink.right * glyphChar.fontSize),
+              bottom: Math.round(glyphChar.y - ink.yMin * glyphChar.fontSize),
+            },
+          });
+        }
+      }
+      const wordObj = new ocr.OcrWord(lineObj, wordID, wordText, wordBbox);
+      wordObj.conf = 100;
+      wordObj.visualCoords = false;
+      wordObj.lang = wordLang;
+      // On OcrWord these signals would serialize into every .scribe export and outlive their only consumer, the layout pass.
+      const artifact = wordChars.some((c) => c.artifact);
+      const sChar = wordChars.find((c) => c.structTag) || null;
+      const brokenFont = wordChars.some((c) => brokenToUnicodeFont(c._font));
+      if (artifact || sChar || brokenFont) {
+        wordSignals.set(wordObj, {
+          artifact, mcid: sChar?.mcid ?? null, structElemId: null, structElemTag: null, brokenFont,
+        });
+      }
+
+      // Style from first alphanumeric character (matching mupdf behavior for leading punctuation)
+      const firstAlphaNum = wordChars.find((c) => /[A-Za-z\d]/.test(c.text)) || wordChars[0];
+
+      // Presence of a native-text entry is what marks a word editable, so only visibly drawn words get one.
+      // Sup words keep their true raised y here even though their char bboxes below are normalized onto the body line.
+      if (!wordChars.some((c) => c.invisible || c.alpha === 0)) {
+        /** @type {NativeTextWord} */
+        const ntEntry = { baselineY: round3(wordChars[0].y) };
+        if (Number.isFinite(firstAlphaNum._font?.fontObjNum)) ntEntry.fontObjNum = firstAlphaNum._font.fontObjNum;
+        // The edit path re-typesets along a horizontal pen with the font's own codes, which a Type 3 font or vertical writing does not give it.
+        if (wordChars.some((c) => c._font && (c._font.type3 || c._font.verticalMode))) ntEntry.uneditable = true;
+        // Faux-bold words are redrawn with the same stroke, or the edit visibly thins them.
+        if ((firstAlphaNum.renderMode === 1 || firstAlphaNum.renderMode === 2) && firstAlphaNum.strokeWidthPx > 0) {
+          ntEntry.renderMode = firstAlphaNum.renderMode;
+          ntEntry.strokeWidthPx = round3(firstAlphaNum.strokeWidthPx);
+          const strokeRgb = firstAlphaNum.strokeColor ? colorToRgb(firstAlphaNum.strokeColor) : null;
+          if (strokeRgb) ntEntry.strokeColor = rgbToHex(strokeRgb);
+        }
+        nativeText[wordID] = ntEntry;
+      }
+
+      wordObj.style.font = firstAlphaNum.fontInfo.familyName;
+      wordObj.style.bold = firstAlphaNum.fontInfo.bold;
+      wordObj.style.italic = firstAlphaNum.fontInfo.italic;
+
+      if (firstAlphaNum.textColor) {
+        const rgb = colorToRgb(firstAlphaNum.textColor);
+        if (rgb) wordObj.style.color = rgbToHex(rgb);
+      }
+      if (firstAlphaNum.invisible) {
+        wordObj.style.opacity = 0;
+      } else if (typeof firstAlphaNum.alpha === 'number') {
+        wordObj.style.opacity = firstAlphaNum.alpha;
+      }
+
+      // For superscript and drop cap words, use the raw font size.
+      // round3 collapses ~1e-16 drift from the (300/72) scale-factor multiplication chain;
+      // layout uses char-level fontSize unchanged, only the user/test-facing style.size is rounded.
+      if (isSup) {
+        wordObj.style.size = round3(wordChars[0].fontSize);
+        wordObj.style.sup = true;
+      } else if (words[wi].dropcap) {
+        wordObj.style.size = round3(wordChars[0].fontSize);
+        wordObj.style.dropcap = true;
+      } else {
+        wordObj.style.size = round3(firstAlphaNum.fontSize);
+      }
+
+      // Small caps detection
+      if (firstAlphaNum.fontInfo.smallCaps) {
+        // Method A: Font name indicates small caps.
+        wordObj.style.smallCaps = true;
+      } else if (words[wi].smallCapsAlt) {
+        // Method B: Fake small caps (font size decrease, no baseline shift, all uppercase).
+        if (!/[a-z]/.test(wordObj.text) && /[A-Z].?[A-Z]/.test(wordObj.text)) {
+          wordObj.style.smallCaps = true;
+          if (words[wi].smallCapsLargeFontSize > 0) {
+            wordObj.style.size = round3(words[wi].smallCapsLargeFontSize);
+          }
+        }
+      }
+
+      // Underline detection: a thin horizontal rectangle that overlaps this word, sits just below the baseline, and does not clash with the text color.
+      if (underlineRects.length > 0) {
+        const baselineYWord = wordChars[0].y;
+        const charColor = wordChars[0].textColor;
+        // A rect extending well past the line's text on either side is a table-row divider or section rule passing under the word, not an underline.
+        // The tolerance absorbs the slight overshoot real underlines get from stroke caps and trailing spaces.
+        const ruleOverhangLimit = wordChars[0].fontSize * 0.5;
+        for (let rectI = 0; rectI < underlineRects.length; rectI++) {
+          const rect = underlineRects[rectI];
+          if (rect.right > wordLeft && rect.left < wordRight
+            && rect.y >= baselineYWord - wordChars[0].fontSize * 0.1
+            && rect.y <= baselineYWord + wordChars[0].fontSize * 0.35
+            && rect.left >= lineLeft - ruleOverhangLimit
+            && rect.right <= lineRight + ruleOverhangLimit) {
+            // Color match: a saturated rule whose hue differs from the text is a decorative rule, not a text underline.
+            // Normalize across color spaces first, since the same black may be stored as DeviceGray for the text and DeviceRGB for the path.
+            // A grayscale rule is exempt: producers draw hyperlink underlines in neutral gray under black link text, and the overhang guard above already pins the rect within the line.
+            if (rect.color && charColor) {
+              const rectRgb = colorToRgb(rect.color);
+              const charRgb = colorToRgb(charColor);
+              const rectGray = rectRgb && Math.max(rectRgb[0], rectRgb[1], rectRgb[2]) - Math.min(rectRgb[0], rectRgb[1], rectRgb[2]) < 0.1;
+              const bothDark = rectRgb && charRgb
+                && rectRgb.every((v) => v < 0.3) && charRgb.every((v) => v < 0.3);
+              if (rectRgb && charRgb && !bothDark && !rectGray
+                && rectRgb.some((v, ci) => Math.abs(v - charRgb[ci]) > 0.1)) {
+                continue;
+              }
+            }
+            wordObj.style.underline = true;
+            // Mark the rect as consumed so parseSinglePage does not carry it into pageObj.rules as a paragraph separator.
+            rect.isUnderline = true;
+            break;
+          }
+        }
+      }
+
+      fontSet.add(cleanFamilyName(wordObj.style.font));
+
+      // Create char objects
+      wordObj.chars = wordChars.map((c) => {
+        let charTop = Math.round(c.y - (c.fontInfo.ascent / 1000) * c.fontSize);
+        let charBottom = Math.round(c.y - (c.fontInfo.descent / 1000) * c.fontSize);
+        // Adjust superscript char bbox.
+        if (isSup && normalBaselineY !== null) {
+          const supBaselineOffset = c.y - normalBaselineY;
+          charTop -= Math.round(supBaselineOffset);
+          charBottom -= Math.round(supBaselineOffset);
+        }
+        return new ocr.OcrChar(c.text, {
+          left: Math.round(c.x), top: charTop, right: Math.round(c.x + c.width), bottom: charBottom,
+        });
+      });
+
+      // Char bboxes are rounded, so edited text redrawn from them has visibly wrong letter spacing.
+      const ntEntry = nativeText[wordID];
+      if (ntEntry) {
+        ntEntry.penX = wordChars.map((c) => round3(c.x));
+        // The Edit Text controls read the shear to tell a sheared word from one whose font is italic; nothing in js/ does.
+        if (wordChars.some((c) => c.skew)) ntEntry.skew = wordChars.map((c) => c.skew || 0);
+        if (wordChars.some((c) => c.stretch)) ntEntry.stretch = wordChars.map((c) => c.stretch || 0);
+        // A character recorded later replaces a placeholder's U+E000 + code text in place, so the code is kept to find the glyph again.
+        const placeholderCode = (c) => (c._font?.type3 && Number.isInteger(c._charCode) && c.text === String.fromCodePoint(0xE000 + c._charCode) ? c._charCode : -1);
+        if (wordChars.some((c) => placeholderCode(c) >= 0)) ntEntry.codes = wordChars.map(placeholderCode);
+      }
+
+      // Apply small caps lowercase restoration.
+      if (wordObj.style.smallCaps && words[wi].smallCapsAlt) {
+        const lgFont = words[wi].smallCapsLargeFontSize;
+        const wc = words[wi].chars;
+        if (lgFont > 0) {
+          for (let ci = 0; ci < wordObj.chars.length; ci++) {
+            if (wc[ci].fontSize < lgFont * 0.95) {
+              wordObj.chars[ci].text = wordObj.chars[ci].text.toLowerCase();
+            }
+          }
+        } else if (words[wi].smallCapsAltTitleCase) {
+          wordObj.chars.slice(1).forEach((x) => { x.text = x.text.toLowerCase(); });
+        } else {
+          wordObj.chars.forEach((x) => { x.text = x.text.toLowerCase(); });
+        }
+        wordObj.text = wordObj.chars.map((x) => x.text).join('');
+      }
+
+      // Stylistic ligatures are font-rendering decoration; downstream code
+      // (search, OCR diff, paragraph text) expects the component letters.
+      wordObj.text = ocr.replaceLigatures(wordObj.text);
+
+      // Run indices count ligature-expanded text, matching the replaceLigatures rewrite of the word text above.
+      // A word whose first char's style differs from the word style is skipped, since a run cannot express a styled prefix.
+      if (wordChars[0].fontInfo.bold === wordObj.style.bold
+        && wordChars[0].fontInfo.italic === wordObj.style.italic
+        && wordChars[0].fontInfo.smallCaps === wordObj.style.smallCaps) {
+        let textOffset = ocr.replaceLigatures(wordChars[0].text).length;
+        for (let ci = 1; ci < wordChars.length; ci++) {
+          const prevFi = wordChars[ci - 1].fontInfo;
+          const fi = wordChars[ci].fontInfo;
+          if (fi.bold !== prevFi.bold || fi.italic !== prevFi.italic || fi.smallCaps !== prevFi.smallCaps) {
+            const delta = {};
+            if (fi.bold !== wordObj.style.bold) delta.bold = fi.bold;
+            if (fi.italic !== wordObj.style.italic) delta.italic = fi.italic;
+            if (fi.smallCaps !== wordObj.style.smallCaps) delta.smallCaps = fi.smallCaps;
+            wordObj.styleRuns = wordObj.styleRuns || [];
+            wordObj.styleRuns.push({ i: textOffset, style: delta });
+          }
+          textOffset += ocr.replaceLigatures(wordChars[ci].text).length;
+        }
+      }
+
+      lineObj.words.push(wordObj);
+    }
+
+    if (lineObj.words.length === 0) continue;
+
+    ocr.updateLineBbox(lineObj);
+    pageObj.lines.push(lineObj);
+  }
+
+  // Compute page angle from line baseline slopes (median of middle 50%).
+  // Only use orientation-0 lines; rotated text should not affect the page angle.
+  const angleRisePage = pageObj.lines
+    .filter((l) => l.orientation === 0)
+    .map((l) => l.baseline[0])
+    .filter((s) => Math.abs(s) < 0.3);
+  const angleRiseMedian = mean50(angleRisePage) || 0;
+  pageObj.angle = Math.asin(angleRiseMedian) * (180 / Math.PI);
+
+  // Detect tables from text structure and vector paths, and convert to LayoutDataTable format.
+  // Provisional open-top grids are carried raw for the cross-page promotion pass instead of converting here.
+  const detectedTables = detectTableRegions(pageObj, paths, scale, visualHeightPts, boxOriginX, boxOriginY,
+    underlineRects.filter((r) => r.isUnderline));
+  const provisionalTables = detectedTables.filter((dt) => dt.provisionalTopOpen);
+  const dataTablePage = new LayoutDataTablePage(n);
+  for (const dt of detectedTables) {
+    if (dt.provisionalTopOpen) continue;
+    dataTablePage.tables.push(convertDetectedTable(dt, dataTablePage, pageObj));
+  }
+
+  // Split rows that the stream draws across side-by-side pages, since line grouping keeps such a row as one line when the gutter is under four em.
+  for (const dt of dataTablePage.tables) {
+    if (dt.boxes.length < 2) continue;
+    const cols = dt.boxes.map((c) => c.coords);
+    const regionLeft = Math.min(...cols.map((c) => c.left));
+    const regionRight = Math.max(...cols.map((c) => c.right));
+    const regionTop = Math.min(...cols.map((c) => c.top));
+    const regionBottom = Math.max(...cols.map((c) => c.bottom));
+    if (regionBottom - regionTop < 0.5 * pageHeight) continue;
+    /** @type {Set<OcrLine>} */
+    const rows = new Set();
+    for (const l of pageObj.lines) {
+      const cy = (l.bbox.top + l.bbox.bottom) / 2;
+      if (cy >= regionTop && cy <= regionBottom && l.bbox.right > regionLeft && l.bbox.left < regionRight) rows.add(l);
+    }
+    if (rows.size < 8) continue;
+    let numeric = 0;
+    let total = 0;
+    const colRows = cols.map(() => 0);
+    const colWords = cols.map(() => 0);
+    for (const l of rows) {
+      const seen = cols.map(() => false);
+      for (const w of l.words) {
+        const cx = (w.bbox.left + w.bbox.right) / 2;
+        if (cx < regionLeft || cx > regionRight) continue;
+        total++;
+        const wt = w.text.trim();
+        if (/\d/.test(wt) && /^[\d.,%()$/-]+$/.test(wt)) numeric++;
+        const ci = cols.findIndex((c) => cx >= c.left && cx <= c.right);
+        if (ci >= 0) {
+          colWords[ci]++;
+          seen[ci] = true;
+        }
+      }
+      seen.forEach((v, ci) => { if (v) colRows[ci]++; });
+    }
+    if (total === 0 || numeric / total >= 0.5) continue;
+    if (cols.some((c, ci) => colRows[ci] > 0 && colWords[ci] / colRows[ci] < 3)) continue;
+    for (let ci = 1; ci < cols.length; ci++) {
+      const x = (cols[ci - 1].right + cols[ci].left) / 2;
+      for (let li = 0; li < pageObj.lines.length; li++) {
+        const l = pageObj.lines[li];
+        if (!rows.has(l) || l.orientation !== 0 || l.words.length < 2 || !(l.bbox.left < x && l.bbox.right > x)) continue;
+        const size = l.words[0].style.size || (l.bbox.bottom - l.bbox.top);
+        // Cutting by word centers lets a row that an edit grew past the gutter's middle still part from the row beside it.
+        const at = l.words.findIndex((w) => (w.bbox.left + w.bbox.right) / 2 > x);
+        if (at < 1 || l.words[at].bbox.left - l.words[at - 1].bbox.right < 0.5 * size) continue;
+        const tail = l.words.splice(at);
+        const baselineY = l.bbox.bottom + l.baseline[1];
+        const tailBbox = calcBboxUnion(tail.map((w) => w.bbox));
+        const lineNew = new ocr.OcrLine(pageObj, tailBbox, [l.baseline[0], baselineY - tailBbox.bottom], l.ascHeight, l.xHeight);
+        lineNew.words = tail;
+        for (const w of tail) w.line = lineNew;
+        lineNew.orientation = l.orientation;
+        l.bbox = calcBboxUnion(l.words.map((w) => w.bbox));
+        l.baseline = [l.baseline[0], baselineY - l.bbox.bottom];
+        rows.add(lineNew);
+        pageObj.lines.splice(li + 1, 0, lineNew);
+      }
+    }
+  }
+
+  if (pageObj.lines.length > 0) {
+    assignParagraphs(pageObj, pageObj.angle);
+  }
+
+  return {
+    pageObj, langSet, fontSet, wordSignals, nativeText, dataTablePage, provisionalTables, fillGlyphBoxes,
+  };
+}

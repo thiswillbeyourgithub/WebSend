@@ -7,6 +7,6 @@
     "eruda": "3.4.3",
     "jsqr": "1.4.0",
     "qrcode": "1.5.4",
-    "scribe.js-ocr": "0.10.1"
+    "scribe.js-ocr": "0.17.0"
   }
 }

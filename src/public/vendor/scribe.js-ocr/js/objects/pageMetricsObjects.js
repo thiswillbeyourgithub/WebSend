@@ -10,6 +10,14 @@
  * @property {dims} dims
  * @property {?number} left -
  * @property {number} manAdj
+ * @property {number} rotation - User-applied page rotation in degrees (0, 90, 180, or 270), composed with the input PDF's `/Rotate` only at export.
+ *   Distinct from `angle` (deskew) and from the input `/Rotate`, which is already baked into the rendered raster and the stored `dims`.
+ * @property {?number} sourcePageN - Which original (immutable worker) page to raster for this display slot, set once the page order is edited (delete/reorder).
+ *   `null` means "identity" (raster the page's own current index), the state of every page until the first structural edit.
+ *   Lets the display order diverge from the source PDF without mutating the worker.
+ * @property {?number} sourceId - Which render source (see `RenderSource`) the `sourcePageN` index belongs to.
+ *   `null` means this document's own (primary) source — the state of every page until one is copied in from another document.
+ *   Set to a concrete source id when a foreign page is inserted, so its raster (and, on export, its bytes) come from its true origin.
  * @description The `pageMetrics` object contains the "official" metrics for each page of the source document, and exists independent from the OCR data.
  * For general tasks (not specifically analyzing OCR data), `pageMetrics` metrics should be used for information about a page.
  * For example, both `ocrPage` and `pageMetrics` have an `angle` property.  However, the `angle` property of `ocrPage`
@@ -25,4 +33,10 @@ export function PageMetrics(dims) {
   this.left = null;
   /** @type {number} */
   this.manAdj = 0;
+  /** @type {number} */
+  this.rotation = 0;
+  /** @type {?number} */
+  this.sourcePageN = null;
+  /** @type {?number} */
+  this.sourceId = null;
 }

@@ -9,16 +9,43 @@ declare global {
         smallCaps: boolean;
         sup: boolean;
         dropcap: boolean;
+        color: string;
+        opacity: number;
+        /** Target URL of the hyperlink this word belongs to, absent when the word is not part of one. */
+        link?: string;
     };
 
-    // Strings representing supported sources of text.
-    // `stext` indicates the text was extracted directly from a PDF using mupdf.
-    type TextSource = null | 'tesseract' | 'textract' | 'google_vision' | 'google_doc_ai' | 'abbyy' | 'alto' | 'stext' | 'hocr' | 'text' | 'azure_doc_intel' | 'docx';
+    /**
+     * A mid-word style change, e.g. an italic title's roman trailing comma.
+     * A new style begins at text index `i` and runs to the next entry or the end of the word.
+     * Fields omitted from `style` inherit the word's own style.
+     */
+    type StyleRun = {
+        i: number;
+        style: Partial<Style>;
+    };
+
+    // The kind of file or data a page's text layer was imported from.
+    // `stext` is the legacy spelling of `pdf`, remapped when older files are restored.
+    type TextSource = null | 'scribe.js' | 'pdf' | 'tesseract' | 'textract' | 'google_vision' | 'google_doc_ai' | 'abbyy' | 'alto' | 'stext' | 'hocr' | 'text' | 'azure_doc_intel' | 'docx' | 'md';
+
+    /**
+     * Parse-time signals for one word.
+     * Produced while parsing and consumed by the layout pass of that same import.
+     */
+    type PdfWordSignal = {
+        artifact: boolean;
+        mcid: number | null;
+        /** Object number of the structure element owning this word, once inline tags have rolled up to their block ancestor. */
+        structElemId: number | null;
+        structElemTag: string | null;
+        /** A character of this word is drawn from a font whose ToUnicode is majority-broken. */
+        brokenFont: boolean;
+    };
 
     type FontState = {
         enableOpt: boolean;
         forceOpt: boolean;
-        enableCleanToNimbusMono: boolean;
         defaultFontName: string;
         serifDefaultName: string;
         sansDefaultName: string;
@@ -31,7 +58,9 @@ declare global {
         fontState: FontState;
         layoutRegions: LayoutPage[];
         layoutDataTables: LayoutDataTablePage[];
-        annotations: AnnotationHighlight[][];
+        annotations: Annotation[][];
+        pageRotations?: number[];
+        session?: ScribeSessionData;
     }
 
     type StyleLookup = ('normal' | 'bold' | 'italic' | 'boldItalic');
@@ -90,8 +119,8 @@ declare global {
         boldItalic: ArrayBuffer | null;
     };
 
-    type opentypeFont = import("../lib/opentype.module.js").Font;
-    type opentypeGlyph = import("../lib/opentype.module.js").Glyph;
+    type opentypeFont = import("./font-parser/src/index.js").Font;
+    type opentypeGlyph = import("./font-parser/src/index.js").Glyph;
     type GeneralScheduler = import("./generalWorkerMain.js").GeneralScheduler;
 
     // Image objects
@@ -201,19 +230,555 @@ declare global {
             elapsedMs?: number;
             responsesReceived?: number;
             timestamp?: number;
+            /** Engine-defined stage name, on `status: 'progress'` messages from document-mode models. */
+            stage?: string;
+            /** Document-scoped completion percentage (0-100), on `status: 'progress'` messages. */
+            pct?: number;
         };
     }
 
     type FileNode = import("./import/nodeAdapter.js").FileNode;
 
+    /** One reply in a comment thread. Round-trips as a PDF /Text annotation with /IRT. */
+    type AnnotationReply = {
+        text: string;
+        /** Reply author (PDF /T); omitted when unauthored. */
+        author?: string;
+        /** Reply creation time, UTC ISO-8601. */
+        createdAt?: string;
+    };
+
+    /**
+     * A text-markup annotation (PDF /Highlight, /Underline, or /StrikeOut) anchored to a text range.
+     * A missing `type` is a legacy highlight; `'underline'`/`'strikeout'` are always explicit.
+     */
     type AnnotationHighlight = {
+        type?: 'highlight' | 'underline' | 'strikeout';
         bbox: bbox;
         color: string;
         opacity: number;
         groupId: string;
         comment?: string;
+        author?: string;
+        createdAt?: string;
+        /** Reply thread under the comment, oldest first. */
+        replies?: AnnotationReply[];
         quads?: bbox[];
     };
+
+    type AnnotationFreeText = {
+        type: 'freetext';
+        /** Annotation rectangle in page coordinates (top-left origin, same frame as OCR words). */
+        bbox: bbox;
+        contents: string;
+        /** Text size in the same coordinate frame as bbox (converted to PDF points at write time). */
+        fontSize: number;
+        /** Text color, '#rrggbb'. */
+        textColor: string;
+        /** Background color, '#rrggbb'; omitted = transparent. */
+        fillColor?: string;
+        opacity: number;
+        /** Reply thread on the annotation, oldest first. */
+        replies?: AnnotationReply[];
+    };
+
+    type AnnotationShapeStyle = {
+        /** Stroke/border color, '#rrggbb'. Default '#ff0000'. */
+        borderColor?: string;
+        /** Interior fill, '#rrggbb'; omitted = outline only. */
+        fillColor?: string;
+        /** Opacity 0..1 applied to stroke and fill. Default 1. */
+        opacity?: number;
+        /** Border width in page units. Default 1. */
+        borderWidth?: number;
+        comment?: string;
+        /** Comment author (PDF /T); omitted when unauthored. */
+        author?: string;
+        /** Comment creation time*/
+        createdAt?: string;
+        /** Reply thread under the comment, oldest first. */
+        replies?: AnnotationReply[];
+    };
+
+    /** Geometry below is in page coordinates (top-left origin, same frame as OCR words). */
+    type AnnotationSquare = AnnotationShapeStyle & { type: 'square'; bbox: bbox; };
+    type AnnotationCircle = AnnotationShapeStyle & { type: 'circle'; bbox: bbox; };
+    type AnnotationLine = AnnotationShapeStyle & { type: 'line'; points: [number, number, number, number]; };
+    type AnnotationPolygon = AnnotationShapeStyle & { type: 'polygon' | 'polyline'; vertices: number[]; };
+    type AnnotationShape = AnnotationSquare | AnnotationCircle | AnnotationLine | AnnotationPolygon;
+
+    /** A PDF /Text annotation: a freestanding comment marker, not anchored to a text range. */
+    type AnnotationText = {
+        type: 'text';
+        /** Small icon rect at the drop point, pixel space (top-left origin, same frame as OCR words). */
+        bbox: bbox;
+        comment: string;
+        /** Icon color, '#rrggbb' (PDF /C); omitted = viewer default. */
+        color?: string;
+        /** Comment author (PDF /T). */
+        author?: string;
+        /** Comment creation time. */
+        createdAt?: string;
+        /** Reply thread under the comment, oldest first. */
+        replies?: AnnotationReply[];
+        /** Whether the note popup opens by default. */
+        open?: boolean;
+    };
+
+    /**
+     * A redaction mark: an area slated for destructive removal at export.
+     * `.scribe` saves keep the mark unapplied; every other export removes the marked content.
+     */
+    type AnnotationRedact = {
+        /** Required because writers read a missing `type` as a legacy highlight. */
+        type: 'redact';
+        /** Region to erase, page coordinates (top-left origin, same frame as OCR words). */
+        bbox: bbox;
+        /** Ties together the rects of one mark; a multi-line selection makes several, a box mark one. */
+        groupId: string;
+    };
+
+    /**
+     * A clickable link region.
+     * Exactly one of `dest` / `uri` is set.
+     */
+    type AnnotationLink = {
+        type: 'link';
+        /** Clickable region, page coordinates (top-left origin, same frame as OCR words). */
+        bbox: bbox;
+        /** Internal page target. */
+        dest?: OutlineDest;
+        /** External URL. */
+        uri?: string;
+    };
+
+    /**
+     * An AcroForm field, lifted from a source-PDF Widget annotation.
+     * The filled value of a text/choice field also appears in the page's OCR text as ordinary words.
+     */
+    type AnnotationField = {
+        type: 'field';
+        fieldType: 'text' | 'checkbox' | 'radio' | 'choice' | 'signature' | 'button';
+        /**
+         * Fully-qualified field name.
+         * Each level's /T, root-to-leaf, joined with '.'.
+         */
+        name: string;
+        /** Widget rect, page coordinates (top-left origin, same frame as OCR words). */
+        bbox: bbox;
+        /**
+         * Current field value.
+         * A multi-select choice field's selected options are joined into one '; '-separated string.
+         */
+        value: string | null;
+        /** Source widget object number in the originating PDF. */
+        srcRef?: number;
+        readOnly?: boolean;
+        /** Field flag bit 2. */
+        required?: boolean;
+        /** Text field flag bit 13. */
+        multiline?: boolean;
+        /** Text field flag bit 25. */
+        comb?: boolean;
+        /** Cell count for comb fields. */
+        maxLen?: number;
+        signed?: boolean;
+        /**
+         * Widget carries the hidden or no-view annotation flag.
+         * Its value is not lifted into the page's OCR text.
+         */
+        hidden?: boolean;
+        /**
+         * Text alignment from /Q.
+         * 1 is centered, 2 is right-aligned, absent is left.
+         */
+        quadding?: number;
+        /** /DA default-appearance string. */
+        da?: string;
+        /** Checkbox/radio on-state name. */
+        onState?: string;
+        /**
+         * Choice-field option list from /Opt.
+         * Export/display pairs contribute only the display string, so `value` may be an export value missing from this list.
+         */
+        options?: string[];
+    };
+
+    /**
+     * A drawn fill & sign item.
+     * PDF export flattens it into page content.
+     */
+    type AnnotationInk = {
+        type: 'ink';
+        /** Stroke polylines in page coordinates (top-left origin). */
+        strokes: Array<Array<[number, number]>>;
+        width: number;
+        /** Stroke color, '#RRGGBB'. */
+        color?: string;
+        /** Extent of the strokes padded by half the stroke width. */
+        bbox: bbox;
+    };
+
+    /**
+     * A placed image fill & sign item, such as an uploaded or typed signature.
+     * PDF export flattens it into page content.
+     */
+    type AnnotationStamp = {
+        type: 'stamp';
+        bbox: bbox;
+        /** PNG or JPEG data URL. */
+        imageData: string;
+    };
+
+    type Annotation = AnnotationHighlight | AnnotationFreeText | AnnotationShape | AnnotationText | AnnotationRedact | AnnotationLink | AnnotationField | AnnotationInk | AnnotationStamp;
+
+    /** One image placement a `deleteImage` record removes. */
+    type ImageDeleteSite = {
+        left: number;
+        top: number;
+        right: number;
+        bottom: number;
+        /** Source image XObject number, absent for an inline image. */
+        objNum?: number;
+    };
+
+    /**
+     * An image deletion applied to the raster and to PDF exports.
+     * The `rect` only locates the deletion, and a drawn image is removed only when it also matches a site's identity, so visually-overlapping other images survive.
+     */
+    type ImageEditDelete = {
+        type: 'deleteImage';
+        id: string;
+        /** Merged placement extent, page coordinates (top-left origin, same frame as OCR words). */
+        rect: bbox;
+        sites: ImageDeleteSite[];
+        groupId?: string;
+    };
+
+    /** One painted-path draw a `deletePath` record removes. */
+    type PathDeleteSite = {
+        left: number;
+        top: number;
+        right: number;
+        bottom: number;
+        /** Paint kind: fill, stroke, or both. */
+        paint: 'f' | 's' | 'fs';
+        /** Command count of the draw's construction run after rectangle and shorthand-curve expansion. */
+        commands: number;
+    };
+
+    /**
+     * A painted-path deletion applied to the raster and to PDF exports.
+     * The `rect` only locates the deletion, and a drawn path is removed only when it also agrees with a site's extent, paint kind, and command count, so a bystander path inside the rect survives.
+     */
+    type PathEditDelete = {
+        type: 'deletePath';
+        id: string;
+        /** Placement extent, page coordinates (top-left origin, same frame as OCR words). */
+        rect: bbox;
+        sites: PathDeleteSite[];
+        groupId?: string;
+    };
+
+    /**
+     * The decoded content stream a text patch applies to.
+     * A form stream is named by its resource name path from the page, slash-joined when nested (`Fm1/Fm3`).
+     */
+    type TextPatchStream = { kind: 'page' } | { kind: 'form', path: string };
+
+    /**
+     * A native text edit as byte-range patches to one decoded content stream.
+     * Edit offsets index the stream as the source PDF has it, before any record is applied.
+     * Each edit's `text` is content-stream operator text.
+     */
+    type TextPatch = {
+        type: 'patchText';
+        id: string;
+        stream: TextPatchStream;
+        /** Non-overlapping, in ascending order of `start`. */
+        edits: Array<{ start: number, end: number, text: string }>;
+        /** Ties together the records of one user action. */
+        groupId?: string;
+        /**
+         * The substitute faces this record's edits draw with.
+         * The edits' `Tf` operators select each face by the resource name its fields derive.
+         */
+        fonts?: Array<{ family: string, styleKey: string, ascent?: number, descent?: number }>;
+    };
+
+    /**
+     * A live word identified by its glyph pens.
+     * The pens find the word again in a fresh parse, which can give it a different id.
+     */
+    type TextEditWordSpec = {
+        id: string;
+        text?: string;
+        penX: number[];
+        baselineY?: number;
+    };
+
+    type ContentEdit = ImageEditDelete | PathEditDelete | TextPatch;
+
+    /**
+     * The edits a page render applies.
+     * `dims` is the page's size in the records' page-pixel frame.
+     */
+    type RenderEdits = {
+        records: Array<ContentEdit>;
+        dims: { width: number, height: number };
+    };
+
+    /**
+     * Parse-derived metadata for one visibly-drawn native word.
+     * Array fields are index-aligned with the word's `chars`.
+     */
+    type NativeTextWord = {
+        fontObjNum?: number;
+        /** Unrounded baseline y in page pixels. */
+        baselineY: number;
+        /** Per-glyph pen-origin x, unrounded. */
+        penX?: number[];
+        /**
+         * Per-glyph text-matrix shear, 0 for upright glyphs.
+         * Present only on a word with a sheared glyph.
+         */
+        skew?: number[];
+        /** Per-glyph horizontal stretch of the drawn glyph against the emitted size, 0 for unstretched glyphs. */
+        stretch?: number[];
+        /** Text render mode of faux-bold text: 1 = stroke only, 2 = fill + stroke. Absent for plain filled text. */
+        renderMode?: number;
+        /** Stroke pen width in page pixels, present with `renderMode`. */
+        strokeWidthPx?: number;
+        /** Stroke color, `#rrggbb`; black when absent. */
+        strokeColor?: string;
+        /**
+         * Per-glyph character code of each glyph that extracted as a placeholder (a Type 3 glyph with no Unicode mapping), -1 for every other glyph.
+         * Present only on a word drawn by a Type 3 font that has such a glyph.
+         */
+        codes?: number[];
+        /**
+         * Marks a word drawn by a Type 3 font or in vertical writing.
+         * The word's line is not editable.
+         */
+        uneditable?: true;
+    };
+
+    /**
+     * One glyph of a native line as the page's content stream draws it, in page pixels.
+     */
+    type LineGlyph = {
+        /**
+         * The text the parser gave the glyph.
+         * A ligature glyph's text can be more than one character.
+         */
+        text: string;
+        penX: number;
+        penY: number;
+        /** The declared width under horizontal scaling, where the glyph's box ends. */
+        widthPx: number;
+        sizePx: number;
+        fontObjNum: ?number;
+        /** The built-in face the glyph is drawn with, when its font is a substitute face synthesized for an edit. */
+        face?: { family: string, styleKey: string };
+        /** Fill color, `#rrggbb`. */
+        fillColor: string;
+        /** Text render mode of faux-bold text: 1 = stroke only, 2 = fill + stroke. Absent for plain filled text. */
+        renderMode?: number;
+        /** Stroke pen width in page pixels, present with `renderMode`. */
+        strokeWidthPx?: number;
+        /** Stroke color, `#rrggbb`. */
+        strokeColor?: string;
+        /** Shear ratio of faux-oblique text, 0 when upright. */
+        skew: number;
+        /** Horizontal stretch ratio, 0 when unstretched. */
+        stretch: number;
+        /**
+         * Marks a glyph whose font's declared widths are unreliable.
+         * The raster draws such a glyph in a substitute face at its natural width instead of fitting it to the declared width.
+         */
+        widthsUnreliable?: boolean;
+    };
+
+    /**
+     * The glyphs of a page's words as its content stream draws them.
+     * `words` is aligned with the requested words, with null for a word not found on the page.
+     */
+    type LineState = {
+        words: Array<?{ id: string, glyphs: Array<LineGlyph> }>;
+        /**
+         * The page's records with the requested words' operators deleted, for the raster to apply while the editor draws the line.
+         * Null when a requested word was not found.
+         */
+        hide: ?Array<ContentEdit>;
+    };
+
+    /**
+     * The glyphs of a line as a replacement of it would draw them.
+     * `words` holds one entry per word of the replaced line, in reading order.
+     * `oldId` is the id of the request word a word continues, or null for a word the replacement inserted.
+     * A refused preview carries only `refused`.
+     */
+    type TextEditPreview = {
+        refused?: string;
+        words?: Array<{ text: string, oldId: ?string, glyphs: Array<LineGlyph> }>;
+    };
+
+    /**
+     * The worker's answer to a text edit.
+     * The new `records` replace the existing records named in `foldedIds`.
+     * A refused edit carries only `refused`.
+     * An edit that changes nothing the page draws carries only `unchanged`.
+     */
+    type TextEditResult = {
+        refused?: string;
+        unchanged?: true;
+        records?: Array<TextPatch>;
+        foldedIds?: string[];
+        /**
+         * Words drawn again under the deleted text, by their pens.
+         * The caller finds them on the live page by those pens and removes them too.
+         */
+        twins?: Array<{ penX: number[], baselineY: number }>;
+        /**
+         * A replacement's line as the patched page parses it, in reading order.
+         * `oldId` is the id of the request word a word continues, or null for an inserted word.
+         */
+        lineWords?: Array<{
+            oldId: ?string;
+            text: string;
+            bbox: bbox;
+            chars: Array<{ text: string, bbox: bbox }>;
+            style: Style;
+            lang: string;
+            entry: NativeTextWord;
+        }>;
+    };
+
+    /**
+     * The outline hash of every Type 3 glyph in one source document, keyed by font object number and character code, with the reverse index.
+     * `blank` marks a procedure that draws nothing.
+     * `hash` is null when the procedure could not be read.
+     */
+    type Type3GlyphHashes = {
+        fonts: Map<number, { byCode: Map<number, { hash: ?string, blank: boolean }> }>;
+        /** Every `[fontObjNum, code]` bound to an outline. */
+        byHash: Map<string, Array<[number, number]>>;
+    };
+
+    /**
+     * Data inside a `.scribe` file that only this application consumes.
+     * Written only when the export opts in with `scribeSession`, so standard-format consumers never see it.
+     */
+    type ScribeSessionData = {
+        v: number;
+        /** Per-page index of the source page each slot shows, null before any page edit. */
+        pageSourceIndices?: Array<number | null>;
+        contentEdits?: ContentEdit[][];
+        /** Pre-rename key for `contentEdits`, read from sessions saved before 2026-08 and never written. */
+        textEdits?: ContentEdit[][];
+        nativeText?: Array<Record<string, NativeTextWord>>;
+        /** `[page, index]` positions in `doc.annotations.pages` of the `freetext` rows that are fill & sign typed text. */
+        fillText?: Array<[number, number]>;
+        fillShapes?: Array<EncodedFillShapes | null>;
+        /** Per-page conflict-arbiter payloads, written by sessions saved before 2026-09-03 and ignored on import. */
+        arbiterDecisions?: Array<object | null>;
+        assistantChats?: AssistantChatRecord[];
+        redactions?: { terms: RedactionTermRecord[]; matchCase?: boolean; scannedAt?: string | null };
+        /** Characters recorded against Type 3 glyph outlines, as `[pathHash, text]` pairs. */
+        type3GlyphMappings?: Array<[string, string]>;
+        tableExport?: { excluded?: Record<string, true>; names?: Record<string, string> };
+    };
+
+    /**
+     * One page's parse-derived shapes, in the page-pixel frame.
+     * Images and paths are the placements Edit Graphics selects and deletes, while squares, marks, and glyph boxes feed fill-target detection.
+     */
+    type PageFillShapes = {
+        squares?: Array<{ left: number; top: number; right: number; bottom: number; stroke: boolean }>;
+        marks?: Array<{ left: number; top: number; right: number; bottom: number }>;
+        marksOverflow?: boolean;
+        images?: Array<{ left: number; top: number; right: number; bottom: number; sites: Array<{ left: number; top: number; right: number; bottom: number; objNum?: number }> }>;
+        paths?: Array<{ left: number; top: number; right: number; bottom: number; sites: Array<{ left: number; top: number; right: number; bottom: number; paint: "f" | "s" | "fs"; commands: number }> }>;
+        pathsIneligible?: boolean;
+        glyphBoxes?: Array<{ id: string; bbox: { left: number; top: number; right: number; bottom: number } }>;
+    };
+
+    /**
+     * `PageFillShapes` as serialized in the `.scribe` session block.
+     * Rounded flat arrays keyed `i` (images), `p` (paths), `q` (squares), `m` (marks), `g` (glyph boxes), with the `pi` and `mo` flags.
+     */
+    type EncodedFillShapes = {
+        i?: Array<[number, number, number, number, Array<[number, number, number, number, number]>]>;
+        p?: Array<[number, number, number, number, Array<[number, number, number, number, string, number]>]>;
+        q?: Array<[number, number, number, number, number]>;
+        m?: Array<[number, number, number, number]>;
+        g?: Array<[string, number, number, number, number]>;
+        pi?: 1;
+        mo?: 1;
+    };
+
+    /**
+     * One term in the Redactions workspace.
+     * Its last scan staged one `redact` annotation group per occurrence, listed in `groupIds`.
+     */
+    type RedactionTermRecord = {
+        term: string;
+        /**
+         * How the term matches.
+         * `variants` also accepts possessive and plural forms of the final word.
+         */
+        mode: "variants" | "exact" | "contains";
+        groupIds: string[];
+        /** True while the term's marks are removed but the row is kept for restoring. */
+        removed?: boolean;
+    };
+
+    /**
+     * One entry of an assistant chat's display log, which is the replayable record of what the panel rendered.
+     * The `kind` decides which fields apply.
+     * `user`, `mark`, and `flag` carry `text`, while `prose` carries the reply segment's markdown in `md`.
+     * `receipt` and `batch` carry the rail rows, with a batch's folded per-passage rows in `items`.
+     * `run` records a tool run filed into the chat.
+     */
+    type AssistantChatLogEntry = {
+        kind: "user" | "prose" | "mark" | "flag" | "receipt" | "batch" | "run";
+        text?: string;
+        md?: string;
+        label?: string;
+        page?: number;
+        bbox?: bbox;
+        wordIds?: string[];
+        quote?: string;
+        /** Verb trust tier for the receipt's icon (0 read, 1+ act). */
+        tier?: number;
+        removed?: boolean;
+        items?: Array<{ page?: number; label: string; bbox?: bbox; wordIds?: string[]; removed?: boolean }>;
+        toolId?: string;
+        title?: string;
+        params?: string;
+        /** ISO timestamp of when the run finished. */
+        time?: string;
+        state?: "done" | "failed" | "undone";
+        rows?: Array<{ kind: string; text: string }>;
+        /** True once the run has been described to the model in a recap. */
+        relayed?: boolean;
+    };
+
+    /**
+     * One assistant conversation.
+     * It holds the verbatim provider thread, which continues the chat, and the display log, which replays it.
+     * `messages` stays untyped here because the assistant UI layer owns that format.
+     */
+    type AssistantChatRecord = {
+        id: string;
+        title: string;
+        createdAt: string;
+        updatedAt: string;
+        messages: Array<Object>;
+        log: AssistantChatLogEntry[];
+    };
+
+    type OutlineDest = import("./objects/outlineObjects.js").OutlineDest;
 
     // Layout objects
     type LayoutPage = import("./objects/layoutObjects.js").LayoutPage;
@@ -221,6 +786,7 @@ declare global {
     type LayoutDataTable = import("./objects/layoutObjects.js").LayoutDataTable;
     type LayoutDataColumn = import("./objects/layoutObjects.js").LayoutDataColumn;
     type LayoutRegion = import("./objects/layoutObjects.js").LayoutRegion;
+    type LayoutImageRegion = import("./objects/layoutObjects.js").LayoutImageRegion;
 
     interface Point {
         x: number;
@@ -252,6 +818,28 @@ declare global {
         name: string;
         objN: number;
         opentype: opentypeFont;
+        /**
+         * Width-scaled variants of this font for words that would otherwise split when a viewer extracts text.
+         * These differ only in declared advance widths, sharing the base `opentype` object by reference and carrying a `widthScale` (see below).
+         */
+        widthVariants?: Array<{ scale: number; info: PdfFontInfo }>;
+        /**
+         * Advance-width multiplier for a width-scaled variant. Absent (treated as 1) on base fonts.
+         * Applied when generating the variant's `/W` array and at the export-font advance reads in `writePdfText`.
+         */
+        widthScale?: number;
+        /**
+         * For a width-scaled variant, the object numbers of the base font's shared FontDescriptor and ToUnicode CMap.
+         * The variant references these instead of re-embedding the font program.
+         * Their presence marks "variant mode" in `createEmbeddedFontType0`.
+         */
+        baseDescriptorObjN?: number;
+        baseToUnicodeObjN?: number;
+        /**
+         * Per-GID unicode override for the embedded font's ToUnicode CMap.
+         * For example, ligature or Type3-replacement glyphs whose code does not map to a single source character.
+         */
+        toUnicodeOverride?: Map<number, string>;
     };
 
     type PdfFontFamily = {
@@ -366,12 +954,37 @@ declare global {
         name: string;
         outputFormat: RecognitionOutputFormat | null;
         rateLimit?: { tps: number } | { rpm: number };
+        /** Recognize the whole document in one `recognizeDocument` call instead of per-image dispatch. */
+        documentMode?: boolean;
+        /** The model honors the `pages` input and recognizes only those pages. */
+        documentModePageSelection?: boolean;
     }
+
+    /**
+     * One entry in a document-mode result stream.
+     * Progress entries omit `pageNum` for document-level stages.
+     */
+    type RecognitionDocumentEntry = {
+        pageNum: number;
+        rawData?: string;
+        error?: Error;
+    } | {
+        pageNum?: number;
+        progress: { stage?: string; pct?: number };
+    };
 
     interface RecognitionModel {
         config: RecognitionModelConfig;
         recognizeImage(imageData: Uint8Array | ArrayBuffer, options?: any): Promise<RecognitionResult>;
-        recognizeDocument?(documentData: Uint8Array | ArrayBuffer, options?: any): Promise<RecognitionResult>;
+        /**
+         * Called instead of `recognizeImage` when `config.documentMode` is set.
+         * `pdfBytes` is null for image-mode documents.
+         * `pages` is set only for `documentModePageSelection` models on a partial selection.
+         */
+        recognizeDocument?(
+            input: { pdfBytes: Uint8Array | null; pageCount: number; pageDims: dims[]; pages?: number[] },
+            options?: any,
+        ): AsyncIterable<RecognitionDocumentEntry> | Promise<AsyncIterable<RecognitionDocumentEntry>>;
         convertPage?(rawData: string, n: number): Promise<{
             pageObj: OcrPage;
             dataTables: LayoutDataTablePage;
@@ -407,6 +1020,37 @@ declare global {
         confidence: number;
     }
 
+    interface AzureDocIntelBoundingRegion {
+        pageNumber: number;
+        polygon: number[];
+    }
+
+    interface AzureDocIntelParagraph {
+        content: string;
+        spans: AzureDocIntelSpan[];
+        boundingRegions?: AzureDocIntelBoundingRegion[];
+        role?: 'title' | 'sectionHeading' | 'footnote' | 'pageHeader' | 'pageFooter' | 'pageNumber' | 'formulaBlock';
+    }
+
+    interface AzureDocIntelTableCell {
+        kind?: 'content' | 'rowHeader' | 'columnHeader' | 'stereotype' | 'description';
+        rowIndex: number;
+        columnIndex: number;
+        rowSpan?: number;
+        columnSpan?: number;
+        content: string;
+        boundingRegions?: AzureDocIntelBoundingRegion[];
+        spans: AzureDocIntelSpan[];
+    }
+
+    interface AzureDocIntelTable {
+        rowCount: number;
+        columnCount: number;
+        cells: AzureDocIntelTableCell[];
+        boundingRegions?: AzureDocIntelBoundingRegion[];
+        spans: AzureDocIntelSpan[];
+    }
+
     interface AzureDocIntelPage {
         pageNumber: number;
         angle: number;
@@ -423,6 +1067,8 @@ declare global {
         modelId: string;
         content: string;
         pages: AzureDocIntelPage[];
+        paragraphs?: AzureDocIntelParagraph[];
+        tables?: AzureDocIntelTable[];
         styles: AzureDocIntelStyle[];
     }
 
@@ -437,7 +1083,6 @@ declare global {
     type TessOutputFormats = {
         text: boolean;
         blocks: boolean;
-        layoutBlocks: boolean;
         hocr: boolean;
         tsv: boolean;
         box: boolean;
@@ -447,12 +1092,17 @@ declare global {
         imageGrey: boolean;
         imageBinary: boolean;
         debug: boolean;
+        debugVis: boolean;
     };
 
     type TessRecognizeOptions = {
         rectangle: TessRectangle;
         rotateAuto: boolean;
         rotateRadians: number;
+        legacy: boolean;
+        lstm: boolean;
+        upscale: boolean;
+        gpu: 'auto' | 'force' | 'off';
     };
 
     type TessRecognizeResult = {
@@ -474,7 +1124,6 @@ declare global {
         y0: number;
         x1: number;
         y1: number;
-        has_baseline: boolean;
     };
 
     type TessRowAttributes = {
@@ -496,111 +1145,127 @@ declare global {
     };
 
     type TessSymbol = {
-        choices: TessChoice[];
-        image: any;
         text: string;
         confidence: number;
-        baseline: TessBaseline;
         bbox: TessBbox;
-        is_superscript: boolean;
-        is_subscript: boolean;
-        is_dropcap: boolean;
-        word: TessWord;
-        line: TessLine;
-        paragraph: TessParagraph;
-        block: TessBlock;
-        page: TessPage;
     };
 
     type TessWord = {
-        symbols: TessSymbol[];
-        choices: TessChoice[];
+        symbols: TessSymbol[] | null;
         text: string;
         confidence: number;
-        baseline: TessBaseline;
         bbox: TessBbox;
-        is_numeric: boolean;
-        in_dictionary: boolean;
-        direction: string;
-        language: string;
-        is_bold: boolean;
-        is_italic: boolean;
-        is_underlined: boolean;
-        is_monospace: boolean;
-        is_serif: boolean;
-        is_smallcaps: boolean;
-        font_size: number;
-        font_id: number;
+        language: string | null;
         font_name: string;
-        line: TessLine;
-        paragraph: TessParagraph;
-        block: TessBlock;
-        page: TessPage;
+        italic: number;
+        smallcaps: number;
+        superscript: number;
+        /** Other readings of the word. */
+        alt: Array<{ text: string; conf: number; span: number; msg: string }> | null;
+        comp: number;
+        match: number;
+        charsKept: number;
     };
 
     type TessLine = {
         words: TessWord[];
+        baseline: TessBaseline;
+        xheight: number | null;
+        ascheight: number | null;
+        bbox: TessBbox;
+    };
+
+    type TessParagraph = {
+        lines: TessLine[];
+        bbox: TessBbox;
+        is_ltr: number;
+    };
+
+    type TessBlock = {
+        paragraphs: TessParagraph[];
+        bbox: TessBbox;
+        blocktype: number;
+    };
+
+    // The block JSON the vanilla core serializes.
+    type TessSymbolVanilla = {
+        text: string;
+        confidence: number;
+        bbox: TessBbox;
+        is_superscript: number;
+        is_subscript: number;
+        is_dropcap: number;
+    };
+
+    type TessWordVanilla = {
+        symbols: TessSymbolVanilla[];
+        choices: TessChoice[];
+        text: string;
+        confidence: number;
+        bbox: TessBbox;
+        language: string | null;
+        font_name: string;
+    };
+
+    type TessLineVanilla = {
+        words: TessWordVanilla[];
         text: string;
         confidence: number;
         baseline: TessBaseline;
         rowAttributes: TessRowAttributes;
         bbox: TessBbox;
-        paragraph: TessParagraph;
-        block: TessBlock;
-        page: TessPage;
-        symbols: TessSymbol[];
     };
 
-    type TessParagraph = {
-        lines: TessLine[];
+    type TessParagraphVanilla = {
+        lines: TessLineVanilla[];
         text: string;
         confidence: number;
-        baseline: TessBaseline;
         bbox: TessBbox;
-        is_ltr: boolean;
-        block: TessBlock;
-        page: TessPage;
-        words: TessWord[];
-        symbols: TessSymbol[];
+        is_ltr: number;
     };
 
-    type TessBlock = {
-        paragraphs: TessParagraph[];
+    type TessBlockVanilla = {
+        paragraphs: TessParagraphVanilla[];
         text: string;
         confidence: number;
-        baseline: TessBaseline;
         bbox: TessBbox;
-        blocktype: string;
-        polygon: any;
-        page: TessPage;
-        lines: TessLine[];
-        words: TessWord[];
-        symbols: TessSymbol[];
+        blocktype: number;
     };
 
     type TessPage = {
-        blocks: TessBlock[] | null;
+        blocks: TessBlock[] | TessBlockVanilla[] | null;
         confidence: number;
-        lines: TessLine[];
         oem: string;
         osd: string;
-        paragraphs: TessParagraph[];
         psm: string;
-        symbols: TessSymbol[];
         text: string;
         version: string;
-        words: TessWord[];
         hocr: string | null;
         tsv: string | null;
         box: string | null;
         unlv: string | null;
-        sd: string | null;
         imageColor: string | null;
         imageGrey: string | null;
         imageBinary: string | null;
         rotateRadians: number | null;
+        upscale: boolean;
         debug: string | null;
         debugVis: string | null;
+        timing: { 1: number; 2: number | null; 3: number | null; 4: number };
+        core: string | null;
+        kernel: string;
+    };
+
+    /**
+     * One recognition run's cost for a page. Dev only, not stable.
+     */
+    type OcrPageTiming = {
+        0: number;
+        1?: number;
+        2?: number | null;
+        3?: number | null;
+        4?: number;
+        dev?: Record<string, unknown>;
     };
 
 }

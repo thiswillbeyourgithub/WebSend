@@ -17,7 +17,7 @@
     'use strict';
 
     // Read a Blob/File as a data URL ("data:<mime>;base64,...").
-    // Used to feed scribe's ImageCache.nativeSrc, which expects a string source.
+    // Used to feed ScribeHandle.setPageImage, which expects a string source.
     function fileToDataUrl(file) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -31,7 +31,6 @@
     let exportCollectionId = null;       // null = export all, number = specific collection
     let clientZipPreloaded = null;       // Promise<{downloadZip}> or null
     let scribePreloaded = null;          // Promise<ScribeHandle|null> or null
-    let mupdfInstance = null;            // cached MuPDF worker
     let ocrExportInFlight = false;       // re-entry guard for generateOcrPdf
 
     // -- Wired-in deps (set by attach) --
@@ -78,7 +77,6 @@
                 }
             }).catch(() => {});
         }
-        mupdfInstance = null;
     }
 
     // ============ Modal helpers ============
@@ -448,9 +446,11 @@
 
         signal.throwIfAborted();
 
-        const ImageCache = scribe.data.image;
-        const pageMetrics = scribe.data.pageMetrics;
-        const ocrPages = scribe.data.ocr.active;
+        // OCR ran on the downscaled ocrFiles: scale the recognized
+        // coordinates up to the original size and swap the original-quality
+        // image in, so the PDF embeds the full-resolution page.
+        const pageMetrics = scribe.doc.pageMetrics;
+        const ocrPages = scribe.doc.ocr.active;
         for (let i = 0; i < origFiles.length; i++) {
             const origBmp = await createImageBitmap(origFiles[i]);
             const origW = origBmp.width;
@@ -459,9 +459,7 @@
 
             window.OcrRescale.rescaleOcrPage(ocrPages[i], pageMetrics[i], origW, origH);
 
-            const origBase64 = await fileToDataUrl(origFiles[i]);
-            const origWrapper = { src: origBase64, n: i, type: 'native', rotated: false, binarized: false };
-            ImageCache.nativeSrc[i] = Promise.resolve(origWrapper);
+            await scribe.setPageImage(i, await fileToDataUrl(origFiles[i]));
         }
 
         logger.info('[OCR fallback] Exporting PDF');
@@ -480,9 +478,10 @@
 
     // Splice cached OCR pages onto a scribe that's already imported origFiles.
     // Throws if any image lacks cached data — caller falls back to full OCR.
+    // The page images need no swap here: origFiles were imported as-is, so
+    // scribe already holds the original-quality images.
     async function applyCachedOcrToScribe(scribe, origFiles, activeImages) {
-        const ImageCache = scribe.data.image;
-        const pageMetrics = scribe.data.pageMetrics;
+        const pageMetrics = scribe.doc.pageMetrics;
         for (let i = 0; i < activeImages.length; i++) {
             const cached = activeImages[i].ocrPageData;
             if (!cached || !cached.page) {
@@ -498,12 +497,12 @@
 
             window.OcrRescale.rescaleOcrPage(cachedPage, cachedMetrics, origW, origH);
 
-            scribe.data.ocr.active[i] = cachedPage;
+            // bg-ocr.js recognized each image alone, so every cached page
+            // says it is page 0; renumber it to its slot in this document.
+            cachedPage.n = i;
+            scribe.doc.ocr.active[i] = cachedPage;
             pageMetrics[i].dims.width = origW;
             pageMetrics[i].dims.height = origH;
-
-            const origBase64 = await fileToDataUrl(origFiles[i]);
-            ImageCache.nativeSrc[i] = Promise.resolve({ src: origBase64, n: i, type: 'native', rotated: false, binarized: false });
         }
     }
 
@@ -716,14 +715,6 @@
     // ============ Per-PDF Export Functions ============
     // Per-card "Export as images" and "Export as OCR PDF" actions for received PDFs.
 
-    /** Lazy-load MuPDF worker for PDF rendering */
-    async function getMuPDF() {
-        if (mupdfInstance) return mupdfInstance;
-        const { initMuPDFWorker } = await import('/scribe/mupdf/mupdf-async.js');
-        mupdfInstance = await initMuPDFWorker();
-        return mupdfInstance;
-    }
-
     // Hard ceiling on the number of pages we will render from a peer-
     // supplied PDF. Legitimate documents are typically <100 pages and
     // virtually never exceed a few hundred. A malicious PDF can declare
@@ -734,29 +725,14 @@
     const MAX_PDF_RENDER_PAGES = 1000;
 
     /**
-     * Render all pages of a PDF to PNG data URLs using MuPDF.
+     * Render all pages of a PDF to PNG data URLs (scribe's PDF renderer).
      * @param {Uint8Array} pdfData - Raw PDF bytes
      * @param {number} dpi - Render DPI (default 150)
      * @returns {Promise<string[]>} Array of data:image/png;base64,... URLs
      * @throws Error if pageCount > MAX_PDF_RENDER_PAGES
      */
-    async function renderPdfPages(pdfData, dpi = 150) {
-        const mupdf = await getMuPDF();
-        const doc = await mupdf.openDocument(pdfData.buffer);
-        const pageCount = await mupdf.countPages(doc);
-        if (pageCount > MAX_PDF_RENDER_PAGES) {
-            await mupdf.freeDocument(doc);
-            throw new Error(
-                `PDF has ${pageCount} pages, refusing to render more than ${MAX_PDF_RENDER_PAGES}`
-            );
-        }
-        const pages = [];
-        for (let i = 1; i <= pageCount; i++) {
-            const dataUrl = await mupdf.drawPageAsPNG(doc, { page: i, dpi });
-            pages.push(dataUrl);
-        }
-        await mupdf.freeDocument(doc);
-        return pages;
+    function renderPdfPages(pdfData, dpi = 150) {
+        return window.ScribeHandle.renderPdfPages(pdfData, { dpi, maxPages: MAX_PDF_RENDER_PAGES });
     }
 
     /**
@@ -825,8 +801,8 @@
                 ocrFiles.push(new File([blob], `page_${i + 1}.png`, { type: 'image/png' }));
             }
 
-            // Always go through ScribeHandle: it absorbs the clear()/terminate()
-            // fork and tracks isAlive so dispose() in finally is idempotent.
+            // Always go through ScribeHandle: it tracks isAlive so dispose()
+            // in finally is idempotent.
             let scribe = null;
             const claim = claimScribePreloaded();
             if (claim) {

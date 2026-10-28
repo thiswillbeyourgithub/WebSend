@@ -1,0 +1,8725 @@
+import { parsePageImages, parseImageObject, parseIndexedColorSpace } from './parsePdfImages.js';
+import {
+  parseSeparationTint, parseTintColorSpace,
+  tintComponentsToRGB, cmykToRgb, evaluateFunction, parseFunction, tintSamplesToRgb,
+} from './pdfColorFunctions.js';
+import { extractPdfAnnotations } from './parsePdfAnnots.js';
+import {
+  findRootObjNum, applyPredictor, getPageContentStreams, isFormOCHidden, parseHiddenOCMCNames, parseFormMatrix,
+} from './parsePdfUtils.js';
+import {
+  extractDict, resolveIntValue, resolveNumValue, resolveArrayValue, resolveNumArray, resolveStringValue, resolveDictValue,
+  matMul, bytesToLatin1, scopeDictKeys,
+} from './pdfPrimitives.js';
+import { parseDrawOps } from './parseDrawOps.js';
+import { applyTextPatchRecords, patchPageContents, textPatchesTarget } from './textPatch.js';
+import {
+  mapImageDelete, imageDrawMatchesDelete, mapPathDelete, pathDrawMatchesDelete,
+} from './pageGeometry.js';
+
+/** @typedef {import('./objectCache.js').ObjectCache} ObjectCache */
+/** @typedef {import('./parseDrawOps.js').DrawOp} DrawOp */
+/** @typedef {import('./parseDrawOps.js').ImageDrawOp} ImageDrawOp */
+/** @typedef {import('./parseDrawOps.js').PathCommand} PathCommand */
+/** @typedef {import('./parseDrawOps.js').SmaskRef} SmaskRef */
+/** @typedef {import('./parseDrawOps.js').PatternShading} PatternShading */
+/** @typedef {import('./parseDrawOps.js').TilingPatternRef} TilingPatternRef */
+/** @typedef {import('./parseDrawOps.js').TransparencyGroupAttrs} TransparencyGroupAttrs */
+/** @typedef {import('./parseDrawOps.js').ClipEntry} ClipEntry */
+import { inflate as pakoInflate, inflatePartial as pakoInflatePartial } from '../../lib/pako-inflate.js';
+import { parsePageFonts, parseGlyphStreamPaths } from './fonts/parsePdfFonts.js';
+import { standardFontToCSS, applyStandardFontWidths } from './fonts/standardFontMetrics.js';
+import {
+  base14ToBuiltInFont, cssFamilyToBuiltInFont, genericToBuiltInFont, cssGenericForFontObj,
+} from './fonts/base14Substitution.js';
+import { FALLBACK_CHAIN } from '../fallbackFonts.js';
+import { loadFontFace } from '../containers/fontContainer.js';
+import { decodeCMYKJpegToRGB } from './codecs/decodeJPEG.js';
+import {
+  rebuildFontFromGlyphs, buildFontFromCFF, convertType1ToOTFNew,
+} from './fonts/convertFontToOTF.js';
+import { ca } from '../canvasAdapter.js';
+import { ensureSubstituteFacesForRecords, substituteFaceResourceEntries } from './substituteFaces.js';
+
+// Helvetica AFM advances (1000-em units) for centering synthesized comb-field characters in their cells, matching the exported appearance and the viewer cover.
+const combHelvWidths = new Map();
+const combHelvDefaultWidth = applyStandardFontWidths('Helvetica', combHelvWidths) ?? 500;
+
+/**
+ * Linearly interpolate an RGB value from a tint transform sample table.
+ * The table contains nSamples RGB triplets (R0,G0,B0,R1,G1,B1,...).
+ * `tint` is 0–255 mapping across the sample range.
+ * @param {Uint8Array} tintSamples
+ * @param {number} nSamples
+ * @param {number} tint
+ * @returns {[number, number, number]}
+ */
+function interpolateTint(tintSamples, nSamples, tint) {
+  const t = tint / 255 * (nSamples - 1);
+  const lo = Math.min(Math.floor(t), nSamples - 1);
+  const hi = Math.min(lo + 1, nSamples - 1);
+  const f = t - lo;
+  const li = lo * 3;
+  const hi3 = hi * 3;
+  return [
+    Math.round(tintSamples[li] * (1 - f) + tintSamples[hi3] * f),
+    Math.round(tintSamples[li + 1] * (1 - f) + tintSamples[hi3 + 1] * f),
+    Math.round(tintSamples[li + 2] * (1 - f) + tintSamples[hi3 + 2] * f),
+  ];
+}
+
+/**
+ * Precompute the 256-entry RGB table for a Separation / single-input-DeviceN tint transform.
+ * `interpolateTint` is a pure function of the 0-255 tint byte, so the whole per-pixel interpolation collapses to one table build plus a lookup.
+ * @param {Uint8Array} tintSamples
+ * @param {number} nSamples
+ * @returns {Uint8Array} 256 packed RGB triplets (768 bytes)
+ */
+function buildTintLut(tintSamples, nSamples) {
+  const lut = new Uint8Array(256 * 3);
+  for (let t = 0; t < 256; t++) {
+    const [r, g, b] = interpolateTint(tintSamples, nSamples, t);
+    lut[t * 3] = r;
+    lut[t * 3 + 1] = g;
+    lut[t * 3 + 2] = b;
+  }
+  return lut;
+}
+
+/**
+ * Expand a DeviceCMYK Indexed palette to RGB once, running `cmykToRgb` per palette entry instead of per pixel.
+ * The index is a byte, so there are at most 256 distinct colours no matter how large the image.
+ * @param {Uint8Array} palette - CMYK bytes, 4 per entry
+ * @returns {Uint8Array} one packed RGB triplet per entry
+ */
+function cmykPaletteToRgb(palette) {
+  const entries = Math.floor(palette.length / 4);
+  const rgb = new Uint8Array(entries * 3);
+  for (let e = 0; e < entries; e++) {
+    const o = e * 4;
+    const [r, g, b] = cmykToRgb(palette[o] / 255, palette[o + 1] / 255, palette[o + 2] / 255, palette[o + 3] / 255);
+    rgb[e * 3] = r;
+    rgb[e * 3 + 1] = g;
+    rgb[e * 3 + 2] = b;
+  }
+  return rgb;
+}
+
+/**
+ * Stable family-name alias for an embedded PDF font, keyed on
+ * `(docId, fontObjNum)`. Reused across every page of the document so
+ * `GlobalFonts.register` dedups to one registration per typeface.
+ *
+ * @param {{ docId: number }} objCache
+ * @param {number|null|undefined} fontObjNum
+ * @param {string} fallbackTag — used when fontObjNum is missing (inline
+ *   Type 3 / fonts declared in the Resources dict).
+ */
+function pdfFontFamilyName(objCache, fontObjNum, fallbackTag) {
+  if (fontObjNum != null) return `_pdf_d${objCache.docId}_f${fontObjNum}`;
+  return `_pdf_d${objCache.docId}_t${fallbackTag}`;
+}
+
+/**
+ * After a font registration loop, append a CSS generic family fallback to each
+ * embedded `_pdf_*` entry in `registeredFontNames` so that missing glyphs fall
+ * back to a style-appropriate system font rather than Chrome's default serif.
+ *
+ * @param {Map<string, string>} registeredFontNames
+ * @param {Map<string, any>} fonts
+ */
+function appendGenericFallbacks(registeredFontNames, fonts) {
+  for (const [fontTag, name] of registeredFontNames) {
+    const fontObj = fonts.get(fontTag);
+    if (!fontObj) continue;
+    const trailingGeneric = name.match(/,\s*(sans-serif|serif|monospace|cursive)\s*$/i);
+    if (trailingGeneric) {
+      registeredFontNames.set(fontTag, name.replace(
+        /,\s*(sans-serif|serif|monospace|cursive)\s*$/i,
+        `, ${FALLBACK_CHAIN}, $1`,
+      ));
+    } else {
+      const primary = /[",]/.test(name) ? name : `"${name}"`;
+      registeredFontNames.set(fontTag, `${primary}, ${FALLBACK_CHAIN}, ${cssGenericForFontObj(fontObj)}`);
+    }
+  }
+}
+
+/**
+ * Register a non-embedded font using built-in substitution fonts.
+ *
+ * @param {{ baseName: string, bold?: boolean, italic?: boolean, serifFlag?: boolean }} fontObj
+ * @param {string} _familyName - CSS font-family name to register
+ * @param {Map<string, string>} targetMap - Map to set familyName into (e.g., registeredFontNames)
+ * @param {string} fontTag - Font tag key for targetMap
+ */
+async function registerNonEmbeddedFont(fontObj, _familyName, targetMap, fontTag) {
+  // FontFaces are registered at the variant's actual weight/style.
+  // Otherwise Firefox stacks an extra faux-bold or italic on top of an already-bold/italic file.
+  const hints = { bold: fontObj.bold, italic: fontObj.italic };
+  const sub = base14ToBuiltInFont(fontObj.baseName, hints)
+    || cssFamilyToBuiltInFont(standardFontToCSS(fontObj.baseName), hints)
+    || genericToBuiltInFont(cssGenericForFontObj(fontObj), hints);
+  if (sub) {
+    try {
+      let fontBytes;
+      if (typeof process !== 'undefined') {
+        const { fileURLToPath } = await import('node:url');
+        const { readFileSync } = await import('node:fs');
+        fontBytes = readFileSync(fileURLToPath(sub.url));
+      } else {
+        fontBytes = await fetch(sub.url).then((r) => r.arrayBuffer());
+      }
+      const face = loadFontFace(sub.alias, sub.faceStyle, sub.faceWeight, fontBytes);
+      await face.loaded;
+      targetMap.set(fontTag, sub.alias);
+      return;
+    } catch (_e) {
+      const fallback = standardFontToCSS(fontObj.baseName) || cssGenericForFontObj(fontObj);
+      targetMap.set(fontTag, fallback);
+      console.warn(`[renderPdfPage] Built-in font ${sub.alias} failed to load for "${fontObj.baseName}", using ${fallback} fallback`);
+      return;
+    }
+  }
+  const cssFamily = standardFontToCSS(fontObj.baseName);
+  const fallback = cssFamily || cssGenericForFontObj(fontObj);
+  targetMap.set(fontTag, fallback);
+  if (!cssFamily) console.warn(`[renderPdfPage] No font data for "${fontObj.baseName}", using ${fallback} fallback`);
+}
+
+/**
+ * Convert an embedded font's binary data to OTF and register it.
+ *
+ * @param {string} fontTag
+ * @param {Object} fontObj
+ * @param {Map<string, string>} registeredFontNames - fontTag -> CSS familyName (mutated)
+ * @param {Set<string>} symbolFontTags - (mutated)
+ * @param {Set<string>} cidPUATags - (mutated)
+ * @param {Set<string>} rawCharCodeTags - (mutated)
+ * @param {Map<string, Set<number>>} cidCollisionMap - (mutated)
+ * @param {ObjectCache} objCache
+ * @param {string} familyName - CSS family name to register (used on cache miss only)
+ */
+async function convertAndRegisterFont(
+  fontTag, fontObj, registeredFontNames, symbolFontTags, cidPUATags,
+  rawCharCodeTags, cidCollisionMap, objCache, familyName,
+) {
+  const fontData = fontObj.type0 || fontObj.type1;
+  if (!fontData || !fontData.fontFile) {
+    await registerNonEmbeddedFont(fontObj, familyName, registeredFontNames, fontTag);
+    return;
+  }
+
+  // Cache hit: font already converted and registered in a prior page/context.
+  const cacheKey = fontObj.fontObjNum;
+  if (cacheKey != null) {
+    const cached = objCache.fontConversionCache.get(cacheKey);
+    if (cached) {
+      registeredFontNames.set(fontTag, cached.familyName);
+      if (cached.usesPUA) cidPUATags.add(fontTag);
+      if (cached.cidCollisions) cidCollisionMap.set(fontTag, cached.cidCollisions);
+      if (cached.cmapType === 'symbol') symbolFontTags.add(fontTag);
+      else if (cached.cmapType === 'rawCharCode') rawCharCodeTags.add(fontTag);
+      if (cached.fontMatrix && fontObj.type1) fontObj.type1.fontMatrix = cached.fontMatrix;
+      // All glyph outlines are empty (a metrics-only subset), so flag the fresh fontObj to make the draw path suppress its glyphs.
+      if (cached.allGlyphsEmpty) fontObj.allGlyphsEmpty = true;
+      return;
+    }
+  }
+
+  // Cache miss: convert font binary to OTF and register with loadFontFace.
+  const ab = fontData.fontFile.buffer.slice(
+    fontData.fontFile.byteOffset,
+    fontData.fontFile.byteOffset + fontData.fontFile.byteLength,
+  );
+  let fontBytes = new Uint8Array(ab);
+  const isCFF = fontBytes.length >= 4 && fontBytes[0] === 1 && fontBytes[1] === 0;
+  let isPFA = fontBytes.length >= 2 && fontBytes[0] === 0x25 && fontBytes[1] === 0x21;
+  const isPFB = fontBytes.length >= 6 && fontBytes[0] === 0x80 && (fontBytes[1] === 0x01 || fontBytes[1] === 0x02);
+
+  // PFB→PFA: strip segment headers
+  if (isPFB && !isCFF) {
+    const segments = [];
+    let pfbPos = 0;
+    while (pfbPos + 6 <= fontBytes.length && fontBytes[pfbPos] === 0x80) {
+      const segType = fontBytes[pfbPos + 1];
+      if (segType === 3) break;
+      const segLen = fontBytes[pfbPos + 2] | (fontBytes[pfbPos + 3] << 8) | (fontBytes[pfbPos + 4] << 16) | (fontBytes[pfbPos + 5] << 24);
+      pfbPos += 6;
+      if (pfbPos + segLen > fontBytes.length) break;
+      segments.push(fontBytes.subarray(pfbPos, pfbPos + segLen));
+      pfbPos += segLen;
+    }
+    if (segments.length > 0) {
+      const totalLen = segments.reduce((s, seg) => s + seg.length, 0);
+      const pfaData = new Uint8Array(totalLen);
+      let off = 0;
+      for (const seg of segments) { pfaData.set(seg, off); off += seg.length; }
+      fontBytes = pfaData;
+      isPFA = true;
+    }
+  }
+
+  let usesPUA = false;
+  let cmapType = null;
+  let cidCollisions = null;
+  let fontMatrix = null;
+  let registered = false;
+
+  // OTTO (OpenType/CFF) — try direct load, fall back to CFF extraction
+  const isOTTO = fontBytes.length >= 4 && fontBytes[0] === 0x4F && fontBytes[1] === 0x54
+    && fontBytes[2] === 0x54 && fontBytes[3] === 0x4F;
+  if (isOTTO) {
+    try {
+      const face = loadFontFace(familyName, 'normal', 'normal', ab);
+      await face.loaded;
+      registered = true;
+      if (cacheKey != null) objCache.fontBytesCache.set(cacheKey, { bytes: ab, kind: 'original' });
+    } catch (_e) {
+      const numT = (fontBytes[4] << 8) | fontBytes[5];
+      for (let ti = 0; ti < numT; ti++) {
+        const e = 12 + ti * 16;
+        if (e + 16 > fontBytes.length) break;
+        if (fontBytes[e] === 0x43 && fontBytes[e + 1] === 0x46 && fontBytes[e + 2] === 0x46 && fontBytes[e + 3] === 0x20) {
+          const cffOff = (fontBytes[e + 8] << 24) | (fontBytes[e + 9] << 16) | (fontBytes[e + 10] << 8) | fontBytes[e + 11];
+          const cffLen = (fontBytes[e + 12] << 24) | (fontBytes[e + 13] << 16) | (fontBytes[e + 14] << 8) | fontBytes[e + 15];
+          if (cffOff + cffLen <= fontBytes.length) {
+            const cffBytes = fontBytes.subarray(cffOff, cffOff + cffLen);
+            const result = buildFontFromCFF(cffBytes, fontObj, fontObj.differences);
+            if (result) {
+              try {
+                const face2 = loadFontFace(familyName, 'normal', 'normal', result.otfData);
+                await face2.loaded;
+                usesPUA = result.usesPUA;
+                cidCollisions = result.cidCollisions;
+                registered = true;
+                if (cacheKey != null) objCache.fontBytesCache.set(cacheKey, { bytes: result.otfData, kind: 'rebuilt' });
+              } catch (_e2) { /* */ }
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // Raw CFF
+  if (!registered && isCFF) {
+    const result = buildFontFromCFF(fontBytes, fontObj, fontObj.differences);
+    if (!result) console.warn(`[renderPdfPage] buildFontFromCFF returned null for "${fontObj.baseName}"`);
+    if (result) {
+      try {
+        const face = loadFontFace(familyName, 'normal', 'normal', result.otfData);
+        await face.loaded;
+        usesPUA = result.usesPUA;
+        cidCollisions = result.cidCollisions;
+        registered = true;
+        if (cacheKey != null) objCache.fontBytesCache.set(cacheKey, { bytes: result.otfData, kind: 'rebuilt' });
+      } catch (cffErr) {
+        console.warn(`[renderPdfPage] CFF OTF load failed for "${fontObj.baseName}":`, cffErr);
+      }
+    }
+  }
+
+  // Type1 PFA/PFB
+  if (!registered && isPFA) {
+    const type1Result = convertType1ToOTFNew(fontBytes, fontObj);
+    if (type1Result) {
+      try {
+        const face = loadFontFace(familyName, 'normal', 'normal', type1Result.otfData);
+        await face.loaded;
+        fontMatrix = type1Result.fontMatrix || null;
+        if (fontMatrix && fontObj.type1) fontObj.type1.fontMatrix = fontMatrix;
+        usesPUA = type1Result.usesPUA;
+        registered = true;
+        if (cacheKey != null) objCache.fontBytesCache.set(cacheKey, { bytes: type1Result.otfData, kind: 'rebuilt' });
+      } catch (_e) { /* OTF load failed */ }
+    }
+  }
+
+  // TrueType
+  if (!registered && !isPFA && !isCFF) {
+    const cidToGidMap = fontData.cidToGidMap;
+    let effectiveCidMap;
+    if (cidToGidMap instanceof Uint8Array && cidToGidMap.length > 0) {
+      effectiveCidMap = cidToGidMap;
+    } else if (cidToGidMap === 'identity') {
+      const nT = (fontBytes[4] << 8) | fontBytes[5];
+      let numGlyphs = 0;
+      for (let ti = 0; ti < nT; ti++) {
+        const e = 12 + ti * 16;
+        if (e + 16 > fontBytes.length) break;
+        if (fontBytes[e] === 0x6D && fontBytes[e + 1] === 0x61 && fontBytes[e + 2] === 0x78 && fontBytes[e + 3] === 0x70) {
+          const mo = (fontBytes[e + 8] << 24) | (fontBytes[e + 9] << 16) | (fontBytes[e + 10] << 8) | fontBytes[e + 11];
+          if (mo + 6 <= fontBytes.length) numGlyphs = (fontBytes[mo + 4] << 8) | fontBytes[mo + 5];
+          break;
+        }
+      }
+      if (numGlyphs > 0) {
+        effectiveCidMap = new Uint8Array(numGlyphs * 2);
+        for (let g = 0; g < numGlyphs; g++) {
+          effectiveCidMap[g * 2] = (g >> 8) & 0xFF;
+          effectiveCidMap[g * 2 + 1] = g & 0xFF;
+        }
+      }
+    }
+    const rebuilt = rebuildFontFromGlyphs(ab, fontObj, effectiveCidMap);
+    if (rebuilt) {
+      try {
+        const face = loadFontFace(familyName, 'normal', 'normal', rebuilt.otfData);
+        await face.loaded;
+        usesPUA = rebuilt.usesPUA;
+        cmapType = rebuilt.cmapType || null;
+        cidCollisions = rebuilt.cidCollisions;
+        registered = true;
+        if (cacheKey != null) objCache.fontBytesCache.set(cacheKey, { bytes: rebuilt.otfData, kind: 'rebuilt' });
+      } catch (_e) {
+        console.warn(`[renderPdfPage] Rebuilt TrueType font FAILED for "${fontObj.baseName}" (${rebuilt.otfData.byteLength} bytes):`, _e?.message || _e);
+      }
+    }
+  }
+
+  if (registered) {
+    registeredFontNames.set(fontTag, familyName);
+    if (usesPUA) cidPUATags.add(fontTag);
+    if (cidCollisions) cidCollisionMap.set(fontTag, cidCollisions);
+    if (cmapType === 'symbol') symbolFontTags.add(fontTag);
+    else if (cmapType === 'rawCharCode') rawCharCodeTags.add(fontTag);
+  } else {
+    await registerNonEmbeddedFont(fontObj, familyName, registeredFontNames, fontTag);
+  }
+
+  // Store in document-level cache so subsequent pages/contexts skip conversion.
+  if (cacheKey != null) {
+    objCache.fontConversionCache.set(cacheKey, {
+      familyName: registeredFontNames.get(fontTag),
+      usesPUA,
+      cmapType,
+      cidCollisions,
+      fontMatrix,
+      allGlyphsEmpty: fontObj.allGlyphsEmpty,
+    });
+  }
+}
+
+/**
+ * Convert and register one font outside a page render.
+ * Fills `objCache.fontBytesCache` with the bytes the raster draws with.
+ * Serves native-text editing when it needs a font's program before any page using the font has rendered.
+ * @param {Object} fontObj - Parsed fontInfo from `objCache.fontCache`.
+ * @param {ObjectCache} objCache
+ */
+export async function registerFontForEditing(fontObj, objCache) {
+  const familyName = pdfFontFamilyName(objCache, fontObj.fontObjNum, 'edit');
+  await convertAndRegisterFont(
+    'editProbe', fontObj, new Map(), new Set(), new Set(), new Set(), new Map(), objCache, familyName,
+  );
+}
+
+/** @type {Record<string, GlobalCompositeOperation>} */
+const pdfBlendToCanvas = {
+  Multiply: 'multiply',
+  Screen: 'screen',
+  Overlay: 'overlay',
+  Darken: 'darken',
+  Lighten: 'lighten',
+  ColorDodge: 'color-dodge',
+  ColorBurn: 'color-burn',
+  HardLight: 'hard-light',
+  SoftLight: 'soft-light',
+  Difference: 'difference',
+  Exclusion: 'exclusion',
+  Hue: 'hue',
+  Saturation: 'saturation',
+  Color: 'color',
+  Luminosity: 'luminosity',
+};
+
+/**
+ * Strip EXIF APP1 markers from JPEG data to prevent browser EXIF orientation.
+ * PDF CTM already handles image placement; EXIF rotation would be applied twice.
+ * @param {Uint8Array} data
+ */
+function stripJpegExif(data) {
+  if (data.length < 4 || data[0] !== 0xFF || data[1] !== 0xD8) return data;
+  // Walk markers after SOI, removing APP1 (FF E1) segments
+  const out = [0xFF, 0xD8];
+  let pos = 2;
+  while (pos < data.length - 1) {
+    if (data[pos] !== 0xFF) break;
+    const marker = data[pos + 1];
+    if (marker === 0xDA) break; // SOS — rest is image data
+    const segLen = (data[pos + 2] << 8) | data[pos + 3];
+    if (marker === 0xE1) {
+      // Skip APP1 (EXIF)
+      pos += 2 + segLen;
+      continue;
+    }
+    // Copy this marker segment
+    for (let i = 0; i < 2 + segLen; i++) out.push(data[pos + i]);
+    pos += 2 + segLen;
+  }
+  // Copy the rest (SOS + image data + EOI)
+  for (let i = pos; i < data.length; i++) out.push(data[i]);
+  return new Uint8Array(out);
+}
+
+/**
+ * @param {Uint8Array} rawData - Raw JPEG bytes or already-decoded pixel data
+ */
+async function decodeSmaskJpeg(rawData) {
+  // Check if this looks like raw JPEG data (starts with SOI marker)
+  if (rawData.length >= 2 && rawData[0] === 0xFF && rawData[1] === 0xD8) {
+    let bitmap;
+    try {
+      bitmap = await ca.createImageBitmapFromData(rawData);
+    } catch {
+      // Corrupted JPEG SMask — return raw data as-is (will be treated as already-decoded)
+      return rawData;
+    }
+    const bw = bitmap.width;
+    const bh = bitmap.height;
+    const canvas = ca.makeCanvas(bw, bh);
+    const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+    ctx.drawImage(bitmap, 0, 0);
+    ca.closeDrawable(bitmap);
+    const imgData = ctx.getImageData(0, 0, bw, bh);
+    // Extract grayscale values (use red channel since it's a grayscale JPEG)
+    const pixels = new Uint8Array(bw * bh);
+    for (let i = 0; i < pixels.length; i++) {
+      pixels[i] = imgData.data[i * 4]; // Red channel = grayscale value
+    }
+    ca.closeDrawable(canvas);
+    return pixels;
+  }
+  // JPEG 2000: a JP2 box signature (00 00 00 0C 6A 50 ...) or a bare codestream (SOC marker FF 4F).
+  // A JPXDecode SMask may be stored either way, so decode both.
+  const isJP2Box = rawData.length >= 6 && rawData[0] === 0x00 && rawData[1] === 0x00
+    && rawData[2] === 0x00 && rawData[3] === 0x0C && rawData[4] === 0x6A && rawData[5] === 0x50;
+  const isJ2kCodestream = rawData.length >= 2 && rawData[0] === 0xFF && rawData[1] === 0x4F;
+  if (isJP2Box || isJ2kCodestream) {
+    const { decodeJPX } = await import('./codecs/decodeJPX.js');
+    const decoded = decodeJPX(rawData);
+    if (decoded && decoded.pixelData) {
+      return new Uint8Array(decoded.pixelData.buffer, decoded.pixelData.byteOffset, decoded.pixelData.byteLength);
+    }
+  }
+  // Already decoded pixel data
+  return rawData;
+}
+
+/**
+ * Write a grayscale soft mask into the alpha channel of an RGBA buffer, nearest-neighbor scaling the mask to the image's `w`x`h`.
+ * Mutates `px` in place.
+ *
+ * @param {Uint8ClampedArray} px  RGBA buffer, length w*h*4
+ * @param {number} w
+ * @param {number} h
+ * @param {Uint8Array} sMask  grayscale mask, length sMaskWidth*sMaskHeight
+ * @param {number} sMaskWidth
+ * @param {number} sMaskHeight
+ */
+function applySoftMaskAlpha(px, w, h, sMask, sMaskWidth, sMaskHeight) {
+  const n = w * h;
+  // Mask already matches the image size: copy each byte straight into its alpha slot.
+  if (sMaskWidth === w && sMaskHeight === h) {
+    const n8 = n - (n % 8);
+    let i = 0;
+    let a = 3;
+    for (; i < n8; i += 8, a += 32) {
+      px[a] = sMask[i]; px[a + 4] = sMask[i + 1]; px[a + 8] = sMask[i + 2]; px[a + 12] = sMask[i + 3];
+      px[a + 16] = sMask[i + 4]; px[a + 20] = sMask[i + 5]; px[a + 24] = sMask[i + 6]; px[a + 28] = sMask[i + 7];
+    }
+    for (; i < n; i++, a += 4) px[a] = sMask[i];
+    return;
+  }
+  // Scaling path: precompute each column's source index once so the pixel loop does no per-pixel divide, floor, or clamp.
+  const sxLUT = new Int32Array(w);
+  // Math.min never triggers for x <= w-1, but it's a cheap defensive bound in this one-time O(w) setup.
+  for (let x = 0; x < w; x++) sxLUT[x] = Math.min(Math.floor(x * sMaskWidth / w), sMaskWidth - 1);
+  const w4 = w - (w % 4);
+  let a = 3;
+  for (let y = 0; y < h; y++) {
+    const row = Math.min(Math.floor(y * sMaskHeight / h), sMaskHeight - 1) * sMaskWidth;
+    let x = 0;
+    for (; x < w4; x += 4, a += 16) {
+      px[a] = sMask[row + sxLUT[x]];
+      px[a + 4] = sMask[row + sxLUT[x + 1]];
+      px[a + 8] = sMask[row + sxLUT[x + 2]];
+      px[a + 12] = sMask[row + sxLUT[x + 3]];
+    }
+    for (; x < w; x++, a += 4) px[a] = sMask[row + sxLUT[x]];
+  }
+}
+
+/**
+ * Box-average a binary (0/255) soft mask down to outW x outH.
+ * Used when the mask is higher-resolution than the device area the image occupies:
+ * averaging preserves the edge anti-aliasing a full-resolution draw would produce,
+ * without building a composite at the mask's full resolution.
+ *
+ * The input `sMask` is returned directly (not copied) when the output would be identical, so the output is read-only.
+ *
+ * @param {Uint8Array} sMask
+ * @param {number} sMaskWidth
+ * @param {number} sMaskHeight
+ * @param {number} outW
+ * @param {number} outH
+ * @returns {Uint8Array} length outW*outH (may alias `sMask`)
+ */
+function boxDownsampleMask(sMask, sMaskWidth, sMaskHeight, outW, outH) {
+  // Output already at mask size, so return the mask unchanged (nothing to average).
+  if (outW === sMaskWidth && outH === sMaskHeight) return sMask;
+
+  const out = new Uint8Array(outW * outH);
+  // Column spans don't depend on the row, so compute them once instead of per output pixel.
+  const colStart = new Int32Array(outW);
+  const colW = new Int32Array(outW);
+  for (let ox = 0; ox < outW; ox++) {
+    const sx0 = Math.floor((ox * sMaskWidth) / outW);
+    const sx1 = Math.max(sx0 + 1, Math.floor(((ox + 1) * sMaskWidth) / outW));
+    colStart[ox] = sx0;
+    colW[ox] = sx1 - sx0;
+  }
+  let di = 0;
+  for (let oy = 0; oy < outH; oy++) {
+    const sy0 = Math.floor((oy * sMaskHeight) / outH);
+    const sy1 = Math.max(sy0 + 1, Math.floor(((oy + 1) * sMaskHeight) / outH));
+    const rowH = sy1 - sy0;
+    for (let ox = 0; ox < outW; ox++) {
+      const sx0 = colStart[ox];
+      const w = colW[ox];
+      let sum = 0;
+      for (let sy = sy0; sy < sy1; sy++) {
+        const row = sy * sMaskWidth + sx0;
+        for (let k = 0; k < w; k++) sum += sMask[row + k];
+      }
+      out[di++] = ((sum / (rowH * w)) + 0.5) | 0;
+    }
+  }
+  return out;
+}
+
+/**
+ * Nearest-neighbor upsample a w x h RGBA image to outW x outH, taking the alpha channel from `maskA` (already at outW x outH).
+ * Used to composite a low-resolution colour image with a higher-resolution SMask.
+ *
+ * Each output pixel is one packed little-endian RGBA store, valid because every supported target (browser, Node, WASM) is little-endian.
+ *
+ * @param {Uint8ClampedArray} src - source RGBA, length w*h*4
+ * @param {number} w
+ * @param {number} h
+ * @param {Uint8Array} maskA - alpha values, length outW*outH
+ * @param {number} outW
+ * @param {number} outH
+ * @returns {Uint8ClampedArray} length outW*outH*4
+ */
+function upsampleImageWithMask(src, w, h, maskA, outW, outH) {
+  const out = new Uint8ClampedArray(outW * outH * 4);
+  const out32 = new Uint32Array(out.buffer);
+  if (w === 1 && h === 1) {
+    // Solid colour: every output pixel shares the one source RGB; only alpha varies.
+    const rgb = src[0] | (src[1] << 8) | (src[2] << 16);
+    for (let i = 0, n = outW * outH; i < n; i++) out32[i] = rgb | (maskA[i] << 24);
+    return out;
+  }
+  // Source column indices depend only on x, so precompute them once rather than
+  // recomputing inside the row loop for every output pixel.
+  const colSrc = new Int32Array(outW);
+  for (let x = 0; x < outW; x++) colSrc[x] = Math.min(Math.floor(x * w / outW), w - 1);
+  let di = 0;
+  for (let y = 0; y < outH; y++) {
+    const srcRow = Math.min(Math.floor(y * h / outH), h - 1) * w;
+    const mRow = y * outW;
+    for (let x = 0; x < outW; x++) {
+      const s = (srcRow + colSrc[x]) * 4;
+      out32[di] = (src[s] | (src[s + 1] << 8) | (src[s + 2] << 16)) | (maskA[mRow + x] << 24);
+      di++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Box-average an RGBA buffer down to outW x outH (straight alpha).
+ * Used to shrink a very large decoded image to the device draw size before creating its ImageBitmap.
+ * This optimization is critical for avoiding 10s render times on certain pages, both in browser and Node.js.
+ *
+ * @param {Uint8ClampedArray} rgba
+ * @param {number} width
+ * @param {number} height
+ * @param {number} outW
+ * @param {number} outH
+ * @returns {Uint8ClampedArray} length outW*outH*4
+ */
+function boxDownsampleRgba(rgba, width, height, outW, outH) {
+  const out = new Uint8ClampedArray(outW * outH * 4);
+  // Column spans don't depend on the row, so compute them once instead of per output pixel.
+  const colStart = new Int32Array(outW);
+  const colW = new Int32Array(outW);
+  for (let ox = 0; ox < outW; ox++) {
+    const sx0 = Math.floor((ox * width) / outW);
+    colStart[ox] = sx0;
+    colW[ox] = Math.max(sx0 + 1, Math.floor(((ox + 1) * width) / outW)) - sx0;
+  }
+
+  let di = 0;
+  for (let oy = 0; oy < outH; oy++) {
+    const sy0 = Math.floor((oy * height) / outH);
+    const sy1 = Math.max(sy0 + 1, Math.floor(((oy + 1) * height) / outH));
+    const rowH = sy1 - sy0;
+    for (let ox = 0; ox < outW; ox++) {
+      const sx0 = colStart[ox];
+      const wpx = colW[ox];
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let a = 0;
+      for (let sy = sy0; sy < sy1; sy++) {
+        let si = (sy * width + sx0) * 4;
+        for (let k = 0; k < wpx; k++) { r += rgba[si]; g += rgba[si + 1]; b += rgba[si + 2]; a += rgba[si + 3]; si += 4; }
+      }
+      const cnt = rowH * wpx;
+      out[di] = ((r / cnt) + 0.5) | 0;
+      out[di + 1] = ((g / cnt) + 0.5) | 0;
+      out[di + 2] = ((b / cnt) + 0.5) | 0;
+      out[di + 3] = ((a / cnt) + 0.5) | 0;
+      di += 4;
+    }
+  }
+  return out;
+}
+
+/**
+ * Memory budget for the doc-wide decoded-image cache (`objCache.decodedImageCache`).
+ * Decoded images dominate re-render cost and are otherwise never retained across page renders.
+ * Bounded so image-heavy docs don't grow memory without limit.
+ */
+const DECODED_IMAGE_CACHE_BUDGET = 64 * 1024 * 1024;
+
+/**
+ * Admission threshold for the decoded-image cache: only retain images whose decode took at least this long.
+ * Cheap decodes (CCITT/Flate masks, small images) are faster to redo than the cost of holding their bitmaps.
+ */
+const DECODED_IMAGE_MIN_DECODE_MS = 15;
+
+/**
+ * Cache key for a decoded image. Plain images are shareable by objNum.
+ * Image masks bake the per-draw fill colour into the bitmap, so they key on both.
+ * @param {number} objNum
+ * @param {boolean} isMask
+ * @param {string} [fillColor]
+ * @returns {string}
+ */
+function decodedImageKey(objNum, isMask, fillColor) {
+  return isMask ? `${objNum}|${fillColor}` : `${objNum}`;
+}
+
+/**
+ * Insert a decoded ImageBitmap into the doc-wide cache, evicting by lowest recompute-value-per-byte (decodeMs / bytes) first.
+ * This means the images cheapest to regenerate per unit memory are evicted before the expensive ones.
+ * Closes any prior bitmap held under the same key (e.g. on a render-resolution change).
+ * @param {ObjectCache} objCache
+ * @param {string} key
+ * @param {*} bitmap
+ * @param {number} maxW @param {number} maxH @param {number} bytes @param {number} decodeMs
+ */
+function putDecodedImage(objCache, key, bitmap, maxW, maxH, bytes, decodeMs) {
+  const cache = objCache.decodedImageCache;
+  const prev = cache.get(key);
+  if (prev) {
+    ca.closeDrawable(prev.bitmap);
+    objCache.decodedImageCacheBytes -= prev.bytes;
+  }
+  cache.set(key, {
+    bitmap, maxW, maxH, bytes, decodeMs,
+  });
+  objCache.decodedImageCacheBytes += bytes;
+  while (objCache.decodedImageCacheBytes > DECODED_IMAGE_CACHE_BUDGET && cache.size > 1) {
+    let evictKey = null;
+    let worstDensity = Infinity;
+    for (const [k, e] of cache) {
+      if (k === key) continue; // never evict the entry we just inserted
+      const density = e.decodeMs / e.bytes;
+      if (density < worstDensity) { worstDensity = density; evictKey = k; }
+    }
+    if (evictKey == null) break;
+    const evicted = cache.get(evictKey);
+    if (!evicted) break;
+    ca.closeDrawable(evicted.bitmap);
+    objCache.decodedImageCacheBytes -= evicted.bytes;
+    cache.delete(evictKey);
+  }
+}
+
+/**
+ * Convert decoded image bytes to an ImageBitmap suitable for canvas drawing.
+ * `maxW`/`maxH` are the device px the image will be drawn within (0 = unbounded) and cap JPEG2000 decode resolution.
+ *
+ * @param {import('./parsePdfImages.js').ImageInfo} imageInfo
+ * @param {ObjectCache} [objCache]
+ * @param {number} [maxW]
+ * @param {number} [maxH]
+ * @param {{x0:number,y0:number,x1:number,y1:number}|null} [roi] - visible region in image pixels.
+ *    The DeviceCMYK JPEG path decodes only this rect (the rest is clipped away when drawn).
+ * @param {number} [decodeScale=1] - DeviceCMYK JPEG downscale factor (1/2/4/8) when the image is drawn much smaller than its native resolution.
+ *    Decodes at 1/decodeScale (see `decodeCMYKJpegToRGB`). 1 = full resolution.
+ * @returns {Promise<ImageBitmap|null>} null when the image data is missing or cannot be decoded.
+ */
+async function imageInfoToBitmap(imageInfo, objCache, maxW = 0, maxH = 0, roi = null, decodeScale = 1) {
+  if (imageInfo.imageData == null && objCache && imageInfo.objNum != null) {
+    imageInfo.imageData = objCache.getStreamBytes(imageInfo.objNum);
+  }
+  let {
+    width, height, bitsPerComponent, colorSpace, filter, imageData, sMask, sMaskWidth, sMaskHeight,
+    decodeInvert, colorKeyMask,
+  } = imageInfo;
+
+  if (imageData == null) return null;
+
+  if (sMask && sMaskWidth && sMaskHeight) {
+    sMask = await decodeSmaskJpeg(sMask);
+    // A /Decode [1 0] on a DCTDecode/JPXDecode SMask is inverted here rather than at parse time, where inverting the compressed codestream would corrupt it.
+    if (imageInfo.sMaskDecodeInvert) {
+      for (let i = 0; i < sMask.length; i++) sMask[i] = 255 - sMask[i];
+    }
+  }
+
+  if (filter === 'DCTDecode') {
+    // Chrome's createImageBitmap produces wrong colors for 4-component CMYK/YCCK JPEGs, so decode those in JS.
+    if (colorSpace === 'DeviceCMYK') {
+      const jpegBytes = imageData instanceof Uint8Array ? imageData : new Uint8Array(imageData);
+      // A soft mask rewrites alpha across the whole image below, which would reveal undecoded pixels, so only honour the region of interest when there is no soft mask.
+      // Scaled decode stays safe because it decodes the whole image, just smaller.
+      const cmykRoi = (sMask && sMaskWidth && sMaskHeight) ? null : roi;
+      const cmykResult = decodeCMYKJpegToRGB(jpegBytes, decodeInvert, cmykRoi, decodeScale);
+      if (cmykResult) {
+        const { width: w, height: h, rgbData } = cmykResult;
+        const canvas = ca.makeCanvas(w, h);
+        const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+        const imgData = new ImageData(new Uint8ClampedArray(rgbData.buffer, rgbData.byteOffset, rgbData.byteLength), w, h);
+        if (sMask && sMaskWidth && sMaskHeight) {
+          applySoftMaskAlpha(imgData.data, w, h, sMask, sMaskWidth, sMaskHeight);
+        }
+        ctx.putImageData(imgData, 0, 0);
+        return ca.createImageBitmapFromCanvas(canvas);
+      }
+    }
+
+    // Photoshop-encoded Lab JPEGs carry an Adobe APP14 marker with transform=YCbCr, so the browser decoder applies YCbCr->RGB.
+    // Its RGB output is the L*a*b* sample data.
+    if (colorSpace === 'Lab') {
+      let jpegBytes = imageData instanceof Uint8Array ? imageData : new Uint8Array(imageData);
+      if (jpegBytes.length >= 2 && !(jpegBytes[jpegBytes.length - 2] === 0xFF && jpegBytes[jpegBytes.length - 1] === 0xD9)) {
+        const f = new Uint8Array(jpegBytes.length + 2);
+        f.set(jpegBytes);
+        f[jpegBytes.length] = 0xFF;
+        f[jpegBytes.length + 1] = 0xD9;
+        jpegBytes = f;
+      }
+      try {
+        const labBitmap = await ca.createImageBitmapFromData(stripJpegExif(jpegBytes));
+        const w = labBitmap.width;
+        const h = labBitmap.height;
+        const tmp = ca.makeCanvas(w, h);
+        const tctx = /** @type {OffscreenCanvasRenderingContext2D} */ (tmp.getContext('2d', { willReadFrequently: true }));
+        tctx.drawImage(labBitmap, 0, 0);
+        const labPixels = tctx.getImageData(0, 0, w, h).data;
+        const labBytes = new Uint8Array(w * h * 3);
+        for (let j = 0; j < w * h; j++) {
+          labBytes[j * 3] = labPixels[j * 4];
+          labBytes[j * 3 + 1] = labPixels[j * 4 + 1];
+          labBytes[j * 3 + 2] = labPixels[j * 4 + 2];
+        }
+        const { labBytesToRGBA } = await import('./codecs/decodeJPEG.js');
+        const wp = imageInfo.labWhitePoint || [0.9642, 1.0, 0.8249];
+        const range = imageInfo.labRange || [-100, 100, -100, 100];
+        const rgba = labBytesToRGBA(labBytes, w, h, wp, range);
+        const out = ca.makeCanvas(w, h);
+        const octx = /** @type {OffscreenCanvasRenderingContext2D} */ (out.getContext('2d', { willReadFrequently: true }));
+        octx.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength), w, h), 0, 0);
+        return ca.createImageBitmapFromCanvas(out);
+      } catch { /* fall through */ }
+    }
+
+    // Chrome's createImageBitmap rejects a JPEG with no EOI marker, which some PDFs contain.
+    let jpegData = imageData instanceof Uint8Array ? imageData : new Uint8Array(imageData);
+    if (jpegData.length >= 2 && !(jpegData[jpegData.length - 2] === 0xFF && jpegData[jpegData.length - 1] === 0xD9)) {
+      const fixed = new Uint8Array(jpegData.length + 2);
+      fixed.set(jpegData);
+      fixed[jpegData.length] = 0xFF;
+      fixed[jpegData.length + 1] = 0xD9;
+      jpegData = fixed;
+    }
+    jpegData = stripJpegExif(jpegData);
+    let jpegBitmap;
+    try {
+      jpegBitmap = await ca.createImageBitmapFromData(jpegData);
+    } catch {
+      // Fill undecodable image data with black, matching mupdf's behavior.
+      const w = width || 1;
+      const h = height || 1;
+      const blackPixels = new Uint8ClampedArray(w * h * 4);
+      for (let i = 0; i < w * h; i++) {
+        blackPixels[i * 4 + 3] = 255;
+      }
+      return ca.createImageBitmapFromImageData(new ImageData(blackPixels, w, h));
+    }
+
+    // Separation pixel values are ink amounts (0=no ink, 255=full ink), but the browser decodes them as luminance (0=black, 255=white).
+    if (colorSpace === 'Separation') {
+      const w = jpegBitmap.width;
+      const h = jpegBitmap.height;
+      const canvas = ca.makeCanvas(w, h);
+      const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+      ctx.drawImage(jpegBitmap, 0, 0);
+      ca.closeDrawable(jpegBitmap);
+
+      const tintSamples = imageInfo.separationTintSamples;
+      if (tintSamples && tintSamples.length >= 3) {
+        const nSamples = Math.floor(tintSamples.length / 3);
+        const lut = buildTintLut(tintSamples, nSamples);
+        const imgData = ctx.getImageData(0, 0, w, h);
+        const px = imgData.data;
+        for (let i = 0; i < px.length; i += 4) {
+          const o = (decodeInvert ? (255 - px[i]) : px[i]) * 3;
+          px[i] = lut[o];
+          px[i + 1] = lut[o + 1];
+          px[i + 2] = lut[o + 2];
+        }
+        ctx.putImageData(imgData, 0, 0);
+
+      // With decodeInvert the /Decode [1 0] and ink conventions cancel out, so skip the inversion.
+      } else if (!decodeInvert) {
+        ctx.globalCompositeOperation = 'difference';
+        ctx.fillStyle = 'white';
+        ctx.fillRect(0, 0, w, h);
+      }
+      if (sMask && sMaskWidth && sMaskHeight) {
+        const imgData2 = ctx.getImageData(0, 0, w, h);
+        applySoftMaskAlpha(imgData2.data, w, h, sMask, sMaskWidth, sMaskHeight);
+        ctx.putImageData(imgData2, 0, 0);
+      }
+      return ca.createImageBitmapFromCanvas(canvas);
+    }
+
+    // The samples of an Indexed DCTDecode are palette indices, and the browser decodes them into all three channels (R=G=B=index).
+    if (colorSpace === 'Indexed' && imageInfo.palette) {
+      const w = jpegBitmap.width;
+      const h = jpegBitmap.height;
+      const canvas = ca.makeCanvas(w, h);
+      const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+      ctx.drawImage(jpegBitmap, 0, 0);
+      ca.closeDrawable(jpegBitmap);
+
+      const palette = imageInfo.palette;
+      const base = imageInfo.paletteBase || 'DeviceRGB';
+      const nComp = base === 'DeviceCMYK' ? 4 : (base === 'DeviceGray' || base === 'CalGray' ? 1 : 3);
+      const rgbPal = nComp === 4 ? cmykPaletteToRgb(palette) : new Uint8Array(0);
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const px = imgData.data;
+      for (let i = 0; i < px.length; i += 4) {
+        const idx = px[i];
+        if (nComp === 4) {
+          const o = idx * 3;
+          px[i] = rgbPal[o];
+          px[i + 1] = rgbPal[o + 1];
+          px[i + 2] = rgbPal[o + 2];
+        } else if (nComp === 1) {
+          px[i] = palette[idx];
+          px[i + 1] = palette[idx];
+          px[i + 2] = palette[idx];
+        } else {
+          const po = idx * nComp;
+          px[i] = palette[po];
+          px[i + 1] = palette[po + 1];
+          px[i + 2] = palette[po + 2];
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+
+      if (sMask && sMaskWidth && sMaskHeight) {
+        const imgData2 = ctx.getImageData(0, 0, w, h);
+        applySoftMaskAlpha(imgData2.data, w, h, sMask, sMaskWidth, sMaskHeight);
+        ctx.putImageData(imgData2, 0, 0);
+      }
+      return ca.createImageBitmapFromCanvas(canvas);
+    }
+
+    if (decodeInvert) {
+      const w = jpegBitmap.width;
+      const h = jpegBitmap.height;
+      const canvas = ca.makeCanvas(w, h);
+      const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+      ctx.drawImage(jpegBitmap, 0, 0);
+      ca.closeDrawable(jpegBitmap);
+      ctx.globalCompositeOperation = 'difference';
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, w, h);
+      const invertedBitmap = await ca.createImageBitmapFromCanvas(canvas);
+
+      if (sMask && sMaskWidth && sMaskHeight) {
+        const canvas2 = ca.makeCanvas(w, h);
+        const ctx2 = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas2.getContext('2d', { willReadFrequently: true }));
+        ctx2.drawImage(invertedBitmap, 0, 0);
+        ca.closeDrawable(invertedBitmap);
+        const imgData = ctx2.getImageData(0, 0, w, h);
+        applySoftMaskAlpha(imgData.data, w, h, sMask, sMaskWidth, sMaskHeight);
+        ctx2.putImageData(imgData, 0, 0);
+        return ca.createImageBitmapFromCanvas(canvas2);
+      }
+      return invertedBitmap;
+    }
+
+    if (sMask && sMaskWidth && sMaskHeight) {
+      const w = jpegBitmap.width;
+      const h = jpegBitmap.height;
+      if (sMaskWidth > w || sMaskHeight > h) {
+        // Upsample the image to the mask dimensions to keep the mask's fine detail.
+        // Never build larger than the device area this image occupies (maxW/maxH).
+        let outW = sMaskWidth;
+        let outH = sMaskHeight;
+        if (maxW && maxH && (outW > maxW || outH > maxH)) {
+          const k = Math.min(maxW / outW, maxH / outH);
+          outW = Math.max(w, Math.round(sMaskWidth * k));
+          outH = Math.max(h, Math.round(sMaskHeight * k));
+        }
+        const canvas = ca.makeCanvas(w, h);
+        const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+        ctx.drawImage(jpegBitmap, 0, 0);
+        ca.closeDrawable(jpegBitmap);
+        const imgData = ctx.getImageData(0, 0, w, h);
+        const px = imgData.data;
+        const maskA = boxDownsampleMask(sMask, sMaskWidth, sMaskHeight, outW, outH);
+        const upsampled = upsampleImageWithMask(px, w, h, maskA, outW, outH);
+        return ca.createImageBitmapFromImageData(new ImageData(upsampled, outW, outH));
+      }
+      const canvas = ca.makeCanvas(w, h);
+      const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+      ctx.drawImage(jpegBitmap, 0, 0);
+      ca.closeDrawable(jpegBitmap);
+      const imgData = ctx.getImageData(0, 0, w, h);
+      applySoftMaskAlpha(imgData.data, w, h, sMask, sMaskWidth, sMaskHeight);
+      ctx.putImageData(imgData, 0, 0);
+      return ca.createImageBitmapFromCanvas(canvas);
+    }
+
+    if (jpegBitmap.width === width && jpegBitmap.height === height) {
+      return jpegBitmap;
+    }
+    const canvas = ca.makeCanvas(width, height);
+    const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+    // Canvas defaults to transparent black, so fill explicitly to match mupdf.
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(jpegBitmap, 0, 0);
+    ca.closeDrawable(jpegBitmap);
+    return ca.createImageBitmapFromCanvas(canvas);
+  }
+
+  if (filter === 'JPXDecode') {
+    const { decodeJPX } = await import('./codecs/decodeJPX.js');
+    // Keep the decode at >= sqrt2 x the draw size, because wavelet reduction to at-or-below the draw size renders scanned text visibly softer than area-downscaling a larger decode.
+    let reduceLevels = 0;
+    if (maxW && maxH) {
+      let rw = imageInfo.width;
+      let rh = imageInfo.height;
+      while (reduceLevels < 5 && rw / 2 >= maxW * 1.41 && rh / 2 >= maxH * 1.41) {
+        rw = Math.floor(rw / 2);
+        rh = Math.floor(rh / 2);
+        reduceLevels++;
+      }
+    }
+    // A PDF /Indexed colour space overrides any internal JP2 palette and needs the raw index samples, so skip the internal expansion.
+    const decoded = decodeJPX(imageData, reduceLevels, !imageInfo.palette);
+    if (!decoded) return null;
+    const w = decoded.width;
+    const h = decoded.height;
+    const components = decoded.components;
+    const pixels = decoded.pixelData;
+
+    // A JPX codestream may carry one component more than the PDF color space expects, and that extra component is alpha.
+    const expectedComponents = (colorSpace === 'DeviceGray' || colorSpace === 'CalGray') ? 1
+      : (colorSpace === 'DeviceRGB' || colorSpace === 'CalRGB') ? 3
+        : (colorSpace === 'DeviceCMYK') ? 4 : 0;
+    const hasJpxAlpha = expectedComponents > 0 && components === expectedComponents + 1;
+
+    const rgbaData = new Uint8ClampedArray(w * h * 4);
+    if (colorSpace === 'DeviceN' && imageInfo.deviceNTintCS
+        && components === imageInfo.deviceNTintCS.nInputs) {
+      const rgb = tintSamplesToRgb(imageInfo.deviceNTintCS, pixels, components, w * h);
+      if (rgb) {
+        for (let i = 0; i < w * h; i++) {
+          rgbaData[i * 4] = rgb[i * 3];
+          rgbaData[i * 4 + 1] = rgb[i * 3 + 1];
+          rgbaData[i * 4 + 2] = rgb[i * 3 + 2];
+          rgbaData[i * 4 + 3] = 255;
+        }
+      }
+    } else if (components === 1 && colorSpace === 'Indexed' && imageInfo.palette) {
+      const palette = imageInfo.palette;
+      const base = imageInfo.paletteBase || 'DeviceRGB';
+      const nComp = base === 'DeviceCMYK' ? 4 : (base === 'DeviceGray' || base === 'CalGray' ? 1 : 3);
+      // decodeJPX MSB-aligns sub-8-bit samples to 8 bits, so the palette index is the sample shifted back down.
+      const jpxPrecision = decoded.precision ? decoded.precision[0] : 8;
+      const idxShift = jpxPrecision < 8 ? (8 - jpxPrecision) : 0;
+      const rgbPal = nComp === 4 ? cmykPaletteToRgb(palette) : new Uint8Array(0);
+      for (let i = 0; i < w * h; i++) {
+        const idx = pixels[i] >> idxShift;
+        const pi = i * 4;
+        if (nComp === 4) {
+          const o = idx * 3;
+          rgbaData[pi] = rgbPal[o];
+          rgbaData[pi + 1] = rgbPal[o + 1];
+          rgbaData[pi + 2] = rgbPal[o + 2];
+        } else if (nComp === 1) {
+          const gray = palette[idx];
+          rgbaData[pi] = gray;
+          rgbaData[pi + 1] = gray;
+          rgbaData[pi + 2] = gray;
+        } else {
+          const po = idx * nComp;
+          rgbaData[pi] = palette[po];
+          rgbaData[pi + 1] = palette[po + 1];
+          rgbaData[pi + 2] = palette[po + 2];
+        }
+        rgbaData[pi + 3] = 255;
+      }
+    } else if (components === 1 && colorSpace === 'Separation') {
+      // Separation pixel values are tint amounts (0=no ink, 255=full ink).
+      const tintSamples = imageInfo.separationTintSamples;
+      if (tintSamples && tintSamples.length >= 3) {
+        const nSamples = Math.floor(tintSamples.length / 3);
+        const lut = buildTintLut(tintSamples, nSamples);
+        for (let i = 0; i < w * h; i++) {
+          const o = (decodeInvert ? (255 - pixels[i]) : pixels[i]) * 3;
+          rgbaData[i * 4] = lut[o];
+          rgbaData[i * 4 + 1] = lut[o + 1];
+          rgbaData[i * 4 + 2] = lut[o + 2];
+          rgbaData[i * 4 + 3] = 255;
+        }
+      } else {
+        for (let i = 0; i < w * h; i++) {
+          const val = decodeInvert ? pixels[i] : (255 - pixels[i]);
+          // eslint-disable-next-line no-multi-assign
+          rgbaData[i * 4] = rgbaData[i * 4 + 1] = rgbaData[i * 4 + 2] = val;
+          rgbaData[i * 4 + 3] = 255;
+        }
+      }
+    } else if (components === 1 || (hasJpxAlpha && expectedComponents === 1)) {
+      for (let i = 0; i < w * h; i++) {
+        // eslint-disable-next-line no-multi-assign
+        rgbaData[i * 4] = rgbaData[i * 4 + 1] = rgbaData[i * 4 + 2] = pixels[i * components];
+        rgbaData[i * 4 + 3] = hasJpxAlpha ? pixels[i * components + 1] : 255;
+      }
+    } else if (colorSpace === 'Lab' && components === 3) {
+      const { labBytesToRGBA } = await import('./codecs/decodeJPEG.js');
+      const wp = imageInfo.labWhitePoint || [0.9505, 1.0, 1.089];
+      const range = imageInfo.labRange || [-100, 100, -100, 100];
+      rgbaData.set(labBytesToRGBA(pixels, w, h, wp, range));
+    } else if (components === 3 || (hasJpxAlpha && expectedComponents === 3)) {
+      for (let i = 0; i < w * h; i++) {
+        rgbaData[i * 4] = pixels[i * components];
+        rgbaData[i * 4 + 1] = pixels[i * components + 1];
+        rgbaData[i * 4 + 2] = pixels[i * components + 2];
+        rgbaData[i * 4 + 3] = hasJpxAlpha ? pixels[i * components + 3] : 255;
+      }
+    } else if (components === 4) {
+      if (colorSpace === 'DeviceCMYK') {
+        // Memoize the previous pixel's CMYK->RGB (flat regions repeat the same colour).
+        let pc = -1; let pm = -1; let py = -1; let pk = -1;
+        let pr = 0; let pg = 0; let pb = 0;
+        for (let i = 0; i < w * h; i++) {
+          const b0 = pixels[i * 4]; const b1 = pixels[i * 4 + 1]; const b2 = pixels[i * 4 + 2]; const b3 = pixels[i * 4 + 3];
+          if (b0 !== pc || b1 !== pm || b2 !== py || b3 !== pk) {
+            const c = decodeInvert ? (1 - b0 / 255) : (b0 / 255);
+            const m = decodeInvert ? (1 - b1 / 255) : (b1 / 255);
+            const y = decodeInvert ? (1 - b2 / 255) : (b2 / 255);
+            const k = decodeInvert ? (1 - b3 / 255) : (b3 / 255);
+            const rgb = cmykToRgb(c, m, y, k);
+            pr = rgb[0]; pg = rgb[1]; pb = rgb[2];
+            pc = b0; pm = b1; py = b2; pk = b3;
+          }
+          rgbaData[i * 4] = pr;
+          rgbaData[i * 4 + 1] = pg;
+          rgbaData[i * 4 + 2] = pb;
+          rgbaData[i * 4 + 3] = 255;
+        }
+      } else {
+        for (let i = 0; i < w * h; i++) {
+          rgbaData[i * 4] = pixels[i * 4];
+          rgbaData[i * 4 + 1] = pixels[i * 4 + 1];
+          rgbaData[i * 4 + 2] = pixels[i * 4 + 2];
+          rgbaData[i * 4 + 3] = pixels[i * 4 + 3];
+        }
+      }
+    }
+
+    if (sMask && sMaskWidth && sMaskHeight) {
+      if (sMaskWidth > w || sMaskHeight > h) {
+        // Upsample the image to the mask dimensions to keep the mask's fine detail.
+        // Never build larger than the device area this image occupies (maxW/maxH).
+        let outW = sMaskWidth;
+        let outH = sMaskHeight;
+        if (maxW && maxH && (outW > maxW || outH > maxH)) {
+          const k = Math.min(maxW / outW, maxH / outH);
+          outW = Math.max(w, Math.round(sMaskWidth * k));
+          outH = Math.max(h, Math.round(sMaskHeight * k));
+        }
+        const maskA = boxDownsampleMask(sMask, sMaskWidth, sMaskHeight, outW, outH);
+        const upsampled = upsampleImageWithMask(rgbaData, w, h, maskA, outW, outH);
+        return ca.createImageBitmapFromImageData(new ImageData(upsampled, outW, outH));
+      }
+      applySoftMaskAlpha(rgbaData, w, h, sMask, sMaskWidth, sMaskHeight);
+    }
+
+    return ca.createImageBitmapFromImageData(new ImageData(rgbaData, w, h));
+  }
+
+  // Past the codec branches, imageData is raw decoded pixel bytes.
+  let rgbaData;
+
+  // PDF stores 16-bit samples big-endian, so byte [0] of each pair is the high byte.
+  if (bitsPerComponent === 16) {
+    const sampleCount = imageData.length / 2;
+    const data8 = new Uint8Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) {
+      data8[i] = imageData[i * 2];
+    }
+    imageData = data8;
+    bitsPerComponent = 8;
+  }
+
+  // The general path's cost on a huge scan is the full-resolution RGBA buffer and its ImageBitmap, not the draw, so box-average the packed bits straight to draw size.
+  // This returns before the per-pixel post-processing further down, so the gate must exclude every feature that needs it.
+  const mask11 = sMask && sMaskWidth === width && sMaskHeight === height;
+  if (bitsPerComponent === 1 && (colorSpace === 'DeviceGray' || colorSpace === 'CalGray')
+    && !imageInfo.transparentWhite && (!(sMask && sMaskWidth && sMaskHeight) || mask11)
+    && !colorKeyMask && !imageInfo.iccTransform
+    && maxW && maxH && (width > maxW || height > maxH) && width * height >= 40e6) {
+    const k = Math.min(maxW / width, maxH / height);
+    const outW = Math.max(1, Math.round(width * k));
+    const outH = Math.max(1, Math.round(height * k));
+    if (width * height >= outW * outH * 2) {
+      const rowBytes = Math.ceil(width / 8);
+      const ma = mask11 ? sMask : null;
+      const out = new Uint8ClampedArray(outW * outH * 4);
+      for (let oy = 0; oy < outH; oy++) {
+        const sy0 = Math.floor((oy * height) / outH);
+        const sy1 = Math.max(sy0 + 1, Math.floor(((oy + 1) * height) / outH));
+        for (let ox = 0; ox < outW; ox++) {
+          const sx0 = Math.floor((ox * width) / outW);
+          const sx1 = Math.max(sx0 + 1, Math.floor(((ox + 1) * width) / outW));
+          let sum = 0;
+          let asum = 0;
+          let cnt = 0;
+          for (let sy = sy0; sy < sy1; sy++) {
+            const rb = sy * rowBytes;
+            const mrow = sy * width;
+            for (let sx = sx0; sx < sx1; sx++) {
+              sum += (imageData[rb + (sx >> 3)] >> (7 - (sx & 7))) & 1;
+              if (ma) asum += ma[mrow + sx];
+              cnt++;
+            }
+          }
+          let v = (((sum / cnt) * 255) + 0.5) | 0;
+          if (decodeInvert) v = 255 - v;
+          const di = (oy * outW + ox) * 4;
+          out[di] = v;
+          out[di + 1] = v;
+          out[di + 2] = v;
+          out[di + 3] = ma ? (((asum / cnt) + 0.5) | 0) : 255;
+        }
+      }
+      return ca.createImageBitmapFromImageData(new ImageData(out, outW, outH));
+    }
+  }
+
+  // The 8-bit twin of the 1-bit fast path above, for very large RGB/gray rasters.
+  // The gate mirrors the 1-bit path's so no per-pixel post-processing (masks, ICC, /Decode) is bypassed.
+  if (bitsPerComponent === 8
+    && (colorSpace === 'DeviceRGB' || colorSpace === 'CalRGB' || colorSpace === 'DeviceGray' || colorSpace === 'CalGray')
+    && !imageInfo.transparentWhite && !(sMask && sMaskWidth && sMaskHeight)
+    && !colorKeyMask && !imageInfo.iccTransform && !decodeInvert
+    && maxW && maxH && (width > maxW || height > maxH) && width * height >= 40e6) {
+    const nc = (colorSpace === 'DeviceRGB' || colorSpace === 'CalRGB') ? 3 : 1;
+    const k = Math.min(maxW / width, maxH / height);
+    const outW = Math.max(1, Math.round(width * k));
+    const outH = Math.max(1, Math.round(height * k));
+    if (width * height >= outW * outH * 2 && imageData.length >= width * height * nc) {
+      const out = new Uint8ClampedArray(outW * outH * 4);
+      const colStart = new Int32Array(outW);
+      const colW = new Int32Array(outW);
+      for (let ox = 0; ox < outW; ox++) {
+        const sx0 = Math.floor((ox * width) / outW);
+        colStart[ox] = sx0;
+        colW[ox] = Math.max(sx0 + 1, Math.floor(((ox + 1) * width) / outW)) - sx0;
+      }
+      let di = 0;
+      for (let oy = 0; oy < outH; oy++) {
+        const sy0 = Math.floor((oy * height) / outH);
+        const sy1 = Math.max(sy0 + 1, Math.floor(((oy + 1) * height) / outH));
+        for (let ox = 0; ox < outW; ox++) {
+          const sx0 = colStart[ox];
+          const wpx = colW[ox];
+          if (nc === 3) {
+            let r = 0; let g = 0; let b = 0;
+            for (let sy = sy0; sy < sy1; sy++) {
+              let si = (sy * width + sx0) * 3;
+              for (let px = 0; px < wpx; px++) { r += imageData[si]; g += imageData[si + 1]; b += imageData[si + 2]; si += 3; }
+            }
+            const cnt = (sy1 - sy0) * wpx;
+            out[di] = ((r / cnt) + 0.5) | 0;
+            out[di + 1] = ((g / cnt) + 0.5) | 0;
+            out[di + 2] = ((b / cnt) + 0.5) | 0;
+          } else {
+            let sum = 0;
+            for (let sy = sy0; sy < sy1; sy++) {
+              let si = sy * width + sx0;
+              for (let px = 0; px < wpx; px++) { sum += imageData[si]; si++; }
+            }
+            const v = ((sum / ((sy1 - sy0) * wpx)) + 0.5) | 0;
+            out[di] = v;
+            out[di + 1] = v;
+            out[di + 2] = v;
+          }
+          out[di + 3] = 255;
+          di += 4;
+        }
+      }
+      return ca.createImageBitmapFromImageData(new ImageData(out, outW, outH));
+    }
+  }
+
+  if (colorSpace === 'Indexed' && imageInfo.palette) {
+    const palette = imageInfo.palette;
+    const base = imageInfo.paletteBase || 'DeviceRGB';
+    const nComp = base === 'DeviceCMYK' ? 4 : (base === 'DeviceGray' || base === 'CalGray' ? 1 : 3);
+    const hival = imageInfo.paletteHival != null ? imageInfo.paletteHival : ((1 << bitsPerComponent) - 1);
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    const rowBytes = Math.ceil(width * bitsPerComponent / 8);
+    // imageData can be short of width*height (truncated FlateDecode tail).
+    // Out-of-range reads yield an undefined index that paints solid black, so cap iteration to leave the tail transparent.
+    const maxBytes = imageData ? imageData.length : 0;
+    const validRows = rowBytes > 0 ? Math.min(height, Math.floor(maxBytes / rowBytes)) : height;
+    const rgbPal = nComp === 4 ? cmykPaletteToRgb(palette) : new Uint8Array(0);
+
+    for (let y = 0; y < validRows; y++) {
+      for (let x = 0; x < width; x++) {
+        let idx;
+        if (bitsPerComponent === 8) {
+          idx = imageData[y * rowBytes + x];
+        } else if (bitsPerComponent === 4) {
+          const bytePos = y * rowBytes + Math.floor(x / 2);
+          idx = (x % 2 === 0) ? (imageData[bytePos] >> 4) & 0xF : imageData[bytePos] & 0xF;
+        } else if (bitsPerComponent === 2) {
+          const bytePos = y * rowBytes + Math.floor(x / 4);
+          idx = (imageData[bytePos] >> (6 - (x % 4) * 2)) & 0x3;
+        } else {
+          const bytePos = y * rowBytes + Math.floor(x / 8);
+          idx = (imageData[bytePos] >> (7 - (x % 8))) & 1;
+        }
+        if (decodeInvert) idx = hival - idx;
+
+        const pi = (y * width + x) * 4;
+        if (nComp === 4) {
+          const o = idx * 3;
+          rgbaData[pi] = rgbPal[o];
+          rgbaData[pi + 1] = rgbPal[o + 1];
+          rgbaData[pi + 2] = rgbPal[o + 2];
+        } else if (nComp === 1) {
+          const gray = palette[idx];
+          rgbaData[pi] = gray;
+          rgbaData[pi + 1] = gray;
+          rgbaData[pi + 2] = gray;
+        } else {
+          const po = idx * nComp;
+          rgbaData[pi] = palette[po];
+          rgbaData[pi + 1] = palette[po + 1];
+          rgbaData[pi + 2] = palette[po + 2];
+        }
+        rgbaData[pi + 3] = 255;
+      }
+    }
+  } else if (bitsPerComponent === 1) {
+    // A 1-bit DeviceGray sample is 0=black, 1=white, already flipped by the decoder when /BlackIs1 was set.
+    // A 1-bit Separation sample is the opposite: 0=no ink (white), 1=full ink (black).
+    const isSeparation = colorSpace === 'Separation';
+    const tintSamples = isSeparation ? imageInfo.separationTintSamples : null;
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    for (let y = 0; y < height; y++) {
+      const rowByteWidth = Math.ceil(width / 8);
+      for (let x = 0; x < width; x++) {
+        const byteIndex = y * rowByteWidth + Math.floor(x / 8);
+        const bitIndex = 7 - (x % 8);
+        const rawBit = (imageData[byteIndex] >> bitIndex) & 1;
+        const bit = decodeInvert ? (1 - rawBit) : rawBit;
+        const pi = (y * width + x) * 4;
+        if (isSeparation && tintSamples && tintSamples.length >= 3) {
+          const nSamples = Math.floor(tintSamples.length / 3);
+          const si = (bit === 0 ? 0 : nSamples - 1) * 3;
+          rgbaData[pi] = tintSamples[si];
+          rgbaData[pi + 1] = tintSamples[si + 1];
+          rgbaData[pi + 2] = tintSamples[si + 2];
+          rgbaData[pi + 3] = 255;
+        } else if (isSeparation) {
+          const val = (1 - bit) * 255;
+          rgbaData[pi] = val;
+          rgbaData[pi + 1] = val;
+          rgbaData[pi + 2] = val;
+          rgbaData[pi + 3] = 255;
+        } else {
+          const val = bit * 255;
+          rgbaData[pi] = val;
+          rgbaData[pi + 1] = val;
+          rgbaData[pi + 2] = val;
+          // Inline images inside a tiling pattern paint white as transparent so the pattern shows through.
+          rgbaData[pi + 3] = (imageInfo.transparentWhite && val === 255) ? 0 : 255;
+        }
+      }
+    }
+  } else if (colorSpace === 'DeviceGray' || colorSpace === 'CalGray') {
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    if (bitsPerComponent === 4) {
+      const rowBytes = Math.ceil(width / 2);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const bytePos = y * rowBytes + (x >> 1);
+          const nibble = (x & 1) === 0 ? (imageData[bytePos] >> 4) & 0xF : imageData[bytePos] & 0xF;
+          const raw = nibble * 17;
+          const val = decodeInvert ? (255 - raw) : raw;
+          const pi = (y * width + x) * 4;
+          rgbaData[pi] = val;
+          rgbaData[pi + 1] = val;
+          rgbaData[pi + 2] = val;
+          rgbaData[pi + 3] = 255;
+        }
+      }
+    } else if (bitsPerComponent === 2) {
+      const rowBytes = Math.ceil(width / 4);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const bytePos = y * rowBytes + (x >> 2);
+          const sample = (imageData[bytePos] >> (6 - (x & 3) * 2)) & 0x3;
+          const raw = sample * 85;
+          const val = decodeInvert ? (255 - raw) : raw;
+          const pi = (y * width + x) * 4;
+          rgbaData[pi] = val;
+          rgbaData[pi + 1] = val;
+          rgbaData[pi + 2] = val;
+          rgbaData[pi + 3] = 255;
+        }
+      }
+    } else {
+      for (let i = 0; i < width * height; i++) {
+        const val = decodeInvert ? (255 - imageData[i]) : imageData[i];
+        rgbaData[i * 4] = val;
+        rgbaData[i * 4 + 1] = val;
+        rgbaData[i * 4 + 2] = val;
+        rgbaData[i * 4 + 3] = 255;
+      }
+    }
+  } else if (colorSpace === 'DeviceCMYK') {
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    if (bitsPerComponent === 8) {
+      // Memoize the previous pixel's CMYK->RGB (flat regions repeat the same colour).
+      let pc = -1; let pm = -1; let py = -1; let pk = -1;
+      let pr = 0; let pg = 0; let pb = 0;
+      for (let i = 0; i < width * height; i++) {
+        const b0 = imageData[i * 4]; const b1 = imageData[i * 4 + 1]; const b2 = imageData[i * 4 + 2]; const b3 = imageData[i * 4 + 3];
+        if (b0 !== pc || b1 !== pm || b2 !== py || b3 !== pk) {
+          const c = decodeInvert ? (1 - b0 / 255) : (b0 / 255);
+          const m = decodeInvert ? (1 - b1 / 255) : (b1 / 255);
+          const y = decodeInvert ? (1 - b2 / 255) : (b2 / 255);
+          const k = decodeInvert ? (1 - b3 / 255) : (b3 / 255);
+          const rgb = cmykToRgb(c, m, y, k);
+          pr = rgb[0]; pg = rgb[1]; pb = rgb[2];
+          pc = b0; pm = b1; py = b2; pk = b3;
+        }
+        rgbaData[i * 4] = pr;
+        rgbaData[i * 4 + 1] = pg;
+        rgbaData[i * 4 + 2] = pb;
+        rgbaData[i * 4 + 3] = 255;
+      }
+    } else {
+      const rowBytes = Math.ceil(width * 4 * bitsPerComponent / 8);
+      const compMax = (1 << bitsPerComponent) - 1;
+      // Memoize the previous pixel's CMYK->RGB (flat regions repeat the same colour).
+      let pc = -1; let pm = -1; let py = -1; let pk = -1;
+      let pr = 0; let pg = 0; let pb = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const comps = [0, 0, 0, 0];
+          for (let cc = 0; cc < 4; cc++) {
+            const bitOff = (x * 4 + cc) * bitsPerComponent;
+            const byteIdx = y * rowBytes + (bitOff >> 3);
+            const shift = 8 - (bitOff & 7) - bitsPerComponent;
+            comps[cc] = (imageData[byteIdx] >> shift) & compMax;
+          }
+          if (comps[0] !== pc || comps[1] !== pm || comps[2] !== py || comps[3] !== pk) {
+            const cN = decodeInvert ? (1 - comps[0] / compMax) : (comps[0] / compMax);
+            const mN = decodeInvert ? (1 - comps[1] / compMax) : (comps[1] / compMax);
+            const yN = decodeInvert ? (1 - comps[2] / compMax) : (comps[2] / compMax);
+            const kN = decodeInvert ? (1 - comps[3] / compMax) : (comps[3] / compMax);
+            const rgb = cmykToRgb(cN, mN, yN, kN);
+            pr = rgb[0]; pg = rgb[1]; pb = rgb[2];
+            pc = comps[0]; pm = comps[1]; py = comps[2]; pk = comps[3];
+          }
+          const pi = (y * width + x) * 4;
+          rgbaData[pi] = pr;
+          rgbaData[pi + 1] = pg;
+          rgbaData[pi + 2] = pb;
+          rgbaData[pi + 3] = 255;
+        }
+      }
+    }
+  } else if (colorSpace === 'Separation') {
+    // Separation pixel values are tint amounts (0=no ink/white, 255=full ink).
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    const tintSamples = imageInfo.separationTintSamples;
+    const readTint = (i) => {
+      if (bitsPerComponent === 8) return imageData[i];
+      if (bitsPerComponent === 4) {
+        const rowBytes = Math.ceil(width / 2);
+        const x = i % width;
+        const y = Math.floor(i / width);
+        const byte = imageData[y * rowBytes + (x >> 1)];
+        const nibble = (x & 1) === 0 ? (byte >> 4) & 0xF : byte & 0xF;
+        return nibble * 17;
+      }
+      if (bitsPerComponent === 2) {
+        const rowBytes = Math.ceil(width / 4);
+        const x = i % width;
+        const y = Math.floor(i / width);
+        const byte = imageData[y * rowBytes + (x >> 2)];
+        const sample = (byte >> (6 - (x & 3) * 2)) & 0x3;
+        return sample * 85;
+      }
+      if (bitsPerComponent === 1) {
+        const rowBytes = Math.ceil(width / 8);
+        const x = i % width;
+        const y = Math.floor(i / width);
+        const byte = imageData[y * rowBytes + (x >> 3)];
+        return ((byte >> (7 - (x & 7))) & 1) ? 255 : 0;
+      }
+      return imageData[i];
+    };
+    if (tintSamples && tintSamples.length >= 3) {
+      const nSamples = Math.floor(tintSamples.length / 3);
+      const lut = buildTintLut(tintSamples, nSamples);
+      for (let i = 0; i < width * height; i++) {
+        const raw = readTint(i);
+        const o = (decodeInvert ? (255 - raw) : raw) * 3;
+        rgbaData[i * 4] = lut[o];
+        rgbaData[i * 4 + 1] = lut[o + 1];
+        rgbaData[i * 4 + 2] = lut[o + 2];
+        rgbaData[i * 4 + 3] = 255;
+      }
+    } else {
+      // With decodeInvert, /Decode [1 0] and ink conventions cancel out.
+      for (let i = 0; i < width * height; i++) {
+        const raw = readTint(i);
+        const val = decodeInvert ? raw : (255 - raw);
+        rgbaData[i * 4] = val;
+        rgbaData[i * 4 + 1] = val;
+        rgbaData[i * 4 + 2] = val;
+        rgbaData[i * 4 + 3] = 255;
+      }
+    }
+  } else if ((colorSpace === 'DeviceRGB' || colorSpace === 'CalRGB') && (bitsPerComponent === 4 || bitsPerComponent === 2)) {
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    const rowBytes = Math.ceil(width * 3 * bitsPerComponent / 8);
+    const compMax = (1 << bitsPerComponent) - 1;
+    const scale = 255 / compMax;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const comps = [0, 0, 0];
+        for (let c = 0; c < 3; c++) {
+          const bitOff = (x * 3 + c) * bitsPerComponent;
+          const byteIdx = y * rowBytes + (bitOff >> 3);
+          const shift = 8 - (bitOff & 7) - bitsPerComponent;
+          comps[c] = (imageData[byteIdx] >> shift) & compMax;
+        }
+        const r = decodeInvert ? compMax - comps[0] : comps[0];
+        const g = decodeInvert ? compMax - comps[1] : comps[1];
+        const b = decodeInvert ? compMax - comps[2] : comps[2];
+        const pi = (y * width + x) * 4;
+        rgbaData[pi] = Math.round(r * scale);
+        rgbaData[pi + 1] = Math.round(g * scale);
+        rgbaData[pi + 2] = Math.round(b * scale);
+        rgbaData[pi + 3] = 255;
+      }
+    }
+  } else if (colorSpace === 'Lab') {
+    const wp = imageInfo.labWhitePoint || [0.9505, 1.0, 1.089];
+    const range = imageInfo.labRange || [-100, 100, -100, 100];
+    const { labBytesToRGBA } = await import('./codecs/decodeJPEG.js');
+    rgbaData = new Uint8ClampedArray(labBytesToRGBA(imageData, width, height, wp, range).buffer);
+  } else if (colorSpace === 'DeviceN' && imageInfo.deviceNTintCS) {
+    const nComp = imageInfo.deviceNTintCS.nInputs;
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    const rgb = tintSamplesToRgb(imageInfo.deviceNTintCS, imageData, nComp, width * height);
+    if (rgb) {
+      for (let i = 0; i < width * height; i++) {
+        rgbaData[i * 4] = rgb[i * 3];
+        rgbaData[i * 4 + 1] = rgb[i * 3 + 1];
+        rgbaData[i * 4 + 2] = rgb[i * 3 + 2];
+        rgbaData[i * 4 + 3] = 255;
+      }
+    }
+  } else {
+    // imageData.length can differ from width*height*components on padded or truncated data, so infer the component count only when the color space does not name one.
+    let components;
+    if (colorSpace === 'DeviceRGB' || colorSpace === 'CalRGB' || colorSpace === 'ICCBased') {
+      components = 3;
+    } else {
+      components = Math.round(imageData.length / (width * height)) || 3;
+    }
+    rgbaData = new Uint8ClampedArray(width * height * 4);
+    if (components === 1) {
+      for (let i = 0; i < width * height; i++) {
+        const val = decodeInvert ? (255 - imageData[i]) : imageData[i];
+        rgbaData[i * 4] = val;
+        rgbaData[i * 4 + 1] = val;
+        rgbaData[i * 4 + 2] = val;
+        rgbaData[i * 4 + 3] = 255;
+      }
+    } else if (components === 4) {
+      for (let i = 0; i < width * height; i++) {
+        rgbaData[i * 4] = decodeInvert ? (255 - imageData[i * 4]) : imageData[i * 4];
+        rgbaData[i * 4 + 1] = decodeInvert ? (255 - imageData[i * 4 + 1]) : imageData[i * 4 + 1];
+        rgbaData[i * 4 + 2] = decodeInvert ? (255 - imageData[i * 4 + 2]) : imageData[i * 4 + 2];
+        rgbaData[i * 4 + 3] = imageData[i * 4 + 3];
+      }
+    } else {
+      for (let i = 0; i < width * height; i++) {
+        rgbaData[i * 4] = decodeInvert ? (255 - imageData[i * components]) : imageData[i * components];
+        rgbaData[i * 4 + 1] = decodeInvert ? (255 - imageData[i * components + 1]) : imageData[i * components + 1];
+        rgbaData[i * 4 + 2] = decodeInvert ? (255 - imageData[i * components + 2]) : imageData[i * components + 2];
+        rgbaData[i * 4 + 3] = 255;
+      }
+    }
+  }
+
+  if (imageInfo.iccTransform && rgbaData) {
+    const { gamma, matrix: m } = imageInfo.iccTransform;
+    const lut = gamma.map((g) => {
+      const t = new Float32Array(256);
+      for (let v = 0; v < 256; v++) t[v] = (v / 255) ** g;
+      return t;
+    });
+    const xyzToSrgb = [
+      3.1338561, -1.6168667, -0.4906146,
+      -0.9787684, 1.9161415, 0.0334540,
+      0.0719453, -0.2289914, 1.4052427,
+    ];
+    // Fold each matrix coefficient into its channel's gamma LUT so the per-pixel loop does lookups and adds, not multiplies.
+    // The fold is exact: same f64 products and summation grouping as multiplying per pixel.
+    const term = [];
+    for (let j = 0; j < 9; j++) {
+      const t = new Float64Array(256);
+      const l = lut[j % 3];
+      for (let v = 0; v < 256; v++) t[v] = m[j] * l[v];
+      term.push(t);
+    }
+    // The gamma-encode pows dominate this loop, and these images have few distinct colors, so memoize the pure color map in a direct-mapped cache.
+    const cacheKeys = new Int32Array(1 << 16).fill(-1);
+    const cacheVals = new Int32Array(1 << 16);
+    const n = width * height;
+    for (let i = 0; i < n; i++) {
+      const off = i * 4;
+      const r = rgbaData[off];
+      const g = rgbaData[off + 1];
+      const b = rgbaData[off + 2];
+      const key = (r << 16) | (g << 8) | b;
+      const slot = (Math.imul(key, 2654435761) >>> 16) & 0xFFFF;
+      if (cacheKeys[slot] === key) {
+        const v = cacheVals[slot];
+        rgbaData[off] = (v >>> 16) & 255;
+        rgbaData[off + 1] = (v >>> 8) & 255;
+        rgbaData[off + 2] = v & 255;
+        continue;
+      }
+      const x = term[0][r] + term[1][g] + term[2][b];
+      const y = term[3][r] + term[4][g] + term[5][b];
+      const z = term[6][r] + term[7][g] + term[8][b];
+      const sr = xyzToSrgb[0] * x + xyzToSrgb[1] * y + xyzToSrgb[2] * z;
+      const sg = xyzToSrgb[3] * x + xyzToSrgb[4] * y + xyzToSrgb[5] * z;
+      const sb = xyzToSrgb[6] * x + xyzToSrgb[7] * y + xyzToSrgb[8] * z;
+      const outR = Math.max(0, Math.min(255, Math.round(255 * (Math.max(0, sr) ** (1 / 2.2)))));
+      const outG = Math.max(0, Math.min(255, Math.round(255 * (Math.max(0, sg) ** (1 / 2.2)))));
+      const outB = Math.max(0, Math.min(255, Math.round(255 * (Math.max(0, sb) ** (1 / 2.2)))));
+      rgbaData[off] = outR;
+      rgbaData[off + 1] = outG;
+      rgbaData[off + 2] = outB;
+      cacheKeys[slot] = key;
+      cacheVals[slot] = (outR << 16) | (outG << 8) | outB;
+    }
+  }
+
+  if (sMask && sMaskWidth && sMaskHeight) {
+    if (sMaskWidth > width || sMaskHeight > height) {
+      const outW = sMaskWidth;
+      const outH = sMaskHeight;
+      const upsampled = upsampleImageWithMask(rgbaData, width, height, sMask, outW, outH);
+      return ca.createImageBitmapFromImageData(new ImageData(upsampled, outW, outH));
+    }
+    applySoftMaskAlpha(rgbaData, width, height, sMask, sMaskWidth, sMaskHeight);
+  }
+
+  // The compared values are the source samples before palette lookup (the index for Indexed), read at the image's bit depth.
+  if (colorKeyMask && rgbaData) {
+    const nComp = colorKeyMask.length / 2;
+    const rowBytes = Math.ceil(width * nComp * bitsPerComponent / 8);
+    const sampleMax = (1 << bitsPerComponent) - 1;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let masked = true;
+        for (let c = 0; c < nComp; c++) {
+          let val;
+          if (bitsPerComponent === 8) {
+            val = imageData[y * rowBytes + x * nComp + c];
+          } else {
+            const bitOff = (x * nComp + c) * bitsPerComponent;
+            const byteIdx = y * rowBytes + (bitOff >> 3);
+            val = (imageData[byteIdx] >> (8 - (bitOff & 7) - bitsPerComponent)) & sampleMax;
+          }
+          if (val < colorKeyMask[c * 2] || val > colorKeyMask[c * 2 + 1]) {
+            masked = false;
+            break;
+          }
+        }
+        if (masked) rgbaData[(y * width + x) * 4 + 3] = 0;
+      }
+    }
+  }
+
+  // This still builds the full-resolution RGBA, but it removes the expensive createImageBitmap of a huge bitmap and the large-source drawImage downscale.
+  // Those pay back the extra box pass in both Node and Chrome.
+  if (maxW && maxH && (width > maxW || height > maxH) && width * height >= 40e6) {
+    const k = Math.min(maxW / width, maxH / height);
+    const outW = Math.max(1, Math.round(width * k));
+    const outH = Math.max(1, Math.round(height * k));
+    if (width * height >= outW * outH * 2) {
+      const small = boxDownsampleRgba(rgbaData, width, height, outW, outH);
+      return ca.createImageBitmapFromImageData(new ImageData(small, outW, outH));
+    }
+  }
+
+  const imgData = new ImageData(rgbaData, width, height);
+  return ca.createImageBitmapFromImageData(imgData);
+}
+
+/**
+ * Convert an ImageMask image to an ImageBitmap using the current fill color.
+ *
+ * @param {import('./parsePdfImages.js').ImageInfo} imageInfo
+ * @param {string} fillColor - CSS color string (e.g. 'rgb(20,20,20)')
+ * @param {ObjectCache} [objCache]
+ * @returns {Promise<ImageBitmap>}
+ */
+async function imageMaskToBitmap(imageInfo, fillColor, objCache) {
+  if (imageInfo.imageData == null && objCache && imageInfo.objNum != null) {
+    imageInfo.imageData = objCache.getStreamBytes(imageInfo.objNum);
+  }
+  const { width, height, imageData } = imageInfo;
+
+  if (imageData == null) return null;
+
+  const colorMatch = /rgb\((\d+),(\d+),(\d+)\)/.exec(fillColor);
+  const r = colorMatch ? Number(colorMatch[1]) : 0;
+  const g = colorMatch ? Number(colorMatch[2]) : 0;
+  const b = colorMatch ? Number(colorMatch[3]) : 0;
+
+  const rgbaData = new Uint8ClampedArray(width * height * 4);
+  const rowBytes = Math.ceil(width / 8);
+  // For an ImageMask the default /Decode [0 1] paints sample 0, and /Decode [1 0] paints sample 1.
+  const paintBit = imageInfo.decodeInvert ? 1 : 0;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const byteIndex = y * rowBytes + Math.floor(x / 8);
+      const bitIndex = 7 - (x % 8);
+      const bit = (imageData[byteIndex] >> bitIndex) & 1;
+      const pi = (y * width + x) * 4;
+      if (bit === paintBit) {
+        rgbaData[pi] = r;
+        rgbaData[pi + 1] = g;
+        rgbaData[pi + 2] = b;
+        rgbaData[pi + 3] = 255;
+      }
+    }
+  }
+
+  return ca.createImageBitmapFromImageData(new ImageData(rgbaData, width, height));
+}
+
+/**
+ * Compose `smask`'s snapshotted `parentCtm` with `composedBase`.
+ * The smask object is shared, so a new wrapper is returned rather than mutating it.
+ * `parentCtm` was snapshotted in the coordinate space active when `/gs` set the soft mask.
+ * Any later parent form transform must be composed into it too, or the SMask form lands in the wrong page-space location.
+ * @param {SmaskRef} smask
+ * @param {number[]} composedBase
+ * @returns {SmaskRef}
+ */
+function transformSmaskCtm(smask, composedBase) {
+  if (!smask) return smask;
+  if (!smask.parentCtm) return { ...smask, parentCtm: composedBase.slice() };
+  return { ...smask, parentCtm: matMul(smask.parentCtm, composedBase) };
+}
+
+/**
+ * Apply a Form XObject's composed transform to a draw op.
+ * @param {DrawOp} op
+ * @param {number[]} composedBase - The form's composed transform matrix
+ * @returns {DrawOp}
+ */
+function applyFormTransform(op, composedBase) {
+  /**
+   * Apply the form transform `composedBase` to the op's secondary coordinate references.
+   * Mutates `result` in place.
+   * @param {DrawOp} result
+   */
+  const composeFormRefs = (result) => {
+    if (op.smask) result.smask = transformSmaskCtm(op.smask, composedBase);
+    if (op.outerSmask) result.outerSmask = transformSmaskCtm(op.outerSmask, composedBase);
+    if (op.tilingPattern) result.tilingPattern = { ...op.tilingPattern, matrix: matMul(op.tilingPattern.matrix, composedBase) };
+    if (op.patternShading?.matrix) result.patternShading = { ...op.patternShading, matrix: matMul(op.patternShading.matrix, composedBase) };
+    if (op.type === 'path' && result.type === 'path') {
+      if (op.strokeTilingPattern) result.strokeTilingPattern = { ...op.strokeTilingPattern, matrix: matMul(op.strokeTilingPattern.matrix, composedBase) };
+      if (op.strokePatternShading?.matrix) result.strokePatternShading = { ...op.strokePatternShading, matrix: matMul(op.strokePatternShading.matrix, composedBase) };
+    }
+  };
+  switch (op.type) {
+    case 'image': {
+      const finalCtm = matMul(op.ctm, composedBase);
+      const result = { ...op, ctm: finalCtm };
+      if (op.clips) result.clips = op.clips.map((c) => ({ ...c, ctm: matMul(c.ctm, composedBase) }));
+      composeFormRefs(result);
+      return result;
+    }
+    case 'type0text': {
+      const trm = matMul([op.a, op.b, op.c, op.d, op.x, op.y], composedBase);
+      const result = {
+        ...op, a: trm[0], b: trm[1], c: trm[2], d: trm[3], x: trm[4], y: trm[5],
+      };
+      if (op.clips) result.clips = op.clips.map((c) => ({ ...c, ctm: matMul(c.ctm, composedBase) }));
+      composeFormRefs(result);
+      return result;
+    }
+    case 'type3glyph': {
+      const newTransform = matMul(op.transform, composedBase);
+      const result = { ...op, transform: newTransform };
+      if (op.clips) result.clips = op.clips.map((c) => ({ ...c, ctm: matMul(c.ctm, composedBase) }));
+      composeFormRefs(result);
+      return result;
+    }
+    case 'path': {
+      const newCtm = matMul(op.ctm, composedBase);
+      const result = { ...op, ctm: newCtm };
+      if (op.clips) result.clips = op.clips.map((c) => ({ ...c, ctm: matMul(c.ctm, composedBase) }));
+      composeFormRefs(result);
+      return result;
+    }
+    case 'shading': {
+      const newCtm = matMul(op.ctm, composedBase);
+      const result = { ...op, ctm: newCtm };
+      if (op.clips) result.clips = op.clips.map((c) => ({ ...c, ctm: matMul(c.ctm, composedBase) }));
+      composeFormRefs(result);
+      return result;
+    }
+    case 'inlineImage': {
+      const newCtm = matMul(op.ctm, composedBase);
+      const result = { ...op, ctm: newCtm };
+      if (op.clips) result.clips = op.clips.map((c) => ({ ...c, ctm: matMul(c.ctm, composedBase) }));
+      composeFormRefs(result);
+      return result;
+    }
+    default:
+      return op;
+  }
+}
+
+/**
+ * Flatten image draw operations by expanding Form XObject references into their constituent image draw operations with composed CTMs.
+ *
+ * @param {Array<ImageDrawOp>} imageOps - Image-type draw ops only
+ * @param {Map<string, import('./parsePdfImages.js').ImageInfo>} images
+ * @param {Map<string, import('./parsePdfImages.js').FormXObjectInfo>} forms
+ * @param {ObjectCache} objCache
+ * @param {Map<string, object>} fonts - Font map for parsing nested form streams
+ * @param {Map<string, string>} registeredFontNames
+ * @param {string} [prefix=''] - key prefix for nested lookups
+ * @param {number} [pageIndex=0]
+ * @param {Set<string>} [symbolFontTags]
+ * @param {Set<string>} [cidPUATags]
+ * @param {Map<string, ExtGStateEntry>} [pageExtGStates]
+ * @param {Set<string>} [rawCharCodeTags]
+ * @param {Map} [formResourceCache]
+ * @param {number} [depth=0]
+ * @param {Set<number>} [offOCGs]
+ * @param {Map<string, Set<number>>} [cidCollisionMap]
+ * @param {string} [inheritedFillColor='black']
+ * @param {string} [inheritedStrokeColor='rgb(0,0,0)']
+ * @param {number} [inheritedFillAlpha=1]
+ * @param {number} [inheritedStrokeAlpha=1]
+ * @param {{nextId: number, registry: Map<number, TransparencyGroupAttrs>}|null} [groupContext]
+ * @param {number|null} [currentGroupId]
+ * @param {?Array<TextPatch>} [textPatches]
+ * @returns {Promise<Array<DrawOp>>}
+ */
+async function flattenDrawOps(
+  imageOps, images, forms, objCache, fonts, registeredFontNames, prefix = '',
+  pageIndex = 0, symbolFontTags = new Set(), cidPUATags = new Set(), pageExtGStates = new Map(), rawCharCodeTags = new Set(),
+  formResourceCache = new Map(), depth = 0, offOCGs = new Set(),
+  cidCollisionMap = new Map(),
+  inheritedFillColor = 'black', inheritedStrokeColor = 'rgb(0,0,0)',
+  inheritedFillAlpha = 1, inheritedStrokeAlpha = 1,
+  groupContext = null, currentGroupId = null,
+  textPatches = null,
+) {
+  /** @type {Array<DrawOp>} */
+  const flattened = [];
+  if (depth > 200) return flattened;
+  // The callCount limit is high because legitimate documents reach ~11k objects at this path.
+  const callCount = (formResourceCache.get('_callCount') || 0) + 1;
+  formResourceCache.set('_callCount', callCount);
+  if (callCount > 100000) return flattened;
+
+  for (const op of imageOps) {
+    const fullName = prefix + op.name;
+
+    if (images.has(fullName)) {
+      /** @type {ImageDrawOp} */
+      const imgOp = {
+        type: 'image',
+        name: fullName,
+        ctm: op.ctm,
+        fillAlpha: op.fillAlpha,
+        strokeAlpha: op.strokeAlpha,
+        fillColor: op.fillColor,
+      };
+      if (op.clips) imgOp.clips = op.clips;
+      if (op.overprint) imgOp.overprint = true;
+      if (op.blendMode) imgOp.blendMode = op.blendMode;
+      if (op.tilingPattern) imgOp.tilingPattern = op.tilingPattern;
+      if (op.fillColorInherited) imgOp.fillColorInherited = true;
+      if (op.fillAlphaInherited) imgOp.fillAlphaInherited = true;
+      if (op.strokeColorInherited) imgOp.strokeColorInherited = true;
+      if (op.strokeAlphaInherited) imgOp.strokeAlphaInherited = true;
+      flattened.push(imgOp);
+      continue;
+    }
+
+    const formInfo = forms.get(fullName);
+    if (!formInfo) continue;
+
+    const formObjText = objCache.getObjectText(formInfo.objNum);
+    if (!formObjText) continue;
+
+    if (offOCGs.size > 0 && isFormOCHidden(formObjText, offOCGs, objCache)) continue;
+
+    const formMatrix = parseFormMatrix(formObjText, objCache);
+
+    const composedBase = matMul(formMatrix, op.ctm);
+
+    /** @type {{path: any[], ctm: number[], evenOdd: boolean, fromFormObjNum?: number}|null} */
+    let bboxClip = null;
+    if (formInfo.bbox && formInfo.bbox.length === 4) {
+      // Per PDF spec section 8.10.2 the BBox is in form-local space, so its clip CTM is the composed form transform.
+      // Producers write BBox corners in any order, so normalize to min/max to get a positive rectangle.
+      const bx0 = Math.min(formInfo.bbox[0], formInfo.bbox[2]);
+      const by0 = Math.min(formInfo.bbox[1], formInfo.bbox[3]);
+      const bx1 = Math.max(formInfo.bbox[0], formInfo.bbox[2]);
+      const by1 = Math.max(formInfo.bbox[1], formInfo.bbox[3]);
+      bboxClip = {
+        path: [
+          { type: 'M', x: bx0, y: by0 },
+          { type: 'L', x: bx1, y: by0 },
+          { type: 'L', x: bx1, y: by1 },
+          { type: 'L', x: bx0, y: by1 },
+          { type: 'Z' },
+        ],
+        ctm: composedBase.slice(),
+        evenOdd: false,
+        fromFormObjNum: formInfo.objNum,
+      };
+    }
+
+    // The same objNum always yields the same fonts, images, patterns, and draw ops, so only the prefix and transform vary per call.
+    // Inherited text state (PDF spec section 8.10.1) changes how the form's `T*`/`Tj` operators resolve to glyph positions, so it belongs in the key too.
+    const ts = op.textState || {
+      tc: 0, tw: 0, tl: 0, tz: 100, trise: 0,
+    };
+    // A text edit patches a form by its resource name path, so a patched placement parses apart from other placements of the same object.
+    /** @type {TextPatchStream} */
+    const formStreamKey = { kind: 'form', path: fullName };
+    const formPatched = textPatchesTarget(textPatches, formStreamKey);
+    const cacheKey = `${formInfo.objNum}_${ts.tc}_${ts.tw}_${ts.tl}_${ts.tz}_${ts.trise}${formPatched ? `_patched_${fullName}` : ''}`;
+    let cached = formResourceCache.get(cacheKey);
+    if (!cached) {
+      // Many Form XObjects share the same fonts, so cache the parse by the font reference set.
+      const fontRefMatches = [...formObjText.matchAll(/\/Fo\w+\s+(\d+)\s+\d+\s+R/g)];
+      const fontRefKey = fontRefMatches.map((m) => m[1]).sort().join(',');
+      const cachedFontParse = fontRefKey ? formResourceCache.get(`_fonts_${fontRefKey}`) : null;
+      let formFonts;
+      if (cachedFontParse) {
+        formFonts = cachedFontParse.formFonts;
+      } else {
+        formFonts = parsePageFonts(formObjText, objCache);
+        if (fontRefKey) formResourceCache.set(`_fonts_${fontRefKey}`, { formFonts });
+      }
+      let effectiveFonts2 = fonts;
+      let effectiveRegistered2 = registeredFontNames;
+      // These classifications are keyed by the local font tag, whose meaning is scope-dependent.
+      // Without scoping, a symbol-encoded page /TT0 could mark a same-tagged non-symbol form /TT0 as symbol.
+      let effectiveSymbol2 = symbolFontTags;
+      let effectiveCidPUA2 = cidPUATags;
+      let effectiveRaw2 = rawCharCodeTags;
+      // convertAndRegisterFont records collisions keyed by font tag, so without a per-form clone a form-local tag overwrites the parent's entry.
+      let effectiveCidCollisionMap2 = cidCollisionMap;
+      if (formFonts.size > 0) {
+        effectiveFonts2 = new Map([...fonts, ...formFonts]);
+        effectiveRegistered2 = new Map(registeredFontNames);
+        effectiveSymbol2 = new Set(symbolFontTags);
+        effectiveCidPUA2 = new Set(cidPUATags);
+        effectiveRaw2 = new Set(rawCharCodeTags);
+        effectiveCidCollisionMap2 = new Map(cidCollisionMap);
+        for (const [fontTag, fontObj] of formFonts) {
+          // A Form XObject's local /Resources must shadow the parent scope.
+          // Re-register even when the tag already exists (e.g. /C0_0 on both the page and the form), or parseDrawOps resolves to the parent's family alias.
+          const formId = fullName.replace(/\//g, '_');
+          const familyName = pdfFontFamilyName(objCache, fontObj.fontObjNum, `${formId}_${fontTag}`);
+          // convertAndRegisterFont only adds, so without this a non-symbol form font keeps a parent symbol tag.
+          effectiveSymbol2.delete(fontTag);
+          effectiveCidPUA2.delete(fontTag);
+          effectiveRaw2.delete(fontTag);
+          await convertAndRegisterFont(
+            fontTag, fontObj, effectiveRegistered2, effectiveSymbol2, effectiveCidPUA2,
+            effectiveRaw2, effectiveCidCollisionMap2, objCache, familyName,
+          );
+        }
+        appendGenericFallbacks(effectiveRegistered2, effectiveFonts2);
+      }
+
+      // Many Form XObjects share identical Resources, so this parse is cached by the resource object refs.
+      const resRefMatches = [...formObjText.matchAll(/\/\w+\s+(\d+)\s+\d+\s+R/g)];
+      const resKey = resRefMatches.map((m) => m[1]).join(',');
+      const cachedRes = resKey ? formResourceCache.get(`_res_${resKey}`) : null;
+      let formExtGStates;
+      let formColorSpaces;
+      let formImagesResult;
+      let formShadings;
+      let formPatterns;
+      if (cachedRes) {
+        formExtGStates = cachedRes.formExtGStates;
+        formColorSpaces = cachedRes.formColorSpaces;
+        formImagesResult = cachedRes.formImagesResult;
+        formShadings = cachedRes.formShadings;
+        formPatterns = cachedRes.formPatterns;
+      } else {
+        formExtGStates = parseExtGStates(formObjText, objCache);
+        formColorSpaces = parsePageColorSpaces(formObjText, objCache);
+        formImagesResult = parsePageImages(formObjText, objCache, { recurseForms: false });
+        formShadings = parseShadings(formObjText, objCache);
+        formPatterns = parsePatterns(formObjText, objCache);
+        if (resKey) {
+          formResourceCache.set(`_res_${resKey}`, {
+            formExtGStates, formColorSpaces, formImagesResult, formShadings, formPatterns,
+          });
+        }
+      }
+      let formResourcesText = formObjText;
+      const formResRefMatch = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(formObjText);
+      if (formResRefMatch) {
+        const formResObj = objCache.getObjectText(Number(formResRefMatch[1]));
+        if (formResObj) formResourcesText = formResObj;
+      }
+      const formDefinesOwnExtGState = /\/ExtGState[\s/<]/.test(formResourcesText);
+      const effectiveExtGStates2 = formDefinesOwnExtGState
+        ? formExtGStates
+        : (formExtGStates.size > 0
+          ? new Map([...pageExtGStates, ...formExtGStates])
+          : pageExtGStates);
+
+      const streamBytes = objCache.getStreamBytes(formInfo.objNum);
+      let rawFormDrawOps = [];
+      if (streamBytes) {
+        let formStream = bytesToLatin1(streamBytes);
+        if (formPatched) formStream = applyTextPatchRecords(formStream, textPatches, formStreamKey).text;
+        rawFormDrawOps = parseDrawOps(
+          formStream, effectiveFonts2, effectiveExtGStates2, effectiveRegistered2,
+          formColorSpaces.size > 0 ? formColorSpaces : undefined, effectiveSymbol2, effectiveCidPUA2, effectiveRaw2,
+          formShadings, formPatterns, effectiveCidCollisionMap2, ts,
+          parseHiddenOCMCNames(formObjText, objCache, offOCGs),
+        );
+      }
+
+      cached = {
+        formImagesResult,
+        rawFormDrawOps,
+        effectiveFonts: effectiveFonts2,
+        effectiveRegistered: effectiveRegistered2,
+        effectiveExtGStates: effectiveExtGStates2,
+        effectiveSymbol: effectiveSymbol2,
+        effectiveCidPUA: effectiveCidPUA2,
+        effectiveRaw: effectiveRaw2,
+        effectiveCidCollisionMap: effectiveCidCollisionMap2,
+      };
+      formResourceCache.set(cacheKey, cached);
+    }
+
+    // Per PDF spec section 8.10.1, a form inherits its caller's graphics state at the time of `Do`.
+    // The Do op was emitted by the caller's parser with the caller's then-current colors.
+    // When the caller never set a color explicitly, the Do op is tagged inherited and this function's inherited param takes over, so the chain propagates through nested forms.
+    const formInheritedFill = op.fillColorInherited ? inheritedFillColor : op.fillColor;
+    const formInheritedStroke = op.strokeColorInherited ? inheritedStrokeColor : (op.strokeColor || inheritedStrokeColor);
+    const formInheritedFillAlpha = op.fillAlphaInherited ? inheritedFillAlpha : (op.fillAlpha != null ? op.fillAlpha : 1);
+    const formInheritedStrokeAlpha = op.strokeAlphaInherited ? inheritedStrokeAlpha : (op.strokeAlpha != null ? op.strokeAlpha : 1);
+
+    // The cached `rawFormDrawOps` carry inheritance markers, so the same parsed form can be reused across callers.
+    // The expansion itself is not cached, because each invocation must resolve those markers against its own parent context.
+    for (const [name, info] of cached.formImagesResult.images) {
+      images.set(`${fullName}/${name}`, info);
+    }
+    for (const [name, info] of cached.formImagesResult.forms) {
+      forms.set(`${fullName}/${name}`, info);
+    }
+
+    if (cached.formImagesResult.images.size === 0
+      && cached.formImagesResult.forms.size === 0
+      && !/\/Resources[\s<]/.test(formObjText)) {
+      for (const [name, info] of [...images]) {
+        const relName = prefix ? (name.startsWith(prefix) ? name.substring(prefix.length) : null) : name;
+        if (relName && !relName.includes('/') && relName !== fullName.substring(prefix.length)) {
+          images.set(`${fullName}/${relName}`, info);
+        }
+      }
+      for (const [name, info] of [...forms]) {
+        const relName = prefix ? (name.startsWith(prefix) ? name.substring(prefix.length) : null) : name;
+        if (relName && !relName.includes('/') && relName !== fullName.substring(prefix.length)) {
+          forms.set(`${fullName}/${relName}`, info);
+        }
+      }
+    }
+
+    const effectiveFonts = cached.effectiveFonts;
+    const effectiveRegistered = cached.effectiveRegistered;
+    const effectiveExtGStates = cached.effectiveExtGStates;
+    const effectiveSymbol = cached.effectiveSymbol || symbolFontTags;
+    const effectiveCidPUA = cached.effectiveCidPUA || cidPUATags;
+    const effectiveRaw = cached.effectiveRaw || rawCharCodeTags;
+    const effectiveCidCollisionMap = cached.effectiveCidCollisionMap || cidCollisionMap;
+    const innerPrefix = `${fullName}/`;
+    let formGroupId = null;
+    // Isolating a trivial composite (Normal, alpha 1, no mask) to a transparent canvas and source-over'ing back draws identically.
+    // It also breaks child blends that depend on the backdrop (Multiply, Darken), so isolation is gated on a non-trivial composite.
+    const compositeIsTrivial = (!op.blendMode || op.blendMode === 'Normal')
+      && (op.fillAlpha == null || op.fillAlpha >= 1)
+      && (op.strokeAlpha == null || op.strokeAlpha >= 1)
+      && !op.smask;
+    // When a group's only non-triviality is its alpha and it holds a single op, the alpha folds into that op and no isolation buffer is needed.
+    const singleOpAlphaGroup = !compositeIsTrivial
+      && (!op.blendMode || op.blendMode === 'Normal')
+      && !op.smask
+      && formInfo.transparencyGroup && !formInfo.transparencyGroup.knockout
+      && cached.rawFormDrawOps.length === 1
+      && cached.rawFormDrawOps[0].type !== 'image'
+      && !(cached.rawFormDrawOps[0].fill && cached.rawFormDrawOps[0].stroke);
+    // An isolated group composites against a fully transparent backdrop, which is what a backdrop-dependent child blend needs.
+    // Skipping isolation leaves the child blending against the parent instead, so Screen over a white page erases it.
+    // Only direct ops are inspected, so a blend nested deeper inside a child form still misses this.
+    const isolatedNeedsBuffer = formInfo.transparencyGroup && formInfo.transparencyGroup.isolated
+      && cached.rawFormDrawOps.some((fop) => fop.blendMode && fop.blendMode !== 'Normal');
+    if (groupContext && formInfo.transparencyGroup && (!compositeIsTrivial || isolatedNeedsBuffer) && !singleOpAlphaGroup) {
+      formGroupId = groupContext.nextId++;
+      groupContext.registry.set(formGroupId, {
+        isolated: !!formInfo.transparencyGroup.isolated,
+        knockout: !!formInfo.transparencyGroup.knockout,
+        blendMode: op.blendMode || 'Normal',
+        fillAlpha: op.fillAlpha != null ? op.fillAlpha : 1,
+        strokeAlpha: op.strokeAlpha != null ? op.strokeAlpha : 1,
+        smask: op.smask || null,
+        parentGroupId: currentGroupId,
+      });
+    }
+    const innerGroupId = formGroupId !== null ? formGroupId : currentGroupId;
+
+    /** @type {Array<DrawOp>} */
+    const expandedFormOps = [];
+    for (const innerOp of cached.rawFormDrawOps) {
+      if (innerOp.type === 'image') {
+        const nestedGroupIdStart = groupContext ? groupContext.nextId : 0;
+        const nestedFlattened = await flattenDrawOps(
+          [innerOp], images, forms, objCache, effectiveFonts, effectiveRegistered,
+          innerPrefix, pageIndex, effectiveSymbol, effectiveCidPUA, effectiveExtGStates, effectiveRaw,
+          formResourceCache, depth + 1, offOCGs, effectiveCidCollisionMap,
+          formInheritedFill, formInheritedStroke,
+          formInheritedFillAlpha, formInheritedStrokeAlpha,
+          groupContext, innerGroupId,
+          textPatches,
+        );
+        // applyFormTransform below re-composes each returned content op with composedBase, but a group's SMask lives in the registry rather than on an op, so it never reaches one.
+        if (groupContext) {
+          for (let gid = nestedGroupIdStart; gid < groupContext.nextId; gid++) {
+            const ga = groupContext.registry.get(gid);
+            if (ga && ga.smask) ga.smask = transformSmaskCtm(ga.smask, composedBase);
+          }
+        }
+        for (const nestedOp of nestedFlattened) expandedFormOps.push(nestedOp);
+      } else {
+        expandedFormOps.push(innerOp);
+      }
+    }
+
+    const hasFormSiblingSmasks = op.smask && expandedFormOps.some((fop) => fop.smask);
+    for (const innerOp of expandedFormOps) {
+      const transformed = applyFormTransform(innerOp, composedBase);
+      if (innerOp.fillColorInherited) {
+        transformed.fillColor = formInheritedFill;
+        delete transformed.fillColorInherited;
+      }
+      if (innerOp.strokeColorInherited) {
+        transformed.strokeColor = formInheritedStroke;
+        delete transformed.strokeColorInherited;
+      }
+      const fillAlphaInherited = innerOp.fillAlphaInherited;
+      const strokeAlphaInherited = innerOp.strokeAlphaInherited;
+      delete transformed.fillAlphaInherited;
+      delete transformed.strokeAlphaInherited;
+      // Clone each clip because the rotation transform mutates ctm in place, which would corrupt references shared across sibling ops.
+      if (op.clips && op.clips.length > 0) {
+        if (!transformed.clips) transformed.clips = [];
+        for (const c of op.clips) transformed.clips.push({ ...c, ctm: c.ctm.slice() });
+      }
+      if (bboxClip) {
+        if (!transformed.clips) transformed.clips = [];
+        transformed.clips.push({ ...bboxClip, ctm: bboxClip.ctm.slice() });
+      }
+      // When the outer form is a transparency group its GS attributes (blendMode, alpha, smask) apply at group composite time, so they must not propagate to inner ops.
+      if (formGroupId === null) {
+        if (op.smask) {
+          if (hasFormSiblingSmasks) {
+            transformed.outerSmask = op.smask;
+          } else if (!transformed.smask) {
+            transformed.smask = op.smask;
+          }
+        }
+        if (singleOpAlphaGroup) {
+          const ownFill = fillAlphaInherited ? 1 : (transformed.fillAlpha != null ? transformed.fillAlpha : 1);
+          const ownStroke = strokeAlphaInherited ? 1 : (transformed.strokeAlpha != null ? transformed.strokeAlpha : 1);
+          if (op.fillAlpha != null) transformed.fillAlpha = ownFill * op.fillAlpha;
+          if (op.strokeAlpha != null) transformed.strokeAlpha = ownStroke * op.strokeAlpha;
+        } else {
+          if (fillAlphaInherited && formInheritedFillAlpha < 1) transformed.fillAlpha = formInheritedFillAlpha;
+          if (strokeAlphaInherited && formInheritedStrokeAlpha < 1) transformed.strokeAlpha = formInheritedStrokeAlpha;
+        }
+        if (op.blendMode && !transformed.blendMode) transformed.blendMode = op.blendMode;
+      }
+      if (op.overprint && !transformed.overprint) transformed.overprint = true;
+      if (innerGroupId !== null && transformed.groupId === undefined) {
+        transformed.groupId = innerGroupId;
+      }
+      flattened.push(transformed);
+    }
+  }
+
+  return flattened;
+}
+
+/**
+ * @typedef {{ fillAlpha?: number, strokeAlpha?: number, overprint?: boolean,
+ *   blendMode?: string, smask?: SmaskRef|null, lineWidth?: number,
+ *   lineCap?: number, lineJoin?: number, miterLimit?: number,
+ *   dashArray?: number[], dashPhase?: number }} ExtGStateEntry
+ */
+
+/**
+ * Parse the /BM blend mode from an ExtGState dict.
+ *
+ * @param {string} gsObjText - Raw text of the ExtGState dict
+ * @returns {string|null}
+ */
+function parseBlendMode(gsObjText) {
+  const arrMatch = /\/BM\s*\[([^\]]+)\]/.exec(gsObjText);
+  if (arrMatch) {
+    const names = [...arrMatch[1].matchAll(/\/(\w+)/g)].map((m) => m[1]);
+    for (const n of names) {
+      if (n === 'Normal' || pdfBlendToCanvas[n]) return n;
+    }
+    return names[0] || null;
+  }
+  const nameMatch = /\/BM\s*\/(\w+)/.exec(gsObjText);
+  return nameMatch ? nameMatch[1] : null;
+}
+
+/**
+ * Parse the /TR transfer function from a soft mask dict.
+ * /Identity, or an absent /TR, means no transform.
+ *
+ * @param {string} smaskDict
+ * @param {ObjectCache} objCache
+ * @returns {ReturnType<typeof parseFunction>|null}
+ */
+function parseSmaskTR(smaskDict, objCache) {
+  if (/\/TR\s*\/Identity\b/.test(smaskDict)) return null;
+  const refMatch = /\/TR\s+(\d+)\s+\d+\s+R/.exec(smaskDict);
+  if (refMatch) return parseFunction(Number(refMatch[1]), objCache);
+  const inlineIdx = smaskDict.indexOf('/TR');
+  if (inlineIdx !== -1) {
+    const after = smaskDict.substring(inlineIdx + 3).trimStart();
+    if (after.startsWith('<<')) {
+      const dictStart = smaskDict.indexOf('<<', inlineIdx + 3);
+      if (dictStart !== -1) return parseFunction(extractDict(smaskDict, dictStart), objCache);
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse a soft mask's /BC backdrop colour array, in the mask group's colour space.
+ * Null means absent, for which the spec default is black.
+ * @param {string} smaskDict
+ * @param {ObjectCache} objCache
+ * @returns {number[]|null}
+ */
+function parseSmaskBC(smaskDict, objCache) {
+  const arr = resolveNumArray(smaskDict, 'BC', objCache);
+  return arr && arr.length > 0 ? arr : null;
+}
+
+/**
+ * Parse extended graphics states from a page's Resources dictionary.
+ * @param {string} pageObjText Page object text.
+ * @param {ObjectCache} objCache Object cache for resolving references.
+ * @returns {Map<string, object>} Map of graphics state names to their parsed properties.
+ */
+function parseExtGStates(pageObjText, objCache) {
+  const states = new Map();
+
+  let resourcesText = null;
+  const resRefMatch = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(pageObjText);
+  if (resRefMatch) {
+    resourcesText = objCache.getObjectText(Number(resRefMatch[1])) || null;
+  } else {
+    const resIdx = pageObjText.indexOf('/Resources');
+    if (resIdx !== -1) {
+      const dictStart = pageObjText.indexOf('<<', resIdx);
+      if (dictStart !== -1) resourcesText = extractDict(pageObjText, dictStart);
+    }
+  }
+  if (!resourcesText) return states;
+
+  const gsStart = findTopLevelKey(resourcesText, '/ExtGState');
+  if (gsStart === -1) return states;
+
+  let gsDictText;
+  const afterGs = resourcesText.substring(gsStart + 10).trim();
+  if (afterGs.startsWith('<<')) {
+    gsDictText = extractDict(resourcesText, gsStart + 10 + resourcesText.substring(gsStart + 10).indexOf('<<'));
+  } else {
+    const gsRefMatch = /^(\d+)\s+\d+\s+R/.exec(afterGs);
+    if (gsRefMatch) {
+      const gsObj = objCache.getObjectText(Number(gsRefMatch[1]));
+      if (gsObj) gsDictText = gsObj;
+    }
+  }
+  if (!gsDictText) return states;
+
+  // Each GState entry given as an indirect reference: /GS1 N 0 R
+  const gsEntryRegex = /\/([^\s/<>[\]]+)\s+(\d+)\s+\d+\s+R/g;
+  for (const match of gsDictText.matchAll(gsEntryRegex)) {
+    const gsName = match[1];
+    const gsObjNum = Number(match[2]);
+    const gsObj = objCache.getObjectText(gsObjNum);
+    if (!gsObj) continue;
+
+    /** @type {ExtGStateEntry} */
+    const entry = {};
+    const fillA = resolveNumValue(gsObj, 'ca', objCache, Number.NaN);
+    const strokeA = resolveNumValue(gsObj, 'CA', objCache, Number.NaN);
+    if (!Number.isNaN(fillA)) entry.fillAlpha = fillA;
+    if (!Number.isNaN(strokeA)) entry.strokeAlpha = strokeA;
+
+    const opMatch = /\/op\s+(true|false)/.exec(gsObj);
+    const OPMatch = /\/OP\s+(true|false)/.exec(gsObj);
+    // /op takes precedence for non-stroking, and /OP applies to both when /op is absent.
+    if (opMatch) {
+      entry.overprint = opMatch[1] === 'true';
+    } else if (OPMatch) {
+      entry.overprint = OPMatch[1] === 'true';
+    }
+
+    if (/\/SMask\s*\/None/.test(gsObj)) {
+      entry.smask = null; // explicitly clear
+    } else {
+      const smaskRef = /\/SMask\s+(\d+)\s+\d+\s+R/.exec(gsObj);
+      let smaskDict;
+      if (smaskRef) {
+        smaskDict = objCache.getObjectText(Number(smaskRef[1]));
+      } else {
+        const smaskIdx = gsObj.indexOf('/SMask');
+        if (smaskIdx !== -1) {
+          const afterSmask = gsObj.substring(smaskIdx + 6).trim();
+          if (afterSmask.startsWith('<<')) {
+            smaskDict = extractDict(gsObj, smaskIdx + 6 + gsObj.substring(smaskIdx + 6).indexOf('<<'));
+          }
+        }
+      }
+      if (smaskDict) {
+        const gMatch = /\/G\s+(\d+)\s+\d+\s+R/.exec(smaskDict);
+        const sMatch = /\/S\s*\/(\w+)/.exec(smaskDict);
+        if (gMatch) {
+          entry.smask = {
+            formObjNum: Number(gMatch[1]),
+            type: sMatch ? sMatch[1] : 'Luminosity',
+            tr: parseSmaskTR(smaskDict, objCache),
+            bc: parseSmaskBC(smaskDict, objCache),
+          };
+        }
+      }
+    }
+
+    const bm = parseBlendMode(gsObj);
+    if (bm) entry.blendMode = bm;
+
+    const lw = resolveNumValue(gsObj, 'LW', objCache, Number.NaN);
+    if (!Number.isNaN(lw)) entry.lineWidth = lw;
+
+    const lc = resolveIntValue(gsObj, 'LC', objCache, -1);
+    if (lc !== -1) entry.lineCap = lc;
+    const lj = resolveIntValue(gsObj, 'LJ', objCache, -1);
+    if (lj !== -1) entry.lineJoin = lj;
+    const ml = resolveNumValue(gsObj, 'ML', objCache, Number.NaN);
+    if (!Number.isNaN(ml)) entry.miterLimit = ml;
+    const dMatch = /\/D\s*\[\s*\[([^\]]*)\]\s*([0-9.]+)\s*\]/.exec(gsObj);
+    if (dMatch) {
+      entry.dashArray = dMatch[1].trim() ? dMatch[1].trim().split(/\s+/).map(Number).filter((x) => Number.isFinite(x)) : [];
+      entry.dashPhase = parseFloat(dMatch[2]);
+    }
+
+    if (entry.fillAlpha !== undefined || entry.strokeAlpha !== undefined || entry.smask !== undefined
+      || entry.overprint !== undefined || entry.blendMode !== undefined || entry.lineWidth !== undefined
+      || entry.lineCap !== undefined || entry.lineJoin !== undefined || entry.miterLimit !== undefined
+      || entry.dashArray !== undefined) {
+      states.set(gsName, entry);
+    }
+  }
+
+  // Also check for inline GState dictionaries: /GS1 << /ca 0.5 /CA 0.5 >>
+  const inlineGsRegex = /\/([^\s/<>[\]]+)\s*<</g;
+  let inlineMatch;
+  while ((inlineMatch = inlineGsRegex.exec(gsDictText)) !== null) {
+    const gsName = inlineMatch[1];
+    if (states.has(gsName)) continue;
+    const dictText = extractDict(gsDictText, inlineMatch.index + inlineMatch[0].length - 2);
+    if (!dictText) continue;
+
+    /** @type {ExtGStateEntry} */
+    const entry = {};
+    const ca2 = resolveNumValue(dictText, 'ca', objCache, Number.NaN);
+    const CA2 = resolveNumValue(dictText, 'CA', objCache, Number.NaN);
+    if (!Number.isNaN(ca2)) entry.fillAlpha = ca2;
+    if (!Number.isNaN(CA2)) entry.strokeAlpha = CA2;
+
+    const opMatch2 = /\/op\s+(true|false)/.exec(dictText);
+    const OPMatch2 = /\/OP\s+(true|false)/.exec(dictText);
+    if (opMatch2) {
+      entry.overprint = opMatch2[1] === 'true';
+    } else if (OPMatch2) {
+      entry.overprint = OPMatch2[1] === 'true';
+    }
+
+    if (/\/SMask\s*\/None/.test(dictText)) {
+      entry.smask = null;
+    } else {
+      const smaskRef = /\/SMask\s+(\d+)\s+\d+\s+R/.exec(dictText);
+      let smaskDict;
+      if (smaskRef) {
+        smaskDict = objCache.getObjectText(Number(smaskRef[1]));
+      } else {
+        const smaskIdx = dictText.indexOf('/SMask');
+        if (smaskIdx !== -1) {
+          const afterSmask = dictText.substring(smaskIdx + 6).trim();
+          if (afterSmask.startsWith('<<')) {
+            smaskDict = extractDict(dictText, smaskIdx + 6 + dictText.substring(smaskIdx + 6).indexOf('<<'));
+          }
+        }
+      }
+      if (smaskDict) {
+        const gMatch = /\/G\s+(\d+)\s+\d+\s+R/.exec(smaskDict);
+        const sMatch = /\/S\s*\/(\w+)/.exec(smaskDict);
+        if (gMatch) {
+          entry.smask = {
+            formObjNum: Number(gMatch[1]),
+            type: sMatch ? sMatch[1] : 'Luminosity',
+            tr: parseSmaskTR(smaskDict, objCache),
+            bc: parseSmaskBC(smaskDict, objCache),
+          };
+        }
+      }
+    }
+
+    const bm2 = parseBlendMode(dictText);
+    if (bm2) entry.blendMode = bm2;
+
+    const lw2 = resolveNumValue(dictText, 'LW', objCache, Number.NaN);
+    if (!Number.isNaN(lw2)) entry.lineWidth = lw2;
+
+    const lc2 = resolveIntValue(dictText, 'LC', objCache, -1);
+    if (lc2 !== -1) entry.lineCap = lc2;
+    const lj2 = resolveIntValue(dictText, 'LJ', objCache, -1);
+    if (lj2 !== -1) entry.lineJoin = lj2;
+    const ml2 = resolveNumValue(dictText, 'ML', objCache, Number.NaN);
+    if (!Number.isNaN(ml2)) entry.miterLimit = ml2;
+    const dMatch2 = /\/D\s*\[\s*\[([^\]]*)\]\s*([0-9.]+)\s*\]/.exec(dictText);
+    if (dMatch2) {
+      entry.dashArray = dMatch2[1].trim() ? dMatch2[1].trim().split(/\s+/).map(Number).filter((x) => Number.isFinite(x)) : [];
+      entry.dashPhase = parseFloat(dMatch2[2]);
+    }
+
+    if (entry.fillAlpha !== undefined || entry.strokeAlpha !== undefined || entry.smask !== undefined
+       || entry.overprint !== undefined || entry.blendMode !== undefined || entry.lineWidth !== undefined
+       || entry.lineCap !== undefined || entry.lineJoin !== undefined || entry.miterLimit !== undefined
+       || entry.dashArray !== undefined) {
+      states.set(gsName, entry);
+    }
+  }
+
+  return states;
+}
+
+/**
+ * Find a top-level key inside a PDF dict string.
+ * Returns the index where `key` occurs at depth 1, directly inside the outer `<<`, or -1.
+ *
+ * @param {string} dictText
+ * @param {string} key - includes the leading slash, e.g. "/ColorSpace"
+ */
+function findTopLevelKey(dictText, key) {
+  let depth = 0;
+  let i = 0;
+  const n = dictText.length;
+  while (i < n) {
+    const c = dictText.charCodeAt(i);
+    if (c === 0x3C && dictText.charCodeAt(i + 1) === 0x3C) { // '<<'
+      depth++;
+      i += 2;
+    } else if (c === 0x3E && dictText.charCodeAt(i + 1) === 0x3E) { // '>>'
+      depth--;
+      i += 2;
+    } else if (depth === 1 && c === 0x2F && dictText.startsWith(key, i)) {
+      const after = dictText.charCodeAt(i + key.length);
+      // Valid key terminators: whitespace, '/', '[', '(', '<', digit
+      if (after === 0x20 || after === 0x09 || after === 0x0A || after === 0x0D
+        || after === 0x2F || after === 0x5B || after === 0x28 || after === 0x3C
+        || (after >= 0x30 && after <= 0x39)) {
+        return i;
+      }
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Parse the /ColorSpace entries of a page's Resources dict.
+ *
+ * @param {string} pageObjText - Raw text of the Page object
+ * @param {ObjectCache} objCache - PDF object cache
+ */
+function parsePageColorSpaces(pageObjText, objCache) {
+  /** @type {Map<string, {type: string, tintSamples: Uint8Array|null, nComponents: number, deviceNGrid?: object|null, indexedInfo?: object|null, labWhitePoint?: number[]|null}>} */
+  const colorSpaces = new Map();
+
+  // Narrow to the Resources dict first, because nested dicts (e.g. /Shading << /Sh10 << /ColorSpace /DeviceCMYK >>) carry their own /ColorSpace keys.
+  let resourcesText = null;
+  const resRefMatch = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(pageObjText);
+  if (resRefMatch) {
+    resourcesText = objCache.getObjectText(Number(resRefMatch[1])) || null;
+  } else {
+    const resIdx = pageObjText.indexOf('/Resources');
+    if (resIdx !== -1) {
+      const dictStart = pageObjText.indexOf('<<', resIdx);
+      if (dictStart !== -1) resourcesText = extractDict(pageObjText, dictStart);
+    }
+  }
+  if (!resourcesText) return colorSpaces;
+
+  const csStart = findTopLevelKey(resourcesText, '/ColorSpace');
+  if (csStart === -1) return colorSpaces;
+
+  let csDictText;
+  const afterCs = resourcesText.substring(csStart + 11).trim();
+  if (afterCs.startsWith('<<')) {
+    csDictText = extractDict(resourcesText, csStart + 11 + resourcesText.substring(csStart + 11).indexOf('<<'));
+  } else {
+    const csRefMatch = /^(\d+)\s+\d+\s+R/.exec(afterCs);
+    if (csRefMatch) {
+      const csObj = objCache.getObjectText(Number(csRefMatch[1]));
+      if (csObj) csDictText = csObj;
+    }
+  }
+  if (!csDictText) return colorSpaces;
+
+  // Each color space entry given as an indirect reference: /Cs6 N 0 R
+  const csEntryRegex = /\/([^\s/<>[\]]+)\s+(\d+)\s+\d+\s+R/g;
+  for (const match of csDictText.matchAll(csEntryRegex)) {
+    const csName = match[1];
+    const csObjText = objCache.getObjectText(Number(match[2]));
+    if (!csObjText) continue;
+    const typeMatch = /\/(\w+)/.exec(csObjText);
+    if (typeMatch) {
+      let tintSamples = null;
+      let nComponents = 3;
+      let csType = typeMatch[1];
+      let deviceNGrid = null;
+      // Single-colorant DeviceN (e.g. [/DeviceN [/Black] /DeviceCMYK ...]) is functionally equivalent to Separation, and needs the same ink inversion in scn handling.
+      if (csType === 'DeviceN') {
+        const namesMatch = /\/DeviceN\s*\[\s*((?:\/[^/[\]<>(){}\s]+\s*)+)\]/.exec(csObjText);
+        if (namesMatch) {
+          const colorants = namesMatch[1].match(/\/[^/[\]<>(){}\s]+/g) || [];
+          if (colorants.length === 1) {
+            csType = 'Separation';
+          } else if (colorants.length >= 2) {
+            const tintInfo = parseSeparationTint(csObjText, objCache);
+            if (tintInfo.tintSamples) {
+              // parseSeparationTint returns the RGB samples as a flat array, so the grid dimensions have to be recovered from /Size.
+              const sizeMatch = /\/Size\s*\[\s*([\d\s]+)\]/.exec(csObjText);
+              const allRefs = [...csObjText.matchAll(/(\d+)\s+\d+\s+R/g)];
+              let funcObjText = null;
+              if (allRefs.length > 0) {
+                funcObjText = objCache.getObjectText(Number(allRefs[allRefs.length - 1][1]));
+              }
+              const sizeText = sizeMatch ? sizeMatch[1] : (funcObjText?.match(/\/Size\s*\[\s*([\d\s]+)\]/)?.[1] || '');
+              const gridSizes = sizeText.trim().split(/\s+/).map(Number).filter((n) => n > 0);
+              if (gridSizes.length === colorants.length) {
+                deviceNGrid = {
+                  nInputs: colorants.length,
+                  sizes: gridSizes,
+                  rgbSamples: tintInfo.tintSamples,
+                  nComponents: tintInfo.nComponents,
+                };
+              }
+            }
+            // FunctionType 2/4 tint transforms have no /Size, so no grid is built.
+            // Keep the parsed tint CS for direct per-call evaluation in scn/SCN.
+            if (!deviceNGrid) {
+              const parsedTint = parseTintColorSpace(csObjText, objCache);
+              if (parsedTint.tintFn && parsedTint.nInputs === colorants.length) {
+                deviceNGrid = {
+                  nInputs: colorants.length,
+                  sizes: null,
+                  rgbSamples: null,
+                  nComponents: 3,
+                  parsedTint,
+                };
+              }
+            }
+          }
+        }
+      }
+      if (csType === 'Separation') {
+        const tintInfo = parseSeparationTint(csObjText, objCache);
+        tintSamples = tintInfo.tintSamples;
+        nComponents = tintInfo.nComponents;
+      }
+      let indexedInfo = null;
+      if (csType === 'Indexed') {
+        indexedInfo = parseIndexedColorSpace(csObjText, objCache, Number(match[2]));
+      }
+      let labWhitePoint = null;
+      if (csType === 'Lab') {
+        const wpStr = resolveArrayValue(csObjText, 'WhitePoint', objCache);
+        labWhitePoint = wpStr ? wpStr.split(/\s+/).map(Number) : [0.9642, 1.0, 0.8249];
+      }
+      colorSpaces.set(csName, {
+        type: csType, tintSamples, nComponents, deviceNGrid, indexedInfo, labWhitePoint,
+      });
+    }
+  }
+
+  // Also check for inline array definitions: /Cs6 [/Separation ...]
+  const inlineArrayRegex = /\/([^\s/<>[\]]+)\s*\[\s*\/(\w+)/g;
+  for (const match of csDictText.matchAll(inlineArrayRegex)) {
+    const csName = match[1];
+    if (!colorSpaces.has(csName)) {
+      let tintSamples = null;
+      let nComponents = 3;
+      let csType = match[2];
+      const matchPos = csDictText.indexOf(match[0]);
+      const arrStart = csDictText.indexOf('[', matchPos);
+      let arrEnd = -1;
+      if (arrStart !== -1) {
+        let depth = 0;
+        for (let i = arrStart; i < csDictText.length; i++) {
+          if (csDictText[i] === '[') depth++;
+          else if (csDictText[i] === ']') {
+            depth--;
+            if (depth === 0) { arrEnd = i + 1; break; }
+          }
+        }
+      }
+      const arrText = arrEnd > 0 ? csDictText.substring(arrStart, arrEnd) : '';
+      if (csType === 'DeviceN' && arrText) {
+        const namesMatch = /\/DeviceN\s*\[\s*((?:\/\w+\s*)+)\]/.exec(arrText);
+        if (namesMatch) {
+          const colorants = namesMatch[1].trim().split(/(?=\/)/).filter((s) => s.startsWith('/'));
+          if (colorants.length === 1) csType = 'Separation';
+        }
+      }
+      if (csType === 'Separation' && arrText) {
+        const tintInfo = parseSeparationTint(arrText, objCache);
+        tintSamples = tintInfo.tintSamples;
+        nComponents = tintInfo.nComponents;
+      }
+      let indexedInfo = null;
+      if (csType === 'Indexed' && arrText) {
+        indexedInfo = parseIndexedColorSpace(arrText, objCache);
+      }
+      let labWhitePoint = null;
+      if (csType === 'Lab' && arrText) {
+        const wpStr = resolveArrayValue(arrText, 'WhitePoint', objCache);
+        labWhitePoint = wpStr ? wpStr.split(/\s+/).map(Number) : [0.9642, 1.0, 0.8249];
+      }
+      colorSpaces.set(csName, {
+        type: csType, tintSamples, nComponents, indexedInfo, labWhitePoint,
+      });
+    }
+  }
+
+  return colorSpaces;
+}
+
+/**
+ * @typedef {{
+ *   deviceNTintCS: import('./pdfColorFunctions.js').ParsedTintCS|null,
+ *   sepTintSamples: Uint8Array|null,
+ *   isCMYK: boolean,
+ *   isGray: boolean,
+ * }} ShadingColorInfo
+ */
+
+/**
+ * Convert a parsed function's output components to an `rgb(r,g,b)` string for a gradient stop.
+ *
+ * @param {number[]} values
+ * @param {ShadingColorInfo} colorInfo
+ * @returns {string}
+ */
+function shadingValuesToColor(values, colorInfo) {
+  let r; let g; let b;
+  if (colorInfo.deviceNTintCS) {
+    const rgb = tintComponentsToRGB(colorInfo.deviceNTintCS, values);
+    if (rgb) { [r, g, b] = rgb; } else { r = 128; g = 128; b = 128; }
+  } else if (colorInfo.sepTintSamples) {
+    const sepMax = colorInfo.sepTintSamples.length / 3 - 1;
+    const idx = Math.round(Math.max(0, Math.min(1, values[0])) * sepMax) * 3;
+    r = colorInfo.sepTintSamples[idx]; g = colorInfo.sepTintSamples[idx + 1]; b = colorInfo.sepTintSamples[idx + 2];
+  } else if (colorInfo.isCMYK && values.length >= 4) {
+    [r, g, b] = cmykToRgb(
+      Math.max(0, Math.min(1, values[0])),
+      Math.max(0, Math.min(1, values[1])),
+      Math.max(0, Math.min(1, values[2])),
+      Math.max(0, Math.min(1, values[3])),
+    );
+  } else {
+    r = Math.round(Math.max(0, Math.min(1, values[0] ?? 0)) * 255);
+    g = colorInfo.isGray ? r : Math.round(Math.max(0, Math.min(1, values[1] ?? 0)) * 255);
+    b = colorInfo.isGray ? r : Math.round(Math.max(0, Math.min(1, values[2] ?? 0)) * 255);
+  }
+  return `rgb(${r},${g},${b})`;
+}
+
+/**
+ * Sample a parsed PDF function into axial/radial gradient color stops.
+ * A single function's outputs are the color components.
+ * An array of functions is the shading's `/Function [F0 F1 ...]` form, where each supplies one component from its first output.
+ *
+ * @param {import('./pdfColorFunctions.js').ParsedFunction
+ *   | Array<import('./pdfColorFunctions.js').ParsedFunction|null>} fn
+ * @param {ShadingColorInfo} colorInfo
+ * @returns {Array<{offset: number, color: string}>}
+ */
+function functionToShadingStops(fn, colorInfo) {
+  const stops = [];
+  if (Array.isArray(fn)) {
+    const nStops = fn.some((f) => f && f.type === 0) ? 64 : 16;
+    for (let i = 0; i < nStops; i++) {
+      const t = i / (nStops - 1);
+      const values = fn.map((f) => (f ? (evaluateFunction(f, [t])?.[0] ?? 0) : 0));
+      stops.push({ offset: t, color: shadingValuesToColor(values, colorInfo) });
+    }
+    return stops;
+  }
+  let nStops;
+  if (fn.type === 0) nStops = Math.min(fn.size[0], 64);
+  else if (fn.type === 2) nStops = fn.N === 1 ? 2 : 16;
+  else nStops = (fn.type === 3 && fn.functions.some((f) => f && f.type === 0)) ? 64 : 16;
+  for (let i = 0; i < nStops; i++) {
+    const t = i / (nStops - 1);
+    const values = evaluateFunction(fn, [t]) || [];
+    stops.push({ offset: t, color: shadingValuesToColor(values, colorInfo) });
+  }
+  return stops;
+}
+
+/**
+ * Approximate a ShadingType 1 (function-based) shading with an axial gradient.
+ * Returns null when the shading's function cannot be parsed.
+ *
+ * @param {string} shadingDict - the Shading dictionary text
+ * @param {ObjectCache} objCache
+ * @param {ShadingColorInfo} colorInfo - how to turn the function's outputs into CSS colors
+ * @returns {{ type: 2, coords: number[], stops: Array<{offset:number,color:string}>, extend: boolean[], bbox?: number[], multiply?: boolean, matrix?: number[] } | null}
+ */
+function type1ShadingToAxial(shadingDict, objCache, colorInfo) {
+  const domStr = resolveArrayValue(shadingDict, 'Domain', objCache);
+  const dom = domStr ? domStr.split(/\s+/).map(Number) : [0, 1, 0, 1];
+  const [x0, x1, y0, y1] = dom;
+
+  // The shading's own /Matrix (default identity) maps domain coords into the shading's target space.
+  // The pattern /Matrix (applied later by the renderer) then maps that to user space.
+  const mStr = resolveArrayValue(shadingDict, 'Matrix', objCache);
+  const m = mStr ? mStr.split(/\s+/).map(Number) : [1, 0, 0, 1, 0, 0];
+  const mapPt = (x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+
+  let funcDictText;
+  let funcObjNum;
+  const funcRefMatch = /\/Function\s+(\d+)\s+\d+\s+R/.exec(shadingDict);
+  if (funcRefMatch) {
+    funcObjNum = Number(funcRefMatch[1]);
+    funcDictText = objCache.getObjectText(funcObjNum);
+  } else {
+    const fStart = shadingDict.indexOf('/Function');
+    if (fStart !== -1) {
+      const fOpen = shadingDict.indexOf('<<', fStart + 9);
+      if (fOpen !== -1) funcDictText = extractDict(shadingDict, fOpen);
+    }
+  }
+  const fn = funcDictText ? parseFunction(funcObjNum != null ? funcObjNum : funcDictText, objCache) : null;
+  if (!fn) return null;
+
+  const xm = (x0 + x1) / 2;
+  const ym = (y0 + y1) / 2;
+  const colorVar = (a, b) => {
+    if (!a || !b) return 0;
+    let mx = 0;
+    for (let i = 0; i < Math.max(a.length, b.length); i++) mx = Math.max(mx, Math.abs((a[i] ?? 0) - (b[i] ?? 0)));
+    return mx;
+  };
+  const alongX = colorVar(evaluateFunction(fn, [x0, ym]), evaluateFunction(fn, [x1, ym]))
+    >= colorVar(evaluateFunction(fn, [xm, y0]), evaluateFunction(fn, [xm, y1]));
+
+  const nStops = 16;
+  const stops = [];
+  for (let i = 0; i < nStops; i++) {
+    const t = i / (nStops - 1);
+    const px = alongX ? x0 + (x1 - x0) * t : xm;
+    const py = alongX ? ym : y0 + (y1 - y0) * t;
+    stops.push({ offset: t, color: shadingValuesToColor(evaluateFunction(fn, [px, py]) || [], colorInfo) });
+  }
+  const [cx0, cy0] = mapPt(alongX ? x0 : xm, alongX ? ym : y0);
+  const [cx1, cy1] = mapPt(alongX ? x1 : xm, alongX ? ym : y1);
+  return {
+    type: 2, coords: [cx0, cy0, cx1, cy1], stops, extend: [true, true],
+  };
+}
+
+/**
+ * Compute a Coons patch interior control point from 12 boundary control points (PDF spec section 8.7.4.5.7).
+ *
+ * @param {number[]} corner
+ * @param {number[]} adj1
+ * @param {number[]} adj2
+ * @param {number[]} far1
+ * @param {number[]} far2
+ * @param {number[]} diag1
+ * @param {number[]} diag2
+ * @param {number[]} opp
+ */
+function coonsInteriorPt(corner, adj1, adj2, far1, far2, diag1, diag2, opp) {
+  return [
+    (-4 * corner[0] + 6 * (adj1[0] + adj2[0]) - 2 * (far1[0] + far2[0]) + 3 * (diag1[0] + diag2[0]) - opp[0]) / 9,
+    (-4 * corner[1] + 6 * (adj1[1] + adj2[1]) - 2 * (far1[1] + far2[1]) + 3 * (diag1[1] + diag2[1]) - opp[1]) / 9,
+  ];
+}
+
+/**
+ * Parse a Type 6 (Coons) or Type 7 (tensor-product) mesh patch shading.
+ * Returns an array of patches, each with a 4x4 grid of control points and 4 corner colors in RGB.
+ *
+ * @param {string} shObjText - Raw text of the Shading object
+ * @param {number} shObjNum - Object number of the Shading stream
+ * @param {number} shadingType - 6 (Coons) or 7 (tensor-product)
+ * @param {ObjectCache} objCache - PDF object cache
+ */
+function parseMeshShading(shObjText, shObjNum, shadingType, objCache) {
+  const bpc = resolveIntValue(shObjText, 'BitsPerComponent', objCache);
+  const bpco = resolveIntValue(shObjText, 'BitsPerCoordinate', objCache);
+  const bpf = resolveIntValue(shObjText, 'BitsPerFlag', objCache);
+  const decodeStr = resolveArrayValue(shObjText, 'Decode', objCache);
+  if (!bpc || !bpco || !bpf || !decodeStr) return null;
+
+  const decode = decodeStr.split(/\s+/).map(Number);
+  // Decode is [xmin xmax ymin ymax c1min c1max ... cnmin cnmax].
+  const nComps = (decode.length - 4) / 2;
+
+  const streamBytes = objCache.getStreamBytes(shObjNum);
+  if (!streamBytes || streamBytes.length === 0) return null;
+
+  const colorEval = buildMeshColorEvaluator(shObjText, objCache);
+
+  let bitPos = 0;
+  const totalBits = streamBytes.length * 8;
+
+  function readBits(n) {
+    let val = 0;
+    let rem = n;
+    while (rem > 0) {
+      const byteIdx = bitPos >>> 3;
+      const bitOff = bitPos & 7;
+      const avail = 8 - bitOff;
+      const take = Math.min(avail, rem);
+      const shift = avail - take;
+      val = val * (1 << take) + ((streamBytes[byteIdx] >>> shift) & ((1 << take) - 1));
+      bitPos += take;
+      rem -= take;
+    }
+    return val;
+  }
+
+  const coordMax = 2 ** bpco - 1;
+  const compMax = 2 ** bpc - 1;
+
+  function readCoord() {
+    const rx = readBits(bpco);
+    const ry = readBits(bpco);
+    return [
+      decode[0] + rx * (decode[1] - decode[0]) / coordMax,
+      decode[2] + ry * (decode[3] - decode[2]) / coordMax,
+    ];
+  }
+
+  function readColor() {
+    const comps = [];
+    for (let i = 0; i < nComps; i++) {
+      comps.push(decode[4 + i * 2] + readBits(bpc) * (decode[4 + i * 2 + 1] - decode[4 + i * 2]) / compMax);
+    }
+    return colorEval(comps);
+  }
+
+  /**
+   * Map 12 stream-order points to the non-inherited positions in the 4x4 grid.
+   * Stream order: p13, p23, p33, p32, p31, p30, p20, p10, p11, p12, p22, p21
+   */
+  function mapStreamPoints12(p) {
+    return [
+      [p[7], p[8], p[9], p[0]], // i=1: p10, p11, p12, p13
+      [p[6], p[11], p[10], p[1]], // i=2: p20, p21, p22, p23
+      [p[5], p[4], p[3], p[2]], // i=3: p30, p31, p32, p33
+    ];
+  }
+
+  const bitsNewT7 = bpf + 32 * bpco + 4 * nComps * bpc;
+  const bitsContT7 = bpf + 24 * bpco + 2 * nComps * bpc;
+  const bitsNewT6 = bpf + 24 * bpco + 4 * nComps * bpc;
+  const bitsContT6 = bpf + 16 * bpco + 2 * nComps * bpc;
+
+  const patches = [];
+  let prev = null;
+
+  while (true) {
+    const minBits = prev
+      ? (shadingType === 7 ? bitsContT7 : bitsContT6)
+      : (shadingType === 7 ? bitsNewT7 : bitsNewT6);
+    if (bitPos + minBits > totalBits) break;
+
+    const flag = readBits(bpf) & 3;
+    if (!prev && flag !== 0) break;
+
+    let points; // points[i][j] = [x,y]
+    let colors; // [c00, c03, c33, c30] as RGB [r,g,b]
+
+    if (shadingType === 7) {
+      if (flag === 0) {
+        const p = [];
+        for (let k = 0; k < 16; k++) p.push(readCoord());
+        const c = [readColor(), readColor(), readColor(), readColor()];
+        // Stream: p00,p01,p02,p03, p13,p23,p33, p32,p31,p30, p20,p10, p11,p12,p22,p21
+        const rows = mapStreamPoints12(p.slice(4));
+        points = [[p[0], p[1], p[2], p[3]], rows[0], rows[1], rows[2]];
+        colors = [c[0], c[1], c[2], c[3]]; // c00, c03, c33, c30
+      } else {
+        // Inherit left column (i=0) from an edge of previous patch
+        let ip;
+        let ic00;
+        let ic03;
+        if (flag === 1) {
+          ip = [prev.points[0][3], prev.points[1][3], prev.points[2][3], prev.points[3][3]];
+          ic00 = prev.colors[1]; ic03 = prev.colors[2];
+        } else if (flag === 2) {
+          ip = [prev.points[3][3], prev.points[3][2], prev.points[3][1], prev.points[3][0]];
+          ic00 = prev.colors[2]; ic03 = prev.colors[3];
+        } else {
+          ip = [prev.points[3][0], prev.points[2][0], prev.points[1][0], prev.points[0][0]];
+          ic00 = prev.colors[3]; ic03 = prev.colors[0];
+        }
+        const p = [];
+        for (let k = 0; k < 12; k++) p.push(readCoord());
+        const nc33 = readColor();
+        const nc30 = readColor();
+        const rows = mapStreamPoints12(p);
+        points = [[ip[0], ip[1], ip[2], ip[3]], rows[0], rows[1], rows[2]];
+        colors = [ic00, ic03, nc33, nc30];
+      }
+    } else {
+      let bp00;
+      let bp10;
+      let bp20;
+      let bp30;
+      let bp31;
+      let bp32;
+      let bp33;
+      let bp23;
+      let bp13;
+      let bp03;
+      let bp02;
+      let bp01;
+      let cc00;
+      let cc03;
+      let cc33;
+      let cc30;
+
+      if (flag === 0) {
+        const p = [];
+        for (let k = 0; k < 12; k++) p.push(readCoord());
+        const c = [readColor(), readColor(), readColor(), readColor()];
+        // Stream order traces boundary: p00,p10,p20,p30, p31,p32,p33, p23,p13,p03, p02,p01
+        bp00 = p[0]; bp10 = p[1]; bp20 = p[2]; bp30 = p[3];
+        bp31 = p[4]; bp32 = p[5]; bp33 = p[6];
+        bp23 = p[7]; bp13 = p[8]; bp03 = p[9];
+        bp02 = p[10]; bp01 = p[11];
+        cc00 = c[0]; cc30 = c[1]; cc33 = c[2]; cc03 = c[3];
+      } else {
+        // Inherit 4 boundary points (bottom edge of new = one edge of previous) + 2 colors
+        if (flag === 1) {
+          bp00 = prev.points[3][0]; bp10 = prev.points[3][1];
+          bp20 = prev.points[3][2]; bp30 = prev.points[3][3];
+          cc00 = prev.colors[3]; cc30 = prev.colors[2];
+        } else if (flag === 2) {
+          bp00 = prev.points[3][3]; bp10 = prev.points[2][3];
+          bp20 = prev.points[1][3]; bp30 = prev.points[0][3];
+          cc00 = prev.colors[2]; cc30 = prev.colors[1];
+        } else {
+          bp00 = prev.points[0][3]; bp10 = prev.points[0][2];
+          bp20 = prev.points[0][1]; bp30 = prev.points[0][0];
+          cc00 = prev.colors[1]; cc30 = prev.colors[0];
+        }
+        const p = [];
+        for (let k = 0; k < 8; k++) p.push(readCoord());
+        cc33 = readColor(); cc03 = readColor();
+        bp31 = p[0]; bp32 = p[1]; bp33 = p[2];
+        bp23 = p[3]; bp13 = p[4]; bp03 = p[5];
+        bp02 = p[6]; bp01 = p[7];
+      }
+
+      const bp11 = coonsInteriorPt(bp00, bp01, bp10, bp03, bp30, bp13, bp31, bp33);
+      const bp12 = coonsInteriorPt(bp03, bp02, bp13, bp00, bp33, bp10, bp32, bp30);
+      const bp21 = coonsInteriorPt(bp30, bp31, bp20, bp33, bp00, bp23, bp01, bp03);
+      const bp22 = coonsInteriorPt(bp33, bp32, bp23, bp30, bp03, bp20, bp02, bp00);
+
+      points = [
+        [bp00, bp01, bp02, bp03],
+        [bp10, bp11, bp12, bp13],
+        [bp20, bp21, bp22, bp23],
+        [bp30, bp31, bp32, bp33],
+      ];
+      colors = [cc00, cc03, cc33, cc30];
+    }
+
+    const patch = { points, colors };
+    patches.push(patch);
+    prev = patch;
+  }
+
+  return patches.length > 0 ? { type: 'mesh', patches } : null;
+}
+
+/**
+ * Render mesh patch shading (Types 6/7) onto a canvas context.
+ *
+ * @param {CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D} ctx
+ * @param {Array<{points: number[][][], colors: number[][]}>} patches
+ */
+function renderMeshPatches(ctx, patches) {
+  const xform = ctx.getTransform();
+  const ta = xform.a;
+  const tb = xform.b;
+  const tc = xform.c;
+  const td = xform.d;
+  const te = xform.e;
+  const tf = xform.f;
+
+  let minPx = Infinity;
+  let minPy = Infinity;
+  let maxPx = -Infinity;
+  let maxPy = -Infinity;
+  for (const patch of patches) {
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) {
+        const sx = patch.points[i][j][0];
+        const sy = patch.points[i][j][1];
+        const px = ta * sx + tc * sy + te;
+        const py = tb * sx + td * sy + tf;
+        if (px < minPx) minPx = px;
+        if (py < minPy) minPy = py;
+        if (px > maxPx) maxPx = px;
+        if (py > maxPy) maxPy = py;
+      }
+    }
+  }
+
+  const ox = Math.floor(minPx);
+  const oy = Math.floor(minPy);
+  const w = Math.ceil(maxPx) - ox + 1;
+  const h = Math.ceil(maxPy) - oy + 1;
+  if (w <= 0 || h <= 0 || w > 8000 || h > 8000) return;
+
+  // Rasterizing into one pixel buffer avoids the millions of Canvas 2D path calls a per-patch fill would cost.
+  const tmpCanvas = ca.makeCanvas(w, h);
+  const tmpCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tmpCanvas.getContext('2d', { willReadFrequently: true }));
+  const imgData = tmpCtx.createImageData(w, h);
+  const pix = imgData.data;
+
+  // With thousands of patches only a few pixels wide, a fixed 32x32 grid per patch is far finer than the pixels show, so scaling subdivisions to patch size is much cheaper and looks the same.
+  // It is gated to small-scale (thumbnail) output because at full resolution the saving is small.
+  const MAX_N = 32;
+  const outScale = Math.sqrt(Math.abs(ta * td - tb * tc)) || 1;
+  const adaptTess = outScale < 1.5;
+  const basisCache = new Map();
+  const basisFor = (n) => {
+    let b = basisCache.get(n);
+    if (b) return b;
+    b = new Array(n + 1);
+    for (let k = 0; k <= n; k++) {
+      const t = k / n;
+      const t1 = 1 - t;
+      b[k] = [t1 * t1 * t1, 3 * t * t1 * t1, 3 * t * t * t1, t * t * t];
+    }
+    basisCache.set(n, b);
+    return b;
+  };
+
+  for (const patch of patches) {
+    const { points: pts, colors: [c00, c03, c33, c30] } = patch;
+
+    let N = MAX_N;
+    if (adaptTess) {
+      let pminx = Infinity;
+      let pminy = Infinity;
+      let pmaxx = -Infinity;
+      let pmaxy = -Infinity;
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) {
+          const sx = pts[i][j][0];
+          const sy = pts[i][j][1];
+          const px = ta * sx + tc * sy + te;
+          const py = tb * sx + td * sy + tf;
+          if (px < pminx) pminx = px;
+          if (py < pminy) pminy = py;
+          if (px > pmaxx) pmaxx = px;
+          if (py > pmaxy) pmaxy = py;
+        }
+      }
+      N = Math.min(MAX_N, Math.max(2, Math.ceil(2 * Math.max(pmaxx - pminx, pmaxy - pminy))));
+    }
+    const basis = basisFor(N);
+
+    const gx = new Float64Array((N + 1) * (N + 1));
+    const gy = new Float64Array((N + 1) * (N + 1));
+    for (let jv = 0; jv <= N; jv++) {
+      const bv = basis[jv];
+      for (let iu = 0; iu <= N; iu++) {
+        const bu = basis[iu];
+        let sx = 0;
+        let sy = 0;
+        for (let i = 0; i < 4; i++) {
+          const wi = bu[i];
+          for (let j = 0; j < 4; j++) {
+            const ww = wi * bv[j];
+            sx += pts[i][j][0] * ww;
+            sy += pts[i][j][1] * ww;
+          }
+        }
+        const idx = jv * (N + 1) + iu;
+        gx[idx] = ta * sx + tc * sy + te - ox;
+        gy[idx] = tb * sx + td * sy + tf - oy;
+      }
+    }
+
+    for (let jv = 0; jv < N; jv++) {
+      for (let iu = 0; iu < N; iu++) {
+        const i00 = jv * (N + 1) + iu;
+        const i10 = i00 + 1;
+        const i01 = i00 + (N + 1);
+        const i11 = i01 + 1;
+
+        const x0 = Math.max(0, Math.floor(Math.min(gx[i00], gx[i10], gx[i01], gx[i11])));
+        const y0 = Math.max(0, Math.floor(Math.min(gy[i00], gy[i10], gy[i01], gy[i11])));
+        const x1 = Math.min(w - 1, Math.ceil(Math.max(gx[i00], gx[i10], gx[i01], gx[i11])));
+        const y1 = Math.min(h - 1, Math.ceil(Math.max(gy[i00], gy[i10], gy[i01], gy[i11])));
+
+        const u = (iu + 0.5) / N;
+        const v = (jv + 0.5) / N;
+        const u1 = 1 - u;
+        const v1 = 1 - v;
+        const cr = u1 * v1 * c00[0] + u * v1 * c30[0] + u1 * v * c03[0] + u * v * c33[0];
+        const cg = u1 * v1 * c00[1] + u * v1 * c30[1] + u1 * v * c03[1] + u * v * c33[1];
+        const cb = u1 * v1 * c00[2] + u * v1 * c30[2] + u1 * v * c03[2] + u * v * c33[2];
+        const rr = Math.round(cr);
+        const gg = Math.round(cg);
+        const bb = Math.round(cb);
+
+        for (let py = y0; py <= y1; py++) {
+          let off = (py * w + x0) * 4;
+          for (let px = x0; px <= x1; px++) {
+            pix[off] = rr;
+            pix[off + 1] = gg;
+            pix[off + 2] = bb;
+            pix[off + 3] = 255;
+            off += 4;
+          }
+        }
+      }
+    }
+  }
+
+  // putImageData would ignore the active clip, so composite through drawImage instead.
+  tmpCtx.putImageData(imgData, 0, 0);
+  ctx.save();
+  ctx.resetTransform();
+  ctx.drawImage(tmpCanvas, ox, oy);
+  ctx.restore();
+  ca.closeDrawable(tmpCanvas);
+}
+
+/**
+ * Render Gouraud-shaded triangles (ShadingType 4) into the current canvas context.
+ * @param {OffscreenCanvasRenderingContext2D} ctx
+ * @param {Array<{vertices: number[][], colors: number[][]}>} triangles
+ * @param {number[]|null} [clipBounds] - Optional [xMin, yMin, xMax, yMax] in device
+ *   pixels to clamp the rendering area. Used by batched Gouraud rendering.
+ * @param {number[]} [canvasDims] - [width, height] of the canvas, used as fallback when clipBounds is null
+ */
+function renderGouraudTriangles(ctx, triangles, clipBounds, canvasDims) {
+  const xform = ctx.getTransform();
+  const ta = xform.a;
+  const tb = xform.b;
+  const tc = xform.c;
+  const td = xform.d;
+  const te = xform.e;
+  const tf = xform.f;
+
+  let minPx = Infinity;
+  let minPy = Infinity;
+  let maxPx = -Infinity;
+  let maxPy = -Infinity;
+  for (const tri of triangles) {
+    for (const v of tri.vertices) {
+      const px = ta * v[0] + tc * v[1] + te;
+      const py = tb * v[0] + td * v[1] + tf;
+      if (px < minPx) minPx = px;
+      if (py < minPy) minPy = py;
+      if (px > maxPx) maxPx = px;
+      if (py > maxPy) maxPy = py;
+    }
+  }
+
+  // Pattern-fill triangles can have extreme vertices (Decode range [-16384,16384]) spanning far beyond the visible area.
+  // Clamping matters for performance because this is called thousands of times.
+  const bxMin = clipBounds ? clipBounds[0] : 0;
+  const byMin = clipBounds ? clipBounds[1] : 0;
+  const bxMax = clipBounds ? clipBounds[2] : (canvasDims ? canvasDims[0] : 8000);
+  const byMax = clipBounds ? clipBounds[3] : (canvasDims ? canvasDims[1] : 8000);
+  const ox = Math.max(bxMin, Math.floor(minPx));
+  const oy = Math.max(byMin, Math.floor(minPy));
+  const w = Math.min(bxMax, Math.ceil(maxPx)) - ox + 1;
+  const h = Math.min(byMax, Math.ceil(maxPy)) - oy + 1;
+  if (w <= 0 || h <= 0 || w > 8000 || h > 8000) return;
+
+  const tmpCanvas = ca.makeCanvas(w, h);
+  const tmpCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tmpCanvas.getContext('2d', { willReadFrequently: true }));
+  const imgData = tmpCtx.createImageData(w, h);
+  const pix = imgData.data;
+
+  for (const tri of triangles) {
+    const [v0, v1, v2] = tri.vertices;
+    const [c0, c1, c2] = tri.colors;
+
+    const x0 = ta * v0[0] + tc * v0[1] + te - ox;
+    const y0 = tb * v0[0] + td * v0[1] + tf - oy;
+    const x1 = ta * v1[0] + tc * v1[1] + te - ox;
+    const y1 = tb * v1[0] + td * v1[1] + tf - oy;
+    const x2 = ta * v2[0] + tc * v2[1] + te - ox;
+    const y2 = tb * v2[0] + td * v2[1] + tf - oy;
+
+    const bx0 = Math.max(0, Math.floor(Math.min(x0, x1, x2)));
+    const by0 = Math.max(0, Math.floor(Math.min(y0, y1, y2)));
+    const bx1 = Math.min(w - 1, Math.ceil(Math.max(x0, x1, x2)));
+    const by1 = Math.min(h - 1, Math.ceil(Math.max(y0, y1, y2)));
+
+    const d00 = x1 - x0;
+    const d01 = x2 - x0;
+    const d10 = y1 - y0;
+    const d11 = y2 - y0;
+    const denom = d00 * d11 - d01 * d10;
+    if (Math.abs(denom) < 1e-10) continue;
+    const invDenom = 1 / denom;
+
+    for (let py = by0; py <= by1; py++) {
+      for (let px = bx0; px <= bx1; px++) {
+        const dx = px + 0.5 - x0;
+        const dy = py + 0.5 - y0;
+        const u = (dx * d11 - d01 * dy) * invDenom;
+        const v = (d00 * dy - dx * d10) * invDenom;
+        if (u < -0.001 || v < -0.001 || u + v > 1.002) continue;
+        const w0 = 1 - u - v;
+        const idx = (py * w + px) * 4;
+        pix[idx] = Math.round(w0 * c0[0] + u * c1[0] + v * c2[0]);
+        pix[idx + 1] = Math.round(w0 * c0[1] + u * c1[1] + v * c2[1]);
+        pix[idx + 2] = Math.round(w0 * c0[2] + u * c1[2] + v * c2[2]);
+        pix[idx + 3] = 255;
+      }
+    }
+  }
+
+  // putImageData would ignore the active clip, so the pixels go through a temp canvas and drawImage instead.
+  // The clip was set before any transform changes, so it survives the resetTransform here.
+  tmpCtx.putImageData(imgData, 0, 0);
+  ctx.save();
+  ctx.resetTransform();
+  ctx.drawImage(tmpCanvas, ox, oy);
+  ctx.restore();
+  ca.closeDrawable(tmpCanvas);
+}
+
+/**
+ * Build a per-vertex/per-corner color evaluator for a mesh shading (types 4-7).
+ *
+ * The returned function takes the color components decoded from the shading stream for one vertex or corner.
+ * With a /Function those components are its parametric inputs, which it maps to colorant values; without one they are colorant values already.
+ * Either way the colorant values are converted to sRGB through /ColorSpace.
+ *
+ * @param {string} shObjText - Raw text of the Shading object
+ * @param {ObjectCache} objCache
+ * @returns {(comps: number[]) => [number, number, number]}
+ */
+function buildMeshColorEvaluator(shObjText, objCache) {
+  /** @type {import('./pdfColorFunctions.js').ParsedFunction|null} */
+  let tintFn = null;
+  /** @type {Array<import('./pdfColorFunctions.js').ParsedFunction|null>|null} */
+  let tintFnArray = null;
+  const funcArrMatch = /\/Function\s*\[\s*((?:\d+\s+\d+\s+R\s*)+)\]/.exec(shObjText);
+  if (funcArrMatch) {
+    const refs = [...funcArrMatch[1].matchAll(/(\d+)\s+\d+\s+R/g)].map((m) => Number(m[1]));
+    if (refs.length === 1) tintFn = parseFunction(refs[0], objCache);
+    else tintFnArray = refs.map((r) => parseFunction(r, objCache));
+  } else {
+    const funcRefMatch = /\/Function\s+(\d+)\s+\d+\s+R/.exec(shObjText);
+    if (funcRefMatch) {
+      tintFn = parseFunction(Number(funcRefMatch[1]), objCache);
+    } else {
+      const funcIdx = shObjText.indexOf('/Function');
+      if (funcIdx !== -1) {
+        const funcDictOpen = shObjText.indexOf('<<', funcIdx + 9);
+        if (funcDictOpen !== -1) {
+          const funcDictText = extractDict(shObjText, funcDictOpen);
+          if (funcDictText && /\/FunctionType/.test(funcDictText)) tintFn = parseFunction(funcDictText, objCache);
+        }
+      }
+    }
+  }
+
+  let csText = null;
+  const csArrStart = /\/ColorSpace\s*\[/.exec(shObjText);
+  if (csArrStart) {
+    const bracketIdx = csArrStart.index + csArrStart[0].length - 1;
+    let depth = 1;
+    let endIdx = bracketIdx + 1;
+    while (endIdx < shObjText.length && depth > 0) {
+      const ch = shObjText[endIdx];
+      if (ch === '[') depth++;
+      else if (ch === ']') depth--;
+      if (depth > 0) endIdx++;
+    }
+    csText = shObjText.substring(bracketIdx, endIdx + 1);
+  } else {
+    const csRefMatch = /\/ColorSpace\s+(\d+)\s+\d+\s+R/.exec(shObjText);
+    if (csRefMatch) csText = objCache.getObjectText(Number(csRefMatch[1]));
+    else {
+      const csNameMatch = /\/ColorSpace\s*\/(\w+)/.exec(shObjText);
+      if (csNameMatch) csText = `/${csNameMatch[1]}`;
+    }
+  }
+
+  const grayConvert = (c) => { const v = Math.max(0, Math.min(255, Math.round((c[0] || 0) * 255))); return [v, v, v]; };
+  const rgbConvert = (c) => [
+    Math.max(0, Math.min(255, Math.round((c[0] || 0) * 255))),
+    Math.max(0, Math.min(255, Math.round((c[1] || 0) * 255))),
+    Math.max(0, Math.min(255, Math.round((c[2] || 0) * 255))),
+  ];
+  /** @type {(c: number[]) => [number, number, number]} */
+  let csConvert;
+  if (csText && /\/Separation|\/DeviceN/.test(csText)) {
+    const parsed = parseTintColorSpace(csText, objCache);
+    csConvert = (c) => tintComponentsToRGB(parsed, c) || [128, 128, 128];
+  } else if (csText && /\/DeviceCMYK/.test(csText)) {
+    csConvert = (c) => cmykToRgb(c[0] || 0, c[1] || 0, c[2] || 0, c[3] || 0);
+  } else if (csText && /\/DeviceGray|\/CalGray/.test(csText)) {
+    csConvert = grayConvert;
+  } else if (csText && /\/ICCBased/.test(csText)) {
+    const iccRefMatch = /(\d+)\s+\d+\s+R/.exec(csText);
+    const iccObjText = iccRefMatch ? objCache.getObjectText(Number(iccRefMatch[1])) : null;
+    const nComp = iccObjText ? resolveIntValue(iccObjText, 'N', objCache, 3) : 3;
+    if (nComp === 1) csConvert = grayConvert;
+    else if (nComp === 4) csConvert = (c) => cmykToRgb(c[0] || 0, c[1] || 0, c[2] || 0, c[3] || 0);
+    else csConvert = rgbConvert;
+  } else {
+    csConvert = rgbConvert;
+  }
+
+  if (tintFnArray) {
+    return (comps) => csConvert(tintFnArray.map((fn) => {
+      if (!fn) return 0;
+      const o = evaluateFunction(fn, comps);
+      return o ? o[0] : 0;
+    }));
+  }
+  if (tintFn) {
+    return (comps) => csConvert(evaluateFunction(tintFn, comps) || comps);
+  }
+  return (comps) => csConvert(comps);
+}
+
+/**
+ * Parse a ShadingType 4 (free-form Gouraud-shaded triangle mesh) shading.
+ * @param {string} shObjText Shading dictionary content.
+ * @param {number} shObjNum Object number for stream bytes.
+ * @param {ObjectCache} objCache Object cache for resolving references.
+ * @returns {{ type: 'gouraud', triangles: Array<{vertices: number[][], colors: number[][]}> } | null}
+ */
+function parseType4Shading(shObjText, shObjNum, objCache) {
+  const bpc = resolveIntValue(shObjText, 'BitsPerComponent', objCache);
+  const bpco = resolveIntValue(shObjText, 'BitsPerCoordinate', objCache);
+  const bpf = resolveIntValue(shObjText, 'BitsPerFlag', objCache);
+  const decodeStr = resolveArrayValue(shObjText, 'Decode', objCache);
+  if (!bpc || !bpco || !bpf || !decodeStr) return null;
+
+  const decode = decodeStr.split(/\s+/).map(Number);
+  const nComps = (decode.length - 4) / 2;
+
+  const streamBytes = objCache.getStreamBytes(shObjNum);
+  if (!streamBytes || streamBytes.length === 0) return null;
+
+  const colorEval = buildMeshColorEvaluator(shObjText, objCache);
+
+  let bitPos = 0;
+  const totalBits = streamBytes.length * 8;
+
+  function readBits(n) {
+    let val = 0;
+    let rem = n;
+    while (rem > 0) {
+      const byteIdx = bitPos >>> 3;
+      const bitOff = bitPos & 7;
+      const avail = 8 - bitOff;
+      const take = Math.min(avail, rem);
+      const shift = avail - take;
+      val = val * (1 << take) + ((streamBytes[byteIdx] >>> shift) & ((1 << take) - 1));
+      bitPos += take;
+      rem -= take;
+    }
+    return val;
+  }
+
+  const coordMax = 2 ** bpco - 1;
+  const compMax = 2 ** bpc - 1;
+
+  function readVertex() {
+    const rx = readBits(bpco);
+    const ry = readBits(bpco);
+    const x = decode[0] + rx * (decode[1] - decode[0]) / coordMax;
+    const y = decode[2] + ry * (decode[3] - decode[2]) / coordMax;
+    const comps = [];
+    for (let i = 0; i < nComps; i++) {
+      comps.push(decode[4 + i * 2] + readBits(bpc) * (decode[4 + i * 2 + 1] - decode[4 + i * 2]) / compMax);
+    }
+    return { coord: [x, y], color: colorEval(comps) };
+  }
+
+  const triangles = [];
+  let prev = null; // previous triangle vertices/colors for flag 1/2 continuation
+
+  while (bitPos + bpf <= totalBits) {
+    const flag = readBits(bpf) & 3;
+    if (flag === 0) {
+      // The 2nd and 3rd vertex flags are ignored per spec but still present in the stream.
+      const vertexBits = 2 * bpco + nComps * bpc;
+      if (bitPos + 3 * vertexBits + 2 * bpf > totalBits) break;
+      const v0 = readVertex();
+      readBits(bpf); // skip flag of 2nd vertex
+      const v1 = readVertex();
+      readBits(bpf); // skip flag of 3rd vertex
+      const v2 = readVertex();
+      const tri = { vertices: [v0.coord, v1.coord, v2.coord], colors: [v0.color, v1.color, v2.color] };
+      triangles.push(tri);
+      prev = tri;
+    } else if (flag === 1 && prev) {
+      if (bitPos + 2 * bpco + nComps * bpc > totalBits) break;
+      const vNew = readVertex();
+      const tri = {
+        vertices: [prev.vertices[1], prev.vertices[2], vNew.coord],
+        colors: [prev.colors[1], prev.colors[2], vNew.color],
+      };
+      triangles.push(tri);
+      prev = tri;
+    } else if (flag === 2 && prev) {
+      if (bitPos + 2 * bpco + nComps * bpc > totalBits) break;
+      const vNew = readVertex();
+      const tri = {
+        vertices: [prev.vertices[0], prev.vertices[2], vNew.coord],
+        colors: [prev.colors[0], prev.colors[2], vNew.color],
+      };
+      triangles.push(tri);
+      prev = tri;
+    } else {
+      break;
+    }
+  }
+
+  if (triangles.length === 0) return null;
+  return { type: 'gouraud', triangles };
+}
+
+/**
+ * Parse a Type 5 (lattice-form Gouraud-shaded triangle mesh) shading.
+ * @param {string} shObjText
+ * @param {number} shObjNum
+ * @param {ObjectCache} objCache
+ */
+function parseLatticeShading(shObjText, shObjNum, objCache) {
+  const bpc = resolveIntValue(shObjText, 'BitsPerComponent', objCache);
+  const bpco = resolveIntValue(shObjText, 'BitsPerCoordinate', objCache);
+  const vpr = resolveIntValue(shObjText, 'VerticesPerRow', objCache);
+  const decodeStr = resolveArrayValue(shObjText, 'Decode', objCache);
+  if (!bpc || !bpco || !vpr || vpr < 2 || !decodeStr) return null;
+
+  const decode = decodeStr.split(/\s+/).map(Number);
+  const nComps = (decode.length - 4) / 2;
+
+  const streamBytes = objCache.getStreamBytes(shObjNum);
+  if (!streamBytes || streamBytes.length === 0) return null;
+
+  const colorEval = buildMeshColorEvaluator(shObjText, objCache);
+
+  let bitPos = 0;
+  const totalBits = streamBytes.length * 8;
+  function readBits(n) {
+    let val = 0;
+    let rem = n;
+    while (rem > 0) {
+      const byteIdx = bitPos >>> 3;
+      const bitOff = bitPos & 7;
+      const avail = 8 - bitOff;
+      const take = Math.min(avail, rem);
+      const shift = avail - take;
+      val = val * (1 << take) + ((streamBytes[byteIdx] >>> shift) & ((1 << take) - 1));
+      bitPos += take;
+      rem -= take;
+    }
+    return val;
+  }
+
+  const coordMax = 2 ** bpco - 1;
+  const compMax = 2 ** bpc - 1;
+
+  const bitsPerVertex = bpco * 2 + bpc * nComps;
+  const vertices = [];
+  while (bitPos + bitsPerVertex <= totalBits) {
+    const rx = readBits(bpco);
+    const ry = readBits(bpco);
+    const x = decode[0] + rx * (decode[1] - decode[0]) / coordMax;
+    const y = decode[2] + ry * (decode[3] - decode[2]) / coordMax;
+    const comps = [];
+    for (let i = 0; i < nComps; i++) {
+      comps.push(decode[4 + i * 2] + readBits(bpc) * (decode[4 + i * 2 + 1] - decode[4 + i * 2]) / compMax);
+    }
+    vertices.push({ x, y, color: colorEval(comps) });
+  }
+
+  const nRows = Math.floor(vertices.length / vpr);
+  if (nRows < 2) return null;
+
+  // Convert grid cells to bilinear patches (degree-elevated to cubic for renderMeshPatches)
+  const patches = [];
+  for (let r = 0; r < nRows - 1; r++) {
+    for (let c = 0; c < vpr - 1; c++) {
+      const v00 = vertices[r * vpr + c];
+      const v01 = vertices[r * vpr + (c + 1)];
+      const v10 = vertices[(r + 1) * vpr + c];
+      const v11 = vertices[(r + 1) * vpr + (c + 1)];
+      const points = [];
+      for (let i = 0; i < 4; i++) {
+        const si = i / 3;
+        const row = [];
+        for (let j = 0; j < 4; j++) {
+          const sj = j / 3;
+          row.push([
+            (1 - si) * ((1 - sj) * v00.x + sj * v01.x) + si * ((1 - sj) * v10.x + sj * v11.x),
+            (1 - si) * ((1 - sj) * v00.y + sj * v01.y) + si * ((1 - sj) * v10.y + sj * v11.y),
+          ]);
+        }
+        points.push(row);
+      }
+      // colors: [c00, c03, c33, c30] per renderMeshPatches convention
+      patches.push({
+        points,
+        colors: [v00.color, v01.color, v11.color, v10.color],
+      });
+    }
+  }
+
+  return patches.length > 0 ? { type: 'mesh', patches } : null;
+}
+
+/**
+ * Parse Shading entries from page resources.
+ * @param {string} pageObjText - Raw text of the Page object
+ * @param {ObjectCache} objCache - PDF object cache
+ */
+function parseShadings(pageObjText, objCache) {
+  const shadings = new Map();
+
+  let resourcesText = null;
+  const resRefMatch = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(pageObjText);
+  if (resRefMatch) {
+    resourcesText = objCache.getObjectText(Number(resRefMatch[1])) || null;
+  } else {
+    const resIdx = pageObjText.indexOf('/Resources');
+    if (resIdx !== -1) {
+      const dictStart = pageObjText.indexOf('<<', resIdx);
+      if (dictStart !== -1) resourcesText = extractDict(pageObjText, dictStart);
+    }
+  }
+  if (!resourcesText) return shadings;
+
+  const shStart = findTopLevelKey(resourcesText, '/Shading');
+  if (shStart === -1) return shadings;
+
+  let shDictText;
+  const afterSh = resourcesText.substring(shStart + 8).trim();
+  if (afterSh.startsWith('<<')) {
+    shDictText = extractDict(resourcesText, shStart + 8 + resourcesText.substring(shStart + 8).indexOf('<<'));
+  } else {
+    const shRefMatch = /^(\d+)\s+\d+\s+R/.exec(afterSh);
+    if (shRefMatch) {
+      const shObj = objCache.getObjectText(Number(shRefMatch[1]));
+      if (shObj) shDictText = shObj;
+    }
+  }
+  if (!shDictText) return shadings;
+
+  // A regex would miss the inline `/ShName << ... >>` form and would wrongly match `/Function N 0 R` inside nested shading dicts, creating bogus entries.
+  /** @type {Array<{name: string, objNum: number, inline: string|null}>} */
+  const entries = [];
+  {
+    let depth = 0;
+    let i = 0;
+    const n = shDictText.length;
+    while (i < n) {
+      if (shDictText[i] === '<' && shDictText[i + 1] === '<') {
+        depth++;
+        i += 2;
+      } else if (shDictText[i] === '>' && shDictText[i + 1] === '>') {
+        depth--;
+        i += 2;
+      } else if (depth === 1 && shDictText[i] === '/') {
+        const nameMatch = /^\/([^\s/<>[\]]+)/.exec(shDictText.substring(i));
+        if (!nameMatch) { i++; continue; }
+        let j = i + nameMatch[0].length;
+        while (j < n && /\s/.test(shDictText[j])) j++;
+        if (shDictText[j] === '<' && shDictText[j + 1] === '<') {
+          const inlineDict = extractDict(shDictText, j);
+          entries.push({ name: nameMatch[1], objNum: 0, inline: inlineDict });
+          i = j + inlineDict.length;
+        } else {
+          const refMatch = /^(\d+)\s+\d+\s+R/.exec(shDictText.substring(j));
+          if (refMatch) {
+            entries.push({ name: nameMatch[1], objNum: Number(refMatch[1]), inline: null });
+            i = j + refMatch[0].length;
+          } else {
+            i = j;
+          }
+        }
+      } else {
+        i++;
+      }
+    }
+  }
+
+  for (const entry of entries) {
+    const shName = entry.name;
+    const shObjNum = entry.objNum;
+    const shObjText = entry.inline || (shObjNum ? objCache.getObjectText(shObjNum) : null);
+    if (!shObjText) continue;
+
+    const shadingType = resolveIntValue(shObjText, 'ShadingType', objCache, 0);
+
+    if (shadingType === 4) {
+      const gouraudResult = parseType4Shading(shObjText, shObjNum, objCache);
+      if (gouraudResult) shadings.set(shName, gouraudResult);
+      continue;
+    }
+    if (shadingType === 5) {
+      const meshResult = parseLatticeShading(shObjText, shObjNum, objCache);
+      if (meshResult) shadings.set(shName, meshResult);
+      continue;
+    }
+    if (shadingType === 6 || shadingType === 7) {
+      const meshResult = parseMeshShading(shObjText, shObjNum, shadingType, objCache);
+      if (meshResult) shadings.set(shName, meshResult);
+      continue;
+    }
+
+    if (shadingType !== 1 && shadingType !== 2 && shadingType !== 3) continue;
+
+    let coords = null;
+    if (shadingType !== 1) {
+      const coordsStr = resolveArrayValue(shObjText, 'Coords', objCache);
+      if (!coordsStr) continue;
+      coords = coordsStr.split(/\s+/).map(Number);
+    }
+
+    const extendStr = resolveArrayValue(shObjText, 'Extend', objCache);
+    const extendParts = extendStr ? extendStr.split(/\s+/) : [];
+    const extend = [extendParts[0] === 'true', extendParts[1] === 'true'];
+
+    const bboxStr = resolveArrayValue(shObjText, 'BBox', objCache);
+    const bbox = bboxStr ? bboxStr.split(/\s+/).map(Number) : null;
+
+    // Extract the shading's /ColorSpace defining text once so the tests below treat its three encodings uniformly.
+    // Those are a scalar name (`/DeviceGray`), an inline array (`[/Separation /Black /DeviceCMYK N 0 R]`), or an indirect reference (`N 0 R`).
+    let csText = null;
+    const csArrStart = /\/ColorSpace\s*\[/.exec(shObjText);
+    if (csArrStart) {
+      const bracketIdx = csArrStart.index + csArrStart[0].length - 1;
+      let depth = 1;
+      let endIdx = bracketIdx + 1;
+      while (endIdx < shObjText.length && depth > 0) {
+        const ch = shObjText[endIdx];
+        if (ch === '[') depth++;
+        else if (ch === ']') depth--;
+        if (depth > 0) endIdx++;
+      }
+      csText = shObjText.substring(bracketIdx, endIdx + 1);
+    } else {
+      const csRefMatch = /\/ColorSpace\s+(\d+)\s+\d+\s+R/.exec(shObjText);
+      if (csRefMatch) {
+        csText = objCache.getObjectText(Number(csRefMatch[1]));
+      } else {
+        const csNameMatch = /\/ColorSpace\s*\/(\w+)/.exec(shObjText);
+        if (csNameMatch) csText = `/${csNameMatch[1]}`;
+      }
+    }
+
+    let shadingCS = 'DeviceRGB';
+    let isGray = false;
+    let sepTintSamples = null;
+    /** @type {import('./pdfColorFunctions.js').ParsedTintCS|null} */
+    let deviceNTintCS = null;
+    let isSeparationShading = false;
+
+    if (csText) {
+      if (/\/Separation|\/DeviceN/.test(csText)) {
+        isSeparationShading = true;
+        // For multi-colorant DeviceN the 1D tint LUT is wrong, because the function's outputs form one N-tuple input to the tint transform rather than independent lookups.
+        const dnNamesMatch = /\/DeviceN\s*\[\s*((?:\/[^/[\]<>(){}\s]+\s*)+)\]/.exec(csText);
+        const dnNumColorants = dnNamesMatch ? (dnNamesMatch[1].match(/\/[^/[\]<>(){}\s]+/g) || []).length : 0;
+        if (dnNumColorants >= 2) {
+          deviceNTintCS = parseTintColorSpace(csText, objCache);
+        } else {
+          const tintInfo = parseSeparationTint(csText, objCache);
+          if (tintInfo.tintSamples) sepTintSamples = tintInfo.tintSamples;
+        }
+      } else if (/\/DeviceCMYK/.test(csText)) {
+        shadingCS = 'DeviceCMYK';
+      } else if (/\/DeviceGray|\/CalGray/.test(csText)) {
+        shadingCS = 'DeviceGray';
+        isGray = true;
+      } else if (/\/DeviceRGB|\/CalRGB/.test(csText)) {
+        shadingCS = 'DeviceRGB';
+      } else if (/\/ICCBased/.test(csText)) {
+        const iccRefMatch = /(\d+)\s+\d+\s+R/.exec(csText);
+        if (iccRefMatch) {
+          const iccObjText = objCache.getObjectText(Number(iccRefMatch[1]));
+          const nComp = iccObjText ? resolveIntValue(iccObjText, 'N', objCache, 3) : 3;
+          if (nComp === 1) { shadingCS = 'DeviceGray'; isGray = true; } else if (nComp === 4) shadingCS = 'DeviceCMYK';
+          else shadingCS = 'DeviceRGB';
+        }
+      }
+    }
+
+    if (shadingType === 1) {
+      const axial = type1ShadingToAxial(shObjText, objCache, {
+        deviceNTintCS, sepTintSamples, isCMYK: shadingCS === 'DeviceCMYK', isGray,
+      });
+      if (axial) {
+        if (bbox) axial.bbox = bbox;
+        if (isSeparationShading) axial.multiply = true;
+        shadings.set(shName, axial);
+      }
+      continue;
+    }
+
+    // /Function is either a single indirect ref `N 0 R` or an array `[N 0 R M 0 R ...]` where each function produces one output component.
+    const funcArrAllMatch = /\/Function\s*\[\s*((?:\d+\s+\d+\s+R\s*)+)\]/.exec(shObjText);
+    const funcArrRefs = funcArrAllMatch
+      ? [...funcArrAllMatch[1].matchAll(/(\d+)\s+\d+\s+R/g)].map((m) => Number(m[1]))
+      : null;
+
+    if (funcArrRefs && funcArrRefs.length > 1) {
+      const fns = funcArrRefs.map((ref) => parseFunction(ref, objCache));
+      const stops = functionToShadingStops(fns, {
+        deviceNTintCS, sepTintSamples, isCMYK: shadingCS === 'DeviceCMYK', isGray,
+      });
+      shadings.set(shName, {
+        type: shadingType, coords, stops, extend, bbox, multiply: isSeparationShading,
+      });
+      continue;
+    }
+
+    let funcObjNum;
+    if (funcArrRefs && funcArrRefs.length === 1) {
+      funcObjNum = funcArrRefs[0];
+    } else {
+      const funcSingleMatch = /\/Function\s+(\d+)\s+\d+\s+R/.exec(shObjText);
+      if (funcSingleMatch) funcObjNum = Number(funcSingleMatch[1]);
+    }
+    if (funcObjNum == null) continue;
+
+    const fn = parseFunction(funcObjNum, objCache);
+    if (!fn) continue;
+    const stops = functionToShadingStops(fn, {
+      deviceNTintCS, sepTintSamples, isCMYK: shadingCS === 'DeviceCMYK', isGray,
+    });
+    shadings.set(shName, {
+      type: shadingType, coords, stops, extend, bbox, multiply: isSeparationShading,
+    });
+  }
+
+  return shadings;
+}
+
+/**
+ * Parse Pattern entries from page resources.
+ *
+ * @param {string} pageObjText
+ * @param {ObjectCache} objCache
+ * @returns {Map<string, { color: string, shading?: PatternShading, tiling?: TilingPatternRef }>}
+ */
+function parsePatterns(pageObjText, objCache) {
+  const patterns = new Map();
+
+  let resourcesText = pageObjText;
+  const resRefMatch = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(pageObjText);
+  if (resRefMatch) {
+    const resObj = objCache.getObjectText(Number(resRefMatch[1]));
+    if (resObj) resourcesText = resObj;
+  }
+
+  // Search for /Pattern as a Resources dictionary key (not a color space value like /CS0/Pattern).
+  let patDictText;
+  let searchFrom = 0;
+  while (!patDictText) {
+    const patStart = resourcesText.indexOf('/Pattern', searchFrom);
+    if (patStart === -1) break;
+    const afterPat = resourcesText.substring(patStart + 8).trim();
+    if (afterPat.startsWith('<<')) {
+      patDictText = extractDict(resourcesText, patStart + 8 + resourcesText.substring(patStart + 8).indexOf('<<'));
+    } else {
+      const patRefMatch = /^(\d+)\s+\d+\s+R/.exec(afterPat);
+      if (patRefMatch) {
+        const patObj = objCache.getObjectText(Number(patRefMatch[1]));
+        if (patObj) patDictText = patObj;
+      }
+    }
+    searchFrom = patStart + 8;
+  }
+  if (!patDictText) return patterns;
+
+  const patEntries = [];
+  const patEntryRegex = /\/([^\s/<>[\]]+)\s+(\d+)\s+\d+\s+R/g;
+  for (const match of patDictText.matchAll(patEntryRegex)) {
+    const patObjText = objCache.getObjectText(Number(match[2]));
+    if (patObjText) patEntries.push({ patName: match[1], patObjNum: Number(match[2]), patObjText });
+  }
+  const inlineRegex = /\/([^\s/<>[\]]+)\s*<</g;
+  let inlineMatch;
+  while ((inlineMatch = inlineRegex.exec(patDictText)) !== null) {
+    const patName = inlineMatch[1];
+    if (patEntries.some((e) => e.patName === patName)) continue;
+    const dictStart = inlineMatch.index + inlineMatch[0].length - 2;
+    const inlineDictText = extractDict(patDictText, dictStart);
+    if (inlineDictText) patEntries.push({ patName, patObjNum: null, patObjText: inlineDictText });
+  }
+  for (const { patName, patObjNum, patObjText } of patEntries) {
+    const patType = resolveIntValue(patObjText, 'PatternType', objCache, 0);
+
+    if (patType === 1) {
+      const bboxStr = resolveArrayValue(patObjText, 'BBox', objCache);
+      if (!bboxStr) continue;
+      const bbox = bboxStr.split(/\s+/).map(Number);
+      const matrixStr = resolveArrayValue(patObjText, 'Matrix', objCache);
+      const matrix = matrixStr ? matrixStr.split(/\s+/).map(Number) : [1, 0, 0, 1, 0, 0];
+      const xStep = resolveNumValue(patObjText, 'XStep', objCache) || (bbox[2] - bbox[0]);
+      const yStep = resolveNumValue(patObjText, 'YStep', objCache) || (bbox[3] - bbox[1]);
+      const paintType = resolveIntValue(patObjText, 'PaintType', objCache, 1);
+      patterns.set(patName, {
+        color: 'rgb(128,128,128)',
+        tiling: {
+          objNum: patObjNum, bbox, xStep, yStep, matrix, paintType,
+        },
+      });
+      continue;
+    }
+
+    if (patType !== 2) continue;
+
+    const shadingIdx = patObjText.indexOf('/Shading');
+    if (shadingIdx === -1) continue;
+    let shadingDict;
+    const afterShading = patObjText.substring(shadingIdx + 8).trim();
+    const shadingRefMatch = /^(\d+)\s+\d+\s+R/.exec(afterShading);
+    if (shadingRefMatch) {
+      shadingDict = objCache.getObjectText(Number(shadingRefMatch[1]));
+    } else {
+      const shadingDictStart = patObjText.indexOf('<<', shadingIdx + 8);
+      if (shadingDictStart !== -1) shadingDict = extractDict(patObjText, shadingDictStart);
+    }
+    if (!shadingDict) continue;
+
+    // Extract the /ColorSpace defining text once so the family tests below treat all forms alike.
+    // It may be a scalar name (`/DeviceRGB`), an inline array (`[/ICCBased N 0 R]`, `[/Separation ...]`), or an indirect reference (`N 0 R`).
+    let patCsText = null;
+    const patCsArrStart = /\/ColorSpace\s*\[/.exec(shadingDict);
+    if (patCsArrStart) {
+      const bracketIdx = patCsArrStart.index + patCsArrStart[0].length - 1;
+      let depth = 1;
+      let endIdx = bracketIdx + 1;
+      while (endIdx < shadingDict.length && depth > 0) {
+        const ch = shadingDict[endIdx];
+        if (ch === '[') depth++;
+        else if (ch === ']') depth--;
+        if (depth > 0) endIdx++;
+      }
+      patCsText = shadingDict.substring(bracketIdx, endIdx + 1);
+    } else {
+      const csRefMatch = /\/ColorSpace\s+(\d+)\s+\d+\s+R/.exec(shadingDict);
+      if (csRefMatch) {
+        patCsText = objCache.getObjectText(Number(csRefMatch[1]));
+      } else {
+        const csNameMatch = /\/ColorSpace\s*\/(\w+)/.exec(shadingDict);
+        if (csNameMatch) patCsText = `/${csNameMatch[1]}`;
+      }
+    }
+
+    let patShadingCS = 'DeviceRGB';
+    let patSepTintSamples = null;
+    /** @type {import('./pdfColorFunctions.js').ParsedTintCS|null} */
+    let patDeviceNTintCS = null;
+
+    if (patCsText) {
+      if (/\/Separation|\/DeviceN/.test(patCsText)) {
+        // For multi-colorant DeviceN (e.g. 5-channel PANTONE+CMYK), the 1D diagonal tint LUT is wrong.
+        // The function's outputs form one N-tuple input to the tint transform, not independent per-channel lookups.
+        const dnNamesMatch = /\/DeviceN\s*\[\s*((?:\/[^/[\]<>(){}\s]+\s*)+)\]/.exec(patCsText);
+        const dnNumColorants = dnNamesMatch
+          ? (dnNamesMatch[1].match(/\/[^/[\]<>(){}\s]+/g) || []).length
+          : 0;
+        if (dnNumColorants >= 2) {
+          patDeviceNTintCS = parseTintColorSpace(patCsText, objCache);
+        } else {
+          const tintInfo = parseSeparationTint(patCsText, objCache);
+          if (tintInfo.tintSamples) patSepTintSamples = tintInfo.tintSamples;
+        }
+        patShadingCS = 'Separation';
+      } else if (/\/DeviceCMYK/.test(patCsText)) {
+        patShadingCS = 'DeviceCMYK';
+      } else if (/\/DeviceGray|\/CalGray/.test(patCsText)) {
+        patShadingCS = 'DeviceGray';
+      } else if (/\/DeviceRGB|\/CalRGB/.test(patCsText)) {
+        patShadingCS = 'DeviceRGB';
+      } else if (/\/ICCBased/.test(patCsText)) {
+        const iccRefMatch = /(\d+)\s+\d+\s+R/.exec(patCsText);
+        if (iccRefMatch) {
+          const iccObjText = objCache.getObjectText(Number(iccRefMatch[1]));
+          const nComp = iccObjText ? resolveIntValue(iccObjText, 'N', objCache, 3) : 3;
+          patShadingCS = nComp === 1 ? 'DeviceGray' : nComp === 4 ? 'DeviceCMYK' : 'DeviceRGB';
+        }
+      }
+    }
+    if (patShadingCS !== 'DeviceRGB' && patShadingCS !== 'DeviceGray' && patShadingCS !== 'DeviceCMYK' && !patSepTintSamples && !patDeviceNTintCS) continue;
+    const patIsGray = patShadingCS === 'DeviceGray';
+    const patIsCMYK = patShadingCS === 'DeviceCMYK';
+
+    const shadingType = resolveIntValue(shadingDict, 'ShadingType', objCache, 0);
+
+    if (shadingType === 4) {
+      const shObjNum = shadingRefMatch ? Number(shadingRefMatch[1]) : null;
+      if (shObjNum) {
+        const gouraudResult = parseType4Shading(shadingDict, shObjNum, objCache);
+        if (gouraudResult) {
+          const matrixStr = resolveArrayValue(patObjText, 'Matrix', objCache);
+          const matrix = matrixStr ? matrixStr.split(/\s+/).map(Number) : null;
+          if (matrix) gouraudResult.matrix = matrix;
+          patterns.set(patName, { color: 'rgb(128,128,128)', shading: gouraudResult });
+        }
+      }
+      continue;
+    }
+
+    if (shadingType === 5 || shadingType === 6 || shadingType === 7) {
+      const shObjNum = shadingRefMatch ? Number(shadingRefMatch[1]) : null;
+      let meshResult;
+      if (shadingType === 5 && shObjNum) {
+        meshResult = parseLatticeShading(shadingDict, shObjNum, objCache);
+      } else if (shObjNum) {
+        meshResult = parseMeshShading(shadingDict, shObjNum, shadingType, objCache);
+      }
+      if (meshResult) {
+        const matrixStr = resolveArrayValue(patObjText, 'Matrix', objCache);
+        const matrix = matrixStr ? matrixStr.split(/\s+/).map(Number) : null;
+        if (matrix) meshResult.matrix = matrix;
+        patterns.set(patName, { color: 'rgb(128,128,128)', shading: meshResult });
+      }
+      continue;
+    }
+
+    if (shadingType === 1) {
+      const axial = type1ShadingToAxial(shadingDict, objCache, {
+        deviceNTintCS: patDeviceNTintCS, sepTintSamples: patSepTintSamples, isCMYK: patIsCMYK, isGray: patIsGray,
+      });
+      if (axial) {
+        const matrixStr = resolveArrayValue(patObjText, 'Matrix', objCache);
+        const matrix = matrixStr ? matrixStr.split(/\s+/).map(Number) : null;
+        if (matrix) axial.matrix = matrix;
+        const color = axial.stops[Math.floor(axial.stops.length / 2)]?.color || 'rgb(128,128,128)';
+        patterns.set(patName, { color, shading: axial });
+      }
+      continue;
+    }
+
+    if (shadingType !== 2 && shadingType !== 3) continue;
+
+    const coordsStr = resolveArrayValue(shadingDict, 'Coords', objCache);
+    if (!coordsStr) continue;
+    const coords = coordsStr.split(/\s+/).map(Number);
+
+    const extendStr = resolveArrayValue(shadingDict, 'Extend', objCache);
+    const extendParts = extendStr ? extendStr.split(/\s+/) : [];
+    const extend = [extendParts[0] === 'true', extendParts[1] === 'true'];
+
+    const bboxStr = resolveArrayValue(shadingDict, 'BBox', objCache);
+    const bbox = bboxStr ? bboxStr.split(/\s+/).map(Number) : null;
+
+    const matrixStr = resolveArrayValue(patObjText, 'Matrix', objCache);
+    const matrix = matrixStr ? matrixStr.split(/\s+/).map(Number) : null;
+
+    let funcDictText;
+    let funcObjNum;
+    const funcRefMatch = /\/Function\s+(\d+)\s+\d+\s+R/.exec(shadingDict);
+    if (funcRefMatch) {
+      funcObjNum = Number(funcRefMatch[1]);
+      funcDictText = objCache.getObjectText(funcObjNum);
+    } else {
+      const funcDictStart = shadingDict.indexOf('/Function');
+      if (funcDictStart !== -1) {
+        const funcDictOpen = shadingDict.indexOf('<<', funcDictStart + 9);
+        if (funcDictOpen !== -1) funcDictText = extractDict(shadingDict, funcDictOpen);
+      }
+    }
+    const fn = funcDictText
+      ? parseFunction(funcObjNum != null ? funcObjNum : funcDictText, objCache)
+      : null;
+    if (fn) {
+      const stops = functionToShadingStops(fn, {
+        deviceNTintCS: patDeviceNTintCS, sepTintSamples: patSepTintSamples, isCMYK: patIsCMYK, isGray: patIsGray,
+      });
+      const shading = {
+        type: shadingType, coords, stops, extend, ...(bbox && { bbox }), ...(matrix && { matrix }),
+      };
+      const color = stops[Math.floor(stops.length / 2)]?.color || 'rgb(128,128,128)';
+      patterns.set(patName, { color, shading });
+    }
+  }
+
+  return patterns;
+}
+
+/**
+ * Tile-canvas pixel size for a tiling pattern at a given device scale, clamped so neither axis exceeds the canvas dimension limit.
+ * Producer and consumers must compute this identically or the pattern-space transform will be wrong.
+ *
+ * @param {number} bboxW
+ * @param {number} bboxH
+ * @param {number} matScaleX
+ * @param {number} matScaleY
+ * @param {number} scale
+ * @returns {{ tileW: number, tileH: number }}
+ */
+function tilingTilePixelDims(bboxW, bboxH, matScaleX, matScaleY, scale) {
+  let tileW = Math.max(1, Math.round(bboxW * matScaleX * scale));
+  let tileH = Math.max(1, Math.round(bboxH * matScaleY * scale));
+  const maxDim = 4096;
+  if (tileW > maxDim || tileH > maxDim) {
+    const reduce = Math.min(maxDim / tileW, maxDim / tileH);
+    tileW = Math.max(1, Math.round(tileW * reduce));
+    tileH = Math.max(1, Math.round(tileH * reduce));
+  }
+  return { tileW, tileH };
+}
+
+/**
+ * Render the contents of a tiling pattern to a tile-sized canvas.
+ *
+ * @param {{ objNum: number, bbox: number[], matrix: number[] }} tp
+ * @param {ObjectCache} objCache
+ * @param {number} scale
+ */
+async function renderTilingPatternTileForSmask(tp, objCache, scale) {
+  const patObjText = objCache.getObjectText(tp.objNum);
+  const patStreamBytes = objCache.getStreamBytes(tp.objNum);
+  if (!patObjText || !patStreamBytes) return null;
+
+  let patResText = patObjText;
+  const patResRef = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(patObjText);
+  if (patResRef) {
+    const resObj = objCache.getObjectText(Number(patResRef[1]));
+    if (resObj) patResText = resObj;
+  }
+
+  const { images: patImages, forms: patForms } = parsePageImages(patResText, objCache, { recurseForms: false });
+  const patExtGStates = parseExtGStates(patObjText, objCache);
+  const patPatterns = parsePatterns(patObjText, objCache);
+
+  const patStream = bytesToLatin1(patStreamBytes);
+  const rawPatDrawOps = parseDrawOps(patStream, new Map(), patExtGStates, new Map(), new Map(),
+    new Set(), new Set(), new Set(), new Map(), patPatterns);
+
+  let patDrawOps;
+  if (patForms.size > 0) {
+    patDrawOps = [];
+    for (const op of rawPatDrawOps) {
+      if (op.type === 'image' && patForms.has(op.name)) {
+        const sub = await flattenDrawOps(
+          [op], patImages, patForms, objCache, new Map(), new Map(),
+          '', 0, new Set(), new Set(), patExtGStates, new Set(),
+          new Map(), 0, new Set(), new Map(),
+          'black', 'rgb(0,0,0)',
+          1, 1,
+          null, null,
+        );
+        for (const sop of sub) patDrawOps.push(sop);
+      } else {
+        patDrawOps.push(op);
+      }
+    }
+  } else {
+    patDrawOps = rawPatDrawOps;
+  }
+
+  const bboxW = tp.bbox[2] - tp.bbox[0];
+  const bboxH = tp.bbox[3] - tp.bbox[1];
+  const matScaleX = Math.sqrt(tp.matrix[0] * tp.matrix[0] + tp.matrix[1] * tp.matrix[1]) || 1;
+  const matScaleY = Math.sqrt(tp.matrix[2] * tp.matrix[2] + tp.matrix[3] * tp.matrix[3]) || 1;
+  let tileW = Math.max(1, Math.round(bboxW * matScaleX * scale));
+  let tileH = Math.max(1, Math.round(bboxH * matScaleY * scale));
+  const maxDim = 4096;
+  if (tileW > maxDim || tileH > maxDim) {
+    const reduceFactor = Math.min(maxDim / tileW, maxDim / tileH);
+    tileW = Math.max(1, Math.round(tileW * reduceFactor));
+    tileH = Math.max(1, Math.round(tileH * reduceFactor));
+  }
+
+  const tileCanvas = ca.makeCanvas(tileW, tileH);
+  const tileCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tileCanvas.getContext('2d', { willReadFrequently: true }));
+  const tileScaleX = tileW / bboxW;
+  const tileScaleY = tileH / bboxH;
+
+  for (const pop of patDrawOps) {
+    if (pop.type === 'image') {
+      const imageInfo = patImages.get(pop.name);
+      if (!imageInfo) continue;
+      const bitmap = imageInfo.imageMask
+        ? await imageMaskToBitmap(imageInfo, pop.fillColor || 'black', objCache)
+        : await imageInfoToBitmap(imageInfo, objCache);
+      if (!bitmap) continue;
+      tileCtx.save();
+      tileCtx.setTransform(
+        pop.ctm[0] * tileScaleX, -pop.ctm[1] * tileScaleY,
+        pop.ctm[2] * tileScaleX, -pop.ctm[3] * tileScaleY,
+        (pop.ctm[4] - tp.bbox[0]) * tileScaleX,
+        (bboxH + tp.bbox[1] - pop.ctm[5]) * tileScaleY,
+      );
+      tileCtx.transform(1, 0, 0, -1, 0, 1);
+      tileCtx.drawImage(bitmap, 0, 0, 1, 1);
+      tileCtx.restore();
+      ca.closeDrawable(bitmap);
+    } else if (pop.type === 'path' && pop.fill) {
+      tileCtx.save();
+      if (pop.fillAlpha < 1) tileCtx.globalAlpha = pop.fillAlpha;
+      tileCtx.setTransform(
+        pop.ctm[0] * tileScaleX, -pop.ctm[1] * tileScaleY,
+        pop.ctm[2] * tileScaleX, -pop.ctm[3] * tileScaleY,
+        (pop.ctm[4] - tp.bbox[0]) * tileScaleX,
+        (bboxH + tp.bbox[1] - pop.ctm[5]) * tileScaleY,
+      );
+      tileCtx.beginPath();
+      for (const cmd of pop.commands) {
+        switch (cmd.type) {
+          case 'M': tileCtx.moveTo(cmd.x, cmd.y); break;
+          case 'L': tileCtx.lineTo(cmd.x, cmd.y); break;
+          case 'C': tileCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y); break;
+          case 'Z': tileCtx.closePath(); break;
+          default: break;
+        }
+      }
+      tileCtx.fillStyle = pop.fillColor || 'black';
+      tileCtx.fill(pop.evenOdd ? 'evenodd' : 'nonzero');
+      tileCtx.restore();
+    }
+  }
+
+  return tileCanvas;
+}
+
+/**
+ * Decode an inline image (BI/ID/EI) and return an ImageBitmap.
+ * Supports image masks with CCITTFaxDecode, DCTDecode (JPEG), and uncompressed data.
+ * @param {{dictText: string, imageData: string, fillColor?: string, fillAlpha?: number, tilingPattern?: any, colorSpaces?: Map<string, any>}} op
+ * @param {ObjectCache} objCache
+ * @param {Map<string, any>} [fallbackColorSpaces] - page-level color-space registry used when op.colorSpaces is absent
+ */
+async function decodeInlineImageBitmap(op, objCache, fallbackColorSpaces = new Map()) {
+  const { dictText, imageData } = op;
+  const getVal = (abbrev, full) => {
+    const re = new RegExp(`/${abbrev}(?![a-zA-Z])\\s*/?([^\\s/<>]+)`);
+    const m = re.exec(dictText) || new RegExp(`/${full}(?![a-zA-Z])\\s*/?([^\\s/<>]+)`).exec(dictText);
+    return m ? m[1] : null;
+  };
+  const getArr = (abbrev, full) => {
+    const re = new RegExp(`/${abbrev}(?![a-zA-Z])\\s*\\[\\s*([^\\]]+)\\]`);
+    const m = re.exec(dictText) || new RegExp(`/${full}(?![a-zA-Z])\\s*\\[\\s*([^\\]]+)\\]`).exec(dictText);
+    return m ? m[1].trim().split(/\s+/).map(Number) : null;
+  };
+  const width = Number(getVal('W', 'Width') || 0);
+  const height = Number(getVal('H', 'Height') || 0);
+  if (!width || !height) return null;
+  const bpc = Number(getVal('BPC', 'BitsPerComponent') || 8);
+  const isImageMask = getVal('IM', 'ImageMask') === 'true';
+  const decode = getArr('D', 'Decode');
+  const filterMap = {
+    CCF: 'CCITTFaxDecode',
+    DCT: 'DCTDecode',
+    Fl: 'FlateDecode',
+    LZW: 'LZWDecode',
+    RL: 'RunLengthDecode',
+    AHx: 'ASCIIHexDecode',
+    A85: 'ASCII85Decode',
+  };
+  let filters;
+  const filterArrMatch = /\/(?:F|Filter)\s*\[\s*([^\]]+)\]/.exec(dictText);
+  if (filterArrMatch) {
+    // Names self-delimit on `/`, so the array may have no whitespace (e.g. `[/A85/Fl]`).
+    filters = (filterArrMatch[1].match(/\/[^\s/\]]+/g) || []).map((f) => {
+      const name = f.replace(/^\//, '');
+      return filterMap[name] || name;
+    });
+  } else {
+    const filterRaw = getVal('F', 'Filter') || '';
+    const f = filterMap[filterRaw] || filterRaw;
+    filters = f ? [f] : [];
+  }
+  const csRaw = getVal('CS', 'ColorSpace') || '';
+  const csMap = { G: 'DeviceGray', RGB: 'DeviceRGB', CMYK: 'DeviceCMYK' };
+  let colorSpace = csMap[csRaw] || csRaw;
+  /** @type {{type: string, indexedInfo: any, tintSamples: Uint8Array|null, nComponents: number, deviceNGrid: any}|null} */
+  let resolvedCS = null;
+  if (!['DeviceGray', 'DeviceRGB', 'DeviceCMYK'].includes(colorSpace)) {
+    const csRegistry = op.colorSpaces || fallbackColorSpaces;
+    const entry = csRegistry.get(csRaw);
+    if (entry) {
+      resolvedCS = entry;
+      if (entry.type === 'Indexed') {
+        colorSpace = 'Indexed';
+      } else if (entry.type === 'Separation' || entry.type === 'DeviceN') {
+        colorSpace = entry.type;
+      } else if (entry.type === 'DeviceRGB' || entry.type === 'CalRGB') {
+        colorSpace = 'DeviceRGB';
+      } else if (entry.type === 'DeviceCMYK') {
+        colorSpace = 'DeviceCMYK';
+      } else if (entry.type === 'DeviceGray' || entry.type === 'CalGray') {
+        colorSpace = 'DeviceGray';
+      }
+    }
+    if (!resolvedCS) {
+      const csKeyMatch = /\/(?:CS|ColorSpace)\s*\[/.exec(dictText);
+      if (csKeyMatch) {
+        const arrStart = dictText.indexOf('[', csKeyMatch.index);
+        let depth = 0;
+        let arrEnd = arrStart;
+        for (let ci = arrStart; ci < dictText.length; ci++) {
+          if (dictText[ci] === '[') depth++;
+          else if (dictText[ci] === ']') { depth--; if (depth === 0) { arrEnd = ci + 1; break; } }
+        }
+        const csText = dictText.substring(arrStart, arrEnd)
+          .replace(/\/([A-Za-z][\w-]*)/g, ' /$1 ')
+          .replace(/\/I\b/, '/Indexed')
+          .replace(/\/RGB\b/, '/DeviceRGB')
+          .replace(/\/G\b/, '/DeviceGray')
+          .replace(/\/CMYK\b/, '/DeviceCMYK');
+        if (/\/Indexed\b/.test(csText)) {
+          const idxResult = parseIndexedColorSpace(csText, objCache);
+          if (idxResult) {
+            colorSpace = 'Indexed';
+            resolvedCS = {
+              type: 'Indexed', indexedInfo: idxResult, tintSamples: null, nComponents: 1, deviceNGrid: null,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  let data = new Uint8Array(imageData.length);
+  for (let j = 0; j < imageData.length; j++) data[j] = imageData.charCodeAt(j);
+
+  // DCTDecode/JPXDecode are image codecs handled downstream by imageInfoToBitmap, so stop at the first one and pass its compressed bytes through unchanged.
+  let imageCodec = null;
+  for (const filter of filters) {
+    if (filter === 'DCTDecode' || filter === 'JPXDecode') { imageCodec = filter; break; }
+    if (filter === 'ASCII85Decode') {
+      const ascii = new TextDecoder('latin1').decode(data);
+      const clean = ascii.replace(/\s/g, '');
+      const endMarker = clean.indexOf('~>');
+      const encoded = endMarker >= 0 ? clean.substring(0, endMarker) : clean;
+      const output = [];
+      let ai = 0;
+      while (ai < encoded.length) {
+        if (encoded[ai] === 'z') {
+          output.push(0, 0, 0, 0);
+          ai++;
+        } else {
+          const groupLen = Math.min(5, encoded.length - ai);
+          const group = [];
+          for (let gj = 0; gj < groupLen; gj++) group.push(encoded.charCodeAt(ai + gj) - 33);
+          while (group.length < 5) group.push(84);
+          let val = 0;
+          for (let gj = 0; gj < 5; gj++) val = val * 85 + group[gj];
+          const numBytes = groupLen === 5 ? 4 : groupLen - 1;
+          const divisors = [16777216, 65536, 256, 1];
+          for (let gj = 0; gj < numBytes; gj++) output.push(Math.floor(val / divisors[gj]) % 256);
+          ai += groupLen;
+        }
+      }
+      data = new Uint8Array(output);
+    } else if (filter === 'ASCIIHexDecode') {
+      const hex = new TextDecoder('latin1').decode(data).replace(/\s/g, '').replace(/>$/, '');
+      const out = new Uint8Array(Math.floor(hex.length / 2));
+      for (let hi = 0; hi < out.length; hi++) out[hi] = parseInt(hex.substring(hi * 2, hi * 2 + 2), 16);
+      data = out;
+    } else if (filter === 'CCITTFaxDecode') {
+      const { decodeCCITTFax } = await import('./codecs/decodeCCITT.js');
+      const dpText = dictText;
+      const params = {};
+      const kMatch = /\/K\s+(-?\d+)/.exec(dpText) || /\/DP\s*<<[^>]*\/K\s+(-?\d+)/.exec(dpText);
+      if (kMatch) params.K = Number(kMatch[1] || kMatch[2]);
+      const colMatch = /\/Columns\s+(\d+)/.exec(dpText) || /\/DP\s*<<[^>]*\/Columns\s+(\d+)/.exec(dpText);
+      if (colMatch) params.Columns = Number(colMatch[1] || colMatch[2]);
+      else params.Columns = width;
+      const blackIs1Match = /\/BlackIs1\s+true/.exec(dpText);
+      if (blackIs1Match) params.BlackIs1 = true;
+      params.Rows = height;
+      params.EndOfBlock = false;
+      const decoded = decodeCCITTFax(data, params);
+      data = new Uint8Array(decoded.buffer);
+    } else if (filter === 'FlateDecode') {
+      let inflated = pakoInflate(data);
+      if (!(inflated instanceof Uint8Array)) inflated = pakoInflatePartial(data);
+      data = inflated;
+      const dpMatch = /\/(?:DP|DecodeParms)\s*(?:\[\s*(?:null\s*)?)?<<([^>]*)>>/.exec(dictText);
+      if (dpMatch) {
+        let dpText = dpMatch[1];
+        if (!/\/Columns\s+\d+/.test(dpText)) dpText = `/Columns ${width} ${dpText}`;
+        data = applyPredictor(data, dpText, objCache);
+      }
+    } else if (filter === 'LZWDecode') {
+      const { decodeLZW } = await import('./codecs/decodeLZW.js');
+      data = decodeLZW(data, resolveIntValue(dictText, 'EarlyChange', null, 1));
+    } else if (filter === 'RunLengthDecode') {
+      const output = [];
+      let pos = 0;
+      while (pos < data.length) {
+        const len = data[pos++];
+        if (len < 128) {
+          for (let k = 0; k < len + 1 && pos < data.length; k++) output.push(data[pos++]);
+        } else if (len > 128) {
+          const val = pos < data.length ? data[pos++] : 0;
+          for (let k = 0; k < 257 - len; k++) output.push(val);
+        } else break;
+      }
+      data = new Uint8Array(output);
+    }
+  }
+
+  const invert = !!(decode && decode[0] === 1);
+
+  /** @type {import('./parsePdfImages.js').ImageInfo} */
+  const imageInfo = {
+    width,
+    height,
+    bitsPerComponent: bpc,
+    colorSpace,
+    filter: imageCodec,
+    imageData: data,
+    objNum: -1,
+    sMask: null,
+    sMaskWidth: null,
+    sMaskHeight: null,
+    sMaskDecodeInvert: false,
+    palette: null,
+    paletteBase: null,
+    imageMask: isImageMask,
+    decodeInvert: invert,
+    separationTintSamples: null,
+    deviceNTintCS: null,
+    iccProfileObjNum: null,
+    iccTransform: null,
+    labWhitePoint: null,
+    labRange: null,
+    paletteHival: null,
+    colorKeyMask: null,
+    transparentWhite: !!op.tilingPattern,
+  };
+
+  if (isImageMask) {
+    if (!op.fillColor || op.fillColor.includes('NaN')) return null;
+    return imageMaskToBitmap(imageInfo, op.fillColor, objCache);
+  }
+
+  if (resolvedCS) {
+    if (resolvedCS.indexedInfo) {
+      imageInfo.palette = resolvedCS.indexedInfo.palette;
+      imageInfo.paletteBase = resolvedCS.indexedInfo.base;
+      imageInfo.paletteHival = resolvedCS.indexedInfo.hival;
+      // CCITTFaxDecode emits 0=black, 1=white, used directly as the index into the 2-entry fax palette.
+      // Invert only when entry 0 is the lighter color, so the fax's black runs land on the darker entry.
+      // Inverting a palette that is already black-at-index-0 (e.g. <00ff>) paints the ink in the background color and the image vanishes.
+      if (bpc === 1 && imageCodec == null && filters.includes('CCITTFaxDecode')
+          && !decode && resolvedCS.indexedInfo.hival === 1) {
+        const pal = resolvedCS.indexedInfo.palette;
+        const nComp = resolvedCS.indexedInfo.base === 'DeviceCMYK' ? 4
+          : (resolvedCS.indexedInfo.base === 'DeviceGray' || resolvedCS.indexedInfo.base === 'CalGray' ? 1 : 3);
+        const brightness = (o) => {
+          if (nComp === 1) return pal[o];
+          if (nComp === 4) {
+            const [r, g, b] = cmykToRgb(pal[o] / 255, pal[o + 1] / 255, pal[o + 2] / 255, pal[o + 3] / 255);
+            return 0.299 * r + 0.587 * g + 0.114 * b;
+          }
+          return 0.299 * pal[o] + 0.587 * pal[o + 1] + 0.114 * pal[o + 2];
+        };
+        if (pal && brightness(0) > brightness(nComp)) imageInfo.decodeInvert = true;
+      }
+    }
+    // Single-input DeviceN reduces to a 1-D tint LUT, same as Separation.
+    if (resolvedCS.tintSamples) {
+      imageInfo.separationTintSamples = resolvedCS.tintSamples;
+      imageInfo.colorSpace = 'Separation';
+    }
+  }
+  return imageInfoToBitmap(imageInfo, objCache);
+}
+
+/**
+ * Render an SMask Form XObject to a canvas and produce an alpha mask.
+ * @param {SmaskRef} smaskInfo
+ * @param {ObjectCache} objCache
+ * @param {number} canvasWidth
+ * @param {number} canvasHeight
+ * @param {number} pageHeightPts
+ * @param {number} boxOriginX
+ * @param {number} boxOriginY
+ * @param {number} scale
+ * @param {{ x: number, y: number, width: number, height: number }|null} [bbox=null]
+ */
+async function renderSMaskToCanvas(smaskInfo, objCache, canvasWidth, canvasHeight, pageHeightPts, boxOriginX, boxOriginY, scale, bbox = null) {
+  const formObjText = objCache.getObjectText(smaskInfo.formObjNum);
+  if (!formObjText) return null;
+
+  const { images: maskImages, forms: maskForms } = parsePageImages(formObjText, objCache, { recurseForms: true });
+
+  const streamBytes = objCache.getStreamBytes(smaskInfo.formObjNum);
+  if (!streamBytes) return null;
+  const formStream = bytesToLatin1(streamBytes);
+
+  const maskExtGStates = parseExtGStates(formObjText, objCache);
+  const maskShadings = parseShadings(formObjText, objCache);
+  const maskPatterns = parsePatterns(formObjText, objCache);
+  const maskColorSpaces = parsePageColorSpaces(formObjText, objCache);
+
+  const maskFonts = parsePageFonts(formObjText, objCache);
+  const maskRegistered = new Map();
+  const maskSymbolTags = new Set();
+  const maskCidPUATags = new Set();
+  const maskRawCharCodeTags = new Set();
+  const maskCidCollisionMap = new Map();
+  for (const [fontTag, fontObj] of maskFonts) {
+    const familyName = pdfFontFamilyName(objCache, fontObj.fontObjNum, `smask_${smaskInfo.formObjNum}_${fontTag}`);
+    await convertAndRegisterFont(
+      fontTag, fontObj, maskRegistered, maskSymbolTags, maskCidPUATags,
+      maskRawCharCodeTags, maskCidCollisionMap, objCache, familyName,
+    );
+  }
+  appendGenericFallbacks(maskRegistered, maskFonts);
+
+  const rawFormDrawOps = parseDrawOps(formStream, maskFonts, maskExtGStates, maskRegistered, maskColorSpaces,
+    maskSymbolTags, maskCidPUATags, maskRawCharCodeTags, maskShadings, maskPatterns, maskCidCollisionMap);
+
+  let formDrawOps;
+  if (maskForms.size > 0) {
+    formDrawOps = [];
+    for (const op of rawFormDrawOps) {
+      if (op.type === 'image' && maskForms.has(op.name)) {
+        const sub = await flattenDrawOps(
+          [op], maskImages, maskForms, objCache, maskFonts, maskRegistered,
+          '', 0, maskSymbolTags, maskCidPUATags, maskExtGStates, maskRawCharCodeTags,
+          new Map(), 0, new Set(), maskCidCollisionMap,
+          'black', 'rgb(0,0,0)',
+          1, 1,
+          null, null,
+        );
+        for (const sop of sub) formDrawOps.push(sop);
+      } else {
+        formDrawOps.push(op);
+      }
+    }
+  } else {
+    formDrawOps = rawFormDrawOps;
+  }
+
+  const formMatrix = parseFormMatrix(formObjText, objCache);
+  for (const op of formDrawOps) {
+    if (op.ctm) op.ctm = matMul(op.ctm, formMatrix);
+  }
+
+  // Per PDF spec 11.6.5.1 an SMask is positioned by the parent CTM in effect when /gs set it, not by the CTM at draw time.
+  if (smaskInfo.parentCtm && smaskInfo.parentCtm.length === 6) {
+    for (const op of formDrawOps) {
+      const opAny = /** @type {any} */ (op);
+      if (opAny.ctm) opAny.ctm = matMul(opAny.ctm, smaskInfo.parentCtm);
+      if (opAny.clips) {
+        for (const clip of opAny.clips) {
+          clip.ctm = matMul(clip.ctm, smaskInfo.parentCtm);
+        }
+      }
+    }
+  }
+
+  // With a `bbox`, the canvas is sized to it and coordinates shift so the bbox origin lands at (0,0).
+  // That is a ~50x speedup on pages with many per-image soft masks, each covering a small portion of the page.
+  const maskW = bbox ? bbox.width : canvasWidth;
+  const maskH = bbox ? bbox.height : canvasHeight;
+  const shiftX = bbox ? bbox.x : 0;
+  const shiftY = bbox ? bbox.y : 0;
+  const maskCanvas = ca.makeCanvas(maskW, maskH);
+  const maskCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (maskCanvas.getContext('2d', { willReadFrequently: true }));
+
+  // For /S/Luminosity the mask group composites over an opaque /BC backdrop (PDF spec 11.6.5.2, default black), so unpainted areas take the backdrop's luminosity rather than alpha 0.
+  // For /S/Alpha the canvas stays transparent, because the alpha channel itself is the mask.
+  const isAlphaMask = smaskInfo.type === 'Alpha';
+  if (!isAlphaMask) {
+    const bc = smaskInfo.bc;
+    let bcColor = 'black';
+    if (bc && bc.length === 1) {
+      const v = Math.round(Math.max(0, Math.min(1, bc[0])) * 255);
+      bcColor = `rgb(${v},${v},${v})`;
+    } else if (bc && bc.length === 3) {
+      bcColor = `rgb(${Math.round(bc[0] * 255)},${Math.round(bc[1] * 255)},${Math.round(bc[2] * 255)})`;
+    } else if (bc && bc.length === 4) {
+      const [r, g, b] = cmykToRgb(bc[0], bc[1], bc[2], bc[3]);
+      bcColor = `rgb(${r},${g},${b})`;
+    }
+    maskCtx.fillStyle = bcColor;
+    maskCtx.fillRect(0, 0, maskW, maskH);
+  }
+
+  for (const op of formDrawOps) {
+    if (op.type === 'image') {
+      const imageInfo = maskImages.get(op.name);
+      if (!imageInfo) continue;
+
+      const bitmap = imageInfo.imageMask
+        ? await imageMaskToBitmap(imageInfo, 'white', objCache)
+        : await imageInfoToBitmap(imageInfo, objCache);
+
+      maskCtx.save();
+      if (op.fillAlpha < 1) maskCtx.globalAlpha = op.fillAlpha;
+      if (op.clips) {
+        for (const clip of op.clips) {
+          if (!clip.path) continue;
+          maskCtx.setTransform(
+            clip.ctm[0] * scale, -clip.ctm[1] * scale, clip.ctm[2] * scale, -clip.ctm[3] * scale,
+            (clip.ctm[4] - boxOriginX) * scale - shiftX, (pageHeightPts + boxOriginY - clip.ctm[5]) * scale - shiftY,
+          );
+          maskCtx.beginPath();
+          for (const cmd of clip.path) {
+            if (cmd.type === 'M') maskCtx.moveTo(cmd.x, cmd.y);
+            else if (cmd.type === 'L') maskCtx.lineTo(cmd.x, cmd.y);
+            else if (cmd.type === 'C') maskCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+            else if (cmd.type === 'Z') maskCtx.closePath();
+          }
+          maskCtx.clip(clip.evenOdd ? 'evenodd' : 'nonzero');
+        }
+      }
+      maskCtx.setTransform(
+        op.ctm[0] * scale,
+        -op.ctm[1] * scale,
+        op.ctm[2] * scale,
+        -op.ctm[3] * scale,
+        (op.ctm[4] - boxOriginX) * scale - shiftX,
+        (pageHeightPts + boxOriginY - op.ctm[5]) * scale - shiftY,
+      );
+      maskCtx.transform(1, 0, 0, -1, 0, 1);
+      maskCtx.drawImage(bitmap, 0, 0, 1, 1);
+      maskCtx.restore();
+      ca.closeDrawable(bitmap);
+    } else if (op.type === 'shading') {
+      const sh = op.shading;
+      maskCtx.save();
+      if (op.fillAlpha < 1) maskCtx.globalAlpha = op.fillAlpha;
+      if (op.clips) {
+        for (const clip of op.clips) {
+          if (!clip.path) continue;
+          maskCtx.setTransform(
+            clip.ctm[0] * scale, -clip.ctm[1] * scale, clip.ctm[2] * scale, -clip.ctm[3] * scale,
+            (clip.ctm[4] - boxOriginX) * scale - shiftX, (pageHeightPts + boxOriginY - clip.ctm[5]) * scale - shiftY,
+          );
+          maskCtx.beginPath();
+          for (const cmd of clip.path) {
+            if (cmd.type === 'M') maskCtx.moveTo(cmd.x, cmd.y);
+            else if (cmd.type === 'L') maskCtx.lineTo(cmd.x, cmd.y);
+            else if (cmd.type === 'C') maskCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+            else if (cmd.type === 'Z') maskCtx.closePath();
+          }
+          maskCtx.clip(clip.evenOdd ? 'evenodd' : 'nonzero');
+        }
+      }
+      maskCtx.setTransform(
+        op.ctm[0] * scale,
+        -op.ctm[1] * scale,
+        op.ctm[2] * scale,
+        -op.ctm[3] * scale,
+        (op.ctm[4] - boxOriginX) * scale - shiftX,
+        (pageHeightPts + boxOriginY - op.ctm[5]) * scale - shiftY,
+      );
+
+      if (sh.type === 2) {
+        const grad = maskCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3]);
+        for (const stop of sh.stops) {
+          grad.addColorStop(stop.offset, stop.color);
+        }
+        maskCtx.fillStyle = grad;
+        maskCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+      } else if (sh.type === 3) {
+        const grad = maskCtx.createRadialGradient(
+          sh.coords[0], sh.coords[1], sh.coords[2],
+          sh.coords[3], sh.coords[4], sh.coords[5],
+        );
+        for (const stop of sh.stops) {
+          grad.addColorStop(stop.offset, stop.color);
+        }
+        maskCtx.fillStyle = grad;
+        maskCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+      } else if (sh.type === 'mesh') {
+        renderMeshPatches(maskCtx, sh.patches);
+      } else if (sh.type === 'gouraud') {
+        renderGouraudTriangles(maskCtx, sh.triangles, null, [maskW, maskH]);
+      }
+      maskCtx.restore();
+    } else if (op.type === 'path' && op.fill) {
+      maskCtx.save();
+      if (op.fillAlpha < 1) maskCtx.globalAlpha = op.fillAlpha;
+      if (op.clips) {
+        for (const clip of op.clips) {
+          if (!clip.path) continue;
+          maskCtx.setTransform(
+            clip.ctm[0] * scale, -clip.ctm[1] * scale, clip.ctm[2] * scale, -clip.ctm[3] * scale,
+            (clip.ctm[4] - boxOriginX) * scale - shiftX, (pageHeightPts + boxOriginY - clip.ctm[5]) * scale - shiftY,
+          );
+          maskCtx.beginPath();
+          for (const cmd of clip.path) {
+            if (cmd.type === 'M') maskCtx.moveTo(cmd.x, cmd.y);
+            else if (cmd.type === 'L') maskCtx.lineTo(cmd.x, cmd.y);
+            else if (cmd.type === 'C') maskCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+            else if (cmd.type === 'Z') maskCtx.closePath();
+          }
+          maskCtx.clip(clip.evenOdd ? 'evenodd' : 'nonzero');
+        }
+      }
+      maskCtx.setTransform(
+        op.ctm[0] * scale,
+        -op.ctm[1] * scale,
+        op.ctm[2] * scale,
+        -op.ctm[3] * scale,
+        (op.ctm[4] - boxOriginX) * scale - shiftX,
+        (pageHeightPts + boxOriginY - op.ctm[5]) * scale - shiftY,
+      );
+      maskCtx.beginPath();
+      for (const cmd of op.commands) {
+        switch (cmd.type) {
+          case 'M': maskCtx.moveTo(cmd.x, cmd.y); break;
+          case 'L': maskCtx.lineTo(cmd.x, cmd.y); break;
+          case 'C': maskCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y); break;
+          case 'Z': maskCtx.closePath(); break;
+          default: break;
+        }
+      }
+      if (op.patternShading) {
+        const sh = op.patternShading;
+        maskCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+        if (sh.matrix) maskCtx.transform(...sh.matrix);
+        if (sh.type === 'mesh') {
+          renderMeshPatches(maskCtx, sh.patches);
+        } else if (sh.type === 'gouraud') {
+          renderGouraudTriangles(maskCtx, sh.triangles, null, [maskW, maskH]);
+        } else {
+          let grad;
+          if (sh.type === 2) {
+            grad = maskCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3]);
+          } else if (sh.type === 3) {
+            grad = maskCtx.createRadialGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3], sh.coords[4], sh.coords[5]);
+          }
+          if (grad) {
+            for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+            maskCtx.fillStyle = grad;
+            maskCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+          } else {
+            maskCtx.fillStyle = op.fillColor || 'black';
+            maskCtx.fill(op.evenOdd ? 'evenodd' : 'nonzero');
+          }
+        }
+      } else if (op.tilingPattern) {
+        const tp = op.tilingPattern;
+        const tileCanvas = await renderTilingPatternTileForSmask(tp, objCache, scale);
+        if (tileCanvas) {
+          const bboxW = tp.bbox[2] - tp.bbox[0];
+          const bboxH = tp.bbox[3] - tp.bbox[1];
+          const tileW = tileCanvas.width;
+          const tileH = tileCanvas.height;
+          const sx = bboxW / tileW * scale;
+          const sy = bboxH / tileH * scale;
+          maskCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+          maskCtx.setTransform(1, 0, 0, 1, 0, 0);
+          const canvasPat = maskCtx.createPattern(tileCanvas, 'repeat');
+          if (canvasPat) {
+            canvasPat.setTransform(new DOMMatrix([
+              tp.matrix[0] * sx, -tp.matrix[1] * sx,
+              -tp.matrix[2] * sy, tp.matrix[3] * sy,
+              (tp.matrix[0] * tp.bbox[0] + tp.matrix[2] * (tp.bbox[1] + bboxH) + tp.matrix[4] - boxOriginX) * scale - shiftX,
+              (pageHeightPts + boxOriginY - tp.matrix[1] * tp.bbox[0] - tp.matrix[3] * (tp.bbox[1] + bboxH) - tp.matrix[5]) * scale - shiftY,
+            ]));
+            maskCtx.fillStyle = canvasPat;
+            maskCtx.fillRect(0, 0, maskW, maskH);
+          }
+          ca.closeDrawable(tileCanvas);
+        }
+      } else {
+        maskCtx.fillStyle = op.fillColor || 'black';
+        maskCtx.fill(op.evenOdd ? 'evenodd' : 'nonzero');
+      }
+      maskCtx.restore();
+    } else if (op.type === 'type0text' && op.fontFamily && op.text) {
+      const isEmbedded = /^"?_pdf_/.test(op.fontFamily);
+      const weight = (!isEmbedded && op.bold) ? 'bold' : 'normal';
+      const style = (!isEmbedded && op.italic) ? 'italic' : 'normal';
+      maskCtx.save();
+      maskCtx.font = /[",]/.test(op.fontFamily)
+        ? `${style} ${weight} 1px ${op.fontFamily}`
+        : `${style} ${weight} 1px "${op.fontFamily}"`;
+      maskCtx.textBaseline = 'alphabetic';
+      let hScale = 1;
+      if (op.pdfGlyphWidth !== undefined) {
+        const mw = maskCtx.measureText(op.text).width;
+        if (mw > 0) {
+          hScale = op.pdfGlyphWidth / (1000 * mw);
+          if (!isEmbedded && hScale > 2.0) hScale = 1;
+        }
+      }
+      maskCtx.setTransform(
+        op.a * scale * hScale, -op.b * scale * hScale,
+        -op.c * scale, op.d * scale,
+        (op.x - boxOriginX) * scale - shiftX,
+        (pageHeightPts + boxOriginY - op.y) * scale - shiftY,
+      );
+      maskCtx.fillStyle = op.fillColor || 'black';
+      if (op.fillAlpha < 1) maskCtx.globalAlpha = op.fillAlpha;
+      maskCtx.fillText(op.text, 0, 0);
+      maskCtx.restore();
+    } else if (op.type === 'inlineImage') {
+      const bitmap = await decodeInlineImageBitmap(op, objCache);
+      if (!bitmap) continue;
+      if (Math.abs(op.ctm[0] * op.ctm[3] - op.ctm[1] * op.ctm[2]) < 1e-9) {
+        ca.closeDrawable(bitmap);
+        continue;
+      }
+      maskCtx.save();
+      if (op.fillAlpha < 1) maskCtx.globalAlpha = op.fillAlpha;
+      if (op.clips) {
+        for (const clip of op.clips) {
+          if (!clip.path) continue;
+          maskCtx.setTransform(
+            clip.ctm[0] * scale, -clip.ctm[1] * scale, clip.ctm[2] * scale, -clip.ctm[3] * scale,
+            (clip.ctm[4] - boxOriginX) * scale - shiftX, (pageHeightPts + boxOriginY - clip.ctm[5]) * scale - shiftY,
+          );
+          maskCtx.beginPath();
+          for (const cmd of clip.path) {
+            if (cmd.type === 'M') maskCtx.moveTo(cmd.x, cmd.y);
+            else if (cmd.type === 'L') maskCtx.lineTo(cmd.x, cmd.y);
+            else if (cmd.type === 'C') maskCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+            else if (cmd.type === 'Z') maskCtx.closePath();
+          }
+          maskCtx.clip(clip.evenOdd ? 'evenodd' : 'nonzero');
+        }
+      }
+      maskCtx.setTransform(
+        op.ctm[0] * scale, -op.ctm[1] * scale,
+        op.ctm[2] * scale, -op.ctm[3] * scale,
+        (op.ctm[4] - boxOriginX) * scale - shiftX,
+        (pageHeightPts + boxOriginY - op.ctm[5]) * scale - shiftY,
+      );
+      maskCtx.transform(1, 0, 0, -1, 0, 1);
+      maskCtx.drawImage(bitmap, 0, 0, 1, 1);
+      maskCtx.restore();
+      ca.closeDrawable(bitmap);
+    }
+  }
+
+  const trFn = smaskInfo.tr || null;
+  let trLut = null;
+  if (trFn) {
+    trLut = new Float64Array(256);
+    for (let k = 0; k < 256; k++) {
+      const out = evaluateFunction(trFn, [k / 255]);
+      trLut[k] = out && out.length > 0 ? out[0] : k / 255;
+    }
+  }
+  const maskData = maskCtx.getImageData(0, 0, maskW, maskH);
+  const px = maskData.data;
+  for (let i = 0; i < px.length; i += 4) {
+    const alpha = px[i + 3] / 255;
+    let outAlpha;
+    if (isAlphaMask) {
+      outAlpha = trLut ? trLut[px[i + 3]] : alpha;
+      px[i] = 255;
+      px[i + 1] = 255;
+      px[i + 2] = 255;
+      px[i + 3] = Math.round(Math.max(0, Math.min(1, outAlpha)) * 255);
+    } else {
+      const luminosity = (0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]) / 255;
+      outAlpha = trLut ? trLut[Math.round(luminosity * 255)] : luminosity;
+      px[i] = 255;
+      px[i + 1] = 255;
+      px[i + 2] = 255;
+      px[i + 3] = Math.round(Math.max(0, Math.min(1, outAlpha)) * alpha * 255);
+    }
+  }
+  maskCtx.putImageData(maskData, 0, 0);
+  return maskCanvas;
+}
+
+/**
+ * Render a single PDF page to an image.
+ *
+ * @param {string} pageObjText - Raw text of the Page object
+ * @param {ObjectCache} objCache
+ * @param {number[]} mediaBox - Page media box [x0, y0, x1, y1]
+ * @param {number} pageIndex
+ * @param {'color'|'gray'} [colorMode='color']
+ * @param {number} [rotate=0] - Page rotation in degrees
+ * @param {number} [dpi=300] - Render resolution in dots per inch
+ * @param {'png'|'jpeg'|'webp'|'bitmap'} [outputFormat='png']
+ * @param {number} [quality=0.6] - JPEG/WebP quality 0-1. WebP quality 1.0 encodes losslessly in Chromium.
+ * @param {?RenderEdits} [edits] - Edit records for this page plus the page dimensions in the records' page-pixel frame.
+ *   Glyphs covered by `deleteText` rects are suppressed, matching what the PDF exporter removes.
+ * @returns {Promise<{dataUrl?: string, blob?: Blob, bitmap?: ImageBitmap, colorMode: string, ok: boolean, failReason?: string, failDetail?: string,
+ *   perf?: {prepMs: number, drawMs: number, decodeMs: number, flushMs: number}}>}
+ *   The rendered image in `dataUrl` ('png'), `blob` ('jpeg'/'webp'), or `bitmap` ('bitmap').
+ *   `colorMode` is the mode actually used, which downgrades to 'gray' on a page with no color.
+ *   'bitmap' falls back to a PNG `dataUrl` when the canvas is not a real OffscreenCanvas (Node).
+ *   On failure `ok` is false and the image is a blank PNG `dataUrl`, whatever `outputFormat` requested.
+ *   `drawMs - decodeMs` estimates the recurring cost of re-rendering the page.
+ */
+export async function renderPdfPageAsImage(pageObjText, objCache, mediaBox, pageIndex, colorMode = 'color', rotate = 0, dpi = 300, outputFormat = 'png', quality = 0.6, edits = null) {
+  const tRenderStart = performance.now();
+  // decodeMs is a subset of drawMs, not a sibling: it counts only the decodes inside the draw loop that were admitted to the doc-wide image cache.
+  const perf = {
+    prepMs: 0, drawMs: 0, decodeMs: 0, flushMs: 0,
+  };
+  const offOCGs = objCache.getOffOCGs();
+  const contentWidthPts = Math.abs(mediaBox[2] - mediaBox[0]);
+  const contentHeightPts = Math.abs(mediaBox[3] - mediaBox[1]);
+  // Box corners may be stored in either order, so the origin is the lower-left corner.
+  const boxOriginX = Math.min(mediaBox[0], mediaBox[2]);
+  const boxOriginY = Math.min(mediaBox[1], mediaBox[3]);
+
+  // Per the PDF spec /Rotate is clockwise, which fixes the sign of each matrix below.
+  // Their translations carry boxOrigin to pair with the offsets the per-op canvas transform applies, so a box with a non-zero origin still lands on the canvas edges.
+  let rotCtm = null;
+  let pageWidthPts = contentWidthPts;
+  let pageHeightPts = contentHeightPts;
+  if (rotate === 90) {
+    rotCtm = [0, -1, 1, 0, boxOriginX - boxOriginY, contentWidthPts + boxOriginX + boxOriginY];
+    pageWidthPts = contentHeightPts;
+    pageHeightPts = contentWidthPts;
+  } else if (rotate === 180) {
+    rotCtm = [-1, 0, 0, -1, contentWidthPts + 2 * boxOriginX, contentHeightPts + 2 * boxOriginY];
+  } else if (rotate === 270) {
+    rotCtm = [0, 1, -1, 0, contentHeightPts + boxOriginY + boxOriginX, boxOriginY - boxOriginX];
+    pageWidthPts = contentHeightPts;
+    pageHeightPts = contentWidthPts;
+  }
+
+  // Content decrypted from a repaired xref offset cannot be trusted, so severe corruption is recoverable only when the document is unencrypted.
+  if (objCache.xrefSeverelyCorrupt && objCache.encryptionKey) {
+    const scale = 300 / 72;
+    const w = Math.ceil(pageWidthPts * scale);
+    const h = Math.ceil(pageHeightPts * scale);
+    const c = ca.makeCanvas(w, h);
+    const cCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (c.getContext('2d', { willReadFrequently: true }));
+    cCtx.fillStyle = 'white';
+    cCtx.fillRect(0, 0, w, h);
+    const _imgData = cCtx.getImageData(0, 0, w, h);
+    const out = {
+      dataUrl: await buildPngDataUrl(_imgData, 'gray'), colorMode: 'gray', ok: false, failReason: 'corrupt_encrypted',
+    };
+    ca.closeDrawable(c);
+    return out;
+  }
+
+  // Nested resources are discovered lazily while flattening only the forms that are actually drawn.
+  const { images, forms } = parsePageImages(pageObjText, objCache, { recurseForms: false });
+
+  // A substitute face a text patch draws with is synthesized into the cache on demand and joins the page's fonts under the tag the patched stream names.
+  await ensureSubstituteFacesForRecords(objCache, edits && edits.records);
+  const fonts = parsePageFonts(pageObjText, objCache);
+  const substituteEntries = substituteFaceResourceEntries(objCache, edits && edits.records);
+  if (substituteEntries) for (const [tag, f] of parsePageFonts(`<</Resources<</Font<<${substituteEntries}>>>>>>`, objCache)) fonts.set(tag, f);
+
+  const registeredFontNames = new Map();
+  /** @type {Set<string>} Font tags with Symbol-only cmap (need PUA codepoints for canvas rendering) */
+  const symbolFontTags = new Set();
+  /** @type {Set<string>} Font tags with Mac-only cmap (need raw charCodes for canvas rendering) */
+  const rawCharCodeTags = new Set();
+  /** @type {Set<string>} Font tags with PUA-based cmap (CID CFF fonts use U+E000+CID for glyph lookup) */
+  const cidPUATags = new Set();
+  /** @type {Map<string, Set<number>>} Font tags to the CIDs forced into the PUA by a Unicode collision */
+  const cidCollisionMap = new Map();
+  /** @type {string[]} Font tags with no embedded data, deferred to a second pass */
+  const deferredFontTags = [];
+  for (const [fontTag, fontObj] of fonts) {
+    const fontData = fontObj.type0 || fontObj.type1;
+    if (!fontData) {
+      deferredFontTags.push(fontTag);
+      continue;
+    }
+    const familyName = pdfFontFamilyName(objCache, fontObj.fontObjNum, fontTag);
+    await convertAndRegisterFont(
+      fontTag, fontObj, registeredFontNames, symbolFontTags, cidPUATags,
+      rawCharCodeTags, cidCollisionMap, objCache, familyName,
+    );
+  }
+
+  for (const fontTag of deferredFontTags) {
+    const fontObj = fonts.get(fontTag);
+    if (!fontObj) continue;
+    // Without a toUnicode map, a non-embedded CID font's char codes are opaque glyph indices, so a substitution font would draw them as garbled Latin.
+    // The type0 exception covers predefined Unicode CMaps, whose 2-byte codes are real codepoints.
+    if (fontObj.isCIDFont && fontObj.toUnicode.size === 0 && !fontObj.type0) {
+      console.warn(`[renderPdfPage] Skipping non-embedded CID font "${fontObj.baseName}" (no toUnicode map)`);
+      continue;
+    }
+    const familyName = pdfFontFamilyName(objCache, fontObj.fontObjNum, fontTag);
+    await registerNonEmbeddedFont(fontObj, familyName, registeredFontNames, fontTag);
+  }
+  appendGenericFallbacks(registeredFontNames, fonts);
+
+  const extGStates = parseExtGStates(pageObjText, objCache);
+  const colorSpaces = parsePageColorSpaces(pageObjText, objCache);
+  const pageShadings = parseShadings(pageObjText, objCache);
+  const pagePatterns = parsePatterns(pageObjText, objCache);
+
+  let pageHasColor = false;
+  for (const [, imgInfo] of images) {
+    if (imgInfo.bitsPerComponent === 1) continue;
+    const cs = imgInfo.colorSpace;
+    if (cs === 'DeviceGray' || cs === 'CalGray') continue;
+    if (cs === 'Indexed') {
+      if (imgInfo.paletteBase === 'DeviceGray' || imgInfo.paletteBase === 'CalGray') continue;
+    }
+    pageHasColor = true;
+    break;
+  }
+
+  const contentStreams = getPageContentStreams(pageObjText, objCache);
+  const recoveredFlags = objCache.lastContentStreamsRecovered;
+  // Text patches address offsets in the newline-joined entries, the same text the parser and the PDF exporter patch.
+  // The entry boundaries go to parseDrawOps so a corrupt entry cannot suppress the rest of the page.
+  /** @type {?Array<TextPatch>} */
+  const textPatches = edits && edits.records ? /** @type {Array<TextPatch>} */ (edits.records.filter((r) => r && r.type === 'patchText')) : null;
+  const pageContents = contentStreams && contentStreams.length > 0 ? patchPageContents(contentStreams, textPatches) : null;
+
+  const rawDrawOps = pageContents
+    ? parseDrawOps(pageContents.text, fonts, extGStates, registeredFontNames, colorSpaces, symbolFontTags,
+      cidPUATags, rawCharCodeTags, pageShadings, pagePatterns, cidCollisionMap, null,
+      parseHiddenOCMCNames(pageObjText, objCache, offOCGs), recoveredFlags, pageContents.boundaries)
+    : [];
+
+  // parseDrawOps tokenizes the whole page synchronously, so on a large page nothing else on the thread has run until this yield.
+  if (pageContents && pageContents.text.length > 500000) {
+    await new Promise((resolve) => { setTimeout(resolve, 0); });
+  }
+
+  /** @type {Array<DrawOp>} */
+  const drawOps = [];
+  /** @type {{nextId: number, registry: Map<number, TransparencyGroupAttrs>}} */
+  const groupContext = { nextId: 1, registry: new Map() };
+  if (forms.size > 0) {
+    const sharedFormResourceCache = new Map();
+    for (const op of rawDrawOps) {
+      if (op.type === 'image') {
+        const flattened = await flattenDrawOps(
+          [op], images, forms, objCache, fonts, registeredFontNames,
+          '', pageIndex, symbolFontTags, cidPUATags, extGStates, rawCharCodeTags,
+          sharedFormResourceCache, 0, offOCGs, cidCollisionMap,
+          'black', 'rgb(0,0,0)',
+          1, 1,
+          groupContext, null,
+          textPatches,
+        );
+        for (let fi = 0; fi < flattened.length; fi++) drawOps.push(flattened[fi]);
+      } else {
+        drawOps.push(op);
+      }
+    }
+  } else {
+    for (let ri = 0; ri < rawDrawOps.length; ri++) drawOps.push(rawDrawOps[ri]);
+  }
+
+  // Edits are applied with the PDF exporter's own rect mapping, em-box hit test, and in-place replacement splice, so the raster shows exactly what an export keeps.
+  if (edits && edits.records?.length && edits.dims) {
+    /**
+     * @type {Array<{ rec: ContentEdit, rects: Array<[number, number, number, number]>,
+     *   gate: ?{pts: Array<{u: ?string, x: number, y: number, f: ?number}>, tol: number},
+     *   imageGate?: ?ReturnType<typeof mapImageDelete>, pathGate?: ?ReturnType<typeof mapPathDelete> }>}
+     */
+    const editEntries = [];
+    for (const rec of edits.records) {
+      if (!rec) continue;
+      if (rec.type === 'deleteImage') {
+        const imageGate = mapImageDelete(rec, edits.dims, mediaBox, rotate);
+        if (imageGate) {
+          editEntries.push({
+            rec, rects: [], gate: null, imageGate,
+          });
+        }
+        continue;
+      }
+      if (rec.type === 'deletePath') {
+        const pathGate = mapPathDelete(rec, edits.dims, mediaBox, rotate);
+        if (pathGate) {
+          editEntries.push({
+            rec, rects: [], gate: null, pathGate,
+          });
+        }
+        continue;
+      }
+    }
+    if (editEntries.length > 0) {
+      let keep = 0;
+      for (let i = 0; i < drawOps.length; i++) {
+        const op = drawOps[i];
+        if (op.type === 'image' || op.type === 'inlineImage') {
+          const opObjNum = op.type === 'image' ? (images.get(op.name)?.objNum ?? null) : null;
+          let imageHit = false;
+          for (const entry of editEntries) {
+            if (entry.imageGate && imageDrawMatchesDelete(op.ctm, entry.imageGate, opObjNum)) { imageHit = true; break; }
+          }
+          if (imageHit) continue;
+        }
+        if (op.type === 'path') {
+          let hull = null;
+          let pathHit = false;
+          for (const entry of editEntries) {
+            if (!entry.pathGate) continue;
+            if (!hull) {
+              let hx0 = Infinity; let hy0 = Infinity; let hx1 = -Infinity; let hy1 = -Infinity;
+              for (const cmd of op.commands) {
+                if (cmd.type === 'Z') continue;
+                const pts = cmd.type === 'C' ? [[cmd.x1, cmd.y1], [cmd.x2, cmd.y2], [cmd.x, cmd.y]] : [[cmd.x, cmd.y]];
+                for (const [cx2, cy2] of pts) {
+                  const gx = cx2 * op.ctm[0] + cy2 * op.ctm[2] + op.ctm[4];
+                  const gy = cx2 * op.ctm[1] + cy2 * op.ctm[3] + op.ctm[5];
+                  hx0 = Math.min(hx0, gx); hy0 = Math.min(hy0, gy); hx1 = Math.max(hx1, gx); hy1 = Math.max(hy1, gy);
+                }
+              }
+              hull = [hx0, hy0, hx1, hy1];
+            }
+            const paint = op.fill && op.stroke ? 'fs' : (op.fill ? 'f' : 's');
+            if (pathDrawMatchesDelete(hull, entry.pathGate, paint, op.commands.length)) { pathHit = true; break; }
+          }
+          if (pathHit) continue;
+        }
+        drawOps[keep] = op;
+        keep += 1;
+      }
+      drawOps.length = keep;
+    }
+  }
+
+  const annotsParsed = extractPdfAnnotations(objCache, pageObjText);
+  let needAppearances = false;
+  {
+    const rootObjNum = findRootObjNum(objCache.pdfBytes);
+    const catalogText = rootObjNum ? objCache.getObjectText(rootObjNum) : null;
+    const acroFormMatch = catalogText ? /\/AcroForm\s+(\d+)\s+\d+\s+R/.exec(catalogText) : null;
+    const acroFormText = acroFormMatch ? objCache.getObjectText(Number(acroFormMatch[1])) : null;
+    if (acroFormText && /\/NeedAppearances\s+true\b/.test(acroFormText)) needAppearances = true;
+  }
+  /** @type {Map<number, import('./parsePdfAnnots.js').PdfHighlightRaw>} */
+  const highlightByRef = new Map(annotsParsed.highlights.map((h) => [h.objNum, h]));
+  const annotRefsRaw = [
+    ...annotsParsed.highlights.map((h) => h.objNum),
+    ...annotsParsed.passthroughRefs,
+  ];
+  // Widget annotations paint on top of non-Widget markup annotations.
+  const annotIsWidget = (ref) => {
+    const t = objCache.getObjectText(ref);
+    return t ? /\/Subtype\s*\/Widget\b/.test(scopeDictKeys(t).keyText('Subtype')) : false;
+  };
+  const annotRefs = [
+    ...annotRefsRaw.filter((r) => !annotIsWidget(r)),
+    ...annotRefsRaw.filter((r) => annotIsWidget(r)),
+  ];
+  if (annotRefs.length > 0) {
+    for (const annotRef of annotRefs) {
+      const annotText = objCache.getObjectText(annotRef);
+      if (!annotText) continue;
+      const annotKeys = scopeDictKeys(annotText);
+      const subtypeText = annotKeys.keyText('Subtype');
+
+      const rectArrText = resolveArrayValue(annotKeys.keyText('Rect'), 'Rect', objCache);
+      if (rectArrText == null) continue;
+      const rect = [];
+      const rectTokRe = /(\d+)\s+\d+\s+R|(-?[\d.]+(?:[eE][-+]?\d+)?)/g;
+      let rectTok;
+      while ((rectTok = rectTokRe.exec(rectArrText)) && rect.length < 4) {
+        if (rectTok[1] !== undefined) {
+          const numText = objCache.getObjectText(Number(rectTok[1]));
+          const numMatch = numText ? /(-?[\d.]+(?:[eE][-+]?\d+)?)/.exec(numText) : null;
+          rect.push(numMatch ? Number(numMatch[1]) : NaN);
+        } else {
+          rect.push(Number(rectTok[2]));
+        }
+      }
+      if (rect.length < 4 || rect.some(Number.isNaN)) continue;
+      // /Rect corners may be stored in either order, so normalize to lower-left + size.
+      const rectX0 = Math.min(rect[0], rect[2]);
+      const rectY0 = Math.min(rect[1], rect[3]);
+      const rectW = Math.abs(rect[2] - rect[0]);
+      const rectH = Math.abs(rect[3] - rect[1]);
+      // Line annotations may have an empty Rect with endpoints defined by /L
+      // Ink annotations may have inverted Rects (coords are in InkList, not Rect)
+      const isLineAnnot = /\/Subtype\s*\/Line\b/.test(subtypeText);
+      const isInkAnnot = /\/Subtype\s*\/Ink\b/.test(subtypeText);
+      if ((rectW <= 0 || rectH <= 0) && !isLineAnnot && !isInkAnnot) continue;
+
+      const flags = resolveIntValue(annotKeys.keyText('F'), 'F', objCache, 0);
+      if (flags & 1 || flags & 2 || flags & 32) continue; // Invisible (bit 1), Hidden (bit 2), NoView (bit 6)
+
+      let apObjNum = null;
+      let apDictText = annotKeys.keyText('AP');
+      const apIndirectMatch = /\/AP\s+(\d+)\s+\d+\s+R/.exec(annotKeys.keyText('AP'));
+      if (apIndirectMatch) {
+        const refText = objCache.getObjectText(Number(apIndirectMatch[1]));
+        if (refText) apDictText = refText;
+      }
+      const apDirectMatch = /\/AP\s*<<[\s\S]*?\/N\s+(\d+)\s+\d+\s+R/.exec(apDictText)
+        || /^<<[\s\S]*?\/N\s+(\d+)\s+\d+\s+R/.exec(apDictText);
+      if (apDirectMatch) {
+        apObjNum = Number(apDirectMatch[1]);
+        // /N may be an indirect ref to a sub-state dict (checkbox/radio) rather than the appearance stream.
+        // That dict has no /BBox, so follow /AS to the state's stream.
+        const nObjText = objCache.getObjectText(apObjNum);
+        if (nObjText && !/\/BBox/.test(nObjText)) {
+          const asMatch = /\/AS\s*\/(\w+)/.exec(annotKeys.keyText('AS'));
+          const currentState = asMatch ? asMatch[1] : 'Off';
+          const stateRefMatch = new RegExp(`\\/${currentState}\\s+(\\d+)\\s+\\d+\\s+R`).exec(nObjText);
+          if (stateRefMatch) apObjNum = Number(stateRefMatch[1]);
+        }
+      } else {
+        // Inline sub-state dict: /AP << /N << /Yes 31 0 R /Off 32 0 R >> >>
+        const apDictMatch = /\/AP\s*<<[\s\S]*?\/N\s*<<([\s\S]*?)>>/.exec(apDictText)
+          || /^<<[\s\S]*?\/N\s*<<([\s\S]*?)>>/.exec(apDictText);
+        if (apDictMatch) {
+          const asMatch = /\/AS\s*\/(\w+)/.exec(annotKeys.keyText('AS'));
+          const currentState = asMatch ? asMatch[1] : 'Off';
+          const stateRefMatch = new RegExp(`\\/${currentState}\\s+(\\d+)\\s+\\d+\\s+R`).exec(apDictMatch[1]);
+          if (stateRefMatch) apObjNum = Number(stateRefMatch[1]);
+        }
+      }
+
+      // Radio kids put /FT on their /Parent, so fall back to it.
+      let resolvedFieldType = '';
+      const ftSelfMatch = /\/FT\s*\/(\w+)/.exec(annotKeys.keyText('FT'));
+      if (ftSelfMatch) {
+        resolvedFieldType = ftSelfMatch[1];
+      } else {
+        const parentRefMatch = /\/Parent\s+(\d+)\s+\d+\s+R/.exec(annotKeys.keyText('Parent'));
+        const parentText = parentRefMatch ? objCache.getObjectText(Number(parentRefMatch[1])) : null;
+        const ftParentMatch = parentText ? /\/FT\s*\/(\w+)/.exec(scopeDictKeys(parentText).keyText('FT')) : null;
+        if (ftParentMatch) resolvedFieldType = ftParentMatch[1];
+      }
+      // Decode /V up front: both the regenerate decision and the synthesis below consume it.
+      let fieldValue = null;
+      if (resolvedFieldType === 'Tx' || resolvedFieldType === 'Ch') {
+        fieldValue = resolveStringValue(annotKeys.keyText('V'), 'V', objCache);
+        if (fieldValue && fieldValue.charCodeAt(0) === 0xfeff) fieldValue = fieldValue.slice(1);
+      }
+
+      // Under /NeedAppearances the embedded /AP is stale, so drop it to force synthesis, but only where the synth can faithfully reproduce the value.
+      // Pushbuttons (Ff bit 17) keep theirs, having no value to regenerate.
+      if (needAppearances && apObjNum !== null) {
+        if (resolvedFieldType === 'Tx') {
+          const txMultiline = (resolveIntValue(annotKeys.keyText('Ff'), 'Ff', objCache, 0) & 0x1000) !== 0;
+          const synthCanRender = fieldValue === null || !/[^\x00-\xff]/.test(fieldValue);
+          if (!txMultiline && synthCanRender) apObjNum = null;
+        } else if (resolvedFieldType === 'Btn') {
+          if (!(resolveIntValue(annotKeys.keyText('Ff'), 'Ff', objCache, 0) & 0x10000)) apObjNum = null;
+        }
+      }
+
+      // No usable /AP: synthesize one and route it through the /AP path below, which handles font parsing and the BBox->Rect transform.
+      if (apObjNum === null) {
+        if (resolvedFieldType === 'Tx' || resolvedFieldType === 'Ch') {
+          if (fieldValue && fieldValue.length > 0) {
+            const da = resolveStringValue(annotKeys.keyText('DA'), 'DA', objCache) ?? '/Helvetica 10 Tf 0 g';
+            const tfMatch = /\/[\w+-]+\s+([\d.]+)\s+Tf/.exec(da);
+            let fontSize = tfMatch ? Number(tfMatch[1]) : 10;
+            // /DA font size 0 means auto-size: pick a size that fits the field height.
+            if (!fontSize) fontSize = Math.min(12, Math.max(6, rectH - 4));
+            const tfEnd = da.lastIndexOf('Tf');
+            const colorOps = tfEnd >= 0 ? da.slice(tfEnd + 2).trim() : '0 g';
+            const quadding = resolveIntValue(annotKeys.keyText('Q'), 'Q', objCache, 0);
+            const synthFf = resolveIntValue(annotKeys.keyText('Ff'), 'Ff', objCache, 0);
+            const multiline = (synthFf & 0x1000) !== 0;
+            // Comb (Ff bit 25) with /MaxLen draws one character per cell.
+            // Read like the importer's gate: Tx only, no /Parent walk, matching the Ff read above.
+            const combMaxLen = resolvedFieldType === 'Tx' && !multiline && (synthFf & 0x1000000)
+              ? resolveIntValue(annotKeys.keyText('MaxLen'), 'MaxLen', objCache, 0) : 0;
+            const pad = 2;
+            const esc = (s) => s.replace(/[\\()]/g, (ch) => `\\${ch}`);
+            // Helvetica's average advance is ~0.5em, enough to place/justify single lines and to wrap a multiline note approximately (no per-glyph metrics needed here).
+            const avgCharW = fontSize * 0.5;
+            let textCommands = '';
+            if (multiline) {
+              const maxChars = Math.max(1, Math.floor((rectW - 2 * pad) / avgCharW));
+              const lines = [];
+              for (const para of fieldValue.split(/\r\n|\r|\n/)) {
+                const words = para.split(/\s+/).filter((w) => w.length > 0);
+                if (words.length === 0) { lines.push(''); continue; }
+                let line = '';
+                for (const w of words) {
+                  if (line.length === 0) line = w;
+                  else if ((line.length + 1 + w.length) <= maxChars) line += ` ${w}`;
+                  else { lines.push(line); line = w; }
+                }
+                if (line.length > 0) lines.push(line);
+              }
+              const leading = fontSize * 1.15;
+              let ty = rectH - pad - fontSize;
+              textCommands = `${pad} ${ty} Td`;
+              for (let li = 0; li < lines.length; li++) {
+                if (li > 0) textCommands += ` 0 ${-leading} Td`;
+                textCommands += ` (${esc(lines[li])}) Tj`;
+                ty -= leading;
+              }
+            } else if (combMaxLen > 0) {
+              // Glyphs are advance-centered in their cell, matching the exported appearance.
+              // Comb layout is left-packed by character index, so quadding does not apply.
+              const cellW = rectW / combMaxLen;
+              const ty = Math.max(pad, (rectH - fontSize) / 2 + fontSize * 0.2);
+              const ops = [];
+              for (const m of fieldValue.matchAll(/\S/g)) {
+                const chW = fontSize * ((combHelvWidths.get(m[0].charCodeAt(0)) ?? combHelvDefaultWidth) / 1000);
+                const x = m.index * cellW + (cellW - chW) / 2;
+                ops.push(`1 0 0 1 ${x.toFixed(2)} ${ty.toFixed(2)} Tm (${esc(m[0])}) Tj`);
+              }
+              textCommands = ops.join(' ');
+            } else {
+              const textW = fieldValue.length * avgCharW;
+              let tx = pad;
+              if (quadding === 1) tx = Math.max(pad, (rectW - textW) / 2);
+              else if (quadding === 2) tx = Math.max(pad, rectW - textW - pad);
+              const ty = Math.max(pad, (rectH - fontSize) / 2 + fontSize * 0.2);
+              textCommands = `${tx} ${ty} Td (${esc(fieldValue)}) Tj`;
+            }
+            const synthDict = `<</Type/XObject/Subtype/Form/FormType 1/BBox[0 0 ${rectW} ${rectH}]`
+              + '/Resources<</Font<</HsynthF<</Type/Font/Subtype/Type1/BaseFont/Helvetica/Encoding/WinAnsiEncoding>>>>/ProcSet[/PDF/Text]>>>>';
+            const clip = `0 0 ${rectW} ${rectH} re W n`;
+            const synthStream = `/Tx BMC q ${clip} BT /HsynthF ${fontSize} Tf ${colorOps} ${textCommands} ET Q EMC`;
+            const synthObjNum = 900000000 + annotRef;
+            objCache.addSyntheticObject(synthObjNum, synthDict, new TextEncoder().encode(synthStream));
+            apObjNum = synthObjNum;
+          }
+        } else if (resolvedFieldType === 'Btn') {
+          // The /MK /CA caption names a ZapfDingbats glyph whose substitute rendering is unreliable, so a circle path draws the dot without a font.
+          const asMatch = /\/AS\s*\/(\w+)/.exec(annotKeys.keyText('AS'));
+          if (asMatch && asMatch[1] !== 'Off') {
+            const da = resolveStringValue(annotKeys.keyText('DA'), 'DA', objCache) ?? '0 g';
+            const tfEnd = da.lastIndexOf('Tf');
+            const dotColor = tfEnd >= 0 ? da.slice(tfEnd + 2).trim() : '0 g';
+            const cx = rectW / 2;
+            const cy = rectH / 2;
+            const r = Math.min(rectW, rectH) * 0.25;
+            const k = 0.5522847498 * r;
+            const f = (n) => n.toFixed(3);
+            const dotPath = `${f(cx + r)} ${f(cy)} m `
+              + `${f(cx + r)} ${f(cy + k)} ${f(cx + k)} ${f(cy + r)} ${f(cx)} ${f(cy + r)} c `
+              + `${f(cx - k)} ${f(cy + r)} ${f(cx - r)} ${f(cy + k)} ${f(cx - r)} ${f(cy)} c `
+              + `${f(cx - r)} ${f(cy - k)} ${f(cx - k)} ${f(cy - r)} ${f(cx)} ${f(cy - r)} c `
+              + `${f(cx + k)} ${f(cy - r)} ${f(cx + r)} ${f(cy - k)} ${f(cx + r)} ${f(cy)} c h f`;
+            const dotDict = `<</Type/XObject/Subtype/Form/FormType 1/BBox[0 0 ${rectW} ${rectH}]/Resources<</ProcSet[/PDF]>>>>`;
+            const dotStream = `q ${dotColor} ${dotPath} Q`;
+            const dotObjNum = 900000000 + annotRef;
+            objCache.addSyntheticObject(dotObjNum, dotDict, new TextEncoder().encode(dotStream));
+            apObjNum = dotObjNum;
+          }
+        }
+      }
+
+      if (apObjNum !== null) {
+        const apObjText = objCache.getObjectText(apObjNum);
+        if (!apObjText) continue;
+        const apSubtypeMatch = /\/Subtype\s*\/(\w+)/.exec(apObjText);
+        if (apSubtypeMatch && apSubtypeMatch[1] !== 'Form') continue;
+
+        const bboxArr = resolveNumArray(apObjText, 'BBox', objCache, null);
+        const bbox = bboxArr && bboxArr.length === 4 ? bboxArr : [0, 0, rectW, rectH];
+
+        // flattenDrawOps applies this Matrix to content coordinates, so annotTransform must be computed against the post-Matrix BBox, not the original.
+        const apMatrix = parseFormMatrix(apObjText, objCache);
+        const corners = [[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[0], bbox[3]], [bbox[2], bbox[3]]];
+        const txArr = corners.map(([x, y]) => x * apMatrix[0] + y * apMatrix[2] + apMatrix[4]);
+        const tyArr = corners.map(([x, y]) => x * apMatrix[1] + y * apMatrix[3] + apMatrix[5]);
+        const effBBox = [Math.min(...txArr), Math.min(...tyArr), Math.max(...txArr), Math.max(...tyArr)];
+        const effW = effBBox[2] - effBBox[0];
+        const effH = effBBox[3] - effBBox[1];
+
+        const sx = effW > 0 ? rectW / effW : 1;
+        const sy = effH > 0 ? rectH / effH : 1;
+        const annotTransform = [sx, 0, 0, sy, rectX0 - effBBox[0] * sx, rectY0 - effBBox[1] * sy];
+
+        // The annotation is registered as a form and drawn as an image op so flattenDrawOps can process it.
+        // Its bbox rides along so flattenDrawOps clips the annotation form to it.
+        const annotFormKey = `_annot_${annotRef}`;
+        forms.set(annotFormKey, { tag: annotFormKey, objNum: apObjNum, bbox: bbox.slice() });
+        const syntheticOp = {
+          type: 'image',
+          name: annotFormKey,
+          ctm: annotTransform,
+          fillAlpha: 1,
+          strokeAlpha: 1,
+          fillColor: 'black',
+        };
+        const annotFlattened = await flattenDrawOps(
+          [syntheticOp], images, forms, objCache, fonts, registeredFontNames,
+          '', pageIndex, symbolFontTags, cidPUATags, extGStates, rawCharCodeTags,
+          new Map(), 0, new Set(), cidCollisionMap,
+        );
+        const annotCA = resolveNumValue(annotKeys.keyText('CA'), 'CA', objCache, 1);
+        for (const aOp of annotFlattened) {
+          if (annotCA < 1) {
+            aOp.fillAlpha = (aOp.fillAlpha ?? 1) * annotCA;
+            aOp.strokeAlpha = (aOp.strokeAlpha ?? 1) * annotCA;
+          }
+          drawOps.push(aOp);
+        }
+      } else {
+        // Text-markup annotations (Highlight/Underline/StrikeOut) with no /AP get a synthesized appearance from the pre-parsed quad points.
+        const highlight = highlightByRef.get(annotRef);
+        if (highlight) {
+          const coords = highlight.quadPoints;
+          if (coords) {
+            const hlColor = highlight.color
+              ? `rgb(${Math.round(highlight.color[0] * 255)},${Math.round(highlight.color[1] * 255)},${Math.round(highlight.color[2] * 255)})`
+              : 'rgb(255,255,0)';
+            for (let qi = 0; qi + 7 < coords.length; qi += 8) {
+              // QuadPoints order: upper-left, upper-right, lower-left, lower-right
+              if (highlight.subtype === 'Underline' || highlight.subtype === 'StrikeOut') {
+                // A stroke on the text (bottom edge, or midline for strikeout) uses Normal blend, because Multiply would vanish the stroke over dark glyphs.
+                const t = highlight.subtype === 'StrikeOut' ? 0.5 : 0;
+                const sx = coords[qi + 4] + (coords[qi] - coords[qi + 4]) * t;
+                const sy = coords[qi + 5] + (coords[qi + 1] - coords[qi + 5]) * t;
+                const ex = coords[qi + 6] + (coords[qi + 2] - coords[qi + 6]) * t;
+                const ey = coords[qi + 7] + (coords[qi + 3] - coords[qi + 7]) * t;
+                const quadHeight = Math.hypot(coords[qi] - coords[qi + 4], coords[qi + 1] - coords[qi + 5]);
+                drawOps.push({
+                  type: 'path',
+                  commands: [{ type: 'M', x: sx, y: sy }, { type: 'L', x: ex, y: ey }],
+                  ctm: [1, 0, 0, 1, 0, 0],
+                  fill: false,
+                  stroke: true,
+                  evenOdd: false,
+                  fillColor: hlColor,
+                  strokeColor: hlColor,
+                  lineWidth: Math.max(quadHeight * 0.07, 0.5),
+                  lineCap: 0,
+                  lineJoin: 0,
+                  miterLimit: 10,
+                  dashArray: [],
+                  dashPhase: 0,
+                  fillAlpha: 0,
+                  strokeAlpha: highlight.opacity,
+                  blendMode: 'Normal',
+                });
+                continue;
+              }
+              /** @type {PathCommand[]} */
+              const commands = [
+                { type: 'M', x: coords[qi], y: coords[qi + 1] },
+                { type: 'L', x: coords[qi + 2], y: coords[qi + 3] },
+                { type: 'L', x: coords[qi + 6], y: coords[qi + 7] },
+                { type: 'L', x: coords[qi + 4], y: coords[qi + 5] },
+                { type: 'Z' },
+              ];
+              drawOps.push({
+                type: 'path',
+                commands,
+                ctm: [1, 0, 0, 1, 0, 0],
+                fill: true,
+                stroke: false,
+                evenOdd: false,
+                fillColor: hlColor,
+                strokeColor: 'rgb(0,0,0)',
+                lineWidth: 0,
+                lineCap: 0,
+                lineJoin: 0,
+                miterLimit: 10,
+                dashArray: [],
+                dashPhase: 0,
+                fillAlpha: 1,
+                strokeAlpha: 0,
+                blendMode: 'Multiply',
+              });
+            }
+          }
+          continue;
+        }
+
+        if (/\/Subtype\s*\/Ink\b/.test(subtypeText)) {
+          const inkListContent = resolveArrayValue(annotKeys.keyText('InkList'), 'InkList', objCache);
+          if (inkListContent != null) {
+            const cMatchInk = /\/C\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/.exec(annotKeys.keyText('C'));
+            const inkColor = cMatchInk
+              ? `rgb(${Math.round(Number(cMatchInk[1]) * 255)},${Math.round(Number(cMatchInk[2]) * 255)},${Math.round(Number(cMatchInk[3]) * 255)})`
+              : 'rgb(0,0,0)';
+
+            const bsInkMatch = /\/BS\s*<<([^>]*)>>/.exec(annotKeys.keyText('BS'));
+            let inkWidth = 1;
+            let inkDash = [];
+            if (bsInkMatch) {
+              const bsContent = bsInkMatch[1];
+              inkWidth = resolveNumValue(bsContent, 'W', objCache, 1);
+              const dMatch = /\/D\s*\[\s*([\d.\s]+)\]/.exec(bsContent);
+              if (dMatch) inkDash = dMatch[1].trim().split(/\s+/).map(Number);
+            }
+
+            const subArrays = [...inkListContent.matchAll(/\[([\d.\-+e\s]+)\]/g)];
+            for (const subArr of subArrays) {
+              const coords = subArr[1].trim().split(/\s+/).map(Number);
+              if (coords.length < 4) continue;
+              /** @type {PathCommand[]} */
+              const commands = [{ type: 'M', x: coords[0], y: coords[1] }];
+              for (let i = 2; i < coords.length; i += 2) {
+                commands.push({ type: 'L', x: coords[i], y: coords[i + 1] });
+              }
+              drawOps.push({
+                type: 'path',
+                commands,
+                ctm: [1, 0, 0, 1, 0, 0],
+                fill: false,
+                stroke: true,
+                evenOdd: false,
+                fillColor: 'rgb(0,0,0)',
+                strokeColor: inkColor,
+                lineWidth: inkWidth,
+                lineCap: 1,
+                lineJoin: 1,
+                miterLimit: 10,
+                dashArray: inkDash,
+                dashPhase: 0,
+                fillAlpha: 1,
+                strokeAlpha: 1,
+              });
+            }
+          }
+          continue;
+        }
+
+        // Some PDFs ship a broken /AP (e.g. /N maps the appearance state to a name, not a stream), so viewers draw the field box from its /MK characteristics instead.
+        if (/\/Subtype\s*\/Widget\b/.test(subtypeText)) {
+          const mkMatch = /\/MK\s*<<([\s\S]*?)>>/.exec(annotKeys.keyText('MK'));
+          if (!mkMatch) continue;
+          const mk = mkMatch[1];
+          const parseMKColor = (key) => {
+            const m = new RegExp(`\\/${key}\\s*\\[([^\\]]*)\\]`).exec(mk);
+            if (!m) return null;
+            const c = m[1].trim().split(/\s+/).filter((s) => s.length > 0).map(Number);
+            if (c.length === 0 || c.some(Number.isNaN)) return null;
+            if (c.length === 1) { const v = Math.round(c[0] * 255); return `rgb(${v},${v},${v})`; }
+            if (c.length === 3) return `rgb(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)})`;
+            if (c.length === 4) { const [r, g, b] = cmykToRgb(c[0], c[1], c[2], c[3]); return `rgb(${r},${g},${b})`; }
+            return null;
+          };
+          const widgetBorderColor = parseMKColor('BC');
+          const widgetBgColor = parseMKColor('BG');
+          if (!widgetBorderColor && !widgetBgColor) continue;
+
+          let widgetBorderWidth = widgetBorderColor ? 1 : 0;
+          if (widgetBorderColor) {
+            const bsWidgetMatch = /\/BS\s*<<([^>]*)>>/.exec(annotKeys.keyText('BS'));
+            if (bsWidgetMatch) widgetBorderWidth = resolveNumValue(bsWidgetMatch[1], 'W', objCache, 1);
+          }
+
+          const ftMatch = /\/FT\s*\/(\w+)/.exec(annotKeys.keyText('FT'));
+          const ft = ftMatch ? ftMatch[1] : '';
+          const ff = resolveIntValue(annotKeys.keyText('Ff'), 'Ff', objCache, 0);
+          // Signature fields and push buttons have no synthesizable box appearance.
+          if (ft === 'Sig' || (ft === 'Btn' && (ff & 0x10000))) continue;
+
+          const whw = widgetBorderWidth / 2;
+          const wx0 = rect[0] + whw;
+          const wy0 = rect[1] + whw;
+          const wx1 = rect[2] - whw;
+          const wy1 = rect[3] - whw;
+          /** @type {PathCommand[]} */
+          let widgetCommands;
+          if (ft === 'Btn' && (ff & 0x8000)) {
+            // A radio button draws a circle inscribed in the inset Rect.
+            const cx = (wx0 + wx1) / 2;
+            const cy = (wy0 + wy1) / 2;
+            const rx = (wx1 - wx0) / 2;
+            const ry = (wy1 - wy0) / 2;
+            const k = 0.5522847498;
+            const kx = rx * k;
+            const ky = ry * k;
+            widgetCommands = [
+              { type: 'M', x: cx + rx, y: cy },
+              {
+                type: 'C', x1: cx + rx, y1: cy + ky, x2: cx + kx, y2: cy + ry, x: cx, y: cy + ry,
+              },
+              {
+                type: 'C', x1: cx - kx, y1: cy + ry, x2: cx - rx, y2: cy + ky, x: cx - rx, y: cy,
+              },
+              {
+                type: 'C', x1: cx - rx, y1: cy - ky, x2: cx - kx, y2: cy - ry, x: cx, y: cy - ry,
+              },
+              {
+                type: 'C', x1: cx + kx, y1: cy - ry, x2: cx + rx, y2: cy - ky, x: cx + rx, y: cy,
+              },
+              { type: 'Z' },
+            ];
+          } else {
+            // Checkbox, text field, and choice field all draw a rectangular box.
+            widgetCommands = [
+              { type: 'M', x: wx0, y: wy0 },
+              { type: 'L', x: wx1, y: wy0 },
+              { type: 'L', x: wx1, y: wy1 },
+              { type: 'L', x: wx0, y: wy1 },
+              { type: 'Z' },
+            ];
+          }
+          drawOps.push({
+            type: 'path',
+            commands: widgetCommands,
+            ctm: [1, 0, 0, 1, 0, 0],
+            fill: !!widgetBgColor,
+            stroke: !!widgetBorderColor,
+            evenOdd: false,
+            fillColor: widgetBgColor || 'rgb(255,255,255)',
+            strokeColor: widgetBorderColor || 'rgb(0,0,0)',
+            lineWidth: widgetBorderWidth || 1,
+            lineCap: 0,
+            lineJoin: 0,
+            miterLimit: 10,
+            dashArray: [],
+            dashPhase: 0,
+            fillAlpha: 1,
+            strokeAlpha: 1,
+          });
+          continue;
+        }
+
+        const subtypeMatch = /\/Subtype\s*\/(Square|Circle|Polygon|PolyLine|Line)/.exec(subtypeText);
+        if (!subtypeMatch) continue;
+        const annotSubtype = subtypeMatch[1];
+
+        const cMatch = /\/C\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/.exec(annotKeys.keyText('C'));
+        const borderColor = cMatch
+          ? `rgb(${Math.round(Number(cMatch[1]) * 255)},${Math.round(Number(cMatch[2]) * 255)},${Math.round(Number(cMatch[3]) * 255)})`
+          : 'rgb(0,0,0)';
+
+        const icMatch = /\/IC\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/.exec(annotKeys.keyText('IC'));
+        const hasFill = !!icMatch;
+        const fillColor = icMatch
+          ? `rgb(${Math.round(Number(icMatch[1]) * 255)},${Math.round(Number(icMatch[2]) * 255)},${Math.round(Number(icMatch[3]) * 255)})`
+          : 'rgb(0,0,0)';
+
+        // /Border format: [hCornerRadius vCornerRadius width]; /BS overrides if present.
+        const borderMatch = /\/Border\s*\[\s*[\d.]+\s+[\d.]+\s+([\d.]+)\s*\]/.exec(annotKeys.keyText('Border'));
+        const bsText = resolveDictValue(annotKeys.keyText('BS'), 'BS', objCache);
+        const bsWidth = bsText ? resolveNumValue(bsText, 'W', objCache, Number.NaN) : Number.NaN;
+        const borderWidth = Number.isNaN(bsWidth) ? (borderMatch ? Number(borderMatch[1]) : 1) : bsWidth;
+
+        // Inset the rect by half the border width so strokes stay inside the annotation rect
+        const hw = borderWidth / 2;
+        const x0 = rect[0] + hw;
+        const y0 = rect[1] + hw;
+        const x1 = rect[2] - hw;
+        const y1 = rect[3] - hw;
+
+        /** @type {PathCommand[]} */
+        let commands;
+        if (annotSubtype === 'Line') {
+          // /L is [x1 y1 x2 y2].
+          const lArr = resolveNumArray(annotKeys.keyText('L'), 'L', objCache, null);
+          if (!lArr || lArr.length < 4) continue;
+          commands = [
+            { type: 'M', x: lArr[0], y: lArr[1] },
+            { type: 'L', x: lArr[2], y: lArr[3] },
+          ];
+        } else if (annotSubtype === 'Polygon' || annotSubtype === 'PolyLine') {
+          // /Vertices is [x1 y1 x2 y2 ...].
+          const vertContent = resolveNumArray(annotKeys.keyText('Vertices'), 'Vertices', objCache, null);
+          if (!vertContent) continue;
+          const coords = vertContent;
+          if (coords.length < 4) continue;
+          commands = [{ type: 'M', x: coords[0], y: coords[1] }];
+          for (let i = 2; i < coords.length; i += 2) {
+            commands.push({ type: 'L', x: coords[i], y: coords[i + 1] });
+          }
+          if (annotSubtype === 'Polygon') commands.push({ type: 'Z' });
+        } else if (annotSubtype === 'Square') {
+          commands = [
+            { type: 'M', x: x0, y: y0 },
+            { type: 'L', x: x1, y: y0 },
+            { type: 'L', x: x1, y: y1 },
+            { type: 'L', x: x0, y: y1 },
+            { type: 'Z' },
+          ];
+        } else {
+          // Circle, approximated as an ellipse with 4 cubic Beziers.
+          const cx = (x0 + x1) / 2;
+          const cy = (y0 + y1) / 2;
+          const rx = (x1 - x0) / 2;
+          const ry = (y1 - y0) / 2;
+          // kappa for cubic Bezier circle approximation
+          const k = 0.5522847498;
+          const kx = rx * k;
+          const ky = ry * k;
+          commands = [
+            { type: 'M', x: cx + rx, y: cy },
+            {
+              type: 'C', x1: cx + rx, y1: cy + ky, x2: cx + kx, y2: cy + ry, x: cx, y: cy + ry,
+            },
+            {
+              type: 'C', x1: cx - kx, y1: cy + ry, x2: cx - rx, y2: cy + ky, x: cx - rx, y: cy,
+            },
+            {
+              type: 'C', x1: cx - rx, y1: cy - ky, x2: cx - kx, y2: cy - ry, x: cx, y: cy - ry,
+            },
+            {
+              type: 'C', x1: cx + kx, y1: cy - ry, x2: cx + rx, y2: cy - ky, x: cx + rx, y: cy,
+            },
+            { type: 'Z' },
+          ];
+        }
+
+        drawOps.push({
+          type: 'path',
+          commands,
+          ctm: [1, 0, 0, 1, 0, 0],
+          fill: hasFill && annotSubtype !== 'PolyLine' && annotSubtype !== 'Line',
+          stroke: true,
+          evenOdd: false,
+          fillColor,
+          strokeColor: borderColor,
+          lineWidth: borderWidth,
+          lineCap: 0,
+          lineJoin: 0,
+          miterLimit: 10,
+          dashArray: [],
+          dashPhase: 0,
+          fillAlpha: 1,
+          strokeAlpha: 1,
+        });
+      }
+    }
+  }
+
+  const isGrayColor = (color) => {
+    const m = /rgb\((\d+),(\d+),(\d+)\)/.exec(color);
+    return m && m[1] === m[2] && m[2] === m[3];
+  };
+  const t3xChecked = new Set();
+  if (!pageHasColor) {
+    for (const op of drawOps) {
+      if (op.type === 'image') {
+        const imgInfo = images.get(op.name);
+        if (!imgInfo) continue;
+        // An image mask painted with a shading pattern carries its color in the pattern stops, not in the (1-bit) image, so it must be checked before the skip.
+        if (op.patternShading && op.patternShading.stops
+          && op.patternShading.stops.some((stop) => !isGrayColor(stop.color))) {
+          pageHasColor = true;
+          break;
+        }
+        if (imgInfo.bitsPerComponent === 1) continue;
+        const cs = imgInfo.colorSpace;
+        if (cs !== 'DeviceGray' && cs !== 'CalGray') {
+          if (cs !== 'Indexed' || (imgInfo.paletteBase !== 'DeviceGray' && imgInfo.paletteBase !== 'CalGray')) {
+            pageHasColor = true;
+            break;
+          }
+        }
+      } else if (op.type === 'path') {
+        if ((op.fill && !isGrayColor(op.fillColor)) || (op.stroke && !isGrayColor(op.strokeColor))) {
+          pageHasColor = true;
+          break;
+        }
+        if (op.patternShading) {
+          const sh = op.patternShading;
+          if (sh.type === 'mesh') {
+            for (const patch of sh.patches) {
+              for (const c of patch.colors) {
+                if (c[0] !== c[1] || c[1] !== c[2]) { pageHasColor = true; break; }
+              }
+              if (pageHasColor) break;
+            }
+          } else if (sh.type === 'gouraud') {
+            for (const tri of sh.triangles) {
+              for (const c of tri.colors) {
+                if (c[0] !== c[1] || c[1] !== c[2]) { pageHasColor = true; break; }
+              }
+              if (pageHasColor) break;
+            }
+          } else if (sh.stops) {
+            for (const stop of sh.stops) {
+              if (!isGrayColor(stop.color)) { pageHasColor = true; break; }
+            }
+          }
+          if (pageHasColor) break;
+        }
+      } else if (op.type === 'type0text' && op.fillColor && !isGrayColor(op.fillColor)) {
+        pageHasColor = true;
+        break;
+      } else if (op.type === 'type3glyph') {
+        if (op.fillColor && !isGrayColor(op.fillColor)) { pageHasColor = true; break; }
+        // A Type3 CharProc can paint a color image XObject (e.g. color emoji glyphs).
+        if (op.type3XObjects) {
+          for (const xObjNum of Object.values(op.type3XObjects)) {
+            if (t3xChecked.has(xObjNum)) continue;
+            t3xChecked.add(xObjNum);
+            const xObjText = objCache.getObjectText(xObjNum);
+            if (!xObjText || !/\/Subtype\s*\/Image/.test(xObjText)) continue;
+            const ii = parseImageObject(xObjText, xObjNum, objCache);
+            if (!ii || ii.imageMask || ii.bitsPerComponent === 1) continue;
+            const cs = ii.colorSpace;
+            if (cs !== 'DeviceGray' && cs !== 'CalGray'
+              && (cs !== 'Indexed' || (ii.paletteBase !== 'DeviceGray' && ii.paletteBase !== 'CalGray'))) {
+              pageHasColor = true;
+              break;
+            }
+          }
+          if (pageHasColor) break;
+        }
+      } else if (op.type === 'shading' && op.shading) {
+        const sh = op.shading;
+        if (sh.type === 'mesh') {
+          for (const patch of sh.patches) {
+            for (const c of patch.colors) {
+              if (c[0] !== c[1] || c[1] !== c[2]) { pageHasColor = true; break; }
+            }
+            if (pageHasColor) break;
+          }
+        } else if (sh.type === 'gouraud') {
+          for (const tri of sh.triangles) {
+            for (const c of tri.colors) {
+              if (c[0] !== c[1] || c[1] !== c[2]) { pageHasColor = true; break; }
+            }
+            if (pageHasColor) break;
+          }
+        } else if (sh.stops) {
+          for (const stop of sh.stops) {
+            if (!isGrayColor(stop.color)) { pageHasColor = true; break; }
+          }
+        }
+        if (pageHasColor) break;
+      }
+    }
+  }
+  if (!pageHasColor) {
+    for (const op of drawOps) {
+      if (op.tilingPattern && op.tilingPattern.objNum) {
+        const patObjText = objCache.getObjectText(op.tilingPattern.objNum);
+        if (patObjText) {
+          const patImgResult = parsePageImages(patObjText, objCache, { recurseForms: false });
+          for (const [, imgInfo] of patImgResult.images) {
+            if (imgInfo.bitsPerComponent === 1) continue;
+            const cs = imgInfo.colorSpace;
+            if (cs !== 'DeviceGray' && cs !== 'CalGray') {
+              if (cs !== 'Indexed' || (imgInfo.paletteBase !== 'DeviceGray' && imgInfo.paletteBase !== 'CalGray')) {
+                pageHasColor = true;
+                break;
+              }
+            }
+          }
+          if (!pageHasColor) {
+            const patPats = parsePatterns(patObjText, objCache);
+            for (const [, patInfo] of patPats) {
+              if (patInfo.shading && patInfo.shading.stops) {
+                for (const stop of patInfo.shading.stops) {
+                  if (!isGrayColor(stop.color)) { pageHasColor = true; break; }
+                }
+              }
+              if (pageHasColor) break;
+            }
+          }
+          if (!pageHasColor) {
+            const patStreamBytes = objCache.getStreamBytes(op.tilingPattern.objNum);
+            if (patStreamBytes) {
+              const patStreamText = bytesToLatin1(patStreamBytes);
+              const rgMatches = patStreamText.matchAll(/([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(?:rg|RG)\b/g);
+              for (const m of rgMatches) {
+                if (m[1] !== m[2] || m[2] !== m[3]) { pageHasColor = true; break; }
+              }
+              if (!pageHasColor) {
+                const kMatches = patStreamText.matchAll(/([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+[kK]\b/g);
+                for (const m of kMatches) {
+                  if (m[1] !== '0' || m[2] !== '0' || m[3] !== '0') { pageHasColor = true; break; }
+                }
+              }
+            }
+          }
+        }
+        if (pageHasColor) break;
+      }
+    }
+  }
+  // Inline images bypass the XObject scan above and are not decoded here, so treat any of them as color.
+  if (!pageHasColor) {
+    for (const op of drawOps) {
+      if (op.type === 'inlineImage') {
+        pageHasColor = true;
+        break;
+      }
+    }
+  }
+  const effectiveColorMode = (pageHasColor && colorMode === 'color') ? 'color' : 'gray';
+
+  // The 3500px width cap must match the one in imageContainer.js and extractPDFText.js.
+  // Without it a wide page renders larger than the dimensions the viewer lays out against.
+  const maxCanvasWidth = 3500;
+  const scaleReq = dpi / 72;
+  const fullWidth = Math.ceil(pageWidthPts * scaleReq);
+  const scale = fullWidth > maxCanvasWidth ? maxCanvasWidth / pageWidthPts : scaleReq;
+
+  // Match mupdf's fz_round_rect: ceil with a small epsilon tolerance for FP precision.
+  const canvasWidth = Math.ceil(pageWidthPts * scale - 0.001);
+  const canvasHeight = Math.ceil(pageHeightPts * scale - 0.001);
+
+  const canvas = ca.makeCanvas(canvasWidth, canvasHeight);
+  // `willReadFrequently` forces Chromium's software 2D canvas backend.
+  // The GPU path fails to render certain pages correctly.
+  const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d', { willReadFrequently: true }));
+  ctx.imageSmoothingQuality = 'high';
+
+  if (drawOps.length === 0) {
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+    perf.prepMs = performance.now() - tRenderStart;
+    const emptyImageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
+    const out = {
+      dataUrl: await buildPngDataUrl(emptyImageData, 'gray'), colorMode: 'gray', ok: true, perf,
+    };
+    ca.closeDrawable(canvas);
+    return out;
+  }
+
+  // Declare caches before try so they're accessible in the finally cleanup block.
+  /** @type {Map<string, CanvasPattern>} */
+  const tilingPatternCache = new Map();
+  // Pattern names are scoped to their Resources dict, so a page and a nested Form XObject can legally reuse a name (P0, P1) for different pattern objects.
+  const tileKeyOf = (ref) => {
+    const base = ref.objNum != null ? `${ref.patName}#${ref.objNum}` : ref.patName;
+    return ref.paintColor ? `${base}|${ref.paintColor}` : base;
+  };
+  // `renderTilingPatternTile` calls this for inline-image pattern cells, and the tiling-pattern pre-pass below runs first.
+  // Declaring it any lower would make that pre-pass hit a temporal-dead-zone ReferenceError.
+  const decodeInlineImage = (op) => decodeInlineImageBitmap(op, objCache, colorSpaces);
+  /** @type {Map<string, ImageBitmap>} */
+  const bitmapCache = new Map();
+  const smaskCanvasCache = new Map();
+  // `createPattern(canvas, ...)` clones the source surface on every call on Node.
+  // The clones are tracked here and disposed in the page-end `finally` block.
+  /** @type {CanvasPattern[]} */
+  const transientPatterns = [];
+  let textMeasureCanvas = null;
+  let renderFailed = false;
+  let failReason = '';
+  let failDetail = '';
+
+  const tDrawStart = performance.now();
+  perf.prepMs = tDrawStart - tRenderStart;
+
+  try {
+  // Apply page rotation to all draw ops by composing rotation CTM with each op's CTM.
+  // This transforms content-space coordinates to visual-space coordinates.
+    if (rotCtm) {
+      for (const op of drawOps) {
+        if (op.type === 'type0text') {
+        // Text ops store transform components as op.a,b,c,d,x,y (equivalent to CTM [a,b,c,d,x,y])
+          const oa = op.a;
+          const ob = op.b;
+          const oc = op.c;
+          const od = op.d;
+          const ox = op.x;
+          const oy = op.y;
+          op.a = rotCtm[0] * oa + rotCtm[2] * ob;
+          op.b = rotCtm[1] * oa + rotCtm[3] * ob;
+          op.c = rotCtm[0] * oc + rotCtm[2] * od;
+          op.d = rotCtm[1] * oc + rotCtm[3] * od;
+          op.x = rotCtm[0] * ox + rotCtm[2] * oy + rotCtm[4];
+          op.y = rotCtm[1] * ox + rotCtm[3] * oy + rotCtm[5];
+        } else if (op.ctm) {
+        // Image and path ops store CTM as op.ctm [a,b,c,d,e,f]
+          op.ctm = [
+            rotCtm[0] * op.ctm[0] + rotCtm[2] * op.ctm[1], rotCtm[1] * op.ctm[0] + rotCtm[3] * op.ctm[1],
+            rotCtm[0] * op.ctm[2] + rotCtm[2] * op.ctm[3], rotCtm[1] * op.ctm[2] + rotCtm[3] * op.ctm[3],
+            rotCtm[0] * op.ctm[4] + rotCtm[2] * op.ctm[5] + rotCtm[4], rotCtm[1] * op.ctm[4] + rotCtm[3] * op.ctm[5] + rotCtm[5],
+          ];
+        }
+        // Transform clip path CTMs for ALL op types (text, image, path)
+        if (op.clips) {
+          for (const clip of op.clips) {
+            clip.ctm = [
+              rotCtm[0] * clip.ctm[0] + rotCtm[2] * clip.ctm[1], rotCtm[1] * clip.ctm[0] + rotCtm[3] * clip.ctm[1],
+              rotCtm[0] * clip.ctm[2] + rotCtm[2] * clip.ctm[3], rotCtm[1] * clip.ctm[2] + rotCtm[3] * clip.ctm[3],
+              rotCtm[0] * clip.ctm[4] + rotCtm[2] * clip.ctm[5] + rotCtm[4], rotCtm[1] * clip.ctm[4] + rotCtm[3] * clip.ctm[5] + rotCtm[5],
+            ];
+          }
+        }
+        if (op.type === 'type3glyph') {
+        // Type3 glyph ops store CTM as op.transform [a,b,c,d,e,f]
+          op.transform = [
+            rotCtm[0] * op.transform[0] + rotCtm[2] * op.transform[1], rotCtm[1] * op.transform[0] + rotCtm[3] * op.transform[1],
+            rotCtm[0] * op.transform[2] + rotCtm[2] * op.transform[3], rotCtm[1] * op.transform[2] + rotCtm[3] * op.transform[3],
+            rotCtm[0] * op.transform[4] + rotCtm[2] * op.transform[5] + rotCtm[4], rotCtm[1] * op.transform[4] + rotCtm[3] * op.transform[5] + rotCtm[5],
+          ];
+        }
+      }
+      // Shading matrices are in pre-rotation user space, so compose rotCtm to match the rotated op.ctm and op.clips above.
+      // The matrix is mutated in place, so the Set stops a shading referenced by many ops from being rotated twice.
+      const rotatedShadings = new Set();
+      for (const op of drawOps) {
+        const sh = op.patternShading;
+        if (!sh || !sh.matrix || rotatedShadings.has(sh)) continue;
+        rotatedShadings.add(sh);
+        const m = sh.matrix;
+        sh.matrix = [
+          rotCtm[0] * m[0] + rotCtm[2] * m[1], rotCtm[1] * m[0] + rotCtm[3] * m[1],
+          rotCtm[0] * m[2] + rotCtm[2] * m[3], rotCtm[1] * m[2] + rotCtm[3] * m[3],
+          rotCtm[0] * m[4] + rotCtm[2] * m[5] + rotCtm[4], rotCtm[1] * m[4] + rotCtm[3] * m[5] + rotCtm[5],
+        ];
+      }
+    }
+
+    /**
+     * Apply all clip paths from an op's clip stack to the canvas context.
+     * Text clips (from Tr modes 4-7) are skipped here, and handled via compositing instead.
+     * @param {*} [skipClip] - Clip entry excluded here.
+     *   The caller renders it as an anti-aliased pattern fill, because Chrome's clip() is not anti-aliased.
+     */
+    function applyClips(renderCtx, op, skipClip) {
+      if (!op.clips || op.clips.length === 0) return;
+      // Clip intersection is commutative, so apply the cheapest (fewest-point) clips first.
+      const clips = op.clips.length > 1
+        ? [...op.clips].sort((a, b) => (a.path ? a.path.length : 0) - (b.path ? b.path.length : 0))
+        : op.clips;
+      for (const clip of clips) {
+        if (clip === skipClip) continue;
+        if (clip.textClip) continue;
+        if (!clip.path) continue;
+        renderCtx.setTransform(
+          clip.ctm[0] * scale,
+          -clip.ctm[1] * scale,
+          clip.ctm[2] * scale,
+          -clip.ctm[3] * scale,
+          (clip.ctm[4] - boxOriginX) * scale,
+          (pageHeightPts + boxOriginY - clip.ctm[5]) * scale,
+        );
+        renderCtx.beginPath();
+        for (const cmd of clip.path) {
+          if (cmd.type === 'M') renderCtx.moveTo(cmd.x, cmd.y);
+          else if (cmd.type === 'L') renderCtx.lineTo(cmd.x, cmd.y);
+          else if (cmd.type === 'C') renderCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+          else if (cmd.type === 'Z') renderCtx.closePath();
+        }
+        renderCtx.clip(clip.evenOdd ? 'evenodd' : 'nonzero');
+      }
+    }
+
+    /**
+     * Clip the canvas to the region where an axial (type 2) gradient is defined.
+     * @param {OffscreenCanvasRenderingContext2D} renderCtx
+     * @param {number[]} coords - [x0, y0, x1, y1]
+     * @param {boolean[]} extend - [extendStart, extendEnd]
+     */
+    function clipAxialExtend(renderCtx, coords, extend) {
+      const [x0, y0, x1, y1] = coords;
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const px = -dy;
+      const py = dx;
+      // The clip strip is built in the current user space, so its half-extent must be sized in that space, not in page points.
+      // When the CTM scales /Coords far from page space (coords in the millions under a ~1e-4 cm), a page-point extent collapses the strip to a sliver and the gradient vanishes.
+      const perpMag = Math.sqrt(px * px + py * py) || 1;
+      let extentUser = Math.max(1e4, pageWidthPts * 10, pageHeightPts * 10);
+      const inv = renderCtx.getTransform().inverse();
+      if (Number.isFinite(inv.a) && Number.isFinite(inv.e)) {
+        let maxDist = 0;
+        for (const [cx, cy] of [[0, 0], [canvasWidth, 0], [0, canvasHeight], [canvasWidth, canvasHeight]]) {
+          const ux = inv.a * cx + inv.c * cy + inv.e;
+          const uy = inv.b * cx + inv.d * cy + inv.f;
+          const d = Math.hypot(ux - x0, uy - y0);
+          if (d > maxDist) maxDist = d;
+        }
+        if (maxDist > 0) extentUser = maxDist * 2;
+      }
+      // perpMag normalizes (px, py) to a unit vector, so BIG * (px, py) spans extentUser in user space.
+      // That keeps the clip polygon's device coordinates near canvas scale, well under the ~1e9 some backends reject.
+      const BIG = extentUser / perpMag;
+
+      if (!extend[0] && !extend[1]) {
+      // Clip to the strip between start and end perpendicular lines
+        renderCtx.beginPath();
+        renderCtx.moveTo(x0 + BIG * px, y0 + BIG * py);
+        renderCtx.lineTo(x0 - BIG * px, y0 - BIG * py);
+        renderCtx.lineTo(x1 - BIG * px, y1 - BIG * py);
+        renderCtx.lineTo(x1 + BIG * px, y1 + BIG * py);
+        renderCtx.closePath();
+        renderCtx.clip();
+      } else if (!extend[0]) {
+      // Clip to half-plane on the end-point side of start
+        renderCtx.beginPath();
+        renderCtx.moveTo(x0 + BIG * px, y0 + BIG * py);
+        renderCtx.lineTo(x0 - BIG * px, y0 - BIG * py);
+        renderCtx.lineTo(x0 - BIG * px + BIG * dx, y0 - BIG * py + BIG * dy);
+        renderCtx.lineTo(x0 + BIG * px + BIG * dx, y0 + BIG * py + BIG * dy);
+        renderCtx.closePath();
+        renderCtx.clip();
+      } else if (!extend[1]) {
+      // Clip to half-plane on the start-point side of end
+        renderCtx.beginPath();
+        renderCtx.moveTo(x1 + BIG * px, y1 + BIG * py);
+        renderCtx.lineTo(x1 - BIG * px, y1 - BIG * py);
+        renderCtx.lineTo(x1 - BIG * px - BIG * dx, y1 - BIG * py - BIG * dy);
+        renderCtx.lineTo(x1 + BIG * px - BIG * dx, y1 + BIG * py - BIG * dy);
+        renderCtx.closePath();
+        renderCtx.clip();
+      }
+    }
+
+    /**
+     * Fill the half-plane "behind" a Type 3 radial gradient's inner circle with the first stop colour when Extend[0] is true.
+     * @param {OffscreenCanvasRenderingContext2D} renderCtx
+     * @param {{coords: number[], extend: boolean[], stops: {offset: number, color: string}[]}} sh
+     */
+    function fillRadialExtendBehind(renderCtx, sh) {
+      // Canvas2D leaves the radial gradient transparent behind the apex, where its parameter resolves negative.
+      if (!sh.extend || !sh.extend[0]) return;
+      const [x0, y0, r0, x1, y1] = sh.coords;
+      if (Math.abs(r0) > 1e-9) return;
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 1e-9) return;
+      const ax = dx / len;
+      const ay = dy / len;
+      const px = -ay;
+      const py = ax;
+      const BIG = 1e6;
+      renderCtx.beginPath();
+      renderCtx.moveTo(x0 + BIG * px, y0 + BIG * py);
+      renderCtx.lineTo(x0 - BIG * px, y0 - BIG * py);
+      renderCtx.lineTo(x0 - BIG * px - BIG * ax, y0 - BIG * py - BIG * ay);
+      renderCtx.lineTo(x0 + BIG * px - BIG * ax, y0 + BIG * py - BIG * ay);
+      renderCtx.closePath();
+      renderCtx.fillStyle = sh.stops[0].color;
+      renderCtx.fill();
+    }
+
+    /**
+     * Check whether an op has a text clip (from Tr modes 4-7) in its clip stack.
+     * Returns the textClip array or null.
+     */
+    function getTextClip(op) {
+      if (!op.clips) return null;
+      for (const clip of op.clips) {
+        if (clip.textClip) return clip.textClip;
+      }
+      return null;
+    }
+
+    /**
+     * Draw text clip characters as filled shapes on a canvas (for compositing mask).
+     * @param {OffscreenCanvas} maskCanvas
+     * @param {Array<{text: string, fontFamily: string, fontSize: number, a: number, b: number, c: number, d: number, x: number, y: number}>} chars
+     */
+    function drawTextClipMask(maskCanvas, chars) {
+      const mCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (maskCanvas.getContext('2d', { willReadFrequently: true }));
+      mCtx.fillStyle = 'white';
+      for (const ch of chars) {
+        mCtx.save();
+        // Mirrors the type0text path's transform, sign flips included, so the mask lands on the same pixels as the rendered glyphs.
+        mCtx.setTransform(
+          ch.a * scale,
+          -ch.b * scale,
+          -ch.c * scale,
+          ch.d * scale,
+          (ch.x - boxOriginX) * scale,
+          (pageHeightPts + boxOriginY - ch.y) * scale,
+        );
+        // fontFamily may already be a full CSS family list with embedded quotes, e.g. '"Courier New", Courier, monospace'.
+        // Size is 1px because the transform above already carries the font size through the text rendering matrix.
+        mCtx.font = /[",]/.test(ch.fontFamily)
+          ? `1px ${ch.fontFamily}`
+          : `1px "${ch.fontFamily}"`;
+        mCtx.fillText(ch.text, 0, 0);
+        mCtx.restore();
+      }
+    }
+
+    /**
+     * Translate every position component of a draw op by (dxPdf, dyPdf) in PDF user space.
+     * Lets an op render into a tight bbox-sized canvas placed at the bbox origin.
+     * @param {any} op
+     * @param {number} dxPdf
+     * @param {number} dyPdf
+     */
+    function shiftOpBy(op, dxPdf, dyPdf) {
+      /** @type {any} */
+      const out = { ...op };
+      if (op.clips) {
+        out.clips = op.clips.map((/** @type {any} */ c) => {
+          /** @type {any} */
+          const nc = {
+            ...c,
+            ctm: c.ctm ? [c.ctm[0], c.ctm[1], c.ctm[2], c.ctm[3], c.ctm[4] + dxPdf, c.ctm[5] + dyPdf] : c.ctm,
+          };
+          if (c.textClip) nc.textClip = c.textClip.map((/** @type {any} */ ch) => ({ ...ch, x: ch.x + dxPdf, y: ch.y + dyPdf }));
+          return nc;
+        });
+      }
+      if (op.smask && op.smask.parentCtm) {
+        const pc = op.smask.parentCtm;
+        out.smask = { ...op.smask, parentCtm: [pc[0], pc[1], pc[2], pc[3], pc[4] + dxPdf, pc[5] + dyPdf] };
+      }
+      if (Array.isArray(op.ctm) && op.ctm.length === 6) {
+        out.ctm = [op.ctm[0], op.ctm[1], op.ctm[2], op.ctm[3], op.ctm[4] + dxPdf, op.ctm[5] + dyPdf];
+      } else if (Array.isArray(op.transform) && op.transform.length === 6) {
+        out.transform = [op.transform[0], op.transform[1], op.transform[2], op.transform[3], op.transform[4] + dxPdf, op.transform[5] + dyPdf];
+      } else if (op.type === 'type0text') {
+        out.x = op.x + dxPdf;
+        out.y = op.y + dyPdf;
+      }
+      return out;
+    }
+
+    /**
+     * Device-pixel bounding box of a single path, image, type0text, or clipped shading op.
+     * Returns null for ops whose extent cannot be bounded (unclipped shadings, other text).
+     * Used to size a transparency group's isolation buffer.
+     * @param {any} op
+     * @returns {{minX:number,minY:number,maxX:number,maxY:number}|null}
+     */
+    function opDeviceBBox(op) {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      const acc = (ux, uy, m) => {
+        const px = (m[0] * ux + m[2] * uy + m[4] - boxOriginX) * scale;
+        const py = (pageHeightPts + boxOriginY - (m[1] * ux + m[3] * uy + m[5])) * scale;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+      };
+      if (op.type === 'path' && op.commands && op.ctm) {
+        for (const cmd of op.commands) {
+          if (cmd.x != null) acc(cmd.x, cmd.y, op.ctm);
+          if (cmd.x1 != null) acc(cmd.x1, cmd.y1, op.ctm);
+          if (cmd.x2 != null) acc(cmd.x2, cmd.y2, op.ctm);
+        }
+        if (!Number.isFinite(minX)) return null;
+        if (op.stroke) {
+          const ctmScale = Math.sqrt(Math.abs(op.ctm[0] * op.ctm[3] - op.ctm[1] * op.ctm[2])) || 1;
+          const pad = ((op.lineWidth || 1) * ctmScale * scale) / 2 + 2;
+          minX -= pad; minY -= pad; maxX += pad; maxY += pad;
+        }
+      } else if (op.type === 'image' && (op.ctm || op.transform)) {
+        const m = op.ctm || op.transform;
+        acc(0, 0, m); acc(1, 0, m); acc(0, 1, m); acc(1, 1, m);
+      } else if (op.type === 'type0text' && op.text && op.fontFamily) {
+        if (!textMeasureCanvas) textMeasureCanvas = ca.makeCanvas(8, 8);
+        const mctx = /** @type {OffscreenCanvasRenderingContext2D} */ (textMeasureCanvas.getContext('2d'));
+        mctx.font = /[",]/.test(op.fontFamily) ? `1px ${op.fontFamily}` : `1px "${op.fontFamily}"`;
+        const mw = mctx.measureText(op.text).width || 0;
+        let hScale = 1;
+        if (op.pdfGlyphWidth !== undefined && mw > 0) {
+          hScale = op.pdfGlyphWidth / (1000 * mw);
+          if (!/^"?_pdf_/.test(op.fontFamily) && hScale > 2.0) hScale = 1;
+        }
+        // Matches the type0text glyph transform: (a*hScale, -b*hScale, -c, d).
+        const a = op.a * scale * hScale;
+        const b = -op.b * scale * hScale;
+        const c = -op.c * scale;
+        const d = op.d * scale;
+        const e = (op.x - boxOriginX) * scale;
+        const f = (pageHeightPts + boxOriginY - op.y) * scale;
+        for (const corner of [[-0.2, -1.3], [mw + 0.2, -1.3], [-0.2, 0.5], [mw + 0.2, 0.5]]) {
+          const px = a * corner[0] + c * corner[1] + e;
+          const py = b * corner[0] + d * corner[1] + f;
+          if (px < minX) minX = px;
+          if (px > maxX) maxX = px;
+          if (py < minY) minY = py;
+          if (py > maxY) maxY = py;
+        }
+      } else if (op.type === 'shading' && op.clips && op.clips.length) {
+        // A standalone shading paints fillRect(-1e9..) clipped to op.clips, so its extent is the intersection of the clip paths.
+        // Curve control points over-bound the curve, which is safe.
+        // Unclipped shadings fill the page -> null.
+        let ix0 = -Infinity;
+        let iy0 = -Infinity;
+        let ix1 = Infinity;
+        let iy1 = Infinity;
+        for (const clip of op.clips) {
+          if (!clip.path || !clip.ctm) return null;
+          let c0x = Infinity;
+          let c0y = Infinity;
+          let c1x = -Infinity;
+          let c1y = -Infinity;
+          for (const cmd of clip.path) {
+            const pts = cmd.x1 != null
+              ? [[cmd.x1, cmd.y1], [cmd.x2, cmd.y2], [cmd.x, cmd.y]]
+              : (cmd.x != null ? [[cmd.x, cmd.y]] : []);
+            for (const [ux, uy] of pts) {
+              const px = (clip.ctm[0] * ux + clip.ctm[2] * uy + clip.ctm[4] - boxOriginX) * scale;
+              const py = (pageHeightPts + boxOriginY - (clip.ctm[1] * ux + clip.ctm[3] * uy + clip.ctm[5])) * scale;
+              if (px < c0x) c0x = px;
+              if (px > c1x) c1x = px;
+              if (py < c0y) c0y = py;
+              if (py > c1y) c1y = py;
+            }
+          }
+          if (!Number.isFinite(c0x)) return null;
+          if (c0x > ix0) ix0 = c0x;
+          if (c0y > iy0) iy0 = c0y;
+          if (c1x < ix1) ix1 = c1x;
+          if (c1y < iy1) iy1 = c1y;
+        }
+        if (ix1 <= ix0 || iy1 <= iy0) return null;
+        minX = ix0; minY = iy0; maxX = ix1; maxY = iy1;
+      } else {
+        return null;
+      }
+      if (!Number.isFinite(minX)) return null;
+      return {
+        minX, minY, maxX, maxY,
+      };
+    }
+
+    /**
+     * Device-pixel bounding box enclosing a text-clip's glyphs, padded and clamped to the page.
+     * @param {Array<{text:string,fontFamily:string,a:number,b:number,c:number,d:number,x:number,y:number}>} chars
+     * @returns {{x:number,y:number,w:number,h:number}|null}
+     */
+    function textClipDeviceBBox(chars) {
+      if (!chars || chars.length === 0) return null;
+      if (!textMeasureCanvas) textMeasureCanvas = ca.makeCanvas(8, 8);
+      const mctx = /** @type {OffscreenCanvasRenderingContext2D} */ (textMeasureCanvas.getContext('2d'));
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const ch of chars) {
+        mctx.font = /[",]/.test(ch.fontFamily) ? `1px ${ch.fontFamily}` : `1px "${ch.fontFamily}"`;
+        const w = mctx.measureText(ch.text).width || 0;
+        // 1px font. Glyphs can reach past the advance width and ~1.3 em above /
+        // ~0.5 em below the baseline. Over-enclose so no glyph is ever clipped.
+        const corners = [[-0.2, -1.3], [w + 0.2, -1.3], [-0.2, 0.5], [w + 0.2, 0.5]];
+        for (let ci = 0; ci < 4; ci++) {
+          const lx = corners[ci][0];
+          const ly = corners[ci][1];
+          // This must stay in lockstep with drawTextClipMask's transform or the measured box will not enclose what gets drawn.
+          const dx = ch.a * scale * lx - ch.c * scale * ly + (ch.x - boxOriginX) * scale;
+          const dy = -ch.b * scale * lx + ch.d * scale * ly + (pageHeightPts + boxOriginY - ch.y) * scale;
+          if (dx < minX) minX = dx;
+          if (dx > maxX) maxX = dx;
+          if (dy < minY) minY = dy;
+          if (dy > maxY) maxY = dy;
+        }
+      }
+      if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+      const x = Math.max(0, Math.floor(minX) - 3);
+      const y = Math.max(0, Math.floor(minY) - 3);
+      const right = Math.min(canvasWidth, Math.ceil(maxX) + 3);
+      const bottom = Math.min(canvasHeight, Math.ceil(maxY) + 3);
+      return {
+        x,
+        y,
+        w: right - x,
+        h: bottom - y,
+      };
+    }
+
+    /**
+     * Render a single tiling pattern tile and cache the resulting bitmap.
+     * @param {string} patName - Pattern name for cache key
+     * @param {{ objNum: number, bbox: number[], xStep: number, yStep: number, matrix: number[], paintType: number, paintColor?: string }} tp - Tiling pattern metadata
+     */
+    async function renderTilingPatternTile(patName, tp) {
+      const cacheKey = tileKeyOf({ ...tp, patName });
+      if (tilingPatternCache.has(cacheKey)) return;
+      const patStreamBytes = objCache.getStreamBytes(tp.objNum);
+      if (!patStreamBytes) return;
+      const patStream = bytesToLatin1(patStreamBytes);
+
+      const patObjText = objCache.getObjectText(tp.objNum);
+      if (!patObjText) return;
+
+      let patResText = patObjText;
+      const patResRef = /\/Resources\s+(\d+)\s+\d+\s+R/.exec(patObjText);
+      if (patResRef) {
+        const resObj = objCache.getObjectText(Number(patResRef[1]));
+        if (resObj) patResText = resObj;
+      }
+      const patImagesResult = parsePageImages(patResText, objCache, { recurseForms: false });
+      const patImages = patImagesResult.images;
+      const patForms = patImagesResult.forms;
+
+      const patFonts = parsePageFonts(patObjText, objCache);
+      const patRegistered = new Map();
+      const patSymbolTags = new Set();
+      const patCidPUATags = new Set();
+      const patRawCharCodeTags = new Set();
+      for (const [fontTag, fontObj] of patFonts) {
+        const familyName = pdfFontFamilyName(objCache, fontObj.fontObjNum, `pat_${patName}_${fontTag}`);
+        await convertAndRegisterFont(
+          fontTag, fontObj, patRegistered, patSymbolTags, patCidPUATags,
+          patRawCharCodeTags, cidCollisionMap, objCache, familyName,
+        );
+      }
+      appendGenericFallbacks(patRegistered, patFonts);
+
+      // The repeat cell is XStep/YStep, not the BBox.
+      // `createPattern('repeat')` tiles at the canvas size, so a BBox larger than the step leaves the canvas mostly empty and the tiles gapped.
+      // Cell content stays positioned relative to the BBox origin (tp.bbox[0/1]).
+      const fullBboxW = tp.bbox[2] - tp.bbox[0];
+      const fullBboxH = tp.bbox[3] - tp.bbox[1];
+      const bboxW = tp.xStep ? Math.min(fullBboxW, Math.abs(tp.xStep)) : fullBboxW;
+      const bboxH = tp.yStep ? Math.min(fullBboxH, Math.abs(tp.yStep)) : fullBboxH;
+      const matScaleX = Math.sqrt(tp.matrix[0] * tp.matrix[0] + tp.matrix[1] * tp.matrix[1]);
+      const matScaleY = Math.sqrt(tp.matrix[2] * tp.matrix[2] + tp.matrix[3] * tp.matrix[3]);
+      const { tileW, tileH } = tilingTilePixelDims(bboxW, bboxH, matScaleX, matScaleY, scale);
+
+      const tileCanvas = ca.makeCanvas(tileW, tileH);
+      const tileCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tileCanvas.getContext('2d', { willReadFrequently: true }));
+
+      const patExtGStates = parseExtGStates(patObjText, objCache);
+      const patShadings = parseShadings(patObjText, objCache);
+      const patPatterns = parsePatterns(patObjText, objCache);
+      const patColorSpaces = parsePageColorSpaces(patObjText, objCache);
+
+      const patRawDrawOps = parseDrawOps(patStream, patFonts, patExtGStates, patRegistered,
+        patColorSpaces.size > 0 ? patColorSpaces : undefined, patSymbolTags, patCidPUATags,
+        patRawCharCodeTags, patShadings, patPatterns, cidCollisionMap);
+
+      let patDrawOps;
+      if (patForms.size > 0) {
+        patDrawOps = [];
+        for (const op of patRawDrawOps) {
+          if (op.type === 'image') {
+            const flattened = await flattenDrawOps(
+              [op], patImages, patForms, objCache, patFonts, patRegistered,
+              '', 0, patSymbolTags, patCidPUATags, patExtGStates, patRawCharCodeTags,
+              new Map(), 0, new Set(), cidCollisionMap,
+            );
+            for (let fi = 0; fi < flattened.length; fi++) patDrawOps.push(flattened[fi]);
+          } else {
+            patDrawOps.push(op);
+          }
+        }
+      } else {
+        patDrawOps = patRawDrawOps;
+      }
+
+      const tileScaleX = tileW / bboxW;
+      const tileScaleY = tileH / bboxH;
+      for (const pop of patDrawOps) {
+        if (pop.type === 'image') {
+          const imgInfo = patImages.get(pop.name);
+          if (!imgInfo) continue;
+          const bitmap = imgInfo.imageMask
+            ? await imageMaskToBitmap(imgInfo, tp.paintColor || pop.fillColor || 'black', objCache)
+            : await imageInfoToBitmap(imgInfo, objCache);
+          tileCtx.save();
+          tileCtx.setTransform(
+            pop.ctm[0] * tileScaleX, -pop.ctm[1] * tileScaleY,
+            pop.ctm[2] * tileScaleX, -pop.ctm[3] * tileScaleY,
+            (pop.ctm[4] - tp.bbox[0]) * tileScaleX,
+            (bboxH + tp.bbox[1] - pop.ctm[5]) * tileScaleY,
+          );
+          tileCtx.transform(1, 0, 0, -1, 0, 1);
+          tileCtx.drawImage(bitmap, 0, 0, 1, 1);
+          tileCtx.restore();
+          ca.closeDrawable(bitmap);
+        } else if (pop.type === 'inlineImage') {
+          try {
+            const bitmap = await decodeInlineImage(pop);
+            if (bitmap) {
+              tileCtx.save();
+              tileCtx.setTransform(
+                pop.ctm[0] * tileScaleX, -pop.ctm[1] * tileScaleY,
+                pop.ctm[2] * tileScaleX, -pop.ctm[3] * tileScaleY,
+                (pop.ctm[4] - tp.bbox[0]) * tileScaleX,
+                (bboxH + tp.bbox[1] - pop.ctm[5]) * tileScaleY,
+              );
+              tileCtx.transform(1, 0, 0, -1, 0, 1);
+              tileCtx.drawImage(bitmap, 0, 0, 1, 1);
+              tileCtx.restore();
+              ca.closeDrawable(bitmap);
+            }
+          } catch { /* skip */ }
+        } else if (pop.type === 'path' && (pop.fill || pop.stroke)) {
+          if (pop.fill) {
+            let drawCtx = tileCtx;
+            let tempCanvas = null;
+            if (pop.smask) {
+              tempCanvas = ca.makeCanvas(tileW, tileH);
+              drawCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tempCanvas.getContext('2d', { willReadFrequently: true }));
+            }
+
+            drawCtx.save();
+            if (pop.fillAlpha < 1) drawCtx.globalAlpha = pop.fillAlpha;
+            drawCtx.setTransform(
+              pop.ctm[0] * tileScaleX, -pop.ctm[1] * tileScaleY,
+              pop.ctm[2] * tileScaleX, -pop.ctm[3] * tileScaleY,
+              (pop.ctm[4] - tp.bbox[0]) * tileScaleX,
+              (bboxH + tp.bbox[1] - pop.ctm[5]) * tileScaleY,
+            );
+            drawCtx.beginPath();
+            for (const cmd of pop.commands) {
+              switch (cmd.type) {
+                case 'M': drawCtx.moveTo(cmd.x, cmd.y); break;
+                case 'L': drawCtx.lineTo(cmd.x, cmd.y); break;
+                case 'C': drawCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y); break;
+                case 'Z': drawCtx.closePath(); break;
+                default: break;
+              }
+            }
+            if (pop.tilingPattern) {
+              const innerPatName = pop.tilingPattern.patName;
+              const innerKey = tileKeyOf(pop.tilingPattern);
+              if (pop.tilingPattern.objNum && !tilingPatternCache.has(innerKey)) {
+                try { await renderTilingPatternTile(innerPatName, pop.tilingPattern); } catch { /* skip */ }
+              }
+              const innerBitmap = tilingPatternCache.get(innerKey);
+              if (innerBitmap) {
+                drawCtx.clip(pop.evenOdd ? 'evenodd' : 'nonzero');
+                const itp = pop.tilingPattern;
+                const imatScaleX = Math.sqrt(itp.matrix[0] * itp.matrix[0] + itp.matrix[1] * itp.matrix[1]);
+                const imatScaleY = Math.sqrt(itp.matrix[2] * itp.matrix[2] + itp.matrix[3] * itp.matrix[3]);
+                const ibboxW = itp.bbox[2] - itp.bbox[0];
+                const ibboxH = itp.bbox[3] - itp.bbox[1];
+
+                // Compute inner tile origin and step vectors in outer tile pixel space
+                const te0 = (itp.matrix[4] + itp.matrix[0] * itp.bbox[0] + itp.matrix[2] * (itp.bbox[1] + ibboxH) - tp.bbox[0]) * tileScaleX;
+                const tf0 = (bboxH + tp.bbox[1] - itp.matrix[5] - itp.matrix[1] * itp.bbox[0] - itp.matrix[3] * (itp.bbox[1] + ibboxH)) * tileScaleY;
+                const dex = itp.matrix[0] * itp.xStep * tileScaleX;
+                const dfx = -itp.matrix[1] * itp.xStep * tileScaleY;
+                const dey = itp.matrix[2] * itp.yStep * tileScaleX;
+                const dfy = -itp.matrix[3] * itp.yStep * tileScaleY;
+                const ta = itp.matrix[0] / imatScaleX;
+                const tb2 = -itp.matrix[1] / imatScaleX;
+                const tc2 = -itp.matrix[2] / imatScaleY;
+                const td2 = itp.matrix[3] / imatScaleY;
+
+                const stepXPx = Math.max(1, Math.sqrt(dex * dex + dfx * dfx));
+                const stepYPx = Math.max(1, Math.sqrt(dey * dey + dfy * dfy));
+                const repeatX = Math.ceil(tileW / stepXPx) + 2;
+                const repeatY = Math.ceil(tileH / stepYPx) + 2;
+
+                for (let ry = -repeatY; ry <= repeatY; ry++) {
+                  for (let rx = -repeatX; rx <= repeatX; rx++) {
+                    const te = te0 + rx * dex + ry * dey;
+                    const tf = tf0 + rx * dfx + ry * dfy;
+                    drawCtx.setTransform(ta, tb2, tc2, td2, te, tf);
+                    drawCtx.drawImage(innerBitmap, 0, 0);
+                  }
+                }
+              } else {
+                drawCtx.fillStyle = pop.fillColor;
+                drawCtx.fill(pop.evenOdd ? 'evenodd' : 'nonzero');
+              }
+            } else if (pop.patternShading) {
+              const sh = pop.patternShading;
+              drawCtx.clip(pop.evenOdd ? 'evenodd' : 'nonzero');
+              if (sh.matrix) drawCtx.transform(...sh.matrix);
+              if (sh.type === 'mesh') {
+                renderMeshPatches(drawCtx, sh.patches);
+              } else if (sh.type === 'gouraud') {
+                renderGouraudTriangles(drawCtx, sh.triangles, null, [tileW, tileH]);
+              } else {
+                let grad;
+                if (sh.type === 2) {
+                  grad = drawCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3]);
+                } else if (sh.type === 3) {
+                  grad = drawCtx.createRadialGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3], sh.coords[4], sh.coords[5]);
+                }
+                if (grad) {
+                  for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+                  drawCtx.fillStyle = grad;
+                  drawCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+                } else {
+                  drawCtx.fillStyle = pop.fillColor;
+                  drawCtx.fill(pop.evenOdd ? 'evenodd' : 'nonzero');
+                }
+              }
+            } else {
+              drawCtx.fillStyle = pop.fillColor;
+              drawCtx.fill(pop.evenOdd ? 'evenodd' : 'nonzero');
+            }
+            drawCtx.restore();
+
+            if (pop.smask && tempCanvas) {
+              const maskCanvas = await renderSMaskToCanvas(pop.smask, objCache, tileW, tileH, bboxH, tp.bbox[0], tp.bbox[1], tileScaleX);
+              if (maskCanvas) {
+                const tempCtx2 = /** @type {OffscreenCanvasRenderingContext2D} */ (tempCanvas.getContext('2d', { willReadFrequently: true }));
+                tempCtx2.globalCompositeOperation = 'destination-in';
+                tempCtx2.drawImage(maskCanvas, 0, 0);
+                ca.closeDrawable(maskCanvas);
+                tempCtx2.globalCompositeOperation = 'source-over';
+              }
+              tileCtx.drawImage(tempCanvas, 0, 0);
+              ca.closeDrawable(tempCanvas);
+            }
+          }
+          if (pop.stroke) {
+            tileCtx.save();
+            if (pop.strokeAlpha < 1) tileCtx.globalAlpha = pop.strokeAlpha;
+            tileCtx.setTransform(
+              pop.ctm[0] * tileScaleX, -pop.ctm[1] * tileScaleY,
+              pop.ctm[2] * tileScaleX, -pop.ctm[3] * tileScaleY,
+              (pop.ctm[4] - tp.bbox[0]) * tileScaleX,
+              (bboxH + tp.bbox[1] - pop.ctm[5]) * tileScaleY,
+            );
+            tileCtx.beginPath();
+            for (const cmd of pop.commands) {
+              switch (cmd.type) {
+                case 'M': tileCtx.moveTo(cmd.x, cmd.y); break;
+                case 'L': tileCtx.lineTo(cmd.x, cmd.y); break;
+                case 'C': tileCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y); break;
+                case 'Z': tileCtx.closePath(); break;
+                default: break;
+              }
+            }
+            tileCtx.strokeStyle = pop.strokeColor || 'black';
+            if (pop.lineWidth > 0) {
+              tileCtx.lineWidth = pop.lineWidth;
+            } else {
+              const sx = Math.sqrt(pop.ctm[0] * pop.ctm[0] + pop.ctm[1] * pop.ctm[1]) * tileScaleX;
+              const sy = Math.sqrt(pop.ctm[2] * pop.ctm[2] + pop.ctm[3] * pop.ctm[3]) * tileScaleY;
+              tileCtx.lineWidth = 1 / (Math.max(sx, sy) || 1);
+            }
+            tileCtx.lineCap = /** @type {CanvasLineCap} */ (['butt', 'round', 'square'][pop.lineCap] || 'butt');
+            tileCtx.lineJoin = /** @type {CanvasLineJoin} */ (['miter', 'round', 'bevel'][pop.lineJoin] || 'miter');
+            if (pop.miterLimit) tileCtx.miterLimit = pop.miterLimit;
+            if (pop.dashArray && pop.dashArray.length > 0) {
+              tileCtx.setLineDash(pop.dashArray);
+              tileCtx.lineDashOffset = pop.dashPhase || 0;
+            }
+            tileCtx.stroke();
+            tileCtx.restore();
+          }
+        } else if (pop.type === 'type0text' && pop.fontFamily && pop.text) {
+          const isEmbedded = /^"?_pdf_/.test(pop.fontFamily);
+          const weight = (!isEmbedded && pop.bold) ? 'bold' : 'normal';
+          const style = (!isEmbedded && pop.italic) ? 'italic' : 'normal';
+          tileCtx.save();
+          tileCtx.font = /[",]/.test(pop.fontFamily)
+            ? `${style} ${weight} 1px ${pop.fontFamily}`
+            : `${style} ${weight} 1px "${pop.fontFamily}"`;
+          tileCtx.textBaseline = 'alphabetic';
+          let tileHScale = 1;
+          if (pop.pdfGlyphWidth !== undefined) {
+            const mw = tileCtx.measureText(pop.text).width;
+            if (mw > 0) {
+              tileHScale = pop.pdfGlyphWidth / (1000 * mw);
+              if (!isEmbedded && tileHScale > 2.0) tileHScale = 1;
+            }
+          }
+          tileCtx.setTransform(
+            pop.a * tileScaleX * tileHScale,
+            -pop.b * tileScaleY * tileHScale,
+            -pop.c * tileScaleX,
+            pop.d * tileScaleY,
+            (pop.x - tp.bbox[0]) * tileScaleX,
+            (bboxH + tp.bbox[1] - pop.y) * tileScaleY,
+          );
+          tileCtx.fillStyle = pop.fillColor || 'black';
+          if (pop.fillAlpha < 1) tileCtx.globalAlpha = pop.fillAlpha;
+          tileCtx.fillText(pop.text, 0, 0);
+          tileCtx.restore();
+        } else if (pop.type === 'shading' && pop.shading) {
+          // Cells can paint standalone `sh` shadings (e.g. a logo built from quadrant Gouraud meshes).
+          const sh = pop.shading;
+          tileCtx.save();
+          if (pop.fillAlpha < 1) tileCtx.globalAlpha = pop.fillAlpha;
+          if (pop.clips) {
+            for (const clip of pop.clips) {
+              if (clip.textClip || !clip.path) continue;
+              tileCtx.setTransform(
+                clip.ctm[0] * tileScaleX, -clip.ctm[1] * tileScaleY,
+                clip.ctm[2] * tileScaleX, -clip.ctm[3] * tileScaleY,
+                (clip.ctm[4] - tp.bbox[0]) * tileScaleX,
+                (bboxH + tp.bbox[1] - clip.ctm[5]) * tileScaleY,
+              );
+              tileCtx.beginPath();
+              for (const cmd of clip.path) {
+                if (cmd.type === 'M') tileCtx.moveTo(cmd.x, cmd.y);
+                else if (cmd.type === 'L') tileCtx.lineTo(cmd.x, cmd.y);
+                else if (cmd.type === 'C') tileCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+                else if (cmd.type === 'Z') tileCtx.closePath();
+              }
+              tileCtx.clip(clip.evenOdd ? 'evenodd' : 'nonzero');
+            }
+          }
+          tileCtx.setTransform(
+            pop.ctm[0] * tileScaleX, -pop.ctm[1] * tileScaleY,
+            pop.ctm[2] * tileScaleX, -pop.ctm[3] * tileScaleY,
+            (pop.ctm[4] - tp.bbox[0]) * tileScaleX,
+            (bboxH + tp.bbox[1] - pop.ctm[5]) * tileScaleY,
+          );
+          if (sh.type === 'mesh') {
+            renderMeshPatches(tileCtx, sh.patches);
+          } else if (sh.type === 'gouraud') {
+            renderGouraudTriangles(tileCtx, sh.triangles, null, [tileW, tileH]);
+          } else if (sh.type === 2 || sh.type === 3) {
+            const grad = sh.type === 2
+              ? tileCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3])
+              : tileCtx.createRadialGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3], sh.coords[4], sh.coords[5]);
+            for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+            tileCtx.fillStyle = grad;
+            tileCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+          }
+          tileCtx.restore();
+        }
+      }
+
+      const tileBitmap = await ca.createImageBitmapFromCanvas(tileCanvas);
+      tilingPatternCache.set(cacheKey, tileBitmap);
+    }
+
+    for (const [patName, patInfo] of pagePatterns) {
+      if (!patInfo.tiling) continue;
+      try { await renderTilingPatternTile(patName, patInfo.tiling); } catch { /* skip */ }
+    }
+
+    // Render any tiling patterns discovered in Form XObjects (referenced from draw ops)
+    for (const op of drawOps) {
+      if (op.tilingPattern && op.tilingPattern.objNum && !tilingPatternCache.has(tileKeyOf(op.tilingPattern))) {
+        try { await renderTilingPatternTile(op.tilingPattern.patName, op.tilingPattern); } catch { /* skip */ }
+      }
+    }
+
+    const imageDrawCounts = new Map();
+    for (const op of drawOps) {
+      if (op.type === 'image') imageDrawCounts.set(op.name, (imageDrawCounts.get(op.name) || 0) + 1);
+    }
+
+    const glyphPathCache = new Map();
+
+    /**
+     * Render a path op synchronously.
+     * @returns {boolean} true if handled, false if caller should use renderSingleOp
+     */
+    function renderPathOpSync(rCtx, op) {
+      // Duplicated from the async path to avoid one microtask transition per op on pages with tens of thousands of vector elements.
+      if (op.type !== 'path') return false;
+      if (op.stroke && (op.strokePatternShading || op.strokeTilingPattern)) return false;
+      rCtx.save();
+      if (op.blendMode && op.blendMode !== 'Normal') {
+        rCtx.globalCompositeOperation = pdfBlendToCanvas[op.blendMode] || op.blendMode.toLowerCase();
+      }
+      applyClips(rCtx, op);
+      rCtx.setTransform(
+        op.ctm[0] * scale, -op.ctm[1] * scale, op.ctm[2] * scale, -op.ctm[3] * scale,
+        (op.ctm[4] - boxOriginX) * scale, (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+      );
+      rCtx.beginPath();
+      for (const cmd of op.commands) {
+        switch (cmd.type) {
+          case 'M': rCtx.moveTo(cmd.x, cmd.y); break;
+          case 'L': rCtx.lineTo(cmd.x, cmd.y); break;
+          case 'C': rCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y); break;
+          case 'Z': rCtx.closePath(); break;
+          default: break;
+        }
+      }
+      if (op.fill) {
+        rCtx.globalAlpha = op.fillAlpha;
+        if (op.tilingPattern) {
+          const tileCvs = tilingPatternCache.get(tileKeyOf(op.tilingPattern));
+          if (tileCvs) {
+            // A small tile bbox can mean hundreds of thousands of tiles per page, so fill them with one native pattern instead of drawing each tile.
+            const tp = op.tilingPattern;
+            const bboxW = tp.bbox[2] - tp.bbox[0];
+            const bboxH = tp.bbox[3] - tp.bbox[1];
+            const matScaleX = Math.sqrt(tp.matrix[0] * tp.matrix[0] + tp.matrix[1] * tp.matrix[1]) || 1;
+            const matScaleY = Math.sqrt(tp.matrix[2] * tp.matrix[2] + tp.matrix[3] * tp.matrix[3]) || 1;
+            const { tileW, tileH } = tilingTilePixelDims(bboxW, bboxH, matScaleX, matScaleY, scale);
+            const sx = bboxW / tileW * scale;
+            const sy = bboxH / tileH * scale;
+
+            rCtx.save();
+            // The clip must be taken before the reset below, while the CTM still maps path space to device.
+            // Identity then leaves the pattern matrix working in device pixels.
+            rCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+            rCtx.setTransform(1, 0, 0, 1, 0, 0);
+            const canvasPat = rCtx.createPattern(tileCvs, 'repeat');
+            transientPatterns.push(canvasPat);
+            canvasPat.setTransform(new DOMMatrix([
+              tp.matrix[0] * sx, -tp.matrix[1] * sx,
+              -tp.matrix[2] * sy, tp.matrix[3] * sy,
+              (tp.matrix[0] * tp.bbox[0] + tp.matrix[2] * (tp.bbox[1] + bboxH) + tp.matrix[4] - boxOriginX) * scale,
+              (pageHeightPts + boxOriginY - tp.matrix[1] * tp.bbox[0] - tp.matrix[3] * (tp.bbox[1] + bboxH) - tp.matrix[5]) * scale,
+            ]));
+            rCtx.fillStyle = canvasPat;
+            rCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+            rCtx.restore();
+          } else {
+            rCtx.fillStyle = op.fillColor;
+            rCtx.fill(op.evenOdd ? 'evenodd' : 'nonzero');
+          }
+        } else if (op.patternShading) {
+          const sh = op.patternShading;
+          // The pattern matrix maps shading coords to the content stream's default user space, which patternBaseCTM then maps to page space for Form XObject content.
+          // It is absent for page-level content, where the default user space already is page space.
+          const bctm = op.patternBaseCTM;
+          if (sh.type === 'mesh') {
+            rCtx.save();
+            rCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+            rCtx.setTransform(scale, 0, 0, -scale, -boxOriginX * scale, (pageHeightPts + boxOriginY) * scale);
+            if (bctm) rCtx.transform(bctm[0], bctm[1], bctm[2], bctm[3], bctm[4], bctm[5]);
+            if (sh.matrix) rCtx.transform(...sh.matrix);
+            renderMeshPatches(rCtx, sh.patches);
+            rCtx.restore();
+          } else if (sh.type === 'gouraud') {
+            rCtx.save();
+            rCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+            rCtx.setTransform(scale, 0, 0, -scale, -boxOriginX * scale, (pageHeightPts + boxOriginY) * scale);
+            if (bctm) rCtx.transform(bctm[0], bctm[1], bctm[2], bctm[3], bctm[4], bctm[5]);
+            if (sh.matrix) rCtx.transform(...sh.matrix);
+            renderGouraudTriangles(rCtx, sh.triangles, gouraudClipBounds);
+            rCtx.restore();
+          } else {
+            rCtx.save();
+            rCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+            rCtx.setTransform(scale, 0, 0, -scale, -boxOriginX * scale, (pageHeightPts + boxOriginY) * scale);
+            if (bctm) rCtx.transform(bctm[0], bctm[1], bctm[2], bctm[3], bctm[4], bctm[5]);
+            if (sh.matrix) rCtx.transform(...sh.matrix);
+            if (sh.bbox) {
+              rCtx.beginPath();
+              rCtx.rect(sh.bbox[0], sh.bbox[1], sh.bbox[2] - sh.bbox[0], sh.bbox[3] - sh.bbox[1]);
+              rCtx.clip();
+            }
+            if (sh.extend && (!sh.extend[0] || !sh.extend[1]) && sh.type === 2) {
+              clipAxialExtend(rCtx, sh.coords, sh.extend);
+            }
+            let grad;
+            if (sh.type === 2) {
+              grad = rCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3]);
+            } else if (sh.type === 3) {
+              grad = rCtx.createRadialGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3], sh.coords[4], sh.coords[5]);
+            }
+            if (grad) {
+              for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+              rCtx.fillStyle = grad;
+              rCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+            } else {
+              rCtx.fillStyle = op.fillColor;
+              rCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+            }
+            rCtx.restore();
+          }
+        } else {
+          rCtx.fillStyle = op.fillColor;
+          rCtx.fill(op.evenOdd ? 'evenodd' : 'nonzero');
+        }
+      }
+      if (op.stroke) {
+        rCtx.globalAlpha = op.strokeAlpha;
+        rCtx.strokeStyle = op.strokeColor;
+        // PDF spec: lineWidth 0 = thinnest line (1 device pixel).
+        // Canvas ignores lineWidth=0, so compute a hairline width instead.
+        if (op.lineWidth > 0) {
+          rCtx.lineWidth = op.lineWidth;
+        } else {
+          const sx = Math.sqrt(op.ctm[0] * op.ctm[0] + op.ctm[1] * op.ctm[1]) * scale;
+          const sy = Math.sqrt(op.ctm[2] * op.ctm[2] + op.ctm[3] * op.ctm[3]) * scale;
+          rCtx.lineWidth = 1 / (Math.max(sx, sy) || 1);
+        }
+        rCtx.lineCap = /** @type {CanvasLineCap} */ (['butt', 'round', 'square'][op.lineCap] || 'butt');
+        rCtx.lineJoin = /** @type {CanvasLineJoin} */ (['miter', 'round', 'bevel'][op.lineJoin] || 'miter');
+        rCtx.miterLimit = op.miterLimit;
+        if (op.dashArray.length > 0) {
+          rCtx.setLineDash(op.dashArray);
+          rCtx.lineDashOffset = op.dashPhase;
+        }
+        rCtx.stroke();
+      }
+      rCtx.restore();
+      return true;
+    }
+
+    async function renderSingleOp(rCtx, op) {
+      if (op.type === 'image') {
+        const imageInfo = images.get(op.name);
+        if (!imageInfo) return;
+
+        if (imageInfo.imageMask && op.tilingPattern) {
+          const tileCvs = tilingPatternCache.get(tileKeyOf(op.tilingPattern));
+          const canvasPat = tileCvs ? rCtx.createPattern(tileCvs, 'repeat') : null; if (canvasPat) transientPatterns.push(canvasPat);
+          if (canvasPat) {
+            const tileMaskKey = `${op.name}|rgb(255,255,255)`;
+            const cachedTileMask = bitmapCache.get(tileMaskKey);
+            const maskBitmap = cachedTileMask || await imageMaskToBitmap(imageInfo, 'rgb(255,255,255)', objCache);
+            const imgW = Math.max(1, Math.round(Math.sqrt(op.ctm[0] * op.ctm[0] + op.ctm[1] * op.ctm[1]) * scale));
+            const imgH = Math.max(1, Math.round(Math.sqrt(op.ctm[2] * op.ctm[2] + op.ctm[3] * op.ctm[3]) * scale));
+            if (imgW <= 4096 && imgH <= 4096) {
+              const tmpCanvas = ca.makeCanvas(imgW, imgH);
+              const tmpCtx = tmpCanvas.getContext('2d', { willReadFrequently: true });
+              tmpCtx.drawImage(maskBitmap, 0, 0, imgW, imgH);
+              tmpCtx.globalCompositeOperation = 'source-in';
+              const tp = op.tilingPattern;
+              const bboxW = tp.bbox[2] - tp.bbox[0];
+              const bboxH = tp.bbox[3] - tp.bbox[1];
+              const matScaleX = Math.sqrt(tp.matrix[0] * tp.matrix[0] + tp.matrix[1] * tp.matrix[1]) || 1;
+              const matScaleY = Math.sqrt(tp.matrix[2] * tp.matrix[2] + tp.matrix[3] * tp.matrix[3]) || 1;
+              const { tileW, tileH } = tilingTilePixelDims(bboxW, bboxH, matScaleX, matScaleY, scale);
+              const sx = bboxW / tileW * scale;
+              const sy = bboxH / tileH * scale;
+              const patOriginX = (tp.matrix[0] * tp.bbox[0] + tp.matrix[2] * (tp.bbox[1] + bboxH) + tp.matrix[4] - boxOriginX) * scale;
+              const patOriginY = (pageHeightPts + boxOriginY - tp.matrix[1] * tp.bbox[0] - tp.matrix[3] * (tp.bbox[1] + bboxH) - tp.matrix[5]) * scale;
+              const imgOriginX = (op.ctm[4] - boxOriginX) * scale;
+              const imgOriginY = (pageHeightPts + boxOriginY - op.ctm[5]) * scale;
+              canvasPat.setTransform(new DOMMatrix([
+                tp.matrix[0] * sx, -tp.matrix[1] * sx, -tp.matrix[2] * sy, tp.matrix[3] * sy,
+                patOriginX - imgOriginX, patOriginY - imgOriginY,
+              ]));
+              tmpCtx.fillStyle = canvasPat;
+              tmpCtx.fillRect(0, 0, imgW, imgH);
+              rCtx.save();
+              if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+              applyClips(rCtx, op);
+              rCtx.setTransform(
+                op.ctm[0] * scale, -op.ctm[1] * scale, op.ctm[2] * scale, -op.ctm[3] * scale,
+                (op.ctm[4] - boxOriginX) * scale, (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+              );
+              rCtx.transform(1, 0, 0, -1, 0, 1);
+              rCtx.drawImage(tmpCanvas, 0, 0, 1, 1);
+              ca.closeDrawable(tmpCanvas);
+              rCtx.restore();
+            }
+            if (!cachedTileMask) ca.closeDrawable(maskBitmap);
+            return;
+          }
+        }
+
+        // For image masks filled with a shading pattern (axial ShadingType 2 or radial type 3), composite the shading through the mask alpha.
+        // The mask is drawn at the image transform to set the alpha, then the gradient is painted in pattern->page->device space
+        // (the same mapping the path shading-pattern fill uses) under source-in.
+        if (imageInfo.imageMask && op.patternShading
+          && (op.patternShading.type === 2 || op.patternShading.type === 3)
+          && op.patternShading.stops) {
+          const sh = op.patternShading;
+          const maskBitmap = await imageMaskToBitmap(imageInfo, 'rgb(0,0,0)', objCache);
+          if (maskBitmap) {
+            const tmpCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+            const tmpCtx = tmpCanvas.getContext('2d', { willReadFrequently: true });
+            tmpCtx.setTransform(
+              op.ctm[0] * scale, -op.ctm[1] * scale, op.ctm[2] * scale, -op.ctm[3] * scale,
+              (op.ctm[4] - boxOriginX) * scale, (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+            );
+            tmpCtx.transform(1, 0, 0, -1, 0, 1);
+            tmpCtx.drawImage(maskBitmap, 0, 0, 1, 1);
+            tmpCtx.setTransform(scale, 0, 0, -scale, -boxOriginX * scale, (pageHeightPts + boxOriginY) * scale);
+            if (op.patternBaseCTM) tmpCtx.transform(...op.patternBaseCTM);
+            if (sh.matrix) tmpCtx.transform(...sh.matrix);
+            tmpCtx.globalCompositeOperation = 'source-in';
+            const grad = sh.type === 2
+              ? tmpCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3])
+              : tmpCtx.createRadialGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3], sh.coords[4], sh.coords[5]);
+            for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+            tmpCtx.fillStyle = grad;
+            tmpCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+            rCtx.save();
+            if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+            applyClips(rCtx, op);
+            rCtx.setTransform(1, 0, 0, 1, 0, 0);
+            rCtx.drawImage(tmpCanvas, 0, 0);
+            rCtx.restore();
+            ca.closeDrawable(tmpCanvas);
+            ca.closeDrawable(maskBitmap);
+            return;
+          }
+        }
+
+        const maskFillColor = op.fillColor;
+        // Fall back to the doc-wide decoded-image cache when the per-page bitmapCache misses.
+        // Its key is the objNum (stable across pages, unlike the per-page `op.name`), so a bitmap decoded for this image on another page can be reused.
+        // Masks additionally key on the fill colour (see decodedImageKey).
+        const docImgCache = objCache && objCache.decodedImageCache;
+        const canDocCache = !!docImgCache && imageInfo.objNum != null;
+        const docKey = canDocCache ? decodedImageKey(imageInfo.objNum, imageInfo.imageMask, maskFillColor) : '';
+        let cachedBitmap = bitmapCache.get(op.name);
+        if (!cachedBitmap && canDocCache) {
+          const dc = docImgCache.get(docKey);
+          if (dc && dc.maxW === canvasWidth && dc.maxH === canvasHeight) cachedBitmap = dc.bitmap;
+        }
+        // The image's visible region in image-pixel coordinates, so the expensive pure-JS CMYK JPEG decode can skip pixels clipped off the page canvas.
+        let imageRoi = null;
+        // Downscale factor (1/2/4/8) for a heavily-oversampled image drawn much smaller than native (thumbnails, zoomed-out views): decode at 1/decodeScale.
+        let decodeScale = 1;
+        if (!cachedBitmap && !imageInfo.imageMask && imageInfo.filter === 'DCTDecode'
+          && imageInfo.colorSpace === 'DeviceCMYK' && imageInfo.width > 0 && imageInfo.height > 0) {
+          const s0 = op.ctm[0] * scale; const s1 = -op.ctm[1] * scale; const s2 = op.ctm[2] * scale; const
+            s3 = -op.ctm[3] * scale;
+          const s4 = (op.ctm[4] - boxOriginX) * scale; const
+            s5 = (pageHeightPts + boxOriginY - op.ctm[5]) * scale;
+          const W = imageInfo.width; const
+            H = imageInfo.height;
+          // Downscale decode when the image is oversampled >=2x in both axes.
+          // drawW/drawH are the image's on-canvas extent in device px = lengths of the placement transform's column vectors (its unit square's edges).
+          const drawW = Math.hypot(s0, s1); const drawH = Math.hypot(s2, s3);
+          if (drawW > 0 && drawH > 0) {
+            const over = Math.min(W / drawW, H / drawH);
+            decodeScale = over >= 8 ? 8 : over >= 4 ? 4 : over >= 2 ? 2 : 1;
+          }
+          // image pixel (ix,iy) -> device: dx = a*ix + c*iy + e, dy = b*ix + d*iy + f
+          const a = s0 / W; const c = -s2 / H; const
+            e = s2 + s4;
+          const b = s1 / W; const d = -s3 / H; const
+            f = s3 + s5;
+          const det = a * d - b * c;
+          if (Math.abs(det) > 1e-9) {
+            let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let
+              maxY = -Infinity;
+            for (let corner = 0; corner < 4; corner++) {
+              const gx = (corner & 1) ? canvasWidth : 0;
+              const gy = (corner & 2) ? canvasHeight : 0;
+              const ix = (d * (gx - e) - c * (gy - f)) / det;
+              const iy = (a * (gy - f) - b * (gx - e)) / det;
+              if (ix < minX) minX = ix; if (ix > maxX) maxX = ix;
+              if (iy < minY) minY = iy; if (iy > maxY) maxY = iy;
+            }
+            const x0 = Math.max(0, Math.floor(minX) - 8); const
+              y0 = Math.max(0, Math.floor(minY) - 8);
+            const x1 = Math.min(W, Math.ceil(maxX) + 8); const
+              y1 = Math.min(H, Math.ceil(maxY) + 8);
+            // Only worth it when a real fraction is clipped away and the visible region is non-empty.
+            if (x1 > x0 && y1 > y0 && (x1 - x0) * (y1 - y0) < 0.85 * W * H) {
+              imageRoi = {
+                x0, y0, x1, y1,
+              };
+            }
+          }
+        }
+        let decodeMs = 0;
+        let bitmap = cachedBitmap;
+        if (!bitmap) {
+          const t0 = performance.now();
+          bitmap = imageInfo.imageMask
+            ? await imageMaskToBitmap(imageInfo, maskFillColor, objCache)
+            : await imageInfoToBitmap(imageInfo, objCache, canvasWidth, canvasHeight, imageRoi, decodeScale);
+          decodeMs = performance.now() - t0;
+        }
+        if (!bitmap) return;
+        // Chrome's canvas clip() is not anti-aliased, so an image clipped to a curved or diagonal outline gets jagged edges.
+        // Fill the clip path with the image as a 'no-repeat' pattern instead, since path fills are anti-aliased.
+        // Rectilinear clips (axis-aligned edges only) do not jag, so they stay on the cheaper clip() path.
+        // Only one path can be pattern-filled, so when several qualify the longest wins and the rest still use clip().
+        let aaClip = null;
+        if (op.clips && op.clips.length > 0) {
+          for (const clip of op.clips) {
+            if (clip.textClip || !clip.path) continue;
+            if (aaClip && clip.path.length <= aaClip.path.length) continue;
+            const [ma, mb, mc, md] = clip.ctm;
+            // Diagonal in device space: both direction components are non-negligible relative to the magnitude (zero-length segments pass).
+            const diagonal = (x0, y0, x1, y1) => {
+              const dx = ma * (x1 - x0) + mc * (y1 - y0);
+              const dy = mb * (x1 - x0) + md * (y1 - y0);
+              return Math.min(Math.abs(dx), Math.abs(dy)) > 1e-7 * Math.max(Math.abs(dx), Math.abs(dy));
+            };
+            let needsAa = false;
+            let sx = NaN; let sy = NaN; let px = NaN; let py = NaN;
+            for (const cmd of clip.path) {
+              if (cmd.type === 'C') { needsAa = true; break; }
+              if (cmd.type === 'M') {
+                // Fill and clip implicitly close an open subpath, so test that edge too.
+                if (!Number.isNaN(px) && diagonal(px, py, sx, sy)) { needsAa = true; break; }
+                sx = cmd.x; sy = cmd.y; px = cmd.x; py = cmd.y;
+              } else if (cmd.type === 'L') {
+                if (diagonal(px, py, cmd.x, cmd.y)) { needsAa = true; break; }
+                px = cmd.x; py = cmd.y;
+              } else if (cmd.type === 'Z') {
+                if (diagonal(px, py, sx, sy)) { needsAa = true; break; }
+                px = sx; py = sy;
+              }
+            }
+            if (!needsAa && !Number.isNaN(px) && diagonal(px, py, sx, sy)) needsAa = true;
+            if (needsAa) aaClip = clip;
+          }
+        }
+        rCtx.save();
+        if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+        if (op.overprint && (imageInfo.colorSpace === 'Separation')) {
+          rCtx.globalCompositeOperation = 'multiply';
+        } else if (op.blendMode && op.blendMode !== 'Normal') {
+          rCtx.globalCompositeOperation = pdfBlendToCanvas[op.blendMode] || op.blendMode.toLowerCase();
+        }
+        const aaPattern = aaClip ? rCtx.createPattern(bitmap, 'no-repeat') : null;
+        if (aaPattern) transientPatterns.push(aaPattern);
+        // If the pattern could not be created, fall back to clip() for aaClip too.
+        applyClips(rCtx, op, aaPattern ? aaClip : null);
+
+        if (aaPattern) {
+          // Canvas bakes path points into device space as they are issued, so the clip path must be built under the clip's own transform.
+          // The transform then switches to the image placement before the fill, so the pattern lands exactly where drawImage(bitmap, 0, 0, 1, 1) would.
+          rCtx.setTransform(
+            aaClip.ctm[0] * scale,
+            -aaClip.ctm[1] * scale,
+            aaClip.ctm[2] * scale,
+            -aaClip.ctm[3] * scale,
+            (aaClip.ctm[4] - boxOriginX) * scale,
+            (pageHeightPts + boxOriginY - aaClip.ctm[5]) * scale,
+          );
+          rCtx.beginPath();
+          for (const cmd of aaClip.path) {
+            if (cmd.type === 'M') rCtx.moveTo(cmd.x, cmd.y);
+            else if (cmd.type === 'L') rCtx.lineTo(cmd.x, cmd.y);
+            else if (cmd.type === 'C') rCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+            else if (cmd.type === 'Z') rCtx.closePath();
+          }
+        }
+        rCtx.setTransform(
+          op.ctm[0] * scale,
+          -op.ctm[1] * scale,
+          op.ctm[2] * scale,
+          -op.ctm[3] * scale,
+          (op.ctm[4] - boxOriginX) * scale,
+          (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+        );
+        rCtx.transform(1, 0, 0, -1, 0, 1);
+        if (aaPattern) {
+          aaPattern.setTransform(new DOMMatrix([1 / (bitmap.width || 1), 0, 0, 1 / (bitmap.height || 1), 0, 0]));
+          rCtx.fillStyle = aaPattern;
+          rCtx.fill(aaClip.evenOdd ? 'evenodd' : 'nonzero');
+        } else {
+          rCtx.drawImage(bitmap, 0, 0, 1, 1);
+        }
+        rCtx.restore();
+
+        if (!cachedBitmap) {
+          if (canDocCache && !imageRoi && decodeScale === 1 && decodeMs >= DECODED_IMAGE_MIN_DECODE_MS) {
+            // Both image caches are keyed by objNum / op.name, not by size or region, so a roi or downscaled decode reused for a different placement would render clipped or blurry.
+            const bytes = (bitmap.width || canvasWidth) * (bitmap.height || canvasHeight) * 4;
+            putDecodedImage(objCache, docKey, bitmap, canvasWidth, canvasHeight, bytes, decodeMs);
+            // Admitted to the doc cache, so this decode will be a cache hit on a re-render.
+            perf.decodeMs += decodeMs;
+          } else if (!imageInfo.imageMask && decodeScale === 1 && imageDrawCounts.get(op.name) > 1) {
+            bitmapCache.set(op.name, bitmap);
+          } else {
+            ca.closeDrawable(bitmap);
+          }
+        }
+      } else if (op.type === 'type3glyph') {
+        let pathData = glyphPathCache.get(op.charProcObjNum);
+        if (!pathData) {
+          const stBytes = objCache.getStreamBytes(op.charProcObjNum);
+          if (!stBytes) return;
+          pathData = parseGlyphStreamPaths(bytesToLatin1(stBytes));
+          glyphPathCache.set(op.charProcObjNum, pathData);
+        }
+
+        if (pathData.doXObject && op.type3XObjects) {
+        // Type3 glyph paints an XObject image via Do operator
+          try {
+            const xObjNum = op.type3XObjects[pathData.doXObject.name];
+            if (xObjNum !== undefined) {
+              const xObjText = objCache.getObjectText(xObjNum);
+              if (xObjText && /\/Subtype\s*\/Image/.test(xObjText)) {
+                const imageInfo = parseImageObject(xObjText, xObjNum, objCache);
+                if (imageInfo) {
+                  const bitmap = imageInfo.imageMask
+                    ? await imageMaskToBitmap(imageInfo, op.fillColor || 'rgb(0,0,0)', objCache)
+                    : await imageInfoToBitmap(imageInfo, objCache, canvasWidth, canvasHeight);
+                  rCtx.save();
+                  if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+                  applyClips(rCtx, op);
+                  rCtx.setTransform(
+                    op.transform[0] * scale, -op.transform[1] * scale,
+                    op.transform[2] * scale, -op.transform[3] * scale,
+                    (op.transform[4] - boxOriginX) * scale,
+                    (pageHeightPts + boxOriginY - op.transform[5]) * scale,
+                  );
+                  rCtx.transform(pathData.doXObject.cm[0], pathData.doXObject.cm[1], pathData.doXObject.cm[2], pathData.doXObject.cm[3], pathData.doXObject.cm[4], pathData.doXObject.cm[5]);
+                  rCtx.transform(1, 0, 0, -1, 0, 1);
+                  rCtx.drawImage(bitmap, 0, 0, 1, 1);
+                  rCtx.restore();
+                  ca.closeDrawable(bitmap);
+                }
+              }
+            }
+          } catch { /* skip failed Type3 Do XObject */ }
+        } else if (pathData.inlineImage) {
+        // Type3 glyph uses an inline bitmap image (BI/ID/EI)
+          try {
+            const syntheticOp = {
+              dictText: pathData.inlineImage.dictText,
+              imageData: pathData.inlineImage.imageData,
+              fillColor: op.fillColor || 'rgb(0,0,0)',
+            };
+            const bitmap = await decodeInlineImage(syntheticOp);
+            if (bitmap) {
+              rCtx.save();
+              if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+              applyClips(rCtx, op);
+              rCtx.setTransform(
+                op.transform[0] * scale, -op.transform[1] * scale,
+                op.transform[2] * scale, -op.transform[3] * scale,
+                (op.transform[4] - boxOriginX) * scale,
+                (pageHeightPts + boxOriginY - op.transform[5]) * scale,
+              );
+              rCtx.transform(pathData.inlineImage.cm[0], pathData.inlineImage.cm[1], pathData.inlineImage.cm[2], pathData.inlineImage.cm[3], pathData.inlineImage.cm[4], pathData.inlineImage.cm[5]);
+              rCtx.transform(1, 0, 0, -1, 0, 1);
+              rCtx.drawImage(bitmap, 0, 0, 1, 1);
+              rCtx.restore();
+              ca.closeDrawable(bitmap);
+            }
+          } catch { /* skip failed Type3 inline image */ }
+        } else if (pathData.nestedText) {
+        // Type3 CharProc that delegates to another embedded font via
+        //   q <cm> cm BT /FontName <size> Tf <tm> Tm (char)Tj ET Q
+        // Compose the effective text rendering matrix:
+        //   trm = [innerSize,0,0,innerSize,0,0] * innerTm * innerCM * op.transform
+        // op.transform already equals `Type3FontMatrix * [outerSize,...] * outerTm * CTM`
+        // (i.e., the CTM the CharProc sees on entry), so composing innerCM and the
+        // inner text state on top gives the final glyph→device transform. We then
+        // draw the char with fillText using the target font's registered CSS name.
+          const nt = pathData.nestedText;
+          const innerFont = fonts.get(nt.fontName);
+          const innerReg = registeredFontNames.get(nt.fontName);
+          if (innerFont && innerReg) {
+            const sizeMat = [nt.fontSize, 0, 0, nt.fontSize, 0, 0];
+            const t1 = matMul(sizeMat, nt.tm);
+            const t2 = matMul(t1, nt.cm);
+            const trm = matMul(t2, op.transform);
+
+            // Map the single-byte Tj string to what fillText should draw.
+            // Use the target font's encoding/toUnicode mapping, matching the
+            // logic in advanceLiteral() for standalone Type1 text.
+            const charCode = nt.text.charCodeAt(0);
+            const unicode = innerFont.toUnicode.get(charCode) || nt.text;
+            const drawText = innerFont.encodingUnicode?.get(charCode) || unicode;
+
+            if (drawText && drawText.trim().length > 0) {
+              rCtx.save();
+              if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+              applyClips(rCtx, op);
+
+              rCtx.font = /[",]/.test(innerReg)
+                ? `1px ${innerReg}`
+                : `1px "${innerReg}"`;
+              rCtx.textBaseline = 'alphabetic';
+              rCtx.fillStyle = op.fillColor || 'black';
+              rCtx.setTransform(
+                trm[0] * scale, -trm[1] * scale,
+                -trm[2] * scale, trm[3] * scale,
+                (trm[4] - boxOriginX) * scale,
+                (pageHeightPts + boxOriginY - trm[5]) * scale,
+              );
+              rCtx.fillText(drawText, 0, 0);
+              rCtx.restore();
+            }
+          }
+        } else if (pathData.commands.length > 0) {
+          rCtx.save();
+          if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+          applyClips(rCtx, op);
+
+          rCtx.setTransform(
+            op.transform[0] * scale,
+            -op.transform[1] * scale,
+            op.transform[2] * scale,
+            -op.transform[3] * scale,
+            (op.transform[4] - boxOriginX) * scale,
+            (pageHeightPts + boxOriginY - op.transform[5]) * scale,
+          );
+          rCtx.beginPath();
+          for (const cmd of pathData.commands) {
+            switch (cmd.type) {
+              case 'M': rCtx.moveTo(cmd.x, cmd.y); break;
+              case 'L': rCtx.lineTo(cmd.x, cmd.y); break;
+              case 'C': rCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y); break;
+              case 'Z': rCtx.closePath(); break;
+              default: break;
+            }
+          }
+          const mode = pathData.paintMode || 'fill';
+          if (mode === 'fill' || mode === 'fillStroke') {
+            rCtx.fillStyle = pathData.fillColor || op.fillColor || 'black';
+            rCtx.fill(pathData.evenOdd ? 'evenodd' : 'nonzero');
+          }
+          if (mode === 'stroke' || mode === 'fillStroke') {
+            rCtx.strokeStyle = pathData.strokeColor || op.fillColor || 'black';
+            // Stroke-based Type3 glyphs (e.g. Korean outline fonts) set a sub-pixel line width in glyph space (a hairline).
+            // Skia renders that as nearly nothing, dropping whole glyphs.
+            // Clamp to a 1-device-pixel minimum, the thinnest visible line, matching how mupdf paints these strokes.
+            const glyphToDevice = Math.sqrt(Math.abs(op.transform[0] * op.transform[3] - op.transform[1] * op.transform[2])) * scale || 1;
+            rCtx.lineWidth = Math.max(pathData.lineWidth || 1, 1 / glyphToDevice);
+            if (pathData.dashArray && pathData.dashArray.length > 0) {
+              rCtx.setLineDash(pathData.dashArray);
+              rCtx.lineDashOffset = pathData.dashPhase || 0;
+            }
+            rCtx.stroke();
+          }
+          rCtx.restore();
+        }
+      } else if (op.type === 'type0text') {
+        rCtx.save();
+        if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+        applyClips(rCtx, op);
+
+        const isEmbedded = /^"?_pdf_/.test(op.fontFamily);
+        const weight = (!isEmbedded && op.bold) ? 'bold' : 'normal';
+        const style = (!isEmbedded && op.italic) ? 'italic' : 'normal';
+        rCtx.font = /[",]/.test(op.fontFamily)
+          ? `${style} ${weight} 1px ${op.fontFamily}`
+          : `${style} ${weight} 1px "${op.fontFamily}"`;
+        rCtx.textBaseline = 'alphabetic';
+
+        // Scale glyph width to match PDF-specified width when using a substitute font.
+        // Cap at 2.0× to reject CJK-on-Latin mismatches and TJ-compensated wide Widths.
+        let hScale = 1;
+        if (op.pdfGlyphWidth !== undefined) {
+          const measuredWidth = rCtx.measureText(op.text).width;
+          if (measuredWidth > 0) {
+            hScale = op.pdfGlyphWidth / (1000 * measuredWidth);
+            if (!isEmbedded && hScale > 2.0) hScale = 1;
+          }
+        }
+
+        // Canvas stores clips in device coordinates, so this clip survives the per-glyph setTransform below.
+        if (op.patternShading && op.patternShading.type === 2
+            && op.patternShading.extend
+            && (!op.patternShading.extend[0] || !op.patternShading.extend[1])
+            && op.patternShading.coords) {
+          const shExt = op.patternShading;
+          rCtx.setTransform(
+            scale, 0, 0, -scale,
+            -boxOriginX * scale,
+            (pageHeightPts + boxOriginY) * scale,
+          );
+          if (op.patternBaseCTM) {
+            rCtx.transform(op.patternBaseCTM[0], op.patternBaseCTM[1], op.patternBaseCTM[2], op.patternBaseCTM[3], op.patternBaseCTM[4], op.patternBaseCTM[5]);
+          }
+          if (shExt.matrix) rCtx.transform(...shExt.matrix);
+          clipAxialExtend(rCtx, shExt.coords, shExt.extend);
+        }
+
+        rCtx.setTransform(
+          op.a * scale * hScale,
+          -op.b * scale * hScale,
+          -op.c * scale,
+          op.d * scale,
+          (op.x - boxOriginX) * scale,
+          (pageHeightPts + boxOriginY - op.y) * scale,
+        );
+
+        // Apply pattern fills (tiling or shading) to text, same as for paths.
+        if (op.tilingPattern) {
+          const tileCvs = tilingPatternCache.get(tileKeyOf(op.tilingPattern));
+          const canvasPat = tileCvs ? rCtx.createPattern(tileCvs, 'repeat') : null; if (canvasPat) transientPatterns.push(canvasPat);
+          if (canvasPat) {
+            const tp = op.tilingPattern;
+            const bboxW = tp.bbox[2] - tp.bbox[0];
+            const bboxH = tp.bbox[3] - tp.bbox[1];
+            const matScaleX = Math.sqrt(tp.matrix[0] * tp.matrix[0] + tp.matrix[1] * tp.matrix[1]);
+            const matScaleY = Math.sqrt(tp.matrix[2] * tp.matrix[2] + tp.matrix[3] * tp.matrix[3]);
+            const { tileW, tileH } = tilingTilePixelDims(bboxW, bboxH, matScaleX, matScaleY, scale);
+            const sx = bboxW / tileW * scale;
+            const sy = bboxH / tileH * scale;
+            // Device-space pattern matrix: maps pattern source pixels to device pixels.
+            const dm = new DOMMatrix([
+              tp.matrix[0] * sx, -tp.matrix[1] * sx,
+              -tp.matrix[2] * sy, tp.matrix[3] * sy,
+              (tp.matrix[0] * tp.bbox[0] + tp.matrix[2] * (tp.bbox[1] + bboxH) + tp.matrix[4] - boxOriginX) * scale,
+              (pageHeightPts + boxOriginY - tp.matrix[1] * tp.bbox[0] - tp.matrix[3] * (tp.bbox[1] + bboxH) - tp.matrix[5]) * scale,
+            ]);
+            // CanvasPattern.setTransform composes with the canvas CTM at paint time.
+            // Passing dm directly would scale it again by the per-glyph transform, flattening the fill to one color.
+            const ctmNow = rCtx.getTransform();
+            const composed = ctmNow.inverse().multiply(dm);
+            canvasPat.setTransform(composed);
+            rCtx.fillStyle = canvasPat;
+          } else {
+            rCtx.fillStyle = op.fillColor || 'black';
+          }
+        } else if (op.patternShading) {
+          const sh = op.patternShading;
+          const det = op.a * op.d - op.b * op.c;
+          if (det !== 0 && sh.coords && sh.stops) {
+            const shMat = sh.matrix;
+            const bctm = op.patternBaseCTM;
+            const toPage = (px, py) => {
+              let x = px;
+              let y = py;
+              if (shMat) {
+                x = shMat[0] * px + shMat[2] * py + shMat[4];
+                y = shMat[1] * px + shMat[3] * py + shMat[5];
+              }
+              if (bctm) {
+                const ox = bctm[0] * x + bctm[2] * y + bctm[4];
+                const oy = bctm[1] * x + bctm[3] * y + bctm[5];
+                x = ox;
+                y = oy;
+              }
+              return [x, y];
+            };
+            const txCoord = (px, py) => {
+              const dx = px - op.x;
+              const dy = op.y - py;
+              return [
+                (op.d * dx + op.c * dy) / (det * hScale),
+                (op.a * dy + op.b * dx) / det,
+              ];
+            };
+            let grad;
+            if (sh.type === 2) {
+              const [px0, py0] = toPage(sh.coords[0], sh.coords[1]);
+              const [px1, py1] = toPage(sh.coords[2], sh.coords[3]);
+              const [x0, y0] = txCoord(px0, py0);
+              const [x1, y1] = txCoord(px1, py1);
+              grad = rCtx.createLinearGradient(x0, y0, x1, y1);
+            } else if (sh.type === 3) {
+              const [px0, py0] = toPage(sh.coords[0], sh.coords[1]);
+              const [px1, py1] = toPage(sh.coords[3], sh.coords[4]);
+              const [x0, y0] = txCoord(px0, py0);
+              const [x1, y1] = txCoord(px1, py1);
+              const shScale = shMat ? Math.sqrt(Math.abs(shMat[0] * shMat[3] - shMat[1] * shMat[2])) : 1;
+              const avgScale = Math.sqrt(Math.abs(det)) * hScale / shScale;
+              const r0 = sh.coords[2] / avgScale;
+              const r1 = sh.coords[5] / avgScale;
+              grad = rCtx.createRadialGradient(x0, y0, r0, x1, y1, r1);
+            }
+            if (grad) {
+              for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+              rCtx.fillStyle = grad;
+            } else {
+              rCtx.fillStyle = op.fillColor || 'black';
+            }
+          } else {
+            rCtx.fillStyle = op.fillColor || 'black';
+          }
+        } else {
+          rCtx.fillStyle = op.fillColor || 'black';
+        }
+
+        const trMode = op.textRenderMode || 0;
+        if (trMode === 0 || trMode === 2) {
+          rCtx.fillText(op.text, 0, 0);
+        }
+        if (trMode === 1 || trMode === 2) {
+          rCtx.strokeStyle = op.strokeColor || 'black';
+          if (op.strokeAlpha < 1) rCtx.globalAlpha = op.strokeAlpha;
+          rCtx.lineWidth = op.lineWidth / (Math.sqrt(op.a * op.a + op.b * op.b) || 1);
+          rCtx.strokeText(op.text, 0, 0);
+        }
+        rCtx.restore();
+      } else if (op.type === 'path') {
+        rCtx.save();
+        if (op.blendMode && op.blendMode !== 'Normal') {
+          rCtx.globalCompositeOperation = pdfBlendToCanvas[op.blendMode] || op.blendMode.toLowerCase();
+        }
+        applyClips(rCtx, op);
+
+        rCtx.setTransform(
+          op.ctm[0] * scale,
+          -op.ctm[1] * scale,
+          op.ctm[2] * scale,
+          -op.ctm[3] * scale,
+          (op.ctm[4] - boxOriginX) * scale,
+          (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+        );
+        rCtx.beginPath();
+        for (const cmd of op.commands) {
+          switch (cmd.type) {
+            case 'M': rCtx.moveTo(cmd.x, cmd.y); break;
+            case 'L': rCtx.lineTo(cmd.x, cmd.y); break;
+            case 'C': rCtx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y); break;
+            case 'Z': rCtx.closePath(); break;
+            default: break;
+          }
+        }
+        if (op.fill) {
+          rCtx.globalAlpha = op.fillAlpha;
+          if (op.patternShading) {
+            const sh = op.patternShading;
+            const bctm = op.patternBaseCTM;
+            if (sh.type === 'mesh') {
+              rCtx.save();
+              rCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+              rCtx.setTransform(scale, 0, 0, -scale, -boxOriginX * scale, (pageHeightPts + boxOriginY) * scale);
+              if (bctm) rCtx.transform(bctm[0], bctm[1], bctm[2], bctm[3], bctm[4], bctm[5]);
+              if (sh.matrix) rCtx.transform(...sh.matrix);
+              renderMeshPatches(rCtx, sh.patches);
+              rCtx.restore();
+            } else if (sh.type === 'gouraud') {
+              rCtx.save();
+              rCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+              rCtx.setTransform(scale, 0, 0, -scale, -boxOriginX * scale, (pageHeightPts + boxOriginY) * scale);
+              if (bctm) rCtx.transform(bctm[0], bctm[1], bctm[2], bctm[3], bctm[4], bctm[5]);
+              if (sh.matrix) rCtx.transform(...sh.matrix);
+              renderGouraudTriangles(rCtx, sh.triangles, gouraudClipBounds);
+              rCtx.restore();
+            } else {
+              rCtx.save();
+              rCtx.clip(op.evenOdd ? 'evenodd' : 'nonzero');
+              rCtx.setTransform(scale, 0, 0, -scale, -boxOriginX * scale, (pageHeightPts + boxOriginY) * scale);
+              if (bctm) rCtx.transform(bctm[0], bctm[1], bctm[2], bctm[3], bctm[4], bctm[5]);
+              if (sh.matrix) rCtx.transform(...sh.matrix);
+              if (sh.bbox) {
+                rCtx.beginPath();
+                rCtx.rect(sh.bbox[0], sh.bbox[1], sh.bbox[2] - sh.bbox[0], sh.bbox[3] - sh.bbox[1]);
+                rCtx.clip();
+              }
+              if (sh.extend && (!sh.extend[0] || !sh.extend[1]) && sh.type === 2) {
+                clipAxialExtend(rCtx, sh.coords, sh.extend);
+              }
+              let grad;
+              if (sh.type === 2) {
+                grad = rCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3]);
+              } else if (sh.type === 3) {
+                grad = rCtx.createRadialGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3], sh.coords[4], sh.coords[5]);
+              }
+              if (grad) {
+                for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+                rCtx.fillStyle = grad;
+                rCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+              } else {
+                rCtx.fillStyle = op.fillColor;
+                rCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+              }
+              rCtx.restore();
+            }
+          } else {
+            rCtx.fillStyle = op.fillColor;
+            rCtx.fill(op.evenOdd ? 'evenodd' : 'nonzero');
+          }
+        }
+        if (op.stroke) {
+          rCtx.globalAlpha = op.strokeAlpha;
+          let strokeStyleVal = op.strokeColor;
+          if (op.strokePatternShading) {
+            const sh = op.strokePatternShading;
+            if ((sh.type === 2 || sh.type === 3) && sh.coords && sh.stops) {
+              const m = sh.matrix || [1, 0, 0, 1, 0, 0];
+              const bm = op.patternBaseCTM;
+              const userX = (px, py) => {
+                const ux = m[0] * px + m[2] * py + m[4];
+                const uy = m[1] * px + m[3] * py + m[5];
+                if (bm) {
+                  return [bm[0] * ux + bm[2] * uy + bm[4], bm[1] * ux + bm[3] * uy + bm[5]];
+                }
+                return [ux, uy];
+              };
+              const opM = op.ctm;
+              const det = opM[0] * opM[3] - opM[1] * opM[2];
+              const invOp = det !== 0 ? [
+                opM[3] / det, -opM[1] / det, -opM[2] / det, opM[0] / det,
+                (opM[2] * opM[5] - opM[3] * opM[4]) / det,
+                (opM[1] * opM[4] - opM[0] * opM[5]) / det,
+              ] : [1, 0, 0, 1, 0, 0];
+              const localCoord = (ux, uy) => [
+                invOp[0] * ux + invOp[2] * uy + invOp[4],
+                invOp[1] * ux + invOp[3] * uy + invOp[5],
+              ];
+              let grad;
+              if (sh.type === 2) {
+                const [u0x, u0y] = userX(sh.coords[0], sh.coords[1]);
+                const [u1x, u1y] = userX(sh.coords[2], sh.coords[3]);
+                const [lx0, ly0] = localCoord(u0x, u0y);
+                const [lx1, ly1] = localCoord(u1x, u1y);
+                grad = rCtx.createLinearGradient(lx0, ly0, lx1, ly1);
+              } else {
+                const [u0x, u0y] = userX(sh.coords[0], sh.coords[1]);
+                const [u1x, u1y] = userX(sh.coords[3], sh.coords[4]);
+                const [lx0, ly0] = localCoord(u0x, u0y);
+                const [lx1, ly1] = localCoord(u1x, u1y);
+                const avgScale = Math.sqrt(Math.abs(det)) * Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
+                grad = rCtx.createRadialGradient(lx0, ly0, sh.coords[2] / avgScale, lx1, ly1, sh.coords[5] / avgScale);
+              }
+              for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+              strokeStyleVal = grad;
+            }
+          } else if (op.strokeTilingPattern) {
+            const tileCvs = tilingPatternCache.get(tileKeyOf(op.strokeTilingPattern));
+            if (tileCvs) {
+              const tp = op.strokeTilingPattern;
+              const bboxW = tp.bbox[2] - tp.bbox[0];
+              const bboxH = tp.bbox[3] - tp.bbox[1];
+              const matScaleX = Math.sqrt(tp.matrix[0] * tp.matrix[0] + tp.matrix[1] * tp.matrix[1]) || 1;
+              const matScaleY = Math.sqrt(tp.matrix[2] * tp.matrix[2] + tp.matrix[3] * tp.matrix[3]) || 1;
+              const { tileW, tileH } = tilingTilePixelDims(bboxW, bboxH, matScaleX, matScaleY, scale);
+              const sx = bboxW / tileW * scale;
+              const sy = bboxH / tileH * scale;
+              const canvasPat = rCtx.createPattern(tileCvs, 'repeat');
+              transientPatterns.push(canvasPat);
+              const dm = new DOMMatrix([
+                tp.matrix[0] * sx, -tp.matrix[1] * sx,
+                -tp.matrix[2] * sy, tp.matrix[3] * sy,
+                (tp.matrix[0] * tp.bbox[0] + tp.matrix[2] * (tp.bbox[1] + bboxH) + tp.matrix[4] - boxOriginX) * scale,
+                (pageHeightPts + boxOriginY - tp.matrix[1] * tp.bbox[0] - tp.matrix[3] * (tp.bbox[1] + bboxH) - tp.matrix[5]) * scale,
+              ]);
+              const ctmNow = rCtx.getTransform();
+              canvasPat.setTransform(ctmNow.inverse().multiply(dm));
+              strokeStyleVal = canvasPat;
+            }
+          }
+          rCtx.strokeStyle = strokeStyleVal;
+          // PDF spec: lineWidth 0 = thinnest line (1 device pixel).
+          // Canvas ignores lineWidth=0, so compute a hairline width instead.
+          if (op.lineWidth > 0) {
+            rCtx.lineWidth = op.lineWidth;
+          } else {
+            const sx = Math.sqrt(op.ctm[0] * op.ctm[0] + op.ctm[1] * op.ctm[1]) * scale;
+            const sy = Math.sqrt(op.ctm[2] * op.ctm[2] + op.ctm[3] * op.ctm[3]) * scale;
+            rCtx.lineWidth = 1 / (Math.max(sx, sy) || 1);
+          }
+          rCtx.lineCap = /** @type {CanvasLineCap} */ (['butt', 'round', 'square'][op.lineCap] || 'butt');
+          rCtx.lineJoin = /** @type {CanvasLineJoin} */ (['miter', 'round', 'bevel'][op.lineJoin] || 'miter');
+          rCtx.miterLimit = op.miterLimit;
+          if (op.dashArray.length > 0) {
+            rCtx.setLineDash(op.dashArray);
+            rCtx.lineDashOffset = op.dashPhase;
+          }
+          rCtx.stroke();
+        }
+        rCtx.restore();
+      } else if (op.type === 'shading') {
+        const sh = op.shading;
+        if (!sh) return;
+        rCtx.save();
+        if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+        // Apply blend mode from graphics state (e.g. Multiply from ExtGState).
+        if (op.blendMode && op.blendMode !== 'Normal') {
+          rCtx.globalCompositeOperation = pdfBlendToCanvas[op.blendMode] || op.blendMode.toLowerCase();
+        }
+        applyClips(rCtx, op);
+
+        rCtx.setTransform(
+          op.ctm[0] * scale,
+          -op.ctm[1] * scale,
+          op.ctm[2] * scale,
+          -op.ctm[3] * scale,
+          (op.ctm[4] - boxOriginX) * scale,
+          (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+        );
+
+        if (sh.type === 2) {
+          if (sh.bbox) {
+            rCtx.beginPath();
+            rCtx.rect(sh.bbox[0], sh.bbox[1], sh.bbox[2] - sh.bbox[0], sh.bbox[3] - sh.bbox[1]);
+            rCtx.clip();
+          }
+          if (sh.extend && (!sh.extend[0] || !sh.extend[1])) {
+            clipAxialExtend(rCtx, sh.coords, sh.extend);
+          }
+          const grad = rCtx.createLinearGradient(sh.coords[0], sh.coords[1], sh.coords[2], sh.coords[3]);
+          for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+          rCtx.fillStyle = grad;
+          rCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+        } else if (sh.type === 3) {
+          if (sh.bbox) {
+            rCtx.beginPath();
+            rCtx.rect(sh.bbox[0], sh.bbox[1], sh.bbox[2] - sh.bbox[0], sh.bbox[3] - sh.bbox[1]);
+            rCtx.clip();
+          }
+          fillRadialExtendBehind(rCtx, sh);
+          const grad = rCtx.createRadialGradient(
+            sh.coords[0], sh.coords[1], sh.coords[2],
+            sh.coords[3], sh.coords[4], sh.coords[5],
+          );
+          for (const stop of sh.stops) grad.addColorStop(stop.offset, stop.color);
+          rCtx.fillStyle = grad;
+          rCtx.fillRect(-1e9, -1e9, 2e9, 2e9);
+        } else if (sh.type === 'mesh') {
+          renderMeshPatches(rCtx, sh.patches);
+        } else if (sh.type === 'gouraud') {
+          renderGouraudTriangles(rCtx, sh.triangles, null, [canvasWidth, canvasHeight]);
+        }
+        rCtx.restore();
+      } else if (op.type === 'inlineImage') {
+      // Decode and render an inline image (BI/ID/EI)
+        try {
+        // Skip degenerate transforms (zero-size images from pattern sub-streams).
+          if (Math.abs(op.ctm[0] * op.ctm[3] - op.ctm[1] * op.ctm[2]) < 1e-9) {
+          // degenerate CTM — skip
+          } else if (op.tilingPattern) {
+          // Image mask with tiling pattern fill: render mask as white bitmap,
+          // composite cached tiling pattern through it via source-in, then draw result.
+            const tileCvs = tilingPatternCache.get(tileKeyOf(op.tilingPattern));
+            const canvasPat = tileCvs ? rCtx.createPattern(tileCvs, 'repeat') : null; if (canvasPat) transientPatterns.push(canvasPat);
+            const maskOp = { ...op, fillColor: 'rgb(255,255,255)' };
+            const maskBitmap = canvasPat ? await decodeInlineImage(maskOp) : null;
+            if (maskBitmap && canvasPat) {
+              const imgW = Math.max(1, Math.round(Math.sqrt(op.ctm[0] * op.ctm[0] + op.ctm[1] * op.ctm[1]) * scale));
+              const imgH = Math.max(1, Math.round(Math.sqrt(op.ctm[2] * op.ctm[2] + op.ctm[3] * op.ctm[3]) * scale));
+              if (imgW <= 4096 && imgH <= 4096) {
+                const tmpCanvas = ca.makeCanvas(imgW, imgH);
+                const tmpCtx = tmpCanvas.getContext('2d', { willReadFrequently: true });
+                tmpCtx.drawImage(maskBitmap, 0, 0, imgW, imgH);
+                tmpCtx.globalCompositeOperation = 'source-in';
+                const tp = op.tilingPattern;
+                const bboxW = tp.bbox[2] - tp.bbox[0];
+                const bboxH = tp.bbox[3] - tp.bbox[1];
+                const matScaleX = Math.sqrt(tp.matrix[0] * tp.matrix[0] + tp.matrix[1] * tp.matrix[1]) || 1;
+                const matScaleY = Math.sqrt(tp.matrix[2] * tp.matrix[2] + tp.matrix[3] * tp.matrix[3]) || 1;
+                const { tileW, tileH } = tilingTilePixelDims(bboxW, bboxH, matScaleX, matScaleY, scale);
+                const sx = bboxW / tileW * scale;
+                const sy = bboxH / tileH * scale;
+                const patOriginX = (tp.matrix[0] * tp.bbox[0] + tp.matrix[2] * (tp.bbox[1] + bboxH) + tp.matrix[4] - boxOriginX) * scale;
+                const patOriginY = (pageHeightPts + boxOriginY - tp.matrix[1] * tp.bbox[0] - tp.matrix[3] * (tp.bbox[1] + bboxH) - tp.matrix[5]) * scale;
+                const imgOriginX = (op.ctm[4] - boxOriginX) * scale;
+                const imgOriginY = (pageHeightPts + boxOriginY - op.ctm[5]) * scale;
+                canvasPat.setTransform(new DOMMatrix([
+                  tp.matrix[0] * sx, -tp.matrix[1] * sx, -tp.matrix[2] * sy, tp.matrix[3] * sy,
+                  patOriginX - imgOriginX, patOriginY - imgOriginY,
+                ]));
+                tmpCtx.fillStyle = canvasPat;
+                tmpCtx.fillRect(0, 0, imgW, imgH);
+                rCtx.save();
+                if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+                applyClips(rCtx, op);
+                rCtx.setTransform(
+                  op.ctm[0] * scale, -op.ctm[1] * scale,
+                  op.ctm[2] * scale, -op.ctm[3] * scale,
+                  (op.ctm[4] - boxOriginX) * scale,
+                  (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+                );
+                rCtx.transform(1, 0, 0, -1, 0, 1);
+                rCtx.drawImage(tmpCanvas, 0, 0, 1, 1);
+                ca.closeDrawable(tmpCanvas);
+                rCtx.restore();
+              }
+              ca.closeDrawable(maskBitmap);
+            }
+          } else {
+            const bitmap = await decodeInlineImage(op);
+            if (bitmap) {
+              rCtx.save();
+              if (op.fillAlpha < 1) rCtx.globalAlpha = op.fillAlpha;
+              // Disable interpolation for small 1-bit images (QR codes, barcodes) to preserve sharp edges
+              if (bitmap.width <= 256 && bitmap.height <= 256) {
+                rCtx.imageSmoothingEnabled = false;
+              }
+              applyClips(rCtx, op);
+              rCtx.setTransform(
+                op.ctm[0] * scale, -op.ctm[1] * scale,
+                op.ctm[2] * scale, -op.ctm[3] * scale,
+                (op.ctm[4] - boxOriginX) * scale,
+                (pageHeightPts + boxOriginY - op.ctm[5]) * scale,
+              );
+              rCtx.transform(1, 0, 0, -1, 0, 1);
+              rCtx.drawImage(bitmap, 0, 0, 1, 1);
+              rCtx.restore();
+              ca.closeDrawable(bitmap);
+            }
+          }
+        } catch { /* skip failed inline images */ }
+      }
+    }
+
+    let gouraudClipBounds = null;
+    {
+      for (const op of drawOps) {
+        if (op.type !== 'path' || !op.patternShading || op.patternShading.type !== 'gouraud') continue;
+        const clipEntry = op.clips?.[op.clips.length - 1];
+        if (clipEntry?.path && clipEntry.ctm) {
+          const ct = clipEntry.ctm;
+          let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity;
+          for (const cmd of clipEntry.path) {
+            if (cmd.x == null) continue;
+            const px = (ct[0] * cmd.x + ct[2] * cmd.y + ct[4] - boxOriginX) * scale;
+            const py = (pageHeightPts + boxOriginY - ct[1] * cmd.x - ct[3] * cmd.y - ct[5]) * scale;
+            if (px < x0) x0 = px; if (px > x1) x1 = px;
+            if (py < y0) y0 = py; if (py > y1) y1 = py;
+          }
+          gouraudClipBounds = [
+            Math.max(0, Math.floor(x0)), Math.max(0, Math.floor(y0)),
+            Math.min(canvasWidth, Math.ceil(x1)), Math.min(canvasHeight, Math.ceil(y1)),
+          ];
+        }
+        break;
+      }
+    }
+
+    const opGroups = [];
+    {
+      let prevKey = '';
+      for (const op of drawOps) {
+        const outerSmask = op.outerSmask || null;
+        const smask = op.smask || null;
+        const groupId = op.groupId || null;
+        // Forms can carry an SMask without a /Group dictionary, so the smask key stays alongside the group key.
+        // outerSmask is a form-level mask over ops that have their own inner smask, and keying on it applies the outer mask to the whole form once.
+        const groupKey = groupId !== null ? `g:${groupId}` : '';
+        const smaskKey = outerSmask ? `outer:${outerSmask.formObjNum}` : (smask ? String(smask.formObjNum) : '');
+        const key = `${groupKey}|${smaskKey}`;
+        if (key !== prevKey || opGroups.length === 0) {
+          opGroups.push({
+            smask: outerSmask || smask,
+            outerSmask,
+            groupId,
+            ops: [op],
+          });
+          prevKey = key;
+        } else {
+          opGroups[opGroups.length - 1].ops.push(op);
+        }
+      }
+    }
+
+    /**
+     * Render a list of ops to a canvas context, handling inner SMask grouping.
+     * Ops with different inner smask values are rendered to temp canvases, masked, then composited.
+     * @param {OffscreenCanvasRenderingContext2D} targetCtx
+     * @param {Array<DrawOp>} ops
+     */
+    async function renderOpsWithInnerSmask(targetCtx, ops) {
+    // Sub-group by inner smask
+      const subGroups = [];
+      let prevKey = '';
+      for (const op of ops) {
+        const smask = op.smask || null;
+        const key = smask ? String(smask.formObjNum) : '';
+        if (key !== prevKey || subGroups.length === 0) {
+          subGroups.push({ smask, ops: [op] });
+          prevKey = key;
+        } else {
+          subGroups[subGroups.length - 1].ops.push(op);
+        }
+      }
+
+      for (const sub of subGroups) {
+        let subCtx = targetCtx;
+        let subCanvas = null;
+        if (sub.smask) {
+          subCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+          subCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (subCanvas.getContext('2d', { willReadFrequently: true }));
+        }
+
+        for (const op of sub.ops) {
+          const textClipCharsForOp = getTextClip(op);
+          const savedCtx = subCtx;
+          let textClipCanvas = null;
+          if (textClipCharsForOp) {
+            textClipCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+            subCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (textClipCanvas.getContext('2d', { willReadFrequently: true }));
+          }
+
+          if (!renderPathOpSync(subCtx, op)) await renderSingleOp(subCtx, op);
+
+          if (textClipCanvas && textClipCharsForOp) {
+            const mCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+            drawTextClipMask(mCanvas, textClipCharsForOp);
+            subCtx.globalCompositeOperation = 'destination-in';
+            subCtx.drawImage(mCanvas, 0, 0);
+            ca.closeDrawable(mCanvas);
+            subCtx.globalCompositeOperation = 'source-over';
+            subCtx = savedCtx;
+            subCtx.drawImage(textClipCanvas, 0, 0);
+            ca.closeDrawable(textClipCanvas);
+          } else if (textClipCharsForOp) {
+            subCtx = savedCtx;
+          }
+        }
+
+        if (sub.smask && subCanvas) {
+          const cacheKey = `${sub.smask.formObjNum}:${sub.smask.parentCtm ? sub.smask.parentCtm.join(',') : ''}`;
+          let maskCanvas = smaskCanvasCache.get(cacheKey);
+          if (!maskCanvas) {
+            maskCanvas = await renderSMaskToCanvas(sub.smask, objCache, canvasWidth, canvasHeight, pageHeightPts, boxOriginX, boxOriginY, scale);
+            if (maskCanvas) smaskCanvasCache.set(cacheKey, maskCanvas);
+          }
+          if (maskCanvas) {
+            subCtx.globalCompositeOperation = 'destination-in';
+            subCtx.drawImage(maskCanvas, 0, 0);
+            // Cached in smaskCanvasCache, disposed once at end of page.
+            // Disposing here leaves a freed 1x1 canvas that SIGSEGVs the next composite.
+            subCtx.globalCompositeOperation = 'source-over';
+          }
+          // Blending inside the isolated sub-canvas never sees the target, so re-apply the ops' blend mode when compositing the sub-canvas back.
+          const subBlend = sub.ops[0]?.blendMode;
+          if (subBlend && subBlend !== 'Normal') {
+            targetCtx.globalCompositeOperation = pdfBlendToCanvas[subBlend] || subBlend.toLowerCase();
+          }
+          targetCtx.drawImage(subCanvas, 0, 0);
+          ca.closeDrawable(subCanvas);
+          if (subBlend && subBlend !== 'Normal') {
+            targetCtx.globalCompositeOperation = 'source-over';
+          }
+        }
+      }
+    }
+
+    // Bottom entry is the page canvas and is never popped, and every entry above it is a transparency-group buffer.
+    // A tight buffer sets offX/offY/w/h to its device-pixel box, while a full-page buffer carries the page size, which is how tightness is detected later.
+    /** @type {Array<{ctx: OffscreenCanvasRenderingContext2D, canvas: any, groupId: number|null, offX: number, offY: number, w: number, h: number}>} */
+    const ctxStack = [{
+      ctx, canvas: null, groupId: null, offX: 0, offY: 0, w: canvasWidth, h: canvasHeight,
+    }];
+
+    // The Node.js canvas package defers drawImage(canvas) compositing and retains each source surface until the destination is read back.
+    let compositeFlushCounter = 0;
+    const flushComposites = () => {
+      if ((++compositeFlushCounter % 12) !== 0) return;
+      for (let i = 0; i < ctxStack.length; i++) ctxStack[i].ctx.getImageData(0, 0, 1, 1);
+    };
+
+    const popAndComposite = async () => {
+      const top = ctxStack.pop();
+      if (!top || top.groupId == null) return;
+      const parent = ctxStack[ctxStack.length - 1];
+      const attrs = groupContext.registry.get(top.groupId);
+      if (!attrs) {
+        ca.closeDrawable(top.canvas);
+        return;
+      }
+      if (attrs.smask) {
+        const isTight = top.w < canvasWidth || top.h < canvasHeight;
+        let maskCanvas;
+        if (isTight) {
+          maskCanvas = await renderSMaskToCanvas(attrs.smask, objCache, canvasWidth, canvasHeight, pageHeightPts, boxOriginX, boxOriginY, scale, {
+            x: top.offX, y: top.offY, width: top.w, height: top.h,
+          });
+        } else {
+          const cacheKey = `${attrs.smask.formObjNum}:${attrs.smask.parentCtm ? attrs.smask.parentCtm.join(',') : ''}`;
+          maskCanvas = smaskCanvasCache.get(cacheKey);
+          if (!maskCanvas) {
+            maskCanvas = await renderSMaskToCanvas(attrs.smask, objCache, canvasWidth, canvasHeight, pageHeightPts, boxOriginX, boxOriginY, scale);
+            if (maskCanvas) smaskCanvasCache.set(cacheKey, maskCanvas);
+          }
+        }
+        if (maskCanvas) {
+          top.ctx.globalCompositeOperation = 'destination-in';
+          top.ctx.drawImage(maskCanvas, 0, 0);
+          top.ctx.globalCompositeOperation = 'source-over';
+          // Full-page masks live in smaskCanvasCache and are disposed at end of page.
+          // Disposing a cached canvas here SIGSEGVs the next composite that reads it.
+          // Tight masks are unique per offset and uncached, so dispose now.
+          if (isTight) ca.closeDrawable(maskCanvas);
+        }
+      }
+      parent.ctx.save();
+      if (attrs.fillAlpha != null && attrs.fillAlpha < 1) parent.ctx.globalAlpha = attrs.fillAlpha;
+      if (attrs.blendMode && attrs.blendMode !== 'Normal') {
+        parent.ctx.globalCompositeOperation = pdfBlendToCanvas[attrs.blendMode] || attrs.blendMode.toLowerCase();
+      }
+      parent.ctx.drawImage(top.canvas, top.offX - parent.offX, top.offY - parent.offY);
+      parent.ctx.restore();
+      ca.closeDrawable(top.canvas);
+      flushComposites();
+    };
+
+    /** @param {number|null} groupId @returns {number[]} root-to-leaf chain of registered ancestors */
+    const getGroupChain = (groupId) => {
+      const chain = [];
+      let g = groupId;
+      while (g != null) {
+        chain.unshift(g);
+        const a = groupContext.registry.get(g);
+        g = a ? a.parentGroupId : null;
+      }
+      return chain;
+    };
+
+    /**
+     * Render a soft-masked op group into a buffer sized to a device-pixel bbox and composite it into the current stack buffer at that offset.
+     * @param {Array<any>} ops
+     * @param {any} smask
+     * @param {number} bx
+     * @param {number} by
+     * @param {number} bw
+     * @param {number} bh
+     * @returns {Promise<boolean>} false if the mask could not be built
+     */
+    async function compositeTightSmaskGroup(ops, smask, bx, by, bw, bh) {
+      const mask = await renderSMaskToCanvas(
+        smask, objCache, canvasWidth, canvasHeight,
+        pageHeightPts, boxOriginX, boxOriginY, scale,
+        {
+          x: bx, y: by, width: bw, height: bh,
+        },
+      );
+      if (!mask) return false;
+      const tightCanvas = ca.makeCanvas(bw, bh);
+      const tightCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tightCanvas.getContext('2d', { willReadFrequently: true }));
+      const dx = -bx / scale;
+      const dy = by / scale;
+      for (const op of ops) {
+        const shiftedOp = shiftOpBy(op, dx, dy);
+        if (!renderPathOpSync(tightCtx, shiftedOp)) await renderSingleOp(tightCtx, shiftedOp);
+      }
+      tightCtx.globalCompositeOperation = 'destination-in';
+      tightCtx.drawImage(mask, 0, 0);
+      ca.closeDrawable(mask);
+      tightCtx.globalCompositeOperation = 'source-over';
+      const entry = ctxStack[ctxStack.length - 1];
+      const blend = ops.length > 0 && ops[0].blendMode;
+      if (blend && blend !== 'Normal') entry.ctx.globalCompositeOperation = pdfBlendToCanvas[blend] || blend.toLowerCase();
+      entry.ctx.drawImage(tightCanvas, bx - entry.offX, by - entry.offY);
+      ca.closeDrawable(tightCanvas);
+      if (blend && blend !== 'Normal') entry.ctx.globalCompositeOperation = 'source-over';
+      return true;
+    }
+
+    /**
+     * Device-pixel bbox outside which the soft mask is guaranteed zero.
+     * The masked result is content*mask, so this bounds the visible output even when the content's own extent is unknown.
+     * Returns null unless the backdrop outside the mask content resolves to zero and every mask op has a computable bbox.
+     * @param {any} smaskInfo
+     * @returns {Promise<{x:number,y:number,w:number,h:number}|null>}
+     */
+    async function smaskOutsideZeroContentBBox(smaskInfo) {
+      // The declared form /BBox cannot substitute here, because the renderer does not clip mask content to it.
+      const trFn = smaskInfo.tr || null;
+      const clamp01 = (v) => Math.max(0, Math.min(1, v));
+      let outsideByte;
+      if (smaskInfo.type === 'Alpha') {
+        let outAlpha = 0;
+        if (trFn) {
+          const out = evaluateFunction(trFn, [0]);
+          outAlpha = out && out.length > 0 ? out[0] : 0;
+        }
+        outsideByte = Math.round(clamp01(outAlpha) * 255);
+      } else {
+        const bc = smaskInfo.bc;
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        if (bc && bc.length === 1) {
+          r = Math.round(clamp01(bc[0]) * 255); g = r; b = r;
+        } else if (bc && bc.length === 3) {
+          r = Math.round(bc[0] * 255); g = Math.round(bc[1] * 255); b = Math.round(bc[2] * 255);
+        } else if (bc && bc.length === 4) {
+          [r, g, b] = cmykToRgb(bc[0], bc[1], bc[2], bc[3]);
+        }
+        const luminosity = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        let outAlpha = luminosity;
+        if (trFn) {
+          const out = evaluateFunction(trFn, [Math.round(luminosity * 255) / 255]);
+          outAlpha = out && out.length > 0 ? out[0] : luminosity;
+        }
+        outsideByte = Math.round(clamp01(outAlpha) * 255);
+      }
+      if (outsideByte !== 0) return null;
+
+      const formObjText = objCache.getObjectText(smaskInfo.formObjNum);
+      if (!formObjText) return null;
+      const streamBytes = objCache.getStreamBytes(smaskInfo.formObjNum);
+      if (!streamBytes) return null;
+      const { forms: maskForms } = parsePageImages(formObjText, objCache, { recurseForms: true });
+      if (maskForms.size > 0) return null;
+      const maskExtGStates = parseExtGStates(formObjText, objCache);
+      const maskShadings = parseShadings(formObjText, objCache);
+      const maskPatterns = parsePatterns(formObjText, objCache);
+      const maskColorSpaces = parsePageColorSpaces(formObjText, objCache);
+      // No fonts registered: text ops can't be bounded by opDeviceBBox, so the give-up below covers them.
+      const maskOps = parseDrawOps(bytesToLatin1(streamBytes), new Map(), maskExtGStates, new Map(), maskColorSpaces,
+        new Set(), new Set(), new Set(), maskShadings, maskPatterns, new Map());
+      const formMatrix = parseFormMatrix(formObjText, objCache);
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const op of maskOps) {
+        const oa = /** @type {any} */ (op);
+        if (oa.patternShading || oa.tilingPattern || oa.strokePatternShading || oa.strokeTilingPattern || oa.smask) return null;
+        let composed = op;
+        if (oa.ctm || oa.clips) {
+          composed = { ...op };
+          if (oa.ctm) {
+            let ctm = matMul(oa.ctm, formMatrix);
+            if (smaskInfo.parentCtm && smaskInfo.parentCtm.length === 6) ctm = matMul(ctm, smaskInfo.parentCtm);
+            /** @type {any} */ (composed).ctm = ctm;
+          }
+          if (oa.clips) {
+            /** @type {any} */ (composed).clips = oa.clips.map((/** @type {any} */ c) => {
+              let cctm = c.ctm ? matMul(c.ctm, formMatrix) : c.ctm;
+              if (cctm && smaskInfo.parentCtm && smaskInfo.parentCtm.length === 6) cctm = matMul(cctm, smaskInfo.parentCtm);
+              return { ...c, ctm: cctm };
+            });
+          }
+        }
+        const bb = opDeviceBBox(composed);
+        if (!bb) return null;
+        if (bb.minX < minX) minX = bb.minX;
+        if (bb.minY < minY) minY = bb.minY;
+        if (bb.maxX > maxX) maxX = bb.maxX;
+        if (bb.maxY > maxY) maxY = bb.maxY;
+      }
+      if (!Number.isFinite(minX)) return null;
+      const x = Math.max(0, Math.floor(minX) - 2);
+      const y = Math.max(0, Math.floor(minY) - 2);
+      const w = Math.min(canvasWidth, Math.ceil(maxX) + 2) - x;
+      const h = Math.min(canvasHeight, Math.ceil(maxY) + 2) - y;
+      if (w <= 0 || h <= 0 || w * h >= canvasWidth * canvasHeight) return null;
+      return {
+        x, y, w, h,
+      };
+    }
+
+    // A soft-masked group can be clamped to its content bbox too, because content*mask is zero wherever the content is transparent.
+    /** @type {Map<number, {x:number,y:number,w:number,h:number}>} */
+    const groupTightBBox = new Map();
+    {
+      const acc = new Map();
+      for (const og of opGroups) {
+        if (og.groupId == null) continue;
+        const chain = getGroupChain(og.groupId);
+        for (const dop of og.ops) {
+          const bb = opDeviceBBox(dop);
+          // shiftOpBy does not move a pattern or shading matrix, so those fills would land wrong in a shifted tight buffer.
+          const dpAny = /** @type {any} */ (dop);
+          const untightable = !!(dop.outerSmask || dop.patternShading || dop.tilingPattern
+            || dpAny.strokePatternShading || dpAny.strokeTilingPattern);
+          for (const g of chain) {
+            let e = acc.get(g);
+            if (!e) {
+              e = {
+                minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity, ok: true,
+              };
+              acc.set(g, e);
+            }
+            if (!bb || untightable) { e.ok = false; continue; }
+            if (bb.minX < e.minX) e.minX = bb.minX;
+            if (bb.minY < e.minY) e.minY = bb.minY;
+            if (bb.maxX > e.maxX) e.maxX = bb.maxX;
+            if (bb.maxY > e.maxY) e.maxY = bb.maxY;
+          }
+        }
+      }
+      for (const [g, e] of acc) {
+        const attrs = groupContext.registry.get(g);
+        if (!e.ok || !attrs || !Number.isFinite(e.minX)) continue;
+        const x = Math.max(0, Math.floor(e.minX) - 2);
+        const y = Math.max(0, Math.floor(e.minY) - 2);
+        const right = Math.min(canvasWidth, Math.ceil(e.maxX) + 2);
+        const bottom = Math.min(canvasHeight, Math.ceil(e.maxY) + 2);
+        // Content entirely off-page clamps to a degenerate rect.
+        // The resulting 1x1 buffer composites at its off-page origin and contributes nothing.
+        const w = Math.max(1, right - x);
+        const h = Math.max(1, bottom - y);
+        if (w * h < canvasWidth * canvasHeight) {
+          groupTightBBox.set(g, {
+            x, y, w, h,
+          });
+        }
+      }
+    }
+
+    for (let groupIdx = 0; groupIdx < opGroups.length; groupIdx++) {
+      const group = opGroups[groupIdx];
+      const targetChain = group.groupId != null ? getGroupChain(group.groupId) : [];
+
+      let common = 0;
+      while (common < ctxStack.length - 1 && common < targetChain.length
+        && ctxStack[common + 1].groupId === targetChain[common]) {
+        common++;
+      }
+      while (ctxStack.length - 1 > common) {
+        await popAndComposite();
+      }
+      for (let i = common; i < targetChain.length; i++) {
+        const tb = groupTightBBox.get(targetChain[i]);
+        const newCanvas = tb ? ca.makeCanvas(tb.w, tb.h) : ca.makeCanvas(canvasWidth, canvasHeight);
+        const newCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (newCanvas.getContext('2d', { willReadFrequently: true }));
+        ctxStack.push({
+          ctx: newCtx, canvas: newCanvas, groupId: targetChain[i], offX: tb ? tb.x : 0, offY: tb ? tb.y : 0, w: tb ? tb.w : canvasWidth, h: tb ? tb.h : canvasHeight,
+        });
+      }
+
+      const currentEntry = ctxStack[ctxStack.length - 1];
+      const currentCtx = currentEntry.ctx;
+      const curOffX = currentEntry.offX;
+      const curOffY = currentEntry.offY;
+
+      if (group.outerSmask) {
+      // Two-level masking: render all ops (with inner SMask handling) to a group canvas,
+      // then apply the outer (form-level) SMask to the combined result.
+        const groupCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+        const groupCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (groupCanvas.getContext('2d', { willReadFrequently: true }));
+
+        await renderOpsWithInnerSmask(groupCtx, group.ops);
+
+        // Apply the outer (form-level) SMask to the combined group result
+        const cacheKey = `${group.outerSmask.formObjNum}:${group.outerSmask.parentCtm ? group.outerSmask.parentCtm.join(',') : ''}`;
+        let maskCanvas = smaskCanvasCache.get(cacheKey);
+        if (!maskCanvas) {
+          maskCanvas = await renderSMaskToCanvas(group.outerSmask, objCache, canvasWidth, canvasHeight, pageHeightPts, boxOriginX, boxOriginY, scale);
+          if (maskCanvas) smaskCanvasCache.set(cacheKey, maskCanvas);
+        }
+        if (maskCanvas) {
+          groupCtx.globalCompositeOperation = 'destination-in';
+          groupCtx.drawImage(maskCanvas, 0, 0);
+          // Cached in smaskCanvasCache, disposed once at end of page.
+          // Disposing here leaves a freed 1x1 canvas that SIGSEGVs the next composite.
+          groupCtx.globalCompositeOperation = 'source-over';
+        }
+        currentCtx.drawImage(groupCanvas, -curOffX, -curOffY);
+        ca.closeDrawable(groupCanvas);
+      } else if (group.smask) {
+      // A page with many per-image soft masks allocates a full-page canvas for each one, so mask a bbox-sized canvas instead.
+        const fastOp = (group.ops.length === 1
+        && group.ops[0].type === 'image'
+        && /** @type {any} */ (group.ops[0]).ctm
+        && !getTextClip(group.ops[0]))
+          ? /** @type {any} */ (group.ops[0])
+          : null;
+
+        if (fastOp) {
+        // Compute destination bbox in canvas pixels by transforming the unit square
+        // through fastOp.ctm, then into canvas coords with Y flip.
+          const corners = [
+            [fastOp.ctm[4], fastOp.ctm[5]],
+            [fastOp.ctm[0] + fastOp.ctm[4], fastOp.ctm[1] + fastOp.ctm[5]],
+            [fastOp.ctm[2] + fastOp.ctm[4], fastOp.ctm[3] + fastOp.ctm[5]],
+            [fastOp.ctm[0] + fastOp.ctm[2] + fastOp.ctm[4], fastOp.ctm[1] + fastOp.ctm[3] + fastOp.ctm[5]],
+          ];
+          let minPxX = Infinity;
+          let minPxY = Infinity;
+          let maxPxX = -Infinity;
+          let maxPxY = -Infinity;
+          for (let ci = 0; ci < 4; ci++) {
+            const px = (corners[ci][0] - boxOriginX) * scale;
+            const py = (pageHeightPts + boxOriginY - corners[ci][1]) * scale;
+            if (px < minPxX) minPxX = px;
+            if (px > maxPxX) maxPxX = px;
+            if (py < minPxY) minPxY = py;
+            if (py > maxPxY) maxPxY = py;
+          }
+          // Pad by 1 pixel so anti-aliasing at bbox edges isn't clipped.
+          const bboxX = Math.max(0, Math.floor(minPxX) - 1);
+          const bboxY = Math.max(0, Math.floor(minPxY) - 1);
+          const bboxRight = Math.min(canvasWidth, Math.ceil(maxPxX) + 1);
+          const bboxBottom = Math.min(canvasHeight, Math.ceil(maxPxY) + 1);
+          const bboxW = bboxRight - bboxX;
+          const bboxH = bboxBottom - bboxY;
+
+          if (bboxW > 0 && bboxH > 0 && bboxW * bboxH < canvasWidth * canvasHeight / 4) {
+          // These masks are unique per image op, so a smaskCanvasCache entry would never be hit and would just retain a canvas per image.
+            const fastBbox = {
+              x: bboxX,
+              y: bboxY,
+              width: bboxW,
+              height: bboxH,
+            };
+            const fastMaskCanvas = await renderSMaskToCanvas(
+              group.smask, objCache, canvasWidth, canvasHeight,
+              pageHeightPts, boxOriginX, boxOriginY, scale,
+              fastBbox,
+            );
+            if (fastMaskCanvas) {
+              const tightCanvas = ca.makeCanvas(bboxW, bboxH);
+              const tightCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tightCanvas.getContext('2d', { willReadFrequently: true }));
+              // Shift op.ctm translation so the image renders at (0,0) of tightCanvas
+              // instead of its absolute canvas-pixel position.
+              const shiftedOp = {
+                ...fastOp,
+                ctm: [fastOp.ctm[0], fastOp.ctm[1], fastOp.ctm[2], fastOp.ctm[3], fastOp.ctm[4] - bboxX / scale, fastOp.ctm[5] + bboxY / scale],
+                clips: fastOp.clips ? fastOp.clips.map((/** @type {any} */ c) => ({
+                  ...c,
+                  ctm: c.ctm
+                    ? [c.ctm[0], c.ctm[1], c.ctm[2], c.ctm[3], c.ctm[4] - bboxX / scale, c.ctm[5] + bboxY / scale]
+                    : c.ctm,
+                })) : fastOp.clips,
+              };
+              await renderSingleOp(tightCtx, shiftedOp);
+              // Apply smask (already bbox-sized) directly onto the tight canvas.
+              tightCtx.globalCompositeOperation = 'destination-in';
+              tightCtx.drawImage(fastMaskCanvas, 0, 0);
+              ca.closeDrawable(fastMaskCanvas);
+              tightCtx.globalCompositeOperation = 'source-over';
+              const fastBlend = fastOp.blendMode;
+              if (fastBlend && fastBlend !== 'Normal') {
+                currentCtx.globalCompositeOperation = pdfBlendToCanvas[fastBlend] || fastBlend.toLowerCase();
+              }
+              currentCtx.drawImage(tightCanvas, bboxX - curOffX, bboxY - curOffY);
+              ca.closeDrawable(tightCanvas);
+              if (fastBlend && fastBlend !== 'Normal') {
+                currentCtx.globalCompositeOperation = 'source-over';
+              }
+              continue;
+            }
+          }
+        }
+
+        // A clip entry carrying fromFormObjNum is the form's /BBox, so ops that share one can render into a canvas sized to it.
+        let formBBoxFastHandled = false;
+        if (!group.ops.some((o) => getTextClip(o))) {
+          const firstFormClip = (() => {
+            const clips = group.ops[0].clips;
+            if (!clips) return null;
+            for (let i = clips.length - 1; i >= 0; i--) {
+              if (clips[i].fromFormObjNum !== undefined) return clips[i];
+            }
+            return null;
+          })();
+          let allShare = !!firstFormClip;
+          if (firstFormClip) {
+            for (let gi = 1; gi < group.ops.length && allShare; gi++) {
+              const clipsI = group.ops[gi].clips;
+              let foundI = null;
+              if (clipsI) {
+                for (let ci = clipsI.length - 1; ci >= 0; ci--) {
+                  if (clipsI[ci].fromFormObjNum !== undefined) { foundI = clipsI[ci]; break; }
+                }
+              }
+              if (!foundI || foundI.fromFormObjNum !== firstFormClip.fromFormObjNum) { allShare = false; break; }
+              for (let mi = 0; mi < 6; mi++) {
+                if (foundI.ctm[mi] !== firstFormClip.ctm[mi]) { allShare = false; break; }
+              }
+            }
+          }
+          if (allShare && firstFormClip && firstFormClip.path) {
+            const pts = firstFormClip.path;
+            // The path is M,L,L,L,Z with 4 corners in form-local space.
+            let minPxX = Infinity;
+            let minPxY = Infinity;
+            let maxPxX = -Infinity;
+            let maxPxY = -Infinity;
+            for (let pi = 0; pi < pts.length; pi++) {
+              const pt = pts[pi];
+              if (pt.type !== 'M' && pt.type !== 'L') continue;
+              const ux = firstFormClip.ctm[0] * pt.x + firstFormClip.ctm[2] * pt.y + firstFormClip.ctm[4];
+              const uy = firstFormClip.ctm[1] * pt.x + firstFormClip.ctm[3] * pt.y + firstFormClip.ctm[5];
+              const px = (ux - boxOriginX) * scale;
+              const py = (pageHeightPts + boxOriginY - uy) * scale;
+              if (px < minPxX) minPxX = px;
+              if (px > maxPxX) maxPxX = px;
+              if (py < minPxY) minPxY = py;
+              if (py > maxPxY) maxPxY = py;
+            }
+            const fbBboxX = Math.max(0, Math.floor(minPxX) - 1);
+            const fbBboxY = Math.max(0, Math.floor(minPxY) - 1);
+            const fbBboxRight = Math.min(canvasWidth, Math.ceil(maxPxX) + 1);
+            const fbBboxBottom = Math.min(canvasHeight, Math.ceil(maxPxY) + 1);
+            const fbBboxW = fbBboxRight - fbBboxX;
+            const fbBboxH = fbBboxBottom - fbBboxY;
+
+            if (fbBboxW > 0 && fbBboxH > 0 && fbBboxW * fbBboxH < canvasWidth * canvasHeight / 4) {
+              formBBoxFastHandled = await compositeTightSmaskGroup(group.ops, group.smask, fbBboxX, fbBboxY, fbBboxW, fbBboxH);
+            }
+          }
+        }
+        if (formBBoxFastHandled) continue;
+
+        let generalTightHandled = false;
+        if (!group.ops.some((o) => getTextClip(o))) {
+          let uMinX = Infinity;
+          let uMinY = Infinity;
+          let uMaxX = -Infinity;
+          let uMaxY = -Infinity;
+          let tightable = true;
+          let contentBounded = true;
+          for (const op of group.ops) {
+            const oa = /** @type {any} */ (op);
+            if (op.outerSmask || oa.patternShading || oa.tilingPattern || oa.strokePatternShading || oa.strokeTilingPattern) { tightable = false; break; }
+            const obb = opDeviceBBox(op);
+            if (!obb) {
+              // A standalone shading has no content bbox, but still renders through op.ctm + clips that shiftOpBy moves, so the mask-bbox fallback below can bound and tighten it.
+              // Other unbounded ops have no such fallback and stay full-page.
+              if (op.type === 'shading') { contentBounded = false; continue; }
+              tightable = false; break;
+            }
+            if (obb.minX < uMinX) uMinX = obb.minX;
+            if (obb.minY < uMinY) uMinY = obb.minY;
+            if (obb.maxX > uMaxX) uMaxX = obb.maxX;
+            if (obb.maxY > uMaxY) uMaxY = obb.maxY;
+          }
+          if (tightable && contentBounded && Number.isFinite(uMinX)) {
+            const ux = Math.max(0, Math.floor(uMinX) - 1);
+            const uy = Math.max(0, Math.floor(uMinY) - 1);
+            const uw = Math.min(canvasWidth, Math.ceil(uMaxX) + 1) - ux;
+            const uh = Math.min(canvasHeight, Math.ceil(uMaxY) + 1) - uy;
+            if (uw > 0 && uh > 0 && uw * uh < canvasWidth * canvasHeight) {
+              generalTightHandled = await compositeTightSmaskGroup(group.ops, group.smask, ux, uy, uw, uh);
+            }
+          } else if (tightable && !contentBounded) {
+            // Content extent unknown: bound the buffer by the mask instead of the content.
+            const mb = await smaskOutsideZeroContentBBox(group.smask);
+            if (mb) {
+              generalTightHandled = await compositeTightSmaskGroup(group.ops, group.smask, mb.x, mb.y, mb.w, mb.h);
+            }
+          }
+        }
+        if (generalTightHandled) continue;
+
+        // Single-level masking (existing behavior): render ops to group canvas, apply mask
+        const groupCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+        const renderCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (groupCanvas.getContext('2d', { willReadFrequently: true }));
+
+        for (const op of group.ops) {
+          const textClipCharsForOp = getTextClip(op);
+          let opCtx = renderCtx;
+          let textClipCanvas = null;
+          if (textClipCharsForOp) {
+            textClipCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+            opCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (textClipCanvas.getContext('2d', { willReadFrequently: true }));
+          }
+
+          if (!renderPathOpSync(opCtx, op)) await renderSingleOp(opCtx, op);
+
+          if (textClipCanvas && textClipCharsForOp) {
+            const mCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+            drawTextClipMask(mCanvas, textClipCharsForOp);
+            opCtx.globalCompositeOperation = 'destination-in';
+            opCtx.drawImage(mCanvas, 0, 0);
+            ca.closeDrawable(mCanvas);
+            opCtx.globalCompositeOperation = 'source-over';
+            renderCtx.drawImage(textClipCanvas, 0, 0);
+            ca.closeDrawable(textClipCanvas);
+          }
+        }
+
+        const cacheKey = `${group.smask.formObjNum}:${group.smask.parentCtm ? group.smask.parentCtm.join(',') : ''}`;
+        let maskCanvas = smaskCanvasCache.get(cacheKey);
+        if (!maskCanvas) {
+          maskCanvas = await renderSMaskToCanvas(group.smask, objCache, canvasWidth, canvasHeight, pageHeightPts, boxOriginX, boxOriginY, scale);
+          if (maskCanvas) smaskCanvasCache.set(cacheKey, maskCanvas);
+        }
+        if (maskCanvas) {
+          renderCtx.globalCompositeOperation = 'destination-in';
+          renderCtx.drawImage(maskCanvas, 0, 0);
+          renderCtx.globalCompositeOperation = 'source-over';
+        }
+        const groupBlend = group.ops.length > 0 && group.ops[0].blendMode;
+        if (groupBlend && groupBlend !== 'Normal') {
+          currentCtx.globalCompositeOperation = pdfBlendToCanvas[groupBlend] || groupBlend.toLowerCase();
+        }
+        currentCtx.drawImage(groupCanvas, -curOffX, -curOffY);
+        ca.closeDrawable(groupCanvas);
+        if (groupBlend && groupBlend !== 'Normal') {
+          currentCtx.globalCompositeOperation = 'source-over';
+        }
+      } else {
+        const tgtEntry = ctxStack[ctxStack.length - 1];
+        const grpShift = tgtEntry.offX !== 0 || tgtEntry.offY !== 0;
+        const grpDx = -tgtEntry.offX / scale;
+        const grpDy = tgtEntry.offY / scale;
+        for (let opIdx = 0; opIdx < group.ops.length; opIdx++) {
+          const op = grpShift ? shiftOpBy(group.ops[opIdx], grpDx, grpDy) : group.ops[opIdx];
+
+          const textClipCharsForOp = getTextClip(op);
+
+          if (textClipCharsForOp) {
+            const tb = textClipDeviceBBox(textClipCharsForOp);
+            if (tb && tb.w > 0 && tb.h > 0 && tb.w * tb.h < canvasWidth * canvasHeight / 4) {
+              const dxPdf = -tb.x / scale;
+              const dyPdf = tb.y / scale;
+              const tightCanvas = ca.makeCanvas(tb.w, tb.h);
+              const tightCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (tightCanvas.getContext('2d', { willReadFrequently: true }));
+              const shiftedOp = shiftOpBy(op, dxPdf, dyPdf);
+              if (!renderPathOpSync(tightCtx, shiftedOp)) await renderSingleOp(tightCtx, shiftedOp);
+              const shiftedChars = textClipCharsForOp.map((/** @type {any} */ ch) => ({ ...ch, x: ch.x + dxPdf, y: ch.y + dyPdf }));
+              const mCanvas = ca.makeCanvas(tb.w, tb.h);
+              drawTextClipMask(mCanvas, shiftedChars);
+              tightCtx.globalCompositeOperation = 'destination-in';
+              tightCtx.drawImage(mCanvas, 0, 0);
+              ca.closeDrawable(mCanvas);
+              tightCtx.globalCompositeOperation = 'source-over';
+              currentCtx.drawImage(tightCanvas, tb.x, tb.y);
+              ca.closeDrawable(tightCanvas);
+              flushComposites();
+              continue;
+            }
+          }
+
+          let opCtx = currentCtx;
+          let textClipCanvas = null;
+          if (textClipCharsForOp) {
+            textClipCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+            opCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (textClipCanvas.getContext('2d', { willReadFrequently: true }));
+          }
+
+          if (!renderPathOpSync(opCtx, op)) await renderSingleOp(opCtx, op);
+
+          if (textClipCanvas && textClipCharsForOp) {
+            const mCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+            drawTextClipMask(mCanvas, textClipCharsForOp);
+            opCtx.globalCompositeOperation = 'destination-in';
+            opCtx.drawImage(mCanvas, 0, 0);
+            ca.closeDrawable(mCanvas);
+            opCtx.globalCompositeOperation = 'source-over';
+            currentCtx.drawImage(textClipCanvas, 0, 0);
+            ca.closeDrawable(textClipCanvas);
+            flushComposites();
+          }
+        }
+      }
+      flushComposites();
+    }
+    while (ctxStack.length > 1) {
+      await popAndComposite();
+    }
+  } catch (err) {
+    // Callers need ok:false and failReason to flag a failure placeholder, since a blank page is otherwise indistinguishable from a genuinely blank one.
+    renderFailed = true;
+    // The first stack frame localizes a caught draw-loop crash, which the message alone cannot.
+    const frame = err instanceof Error && err.stack ? (err.stack.split('\n').find((l) => l.trimStart().startsWith('at ')) || '').trim() : '';
+    failDetail = (err instanceof Error ? err.message : String(err)) + (frame ? ` (${frame})` : '');
+    failReason = /** @type {any} */ (err)?.renderAbort || 'exception';
+    console.warn(`[renderPdfPage] page ${pageIndex} returned blank: ${failDetail}`);
+  } finally {
+    // Dispose every cached Skia surface regardless of whether rendering threw.
+    for (const bmp of bitmapCache.values()) ca.closeDrawable(bmp);
+    for (const bmp of tilingPatternCache.values()) ca.closeDrawable(bmp);
+    for (const cvs of smaskCanvasCache.values()) ca.closeDrawable(cvs);
+    for (const p of transientPatterns) ca.closeDrawable(p);
+    if (textMeasureCanvas) ca.closeDrawable(textMeasureCanvas);
+    bitmapCache.clear();
+    tilingPatternCache.clear();
+    smaskCanvasCache.clear();
+    transientPatterns.length = 0;
+  }
+
+  perf.drawMs = performance.now() - tDrawStart;
+
+  if (renderFailed) {
+    ca.closeDrawable(canvas);
+    const blankCanvas = ca.makeCanvas(canvasWidth, canvasHeight);
+    const blankCtx = /** @type {OffscreenCanvasRenderingContext2D} */ (blankCanvas.getContext('2d', { willReadFrequently: true }));
+    blankCtx.fillStyle = 'white';
+    blankCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+    const blankData = blankCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+    const blankResult = {
+      dataUrl: await buildPngDataUrl(blankData, 'gray'), colorMode: 'gray', ok: false, failReason, failDetail,
+    };
+    ca.closeDrawable(blankCanvas);
+    return blankResult;
+  }
+
+  ctx.globalCompositeOperation = 'destination-over';
+  ctx.fillStyle = 'white';
+  ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+  ctx.globalCompositeOperation = 'source-over';
+
+  // 'bitmap' returns the rendered pixels as a transferable ImageBitmap, skipping the PNG encode/decode round-trip.
+  // Only a real OffscreenCanvas can transfer, so the Node canvas fork and other backends fall through to PNG below.
+  if (outputFormat === 'bitmap' && typeof OffscreenCanvas !== 'undefined' && canvas instanceof OffscreenCanvas) {
+    // The transfer is a handle swap, so this wall time is the deferred rasterization it forces rather than a copy.
+    const tFlushStart = performance.now();
+    const bitmap = canvas.transferToImageBitmap();
+    perf.flushMs = performance.now() - tFlushStart;
+    ca.closeDrawable(canvas);
+    return {
+      bitmap, colorMode: effectiveColorMode, ok: true, perf,
+    };
+  }
+
+  // JPEG/WebP output: encode the canvas directly to a Blob, skipping getImageData and the PNG build.
+  // Pass both `type` (the W3C OffscreenCanvas option browsers read) and `mime` (the option the Node @scribe.js/canvas fork reads).
+  // Given only `type`, the fork ignores the format and falls back to PNG.
+  // WebP at quality 1.0 encodes losslessly in Chromium.
+  if (outputFormat === 'jpeg' || outputFormat === 'webp') {
+    const mime = outputFormat === 'webp' ? 'image/webp' : 'image/jpeg';
+    const tFlushStart = performance.now();
+    const blob = await canvas.convertToBlob({ type: mime, mime, quality });
+    perf.flushMs = performance.now() - tFlushStart;
+    ca.closeDrawable(canvas);
+    return {
+      blob, colorMode: effectiveColorMode, ok: true, perf,
+    };
+  }
+
+  // Encode here rather than with the canvas PNG encoder, because this strips alpha and writes gray as a single channel for smaller output.
+  const tFlushStart = performance.now();
+  const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
+  const dataUrl = await buildPngDataUrl(imageData, effectiveColorMode);
+  perf.flushMs = performance.now() - tFlushStart;
+  const result = {
+    dataUrl, colorMode: effectiveColorMode, ok: true, perf,
+  };
+  ca.closeDrawable(canvas);
+  return result;
+}
+
+/** CRC-32 lookup table for PNG chunk checksums (browser path only). */
+const crcTable = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  crcTable[n] = c;
+}
+
+// Native CRC-32 is what keeps the fast PNG path net-faster than the compressed path, because its IDAT chunk runs to tens of megabytes per page.
+// A top-level `await` here would make every importing module initialize asynchronously.
+// That deadlocks scribe-ui's import cycles and leaves the bundled app silently dead.
+const zlibCrc32 = (typeof process !== 'undefined' && typeof process.versions?.node === 'string')
+  ? process.getBuiltinModule('node:zlib').crc32
+  : null;
+
+/**
+ * Compute CRC-32 of a byte array, matching the PNG spec (ISO 3309 / ITU-T V.42).
+ * @param {Uint8Array} bytes
+ */
+function crc32(bytes) {
+  if (zlibCrc32) return zlibCrc32(bytes);
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = crcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+/**
+ * Build a PNG chunk: 4-byte length + 4-byte type + data + 4-byte CRC.
+ * @param {string} type - 4-character chunk type (e.g. 'IHDR', 'IDAT', 'IEND')
+ * @param {Uint8Array} data - Chunk payload
+ */
+function makePngChunk(type, data) {
+  const chunk = new Uint8Array(4 + 4 + data.length + 4);
+  const view = new DataView(chunk.buffer);
+  view.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) chunk[4 + i] = type.charCodeAt(i);
+  chunk.set(data, 8);
+  view.setUint32(8 + data.length, crc32(chunk.subarray(4, 8 + data.length)));
+  return chunk;
+}
+
+// A top-level `await` here would make every importing module initialize asynchronously.
+// That deadlocks scribe-ui's import cycles and leaves the bundled app silently dead.
+const zlibDeflateSync = (typeof process !== 'undefined' && typeof process.versions?.node === 'string')
+  ? process.getBuiltinModule('node:zlib').deflateSync
+  : null;
+
+/**
+ * Apply PNG Up filter (type 2) to RGBA pixel data while stripping alpha.
+ * @param {Uint8ClampedArray|Uint8Array} data - RGBA pixel bytes, length w*h*4
+ * @param {number} width
+ * @param {number} height
+ * @param {boolean} isGray - produce single-channel output from R component
+ * @returns {Uint8Array} one filter-type byte (2) per row, followed by width*channels pixel bytes
+ */
+function filterUpStripAlpha(data, width, height, isGray) {
+  // Rewriting the running pointers and unrolled inner loop as per-pixel indexing costs about a third of the throughput on page-sized inputs.
+  const channels = isGray ? 1 : 3;
+  const raw = new Uint8Array(height * (1 + width * channels));
+  let d = 0;
+  let s = 0;
+
+  // Row 0: no predecessor — raw stripped pixels.
+  raw[d++] = 2;
+  const row0End = width * 4;
+  if (isGray) {
+    while (s < row0End) { raw[d++] = data[s]; s += 4; }
+  } else {
+    while (s < row0End) {
+      raw[d++] = data[s];
+      raw[d++] = data[s + 1];
+      raw[d++] = data[s + 2];
+      s += 4;
+    }
+  }
+
+  // Rows 1..height-1: subtract the same-channel byte from the previous row.
+  const rowStride = width * 4;
+  for (let y = 1; y < height; y++) {
+    raw[d++] = 2;
+    let a = s - rowStride;
+    const rowEnd = s + rowStride;
+    if (isGray) {
+      while (s < rowEnd) {
+        raw[d++] = (data[s] - data[a]) & 0xFF;
+        s += 4; a += 4;
+      }
+    } else {
+      const evenEnd = s + (width & ~1) * 4;
+      while (s < evenEnd) {
+        raw[d++] = (data[s] - data[a]) & 0xFF;
+        raw[d++] = (data[s + 1] - data[a + 1]) & 0xFF;
+        raw[d++] = (data[s + 2] - data[a + 2]) & 0xFF;
+        raw[d++] = (data[s + 4] - data[a + 4]) & 0xFF;
+        raw[d++] = (data[s + 5] - data[a + 5]) & 0xFF;
+        raw[d++] = (data[s + 6] - data[a + 6]) & 0xFF;
+        s += 8; a += 8;
+      }
+      while (s < rowEnd) {
+        raw[d++] = (data[s] - data[a]) & 0xFF;
+        raw[d++] = (data[s + 1] - data[a + 1]) & 0xFF;
+        raw[d++] = (data[s + 2] - data[a + 2]) & 0xFF;
+        s += 4; a += 4;
+      }
+    }
+  }
+  return raw;
+}
+
+// Level 4 compression is significantly faster than the default level 6,
+// in exchange for a small increase in size (~60% runtime reduction, 6% larger).
+const PNG_DEFLATE_LEVEL = 4;
+
+/**
+ * Deflate for the compressed PNG path.
+ * @param {Uint8Array} raw
+ * @returns {Promise<Uint8Array>|Uint8Array}
+ */
+function deflateCompressed(raw) {
+  if (zlibDeflateSync) return zlibDeflateSync(raw, { level: PNG_DEFLATE_LEVEL });
+  // CompressionStream exposes no level control, so PNG_DEFLATE_LEVEL does not reach the browser path.
+  return deflateViaCompressionStream(raw);
+}
+
+/** Async CompressionStream 'deflate' → concatenated Uint8Array. */
+async function deflateViaCompressionStream(raw) {
+  const cs = new CompressionStream('deflate');
+  const writer = cs.writable.getWriter();
+  writer.write(raw);
+  writer.close();
+  const chunks = [];
+  const reader = cs.readable.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const compressedLen = chunks.reduce((sum, c) => sum + c.length, 0);
+  const compressedData = new Uint8Array(compressedLen);
+  let p = 0;
+  for (const chunk of chunks) {
+    compressedData.set(chunk, p);
+    p += chunk.length;
+  }
+  return compressedData;
+}
+
+/**
+ * Assemble a PNG byte stream from an already-deflated IDAT payload and convert it to a base64 data URL.
+ * @param {number} width
+ * @param {number} height
+ * @param {boolean} isGray
+ * @param {Uint8Array} compressedData
+ */
+function assemblePngDataUrl(width, height, isGray, compressedData) {
+  const ihdr = new Uint8Array(13);
+  const ihdrView = new DataView(ihdr.buffer);
+  ihdrView.setUint32(0, width);
+  ihdrView.setUint32(4, height);
+  ihdr[8] = 8;
+  ihdr[9] = isGray ? 0 : 2;
+  ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+
+  const signature = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdrChunk = makePngChunk('IHDR', ihdr);
+  const idatChunk = makePngChunk('IDAT', compressedData);
+  const iendChunk = makePngChunk('IEND', new Uint8Array(0));
+
+  const totalLen = signature.length + ihdrChunk.length + idatChunk.length + iendChunk.length;
+  const pngBytes = new Uint8Array(totalLen);
+  let pos = 0;
+  pngBytes.set(signature, pos); pos += signature.length;
+  pngBytes.set(ihdrChunk, pos); pos += ihdrChunk.length;
+  pngBytes.set(idatChunk, pos); pos += idatChunk.length;
+  pngBytes.set(iendChunk, pos);
+
+  // Buffer's native base64 is far faster than the String.fromCharCode plus btoa loop below, so this branch is not redundant.
+  if (typeof Buffer !== 'undefined') {
+    return `data:image/png;base64,${Buffer.from(pngBytes.buffer, pngBytes.byteOffset, pngBytes.byteLength).toString('base64')}`;
+  }
+  let binary = '';
+  for (let i = 0; i < pngBytes.length; i++) {
+    binary += String.fromCharCode(pngBytes[i]);
+  }
+  return `data:image/png;base64,${btoa(binary)}`;
+}
+
+/**
+ * Build a compressed PNG data URL from RGBA canvas ImageData.
+ *
+ * @param {ImageData} imageData - RGBA pixel data from canvas getImageData()
+ * @param {'gray'|'color'} colorMode - 'gray' → colorType 0, else colorType 2
+ * @returns {Promise<string>} PNG as data:image/png;base64,... URL
+ */
+async function buildPngDataUrl(imageData, colorMode) {
+  const { width, height, data } = imageData;
+  const isGray = colorMode === 'gray';
+  const raw = filterUpStripAlpha(data, width, height, isGray);
+  const compressed = await deflateCompressed(raw);
+  return assemblePngDataUrl(width, height, isGray, compressed);
+}
+
+export { buildFontFromCFF as _buildFontFromCFF };
+export { type1ShadingToAxial as _type1ShadingToAxial };
+export { parseShadings as _parseShadings };
+export { cssGenericForFontObj as _cssGenericForFontObj };
+export { buildPngDataUrl as _buildPngDataUrl };
+export { imageInfoToBitmap as _imageInfoToBitmap };

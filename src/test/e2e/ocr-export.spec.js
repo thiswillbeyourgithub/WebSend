@@ -29,22 +29,13 @@
 const { test, expect } = require('@playwright/test');
 const { execFileSync } = require('child_process');
 const fs = require('fs');
-const { pairAndVerify } = require('./helpers');
+const { pairAndVerify, hasPdftotext } = require('./helpers');
 
 const IMG_W = 2400;
 const IMG_H = 900;
 // Left edge of the probe word, as a fraction of the image width.
 const PROBE_X_FRAC = 0.5;
 const PROBE_WORD = 'WEBSEND';
-
-function hasPdftotext() {
-    try {
-        execFileSync('pdftotext', ['-v'], { stdio: 'ignore' });
-        return true;
-    } catch (_) {
-        return false;
-    }
-}
 
 /**
  * Extract the words of page 1 of a PDF with their bbox normalized to the
@@ -191,4 +182,5 @@ test.describe('OCR searchable PDF export', () => {
             await ctxB.close();
         }
     });
+
 });

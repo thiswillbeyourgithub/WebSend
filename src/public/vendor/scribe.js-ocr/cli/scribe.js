@@ -7,8 +7,9 @@ import {
   confCLI,
   debugCLI,
   detectPDFTypeCLI,
-  evalInternalCLI, extractCLI, overlayCLI, recognizeCLI,
+  evalInternalCLI, extractCLI, metadataCLI, overlayCLI, recognizeCLI, renderCLI, stripMetadataCLI, subsetCLI,
 } from './cli.js';
+import { parseModelOption, recognitionModels } from './recognitionModels.js';
 
 const program = new Command();
 
@@ -34,13 +35,18 @@ program
 
 program
   .command('extract')
-  .argument('<input_file>', 'Input PDF file or directory (with --dir).')
-  .argument('[output]', 'Output directory or file to save results.', '.')
-  .addOption(new Option('-f, --format <ext>', 'Output format.').choices(['pdf', 'hocr', 'docx', 'xlsx', 'txt', 'text', 'html', 'md']).default('txt'))
+  .argument('<input_file>', 'Input PDF or text document (.txt, .docx, .md), or a directory with --dir (PDFs and images only).')
+  .argument('[output]', 'Output file, or output directory with --dir. Defaults to <input>-<format>/ for --dir, else the current directory.')
+  .addOption(new Option('-f, --format <ext>', 'Output format.').choices(['pdf', 'hocr', 'docx', 'xlsx', 'txt', 'text', 'html', 'md', 'scribe', 'scribe.json']).default('txt'))
   .option('-r, --reflow', 'Reflow text by combining lines into paragraphs.')
   .option('-d, --dir', 'Process all supported files in the input directory.')
+  .option('-R, --recursive', 'With --dir, recurse into subdirectories (output mirrors the input tree).')
+  .option('-w, --workers <number>', 'With --dir, number of documents to process in parallel. Default 4.')
   .option('-l, --line-numbers', 'Prepend page:line numbers to each line (e.g. 0:5  text). Only applies to txt format.')
-  .description('Extract text from PDF file and save in requested format.')
+  .option('--char-boxes', 'Include per-character bounding boxes in scribe/scribe.json output (excluded by default; roughly halves file size). No effect on other formats.')
+  .option('--overwrite', 'With --dir, overwrite existing output files instead of skipping them (directory extraction skips existing outputs by default; single-file extraction always overwrites).')
+  .option('--skip-image-based', 'Skip image-based PDFs without text in input directory instead of writing an empty output file (--dir only).')
+  .description('Extract existing text from a PDF file or directory and save in requested format (does not run OCR; use `recognize` for that).')
   .action(extractCLI);
 
 program
@@ -60,9 +66,54 @@ program
   .option('-v, --vis', 'Print OCR text visibly over provided PDF file with colors coded by confidence.')
   .option('-h, --hocr', 'Output .hocr intermediate data in addition to .pdf.')
   .option('-w, --workers <number>', 'Number of workers to use. Default is up to 8.')
+  .option('--model <name>', `Cloud recognition model. One of: ${Object.keys(recognitionModels).join(', ')}. Requires the matching @scribe.js/* adapter package. Default: built-in model.`)
+  .option('-O, --model-option <key=value>', 'Option forwarded to the cloud model (e.g. --model-option region=us-east-1). Repeatable.', parseModelOption, {})
+  .option('--local-adapters', 'Resolve --model from this repo\'s cloud-adapters/ tree instead of npm. For running from a scribe.js checkout. Also enabled by SCRIBE_LOCAL_ADAPTERS=1.')
+  .addOption(new Option(
+    '--ocr-pages <pages>',
+    'Which pages to OCR. autoShallow: leave text-native docs alone, OCR only detected scanned sections; '
+    + 'autoDeep (alias auto): also OCR lone image pages and image-borne text; all/none: every/no page.',
+  ).choices(['all', 'auto', 'autoShallow', 'autoDeep', 'none']).default('autoShallow'))
   .argument('<files...>', 'Input PDF file and OCR file(s).  Accepts .hocr and Abbyy .xml (with character-level data enabled).')
-  .description('Recognize text in PDF file using internal OCR engine.')
+  .description('Recognize text in PDF file using internal OCR engine or a cloud model.')
   .action(recognizeCLI);
+
+program
+  .command('render')
+  .argument('<input_file>', 'Input PDF file.')
+  .argument('[output]', 'Output directory for page images.', '.')
+  .option('--dpi <number>', 'Render resolution in dots per inch.', '150')
+  .option('--pages <range>', 'Comma/range list of 0-based pages to render (e.g. 0-4,7). Default: all.')
+  .option('--gray', 'Render in grayscale instead of color.')
+  .description('Render each page of a PDF to a PNG image.')
+  .action(renderCLI);
+
+program
+  .command('subset')
+  .argument('<input_file>', 'Input PDF file.')
+  .argument('[output]', 'Output PDF file, or directory to write <stem>-p<pages>.pdf into.', '.')
+  .option('--pages <range>', 'Comma/range list of 0-based pages to keep (e.g. 0-4,7).')
+  .description('Write a new PDF containing only the selected pages of the input PDF.')
+  .action(subsetCLI);
+
+program
+  .command('metadata')
+  .argument('<pdf_file>', 'Input PDF file.')
+  .option('--json', 'Emit the full metadata report as JSON.')
+  .option('-o, --output <file>', 'With --json, write the report to this file instead of stdout.')
+  .description('List every category of identifying metadata embedded in a PDF (does not modify the file).')
+  .action(metadataCLI);
+
+program
+  .command('strip-metadata')
+  .argument('<input_file>', 'Input PDF file.')
+  .argument('[output]', 'Output PDF file, or directory to write <stem>-clean.pdf into.', '.')
+  .option('--strip-tags', 'Also remove accessibility structure tags (kept by default).')
+  .option('--strip-page-labels', 'Also remove page labels (kept by default).')
+  .option('--strip-viewer-prefs', 'Also remove viewer preferences (kept by default).')
+  .option('--drop-layers', 'Also drop optional-content (layer) configuration (kept by default).')
+  .description('Write a privacy-cleaned copy of a PDF with identifying metadata removed; visible pages unchanged.')
+  .action(stripMetadataCLI);
 
 program
   .command('type')

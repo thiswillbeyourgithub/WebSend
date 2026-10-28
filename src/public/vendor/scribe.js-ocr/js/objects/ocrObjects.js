@@ -19,14 +19,43 @@ export function OcrPage(n, dims) {
   this.pars = [];
   /** @type {Array<OcrLine>} */
   this.lines = [];
+  /**
+   * Horizontal separator rules drawn on the page (thin horizontal vector rectangles), in the same top-left coordinate space as line bboxes.
+   * Populated only at PDF import and consumed during that same import, so OCR pages have none.
+   * @type {Array<{y: number, left: number, right: number}>}
+   */
+  this.rules = [];
+  /**
+   * Detected data-table regions, one bounding box per table rather than per column, in the same top-left coordinate space as line bboxes.
+   * Populated only at PDF import and consumed during that same import, so OCR pages have none.
+   * Exempts a table's cells from the lone-number and line-number-column furniture rules, which would otherwise mistype them as furniture.
+   * @type {Array<{left: number, top: number, right: number, bottom: number}>}
+   */
+  this.tableBoxes = [];
   /** @type {TextSource} */
   this.textSource = null;
 }
 
 /**
- * Paragraph type indicating the semantic role of the paragraph.
- * @typedef {'title' | 'body' | 'footnote'} ParType
+ * Semantic role of a paragraph.
+ * 'pagenum' is a line holding only the page number, bare or wrapped, e.g. "5", "- 6 -", "Page 6".
+ * A lone number in the margin that was not read as the page number is a 'header' or 'footer'.
+ * 'header' and 'footer' are running furniture such as a running head, a court/docket stamp, or a Bates stamp, split by which half of the page they sit in.
+ * 'blockquote' is a quotation set off by indentation from both margins.
+ * 'linenum' is the left-margin column of integers, one per text line, found in legal depositions and pleadings.
+ * The layout engine splits a number fused into a body line into its own 'linenum' line.
+ * The printed values themselves are recorded on the lines as `OcrLine.pageNum` and `OcrLine.lineNum`.
+ * @typedef {'title' | 'body' | 'footnote' | 'endnote' | 'pagenum' | 'blockquote' | 'header' | 'footer' | 'linenum'} ParType
  */
+
+/**
+ * Whether a paragraph is page furniture: a page-number line, a running header or footer, or a left-margin line-number column.
+ * @param {?OcrPar} par
+ * @returns {boolean}
+ */
+export function parIsFurniture(par) {
+  return !!par && (par.type === 'pagenum' || par.type === 'header' || par.type === 'footer' || par.type === 'linenum');
+}
 
 export function ParDebugInfo() {
   /** @type {?string} */
@@ -62,9 +91,14 @@ export function OcrPar(page, bbox) {
   this.type = 'body';
 
   /**
-   * Contains the paragraph / list number if applicable.
-   * This is not an index, but the actual number/letter as it appears in the text.
+   * The list marker or footnote label the paragraph opens with, as printed.
    * @type {string | null}
+   */
+  this.marker = null;
+  /**
+   * The number a paragraph citation names.
+   * The paragraphs that continue a numbered paragraph carry its number too.
+   * @type {number | null}
    */
   this.parNum = null;
   /**
@@ -73,6 +107,12 @@ export function OcrPar(page, bbox) {
    * @type {string | null}
    */
   this.footnoteRefId = null;
+  /**
+   * Heading depth inferred from the document's marker ladder (1 = top level).
+   * Only set when type === 'title', and only when the document has a coherent ladder.
+   * @type {number | null}
+   */
+  this.headingLevel = null;
   this.debug = new ParDebugInfo();
 }
 
@@ -93,6 +133,8 @@ export function LineDebugInfo() {
  * @property {?number} xHeight -
  * @property {Array<OcrWord>} words - words in line
  * @property {OcrPage} page - page line belongs to
+ * @property {?number} lineNum - printed transcript line number of the row this line lies on
+ * @property {?string} pageNum - printed page number of the page or condensed mini-page this line lies on
  * @property {?string} raw - Raw string this object was parsed from.
  *    Exists only for debugging purposes, should be `null` in production contexts.
  */
@@ -116,6 +158,16 @@ export function OcrLine(page, bbox, baseline, ascHeight = null, xHeight = null) 
   this.par = null;
   /** @type {number} */
   this.orientation = 0;
+  /**
+   * The line number printed beside this line's row on numbered transcript paper.
+   * @type {?number}
+   */
+  this.lineNum = null;
+  /**
+   * The page number printed on the page, or condensed mini-page, this line lies on.
+   * @type {?string}
+   */
+  this.pageNum = null;
   /** @type {LineDebugInfo} */
   this.debug = new LineDebugInfo();
 }
@@ -130,13 +182,17 @@ export function WordDebugInfo() {
  * @param {string} id
  * @param {string} text
  * @param {bbox} bbox
- * @param {Polygon} [poly]
  */
-export function OcrWord(line, id, text, bbox, poly) {
+export function OcrWord(line, id, text, bbox) {
   /** @type {string} */
   this.text = text;
-  /** @type {?string} */
-  this.textAlt = null;
+  /**
+   * Other readings of the word. Usually `undefined`. Usage varies by OCR model.
+   * `span` is the number of consecutive words, starting at this one, that the reading replaces.
+   * `source` and `msg` are optional fields that may be used to communicate the source and arbitrary data.
+   * @type {Array<{source?: string, text: string, conf: number, span: number, msg?: string}>|undefined}
+   */
+  this.alt = undefined;
   /** @type {Style} */
   this.style = {
     font: null,
@@ -147,15 +203,20 @@ export function OcrWord(line, id, text, bbox, poly) {
     smallCaps: false,
     sup: false,
     dropcap: false,
+    color: '#000000',
+    opacity: 1,
   };
+  /**
+   * Initialized to `undefined` (not `null`) so uniform words serialize without the key.
+   * @type {Array<StyleRun>|undefined}
+   */
+  this.styleRuns = undefined;
   /** @type {string} */
   this.lang = 'eng';
   /** @type {number} */
   this.conf = 0;
   /** @type {bbox} */
   this.bbox = bbox;
-  /** @type {?Polygon} */
-  this.poly = poly || null;
   /** @type {boolean} */
   this.compTruth = false;
   /** @type {boolean} */
@@ -500,33 +561,72 @@ function calcWordAngleAdj(word) {
   return { x: 0, y: 0 };
 }
 
+const LIGATURE_ANY_RE = /[ĲĳŉǱǲǳǄǅǆǇǈǉǊǋǌﬀﬁﬂﬃﬄﬅﬆ]/;
+const LIGATURE_ALL_RE = /[ĲĳŉǱǲǳǄǅǆǇǈǉǊǋǌﬀﬁﬂﬃﬄﬅﬆ]/g;
+const LIGATURE_MAP = {
+  Ĳ: 'IJ',
+  ĳ: 'ij',
+  ŉ: 'ʼn',
+  Ǳ: 'DZ',
+  ǲ: 'Dz',
+  ǳ: 'dz',
+  Ǆ: 'DŽ',
+  ǅ: 'Dž',
+  ǆ: 'dž',
+  Ǉ: 'LJ',
+  ǈ: 'Lj',
+  ǉ: 'lj',
+  Ǌ: 'NJ',
+  ǋ: 'Nj',
+  ǌ: 'nj',
+  ﬀ: 'ff',
+  ﬁ: 'fi',
+  ﬂ: 'fl',
+  ﬃ: 'ffi',
+  ﬄ: 'ffl',
+  ﬅ: 'ſt',
+  ﬆ: 'st',
+};
+
 /**
  * Replace ligatures with individual ascii characters.
  * @param {string} text
  */
 function replaceLigatures(text) {
-  return text.replace(/Ĳ/g, 'IJ')
-    .replace(/ĳ/g, 'ij')
-    .replace(/ŉ/g, 'ʼn')
-    .replace(/Ǳ/g, 'DZ')
-    .replace(/ǲ/g, 'Dz')
-    .replace(/ǳ/g, 'dz')
-    .replace(/Ǆ/g, 'DŽ')
-    .replace(/ǅ/g, 'Dž')
-    .replace(/ǆ/g, 'dž')
-    .replace(/Ǉ/g, 'LJ')
-    .replace(/ǈ/g, 'Lj')
-    .replace(/ǉ/g, 'lj')
-    .replace(/Ǌ/g, 'NJ')
-    .replace(/ǋ/g, 'Nj')
-    .replace(/ǌ/g, 'nj')
-    .replace(/ﬀ/g, 'ff')
-    .replace(/ﬁ/g, 'fi')
-    .replace(/ﬂ/g, 'fl')
-    .replace(/ﬃ/g, 'ffi')
-    .replace(/ﬄ/g, 'ffl')
-    .replace(/ﬅ/g, 'ſt')
-    .replace(/ﬆ/g, 'st');
+  if (!LIGATURE_ANY_RE.test(text)) return text;
+  return text.replace(LIGATURE_ALL_RE, (m) => LIGATURE_MAP[m]);
+}
+
+const LIGATURE_INVERSE = Object.fromEntries(Object.entries(LIGATURE_MAP).map(([lig, expansion]) => [expansion, lig]));
+
+// The two character classes and the map all hold the soft hyphen (U+00AD), which has no visible glyph, after the minus sign.
+const ASCII_PUNCT_ANY_RE = /[‘’‚‛′`´“”„‟″‐‑‒–—−­…]/;
+const ASCII_PUNCT_ALL_RE = /[‘’‚‛′`´“”„‟″‐‑‒–—−­…]/g;
+const ASCII_PUNCT_MAP = {
+  '‘': "'", '’': "'", '‚': "'", '‛': "'", '′': "'", '`': "'", '´': "'",
+  '“': '"', '”': '"', '„': '"', '‟': '"', '″': '"',
+  '‐': '-', '‑': '-', '‒': '-', '–': '-', '—': '-', '−': '-', '­': '-',
+  '…': '...',
+};
+
+/**
+ * Replaces typographic punctuation with its ASCII form.
+ * @param {string} text
+ * @returns {string}
+ */
+function asciiPunctuation(text) {
+  if (!ASCII_PUNCT_ANY_RE.test(text)) return text;
+  return text.replace(ASCII_PUNCT_ALL_RE, (m) => ASCII_PUNCT_MAP[m]);
+}
+
+/**
+ * The ligature codepoint that is, or expands to, `text`.
+ * @param {string} text
+ * @returns {?string}
+ */
+function ligatureForText(text) {
+  if (LIGATURE_MAP[text]) return text;
+  return LIGATURE_INVERSE[text] || null;
 }
 
 /**
@@ -655,17 +755,66 @@ function rotateLine(line, angle, dims = null, useCharLevel = false) {
 }
 
 /**
- * Clones page object.
+ * Clones a page and its paragraphs, lines, words, and chars.
+ * Back-references (`line.page`, `line.par`, `word.line`) are rebuilt onto the clone's own objects.
  * @param {OcrPage} page
+ * @returns {OcrPage}
  */
-function clonePage(page) {
+export function clonePage(page) {
   const pageNew = new OcrPage(page.n, { ...page.dims });
+  pageNew.angle = page.angle;
+  pageNew.textSource = page.textSource;
+  pageNew.rules = (page.rules || []).map((rule) => ({ ...rule }));
+  pageNew.tableBoxes = (page.tableBoxes || []).map((box) => ({ ...box }));
+  const lineMap = new Map();
   for (const line of page.lines) {
     const lineNew = cloneLine(line);
     lineNew.page = pageNew;
+    lineMap.set(line, lineNew);
     pageNew.lines.push(lineNew);
   }
+  for (const par of page.pars || []) {
+    const parNew = new OcrPar(pageNew, { ...par.bbox });
+    parNew.lines = par.lines.map((line) => lineMap.get(line)).filter(Boolean);
+    parNew.id = par.id;
+    parNew.reason = par.reason;
+    parNew.type = par.type;
+    parNew.marker = par.marker;
+    parNew.parNum = par.parNum;
+    parNew.footnoteRefId = par.footnoteRefId;
+    parNew.headingLevel = par.headingLevel;
+    Object.assign(parNew.debug, par.debug);
+    for (const lineNew of parNew.lines) lineNew.par = parNew;
+    pageNew.pars.push(parNew);
+  }
   return pageNew;
+}
+
+/**
+ * Assign fresh ids to a cloned page's paragraphs, lines, and words in place.
+ * Highlight and text-selection resolve the on-screen selection to words by id, so shared ids would make them act on every copy at once.
+ * Within-page links are object references, so renumbering does not break them.
+ * @param {OcrPage} page
+ * @returns {Map<string, string>} Old word id -> new word id, for remapping external references such as text-edit records.
+ */
+export function reIdPage(page) {
+  /** @type {Map<string, string>} */
+  const wordIdMap = new Map();
+  if (!page) return wordIdMap;
+  const lines = new Set(page.lines || []);
+  for (const par of page.pars || []) {
+    par.id = getRandomAlphanum(8);
+    for (const line of par.lines || []) lines.add(line);
+  }
+  for (const line of lines) {
+    line.id = getRandomAlphanum(8);
+    for (const word of line.words || []) {
+      const newId = getRandomAlphanum(8);
+      wordIdMap.set(word.id, newId);
+      word.id = newId;
+    }
+  }
+  return wordIdMap;
 }
 
 /**
@@ -676,7 +825,10 @@ function clonePage(page) {
 function cloneLine(line) {
   const lineNew = new OcrLine(line.page, { ...line.bbox }, line.baseline.slice(), line.ascHeight, line.xHeight);
   lineNew.id = line.id;
-  lineNew.debug.raw = line.debug.raw;
+  lineNew.orientation = line.orientation;
+  lineNew.lineNum = line.lineNum;
+  lineNew.pageNum = line.pageNum;
+  Object.assign(lineNew.debug, line.debug);
   for (const word of line.words) {
     const wordNew = cloneWord(word);
     wordNew.line = lineNew;
@@ -688,19 +840,19 @@ function cloneLine(line) {
 /**
  * Clones word.  Does not clone line or page.
  * Should be used rather than `structuredClone` for performance reasons.
- * TODO: Rewrite this so it is dynamic and does not break every time we edit the properties of OcrWord.
  * @param {OcrWord} word
  */
 function cloneWord(word) {
   const wordNew = new OcrWord(word.line, word.id, word.text, { ...word.bbox });
-  if (word.poly) wordNew.poly = { ...word.poly };
+  wordNew.alt = word.alt ? word.alt.map((a) => ({ ...a })) : undefined;
   wordNew.conf = word.conf;
   wordNew.style = { ...word.style };
+  if (word.styleRuns) wordNew.styleRuns = word.styleRuns.map((run) => ({ i: run.i, style: { ...run.style } }));
   wordNew.lang = word.lang;
   wordNew.compTruth = word.compTruth;
   wordNew.matchTruth = word.matchTruth;
   wordNew.visualCoords = word.visualCoords;
-  wordNew.debug.raw = word.debug.raw;
+  Object.assign(wordNew.debug, word.debug);
   wordNew.footnoteParId = word.footnoteParId;
   if (word.chars) {
     wordNew.chars = [];
@@ -719,6 +871,26 @@ function cloneWord(word) {
 function cloneChar(char) {
   const charNew = new OcrChar(char.text, { ...char.bbox });
   return charNew;
+}
+
+/**
+ * Resolve a word's style runs into contiguous text segments with full styles.
+ * Returns `null` for uniform words.
+ * @param {OcrWord} word
+ * @returns {?Array<{start: number, end: number, style: Style}>}
+ */
+export function getWordStyleSegments(word) {
+  if (!word.styleRuns || word.styleRuns.length === 0) return null;
+  const segments = [];
+  let start = 0;
+  let style = word.style;
+  for (const run of word.styleRuns) {
+    segments.push({ start, end: run.i, style });
+    start = run.i;
+    style = { ...word.style, ...run.style };
+  }
+  segments.push({ start, end: word.text.length, style });
+  return segments.filter((segment) => segment.end > segment.start);
 }
 
 /**
@@ -815,9 +987,49 @@ function getMatchingWordIds(text, ocrPage) {
 }
 
 /**
+ * Gets every match of `text` across all pages, in reading order, as one entry per non-overlapping occurrence.
+ * Each entry's `wordIds[0]` is the occurrence's first (anchor) word.
+ * @param {string} text
+ * @param {Array<?{n: number, lines: Array<{words: Array<{id: string, text: string}>}>}>} ocrPages
+ * @returns {Array<{pageN: number, wordIds: Array<string>}>}
+ */
+function getDocMatches(text, ocrPages) {
+  text = text.trim().toLowerCase();
+
+  if (!text) return [];
+  const textArr = text.split(' ');
+
+  const matches = [];
+
+  for (let p = 0; p < ocrPages.length; p++) {
+    const page = ocrPages[p];
+    if (!page) continue;
+
+    const wordArr = ocr.getPageWords(page);
+
+    for (let i = 0; i <= wordArr.length - textArr.length; i++) {
+      const word = wordArr[i];
+
+      if (!word.text.toLowerCase().includes(textArr[0])) continue;
+
+      const candArr = wordArr.slice(i, i + textArr.length);
+      const candText = candArr.map((x) => x.text).join(' ').toLowerCase();
+
+      if (candText.includes(text)) {
+        matches.push({ pageN: page.n, wordIds: candArr.map((x) => x.id) });
+        // Advance past the matched span so overlapping windows don't double-count one occurrence.
+        i += textArr.length - 1;
+      }
+    }
+  }
+
+  return matches;
+}
+
+/**
  *
  * @param {OcrWord} word
- * @param {"invis" | "ebook" | "eval" | "proof"} displayMode
+ * @param {'invis' | 'ebook' | 'eval' | 'proof' | 'annot'} displayMode
  * @param {number} [confThreshMed=75]
  * @param {number} [confThreshHigh=85]
  * @param {number} [overlayOpacity=80]
@@ -840,6 +1052,9 @@ export function getWordFillOpacity(word, displayMode, confThreshMed = 75, confTh
   if (displayMode === 'invis') {
     opacity = 0;
     fill = 'black';
+  } else if (displayMode === 'annot') {
+    opacity = 1;
+    fill = 'black';
   } else if (displayMode === 'ebook') {
     opacity = 1;
     fill = 'black';
@@ -860,11 +1075,13 @@ export function getWordFillOpacity(word, displayMode, confThreshMed = 75, confTh
  * @param {Array<OcrPage>} pages - Layout data tables.
  * @param {Object} [options]
  * @param {boolean} [options.includeText=false] - Include text properties at page, par, and line level.
+ * @param {boolean} [options.includeCharBoxes=true] - Keep per-character bounding boxes (`word.chars`).
  */
 export const removeCircularRefsOcr = (pages, options = {}) => {
-  const { includeText = false } = options;
+  const { includeText = false, includeCharBoxes = true } = options;
   const pagesClone = structuredClone(pages);
   pagesClone.forEach((page) => {
+    if (!page) return;
     // Add page-level text if requested (must be done before modifying lines)
     if (includeText) {
       // @ts-ignore
@@ -915,6 +1132,10 @@ export const removeCircularRefsOcr = (pages, options = {}) => {
       line.words.forEach((word) => {
         // @ts-ignore
         delete word.line;
+        if (!includeCharBoxes) {
+          // @ts-ignore
+          delete word.chars;
+        }
         // Delete debug if all values are empty/null
         if (word.debug && !word.debug.raw) {
           // @ts-ignore
@@ -934,6 +1155,7 @@ export const removeCircularRefsOcr = (pages, options = {}) => {
  */
 export const addCircularRefsOcr = (pages) => {
   pages.forEach((page) => {
+    if (!page) return;
     // Remove text property if present (added during export with includeText option)
     // @ts-ignore
     delete page.text;
@@ -952,6 +1174,9 @@ export const addCircularRefsOcr = (pages) => {
         if (word.footnoteParId === undefined) {
           word.footnoteParId = null;
         }
+        // Files from older versions carry a stale boolean `lineNum` on words.
+        // @ts-ignore
+        delete word.lineNum;
         // Restore debug object if not present
         if (!word.debug) {
           word.debug = new WordDebugInfo();
@@ -978,6 +1203,12 @@ export const addCircularRefsOcr = (pages) => {
       if (par.footnoteRefId === undefined) {
         par.footnoteRefId = null;
       }
+      // Initialize headingLevel to null if not present (files from before the field existed)
+      if (par.headingLevel === undefined) {
+        par.headingLevel = null;
+      }
+      if (par.marker === undefined) par.marker = null;
+      if (par.parNum === undefined) par.parNum = null;
       // Restore lines array from lineIds
       // @ts-ignore
       if (par.lineIds && !par.lines) {
@@ -1016,6 +1247,8 @@ export const addCircularRefsOcr = (pages) => {
  */
 export const updateOcrFormat = (pages) => {
   pages.forEach((page) => {
+    if (!page) return;
+    if (page.textSource === 'stext') page.textSource = 'pdf';
     page.lines.forEach((line) => {
       if (!line.debug) {
         line.debug = new LineDebugInfo();
@@ -1039,6 +1272,9 @@ export const updateOcrFormat = (pages) => {
         }
         // @ts-ignore
         delete word.raw;
+        // Older .scribe files carry `poly` on every word, so drop it here or it re-exports forever.
+        // @ts-ignore
+        delete word.poly;
       });
     });
   });
@@ -1064,6 +1300,7 @@ const ocr = {
   getMatchingWords,
   getMatchingWordsInLine,
   getMatchingWordIds,
+  getDocMatches,
   getPageText,
   getParText,
   getLineText,
@@ -1072,15 +1309,22 @@ const ocr = {
   getNextLine,
   getWordFillOpacity,
   clonePage,
+  reIdPage,
   cloneLine,
   cloneWord,
   cloneChar,
+  getWordStyleSegments,
   rotateLine,
   deletePageWords,
   replaceLigatures,
+  asciiPunctuation,
+  ligatureForText,
   scaleLine,
   scalePage,
   escapeXml,
+  removeCircularRefsOcr,
+  addCircularRefsOcr,
+  parIsFurniture,
 };
 
 export default ocr;

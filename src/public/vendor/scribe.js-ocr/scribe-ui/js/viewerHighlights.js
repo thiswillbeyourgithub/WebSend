@@ -1,0 +1,468 @@
+/* eslint-disable import/no-cycle */
+import { UiOcrWord } from './viewerWordObjects.js';
+
+/**
+ * Checks if a word bbox is covered by an annotation of the requested markup kind.
+ * Uses bbox containment as a pre-filter, then checks quads overlap if present.
+ * @param {AnnotationHighlight} annot
+ * @param {bbox} wb - Word bounding box
+ * @param {('highlight'|'underline'|'strikeout'|'line')} [kind='highlight'] - Which markup kind counts as a match; 'line' matches underline or strikeout.
+ */
+export function annotMatchesWord(annot, wb, kind = 'highlight') {
+  // Gate on kind, not geometry alone: a redaction mark or other typed annot covering the word must not match as a highlight.
+  // A null type is a legacy highlight that the highlight branch accepts (UI and consolidated annots omit `type`).
+  if (kind === 'highlight') {
+    if (annot.type != null && annot.type !== 'highlight') return false;
+  } else if (kind === 'line') {
+    if (annot.type !== 'underline' && annot.type !== 'strikeout') return false;
+  } else if (annot.type !== kind) return false;
+  if (!(annot.bbox.left <= wb.left && annot.bbox.right >= wb.right
+    && annot.bbox.top <= wb.top && annot.bbox.bottom >= wb.bottom)) return false;
+  if (annot.quads) {
+    return annot.quads.some((quad) => quad.left < wb.right && quad.right > wb.left
+      && quad.top < wb.bottom && quad.bottom > wb.top);
+  }
+  return true;
+}
+
+/**
+ * Draws outline rectangles around all words in the same highlight group as the selected word.
+ * Clears any previous outlines first.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ */
+export function updateHighlightGroupOutline(viewer) {
+  for (const rect of viewer._highlightOutlineRects) rect.remove();
+  viewer._highlightOutlineRects.length = 0;
+
+  const selectedWords = viewer.CanvasSelection.getUiWords();
+  if (!selectedWords || selectedWords.length === 0) return;
+
+  const firstWord = selectedWords[0];
+  const groupId = firstWord.highlightGroupId || firstWord.markupGroupId;
+  if (!groupId) return;
+
+  const allWords = viewer.getUiWords();
+  const groupWords = allWords.filter((kw) => kw.highlightGroupId === groupId || kw.markupGroupId === groupId);
+  if (groupWords.length === 0) return;
+
+  const pageMap = new Map();
+  for (const kw of groupWords) {
+    const pageN = kw.word.line.page.n;
+    if (!pageMap.has(pageN)) pageMap.set(pageN, []);
+    pageMap.get(pageN).push(kw);
+  }
+
+  for (const [pageN, pageWords] of pageMap) {
+    const lineMap = new Map();
+    for (const kw of pageWords) {
+      const lineId = kw.word.line.id;
+      if (!lineMap.has(lineId)) lineMap.set(lineId, []);
+      lineMap.get(lineId).push(kw);
+    }
+
+    const group = viewer.getTextGroup(pageN);
+    const pad = pageWords[0].height() * 0.2;
+
+    for (const lineWords of lineMap.values()) {
+      lineWords.sort((a, b) => a.x() - b.x());
+      const first = lineWords[0];
+      const last = lineWords[lineWords.length - 1];
+      const left = first.x() - first.highlightGapLeft;
+      const right = last.x() + last.width() + last.highlightGapRight;
+      const top = first.y() - pad;
+      const height = first.height() + pad * 2;
+
+      const rect = document.createElement('div');
+      Object.assign(rect.style, {
+        position: 'absolute',
+        left: `${left}px`,
+        top: `${top}px`,
+        width: `${right - left}px`,
+        height: `${height}px`,
+        border: 'calc(2px / var(--scribe-zoom, 1)) dashed rgba(40,123,181,0.8)',
+        boxSizing: 'border-box',
+        pointerEvents: 'none',
+        zIndex: '2',
+      });
+      group.appendChild(rect);
+      viewer._highlightOutlineRects.push(rect);
+    }
+  }
+}
+
+/**
+ * Recalculates highlight gap extensions for words on the same lines as the given words.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {Array<InstanceType<typeof UiOcrWord>>} changedWords
+ */
+function updateHighlightGaps(viewer, changedWords) {
+  const allWords = viewer.getUiWords();
+  const affectedLineIds = new Set(changedWords.map((kw) => kw.word.line.id));
+  const lineWords = new Map();
+  for (const kw of allWords) {
+    if (!affectedLineIds.has(kw.word.line.id)) continue;
+    if (!lineWords.has(kw.word.line.id)) lineWords.set(kw.word.line.id, []);
+    lineWords.get(kw.word.line.id).push(kw);
+  }
+  for (const words of lineWords.values()) {
+    words.sort((a, b) => a.x() - b.x());
+    for (let i = 0; i < words.length; i++) {
+      const wc = words[i];
+      wc.highlightGapLeft = 0;
+      wc.highlightGapRight = 0;
+      if (!wc.highlightColor) continue;
+      if (i > 0 && words[i - 1].highlightColor) {
+        wc.highlightGapLeft = (wc.x() - (words[i - 1].x() + words[i - 1].width())) / 2;
+      }
+      if (i < words.length - 1 && words[i + 1].highlightColor) {
+        wc.highlightGapRight = (words[i + 1].x() - (wc.x() + wc.width())) / 2;
+      }
+    }
+  }
+}
+
+/**
+ * Removes the highlight (or line-markup) and annotation data from the given words.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {Array<InstanceType<typeof UiOcrWord>>} selectedWords
+ * @param {('highlight'|'line')} [kind='highlight'] - Which markup slot to remove.
+ */
+export function removeHighlight(viewer, selectedWords, kind = 'highlight') {
+  if (!selectedWords || selectedWords.length === 0) return;
+
+  for (const kw of selectedWords) {
+    if (kind === 'highlight') {
+      kw.highlightColor = null;
+      kw.highlightOpacity = 1;
+    } else {
+      kw.markupType = null;
+      kw.markupColor = null;
+      kw.markupOpacity = 1;
+    }
+  }
+  const undoSnap = viewer.doc.docHistory.snapshotAnnots(viewer.doc.annotations, [...new Set(selectedWords.map((kw) => kw.word.line.page.n))]);
+  for (const kw of selectedWords) {
+    const n = kw.word.line.page.n;
+    const wb = kw.word.bbox;
+    viewer.doc.annotations.pages[n] = viewer.doc.annotations.pages[n].filter(
+      (annot) => !annotMatchesWord(annot, wb, kind),
+    );
+  }
+  viewer.doc.docHistory.recordAnnots(undoSnap, kind === 'highlight' ? 'Removed highlight' : 'Removed markup');
+  if (kind === 'highlight') updateHighlightGaps(viewer, selectedWords);
+  updateHighlightGroupOutline(viewer);
+  for (const p of new Set(selectedWords.map((kw) => kw.word.line.page.n))) {
+    viewer.renderHighlights(p);
+    viewer.annotationsEdited(p);
+  }
+  UiOcrWord.updateUI();
+}
+
+/**
+ * Applies highlight (or underline/strikeout) color and annotation data to the given words.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {Array<InstanceType<typeof UiOcrWord>>} selectedWords
+ * @param {string} color
+ * @param {number} opacity
+ * @param {('highlight'|'underline'|'strikeout')} [kind='highlight']
+ */
+export function applyHighlight(viewer, selectedWords, color, opacity, kind = 'highlight') {
+  if (!selectedWords || selectedWords.length === 0) return;
+
+  const pageWordsMap = new Map();
+  for (const kw of selectedWords) {
+    const n = kw.word.line.page.n;
+    if (!pageWordsMap.has(n)) pageWordsMap.set(n, []);
+    pageWordsMap.get(n).push(kw);
+  }
+
+  const anyNew = selectedWords.some((kw) => !viewer.doc.annotations.pages[kw.word.line.page.n].some(
+    (annot) => annotMatchesWord(annot, kw.word.bbox, kind),
+  ));
+  const label = `${anyNew ? 'Added' : 'Recolored'} ${kind}`;
+  viewer.doc.docHistory.group(label, () => {
+    for (const [pageIndex, pageSelWords] of pageWordsMap) {
+      /** @type {Array<AnnotationHighlight>} */
+      const existingRows = [];
+      for (const kw of pageSelWords) {
+        const annot = viewer.doc.annotations.pages[pageIndex].find((a) => annotMatchesWord(a, kw.word.bbox, kind));
+        if (annot && !existingRows.includes(annot)) existingRows.push(annot);
+      }
+      viewer.doc.docHistory.recordAnnotFields(existingRows, ['color', 'opacity', 'groupId', 'comment'], [pageIndex], label, () => {
+        for (const kw of pageSelWords) {
+          const wb = kw.word.bbox;
+          const existingAnnot = viewer.doc.annotations.pages[pageIndex].find(
+            (annot) => annotMatchesWord(annot, wb, kind),
+          );
+          if (existingAnnot) {
+            existingAnnot.color = color;
+            existingAnnot.opacity = opacity;
+            if (!existingAnnot.groupId) {
+              existingAnnot.groupId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+              existingAnnot.comment = existingAnnot.comment || '';
+            }
+          }
+          if (kind === 'highlight') {
+            kw.highlightColor = color;
+            kw.highlightOpacity = opacity;
+          } else {
+            kw.markupType = kind;
+            kw.markupColor = color;
+            kw.markupOpacity = opacity;
+          }
+        }
+      });
+
+      const wordsWithoutAnnot = pageSelWords.filter((kw) => {
+        const wb = kw.word.bbox;
+        return !viewer.doc.annotations.pages[pageIndex].some(
+          (annot) => annotMatchesWord(annot, wb, kind),
+        );
+      });
+
+      if (wordsWithoutAnnot.length > 0) {
+        const undoSnap = viewer.doc.docHistory.snapshotAnnots(viewer.doc.annotations, [pageIndex]);
+        const groupId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        for (const kw of wordsWithoutAnnot) {
+          const wb = kw.word.bbox;
+          /** @type {AnnotationHighlight} */
+          const annot = {
+            bbox: {
+              left: wb.left, top: wb.top, right: wb.right, bottom: wb.bottom,
+            },
+            color,
+            opacity,
+            groupId,
+            comment: '',
+          };
+          // UI highlights stay type-less (legacy form); line markups are always explicit.
+          if (kind !== 'highlight') annot.type = kind;
+          viewer.doc.annotations.pages[pageIndex].push(annot);
+          if (kind === 'highlight') {
+            kw.highlightGroupId = groupId;
+            kw.highlightComment = '';
+          } else {
+            kw.markupGroupId = groupId;
+            kw.markupComment = '';
+          }
+        }
+        viewer.doc.docHistory.recordAnnots(undoSnap, label);
+      }
+    }
+  });
+
+  if (kind === 'highlight') updateHighlightGaps(viewer, selectedWords);
+  updateHighlightGroupOutline(viewer);
+  for (const p of pageWordsMap.keys()) {
+    viewer.renderHighlights(p);
+    viewer.annotationsEdited(p);
+  }
+  UiOcrWord.updateUI();
+  // Surface the new highlight in an open comments panel (it lists highlights with or without a comment).
+  if (viewer._rebuildCommentsPanel) viewer._rebuildCommentsPanel();
+}
+
+/**
+ * The page index, group id, and annotations of the highlight (or line markup) containing `uiWord`.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {InstanceType<typeof UiOcrWord>} uiWord
+ * @param {('highlight'|'line')} [kind='highlight'] - Which markup slot's group to resolve.
+ */
+function groupAnnotations(viewer, uiWord, kind = 'highlight') {
+  const n = uiWord.word.line.page.n;
+  const groupId = (kind === 'highlight' ? uiWord.highlightGroupId : uiWord.markupGroupId) || null;
+  const pageAnnotations = viewer.doc.annotations.pages[n] || [];
+  // Filter by kind here too: a highlight and an underline can share a groupId (`addHighlights` numbers groups per call), so a group edit must not cross kinds.
+  const annots = groupId
+    ? pageAnnotations.filter((annot) => annot.groupId === groupId
+      && (kind === 'highlight' ? annot.type == null || annot.type === 'highlight' : annot.type === 'underline' || annot.type === 'strikeout'))
+    // A PDF-imported highlight can be group-less, so this branch falls back to bbox coverage.
+    : pageAnnotations.filter((annot) => annotMatchesWord(annot, uiWord.word.bbox, kind));
+  return { n, groupId, annots };
+}
+
+/**
+ * Build an inset-stroke overlay per fill band, marking a highlight as an open control's target.
+ * @param {HTMLDivElement[]} bands
+ * @returns {HTMLDivElement[]}
+ */
+export function createInkEdges(bands) {
+  const edges = [];
+  for (const band of bands) {
+    const [r, g, b] = (band.style.background.match(/\d+/g) || []).map(Number);
+    if (r === undefined) continue;
+    // 60% highlight colour + 40% page ink (#1f2530): a darkened "ink" shade of the band's own colour.
+    const ink = `rgb(${Math.round(r * 0.6 + 31 * 0.4)}, ${Math.round(g * 0.6 + 37 * 0.4)}, ${Math.round(b * 0.6 + 48 * 0.4)})`;
+    // The band sits in the zoomed (possibly rotated) page layer, so divide the measured scale out of the stroke width to hold the edge at a constant 1.5px on screen.
+    const rect = band.getBoundingClientRect();
+    const diag = Math.hypot(band.offsetWidth, band.offsetHeight);
+    const scale = diag > 0 ? Math.hypot(rect.width, rect.height) / diag : 1;
+    // A separate full-opacity element, not a box-shadow on the band, which the band's fill opacity would wash out.
+    const edge = document.createElement('div');
+    edge.className = 'scribe-hl-ink-edge';
+    Object.assign(edge.style, {
+      position: 'absolute',
+      left: band.style.left,
+      top: band.style.top,
+      width: band.style.width,
+      height: band.style.height,
+      boxShadow: `inset 0 0 0 ${(1.5 / scale).toFixed(3)}px ${ink}`,
+      pointerEvents: 'none',
+    });
+    if (band.parentElement) band.parentElement.appendChild(edge);
+    edges.push(edge);
+  }
+  return edges;
+}
+
+/**
+ * Remove the whole highlight (or line markup) containing `uiWord`.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {InstanceType<typeof UiOcrWord>} uiWord
+ * @param {('highlight'|'line')} [kind='highlight'] - Which markup slot's group to remove.
+ */
+export function removeHighlightGroup(viewer, uiWord, kind = 'highlight') {
+  if (!uiWord) return;
+  if (kind === 'highlight' ? !uiWord.highlightColor : !uiWord.markupType) return;
+  const { n, groupId, annots } = groupAnnotations(viewer, uiWord, kind);
+  const undoSnap = viewer.doc.docHistory.snapshotAnnots(viewer.doc.annotations, [n]);
+  viewer.doc.annotations.pages[n] = (viewer.doc.annotations.pages[n] || []).filter((annot) => !annots.includes(annot));
+  viewer.doc.docHistory.recordAnnots(undoSnap, kind === 'highlight' ? 'Removed highlight' : 'Removed markup');
+
+  for (const kw of viewer.getUiWords()) {
+    // A pasted copy of this page has identical word geometry, so without this page scope the bbox match below would also clear the copy's independent highlight.
+    if (kw.word.line.page.n !== n) continue;
+    const covered = kw === uiWord
+      || (groupId && (kind === 'highlight' ? kw.highlightGroupId : kw.markupGroupId) === groupId)
+      || annots.some((annot) => annotMatchesWord(annot, kw.word.bbox, kind));
+    if (!covered) continue;
+    if (kind === 'highlight') {
+      kw.highlightColor = null;
+      kw.highlightOpacity = 1;
+      kw.highlightGroupId = null;
+      kw.highlightComment = '';
+      kw.highlightGapLeft = 0;
+      kw.highlightGapRight = 0;
+    } else {
+      kw.markupType = null;
+      kw.markupColor = null;
+      kw.markupOpacity = 1;
+      kw.markupGroupId = null;
+      kw.markupComment = '';
+    }
+  }
+
+  updateHighlightGroupOutline(viewer);
+  viewer.renderHighlights(n);
+  viewer.annotationsEdited(n);
+  UiOcrWord.updateUI();
+  // Drop the deleted highlight's row from an open comments panel.
+  if (viewer._rebuildCommentsPanel) viewer._rebuildCommentsPanel();
+}
+
+/**
+ * Recolor the whole highlight (or line markup) containing `uiWord`. Group ids and comments are untouched.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {InstanceType<typeof UiOcrWord>} uiWord
+ * @param {string} color
+ * @param {('highlight'|'line')} [kind='highlight'] - Which markup slot's group to recolor.
+ */
+export function recolorHighlightGroup(viewer, uiWord, color, kind = 'highlight') {
+  if (!uiWord) return;
+  if (kind === 'highlight' ? !uiWord.highlightColor : !uiWord.markupType) return;
+  const { n, groupId, annots } = groupAnnotations(viewer, uiWord, kind);
+  viewer.doc.docHistory.recordAnnotFields(annots, ['color'], [n], kind === 'highlight' ? 'Recolored highlight' : 'Recolored markup', () => {
+    for (const annot of annots) annot.color = color;
+  });
+
+  for (const kw of viewer.getUiWords()) {
+    // Page scope for the same reason as `removeHighlightGroup`: a pasted copy has identical word geometry.
+    if (kw.word.line.page.n !== n) continue;
+    const covered = kw === uiWord
+      || (groupId && (kind === 'highlight' ? kw.highlightGroupId : kw.markupGroupId) === groupId)
+      || annots.some((annot) => annotMatchesWord(annot, kw.word.bbox, kind));
+    if (!covered) continue;
+    if (kind === 'highlight') kw.highlightColor = color;
+    else kw.markupColor = color;
+  }
+
+  viewer.renderHighlights(n);
+  viewer.annotationsEdited(n);
+  UiOcrWord.updateUI();
+  // Refresh the row's color swatch in an open comments panel.
+  if (viewer._rebuildCommentsPanel) viewer._rebuildCommentsPanel();
+}
+
+/**
+ * Set the comment on the highlight (or line-markup) group containing the first selected word.
+ * Author and creation time are set on the first non-empty comment, kept through later edits, and removed when it is cleared.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {Array<InstanceType<typeof UiOcrWord>>} selectedWords
+ * @param {string} comment
+ * @param {('highlight'|'line')} [kind='highlight'] - Which markup slot's group to comment.
+ */
+export function modifyHighlightComment(viewer, selectedWords, comment, kind = 'highlight') {
+  if (!selectedWords || selectedWords.length === 0) return;
+  const pageIndex = selectedWords[0].word.line.page.n;
+  const wb = selectedWords[0].word.bbox;
+  const matchingAnnot = viewer.doc.annotations.pages[pageIndex].find(
+    (annot) => annotMatchesWord(annot, wb, kind),
+  );
+  if (!matchingAnnot || !matchingAnnot.groupId) return;
+  const author = viewer.opt.commentAuthor || '';
+  const now = new Date().toISOString();
+  // A same-groupId annot of a different kind is a separate markup (`hl-0` recurs across `addHighlights` calls), so the edit must not leak onto it.
+  const rows = viewer.doc.annotations.pages[pageIndex].filter(
+    (annot) => annot.groupId === matchingAnnot.groupId && (annot.type ?? 'highlight') === (matchingAnnot.type ?? 'highlight'),
+  );
+  viewer.doc.docHistory.recordAnnotFields(rows, ['comment', 'author', 'createdAt', 'replies'], [pageIndex], 'Edited comment', () => {
+    for (const annot of rows) {
+      annot.comment = comment;
+      if (comment) {
+        if (author && !annot.author) annot.author = author;
+        if (!annot.createdAt) annot.createdAt = now;
+      } else {
+        // An emptied comment that still has replies is reverted by the caller,
+        // so reaching here means an intentional delete of the whole conversation.
+        delete annot.author;
+        delete annot.createdAt;
+        delete annot.replies;
+      }
+    }
+  });
+  for (const kw of viewer.getUiWords()) {
+    if (kind === 'highlight' && kw.highlightGroupId === matchingAnnot.groupId) {
+      kw.highlightComment = comment;
+    } else if (kind === 'line' && kw.markupGroupId === matchingAnnot.groupId) {
+      kw.markupComment = comment;
+    }
+  }
+}
+
+/**
+ * Replace the comment reply thread on the highlight (or line-markup) group containing `uiWord`.
+ * An empty list removes the thread.
+ * @param {import('../viewer.js').ScribeViewer} viewer
+ * @param {import('./viewerWordObjects.js').UiOcrWord} uiWord - Any word of the target group.
+ * @param {AnnotationReply[]} replies
+ * @param {('highlight'|'line')} [kind='highlight'] - Which markup slot's group to set replies on.
+ */
+export function setHighlightReplies(viewer, uiWord, replies, kind = 'highlight') {
+  const pageIndex = uiWord.word.line.page.n;
+  const wb = uiWord.word.bbox;
+  const matchingAnnot = (viewer.doc.annotations.pages[pageIndex] || []).find(
+    (annot) => annotMatchesWord(annot, wb, kind),
+  );
+  if (!matchingAnnot || !matchingAnnot.groupId) return;
+  // A same-groupId annot of another kind is a different markup, never part of this thread.
+  const rows = viewer.doc.annotations.pages[pageIndex].filter(
+    (annot) => annot.groupId === matchingAnnot.groupId && (annot.type ?? 'highlight') === (matchingAnnot.type ?? 'highlight'),
+  );
+  viewer.doc.docHistory.recordAnnotFields(rows, ['replies'], [pageIndex], 'Edited comment', () => {
+    for (const annot of rows) {
+      // Consumers read the thread off whichever annotation of the group they match first, so every member carries it.
+      if (replies.length > 0) annot.replies = replies;
+      else delete annot.replies;
+    }
+  });
+}

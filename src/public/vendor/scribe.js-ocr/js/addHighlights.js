@@ -1,0 +1,532 @@
+import ocr from './objects/ocrObjects.js';
+import { calcBboxUnion } from './utils/miscUtils.js';
+import { TEXT_ANNOT_ICON_PX } from './pdf/parsePdfAnnots.js';
+
+/** @typedef {import('./containers/scribeDoc.js').ScribeDoc} ScribeDoc */
+
+const GROUP_PREFIX = 'hl-';
+
+/**
+ * Map a word/line bbox from scribe's internal "virtual horizontal" frame (how rotated lines are stored) back to page space.
+ * @param {bbox} bbox - bbox in the line's orientation frame.
+ * @param {number} orientation - line orientation (0-3).
+ * @param {dims} dims - page dimensions.
+ * @returns {bbox} bbox in page space.
+ */
+export function bboxToPageSpace(bbox, orientation, dims) {
+  const { width: w, height: h } = dims;
+  if (orientation === 1) {
+    return {
+      left: w - bbox.bottom, top: bbox.left, right: w - bbox.top, bottom: bbox.right,
+    };
+  }
+  if (orientation === 2) {
+    return {
+      left: w - bbox.right, top: h - bbox.bottom, right: w - bbox.left, bottom: h - bbox.top,
+    };
+  }
+  if (orientation === 3) {
+    return {
+      left: bbox.top, top: h - bbox.right, right: bbox.bottom, bottom: h - bbox.left,
+    };
+  }
+  return { ...bbox };
+}
+
+/**
+ * @typedef {Object} HighlightSpec
+ * @property {number} page - Page index (0-based).
+ * @property {number} [startLine] - First line index to highlight (0-based). If omitted, uses quote-only mode.
+ * @property {number} [endLine] - Last line index to highlight (0-based). If omitted, defaults to startLine.
+ * @property {string} [text] - Quote text to highlight. In line mode, narrows the first/last line to the
+ *   matching words. In quote-only mode (no startLine/endLine), searches the entire page for this text.
+ * @property {'highlight'|'underline'|'strikeout'} [markup='highlight'] - Markup kind: a /Highlight fill,
+ *   /Underline, or /StrikeOut line.
+ * @property {string} [color='#ffff00'] - Hex color for the highlight.
+ * @property {number} [opacity=0.4] - Opacity (0 to 1). Underline/strikeout default to 1 instead.
+ * @property {string} [comment] - Comment text for the annotation.
+ */
+
+/**
+ * Add highlight annotations to the current document using page:line references
+ * or page-level quote matching.
+ *
+ * Two modes:
+ * - **Line mode** (`startLine`/`endLine` provided): highlights the specified line range.
+ *   If `text` is also provided, narrows the first and last lines to the matching words.
+ * - **Quote-only mode** (only `page` + `text`): searches the entire page for the quote
+ *   and highlights the matching words.
+ *
+ * @param {ScribeDoc} doc
+ * @param {Array<HighlightSpec>} highlights
+ * @returns {{
+ *   highlightsApplied: number,
+ *   totalLinesHighlighted: number,
+ *   groups: Array<{ page: number, groupId: string, bbox: bbox }>,
+ * }}
+ */
+export function addHighlights(doc, highlights) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, highlights.map((h) => h.page));
+  // Continue numbering above every existing hl-N group so ids stay unique across calls and across a .scribe restore.
+  let groupN = 0;
+  for (const pageAnnots of doc.annotations.pages) {
+    for (const annot of pageAnnots) {
+      const m = /^hl-(\d+)$/.exec(annot.groupId);
+      if (m) groupN = Math.max(groupN, Number(m[1]) + 1);
+    }
+  }
+  let highlightsApplied = 0;
+  let totalLinesHighlighted = 0;
+  /** @type {Array<{ page: number, groupId: string, bbox: bbox }>} */
+  const groups = [];
+
+  for (const highlight of highlights) {
+    const pageObj = doc.ocr.active[highlight.page];
+    if (!pageObj) continue;
+
+    if (highlight.startLine == null && !highlight.text) {
+      throw new Error('Each highlight must specify either startLine or text (or both).');
+    }
+
+    const markup = highlight.markup || 'highlight';
+    const color = highlight.color || '#ffe93b';
+    // Underline/strikeout are thin strokes drawn on the text, not translucent fills behind it.
+    const opacity = highlight.opacity ?? (markup === 'highlight' ? 0.4 : 1);
+    const groupId = `${GROUP_PREFIX}${groupN++}`;
+    const comment = highlight.comment || '';
+
+    if (highlight.startLine != null) {
+      const startLine = highlight.startLine;
+      const endLine = highlight.endLine ?? startLine;
+
+      const textWords = highlight.text ? highlight.text.trim().split(/\s+/) : [];
+      const startSnippet = textWords.length > 0 ? textWords.slice(0, 3).join(' ') : null;
+      const endSnippet = textWords.length > 0 ? textWords.slice(-3).join(' ') : null;
+
+      for (let lineIdx = startLine; lineIdx <= endLine; lineIdx++) {
+        const line = pageObj.lines[lineIdx];
+        if (!line) continue;
+
+        let wordsToHighlight = [...line.words];
+
+        if (lineIdx === startLine && startSnippet) {
+          const matchWords = ocr.getMatchingWordsInLine(startSnippet, line);
+          if (matchWords.length > 0) {
+            const firstMatchIdx = line.words.indexOf(matchWords[0]);
+            if (firstMatchIdx >= 0) {
+              wordsToHighlight = line.words.slice(firstMatchIdx);
+            }
+          }
+        }
+
+        if (lineIdx === endLine && endSnippet) {
+          const matchWords = ocr.getMatchingWordsInLine(endSnippet, line);
+          if (matchWords.length > 0) {
+            const lastMatchIdx = line.words.indexOf(matchWords[matchWords.length - 1]);
+            if (lastMatchIdx >= 0) {
+              const startIdx = line.words.indexOf(wordsToHighlight[0]);
+              wordsToHighlight = line.words.slice(
+                startIdx >= 0 ? startIdx : 0,
+                lastMatchIdx + 1,
+              );
+            }
+          }
+        }
+
+        for (const word of wordsToHighlight) {
+          doc.annotations.pages[highlight.page].push({
+            type: markup, bbox: bboxToPageSpace(word.bbox, line.orientation, pageObj.dims), color, opacity, groupId, comment,
+          });
+        }
+        totalLinesHighlighted++;
+      }
+    } else if (highlight.text) {
+      const matchWords = ocr.getMatchingWords(highlight.text, pageObj);
+      for (const word of matchWords) {
+        doc.annotations.pages[highlight.page].push({
+          type: markup, bbox: bboxToPageSpace(word.bbox, word.line.orientation, pageObj.dims), color, opacity, groupId, comment,
+        });
+      }
+      if (matchWords.length > 0) totalLinesHighlighted++;
+    }
+
+    const added = doc.annotations.pages[highlight.page].filter((a) => a.type !== 'freetext' && a.groupId === groupId);
+    if (added.length > 0) {
+      groups.push({ page: highlight.page, groupId, bbox: calcBboxUnion(added.map((a) => a.bbox)) });
+    }
+
+    highlightsApplied++;
+  }
+
+  doc.docHistory.recordAnnots(undoSnap, highlights.length === 1 ? 'Added highlight' : 'Added highlights');
+  return { highlightsApplied, totalLinesHighlighted, groups };
+}
+
+/**
+ * @typedef {Object} FreeTextSpec
+ * @property {number} page - Page index (0-based).
+ * @property {bbox} bbox - Annotation rectangle in page coordinates
+ *   (top-left origin, same frame as OCR words).
+ * @property {string} contents - Text shown in the annotation.
+ * @property {number} [fontSize=10] - Text size, in the same coordinate frame as bbox.
+ * @property {string} [textColor='#000000'] - Hex text color.
+ * @property {string} [fillColor] - Hex background color; omitted = transparent.
+ * @property {number} [opacity=1] - Opacity (0 to 1).
+ */
+
+/**
+ * Add FreeText (text label) annotations at fixed page positions.
+ *
+ * @param {ScribeDoc} doc
+ * @param {Array<FreeTextSpec>} annotations
+ * @returns {{ annotationsAdded: number }}
+ */
+export function addFreeText(doc, annotations) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, annotations.map((a) => a.page));
+  let annotationsAdded = 0;
+  for (const annot of annotations) {
+    if (!annot.bbox || typeof annot.contents !== 'string') {
+      throw new Error('Each FreeText annotation must specify bbox and contents.');
+    }
+    if (!doc.annotations.pages[annot.page]) continue;
+    doc.annotations.pages[annot.page].push({
+      type: 'freetext',
+      bbox: {
+        left: annot.bbox.left, top: annot.bbox.top, right: annot.bbox.right, bottom: annot.bbox.bottom,
+      },
+      contents: annot.contents,
+      fontSize: annot.fontSize ?? 10,
+      textColor: annot.textColor || '#000000',
+      fillColor: annot.fillColor,
+      opacity: annot.opacity ?? 1,
+    });
+    annotationsAdded++;
+  }
+  doc.docHistory.recordAnnots(undoSnap, annotations.length === 1 ? 'Added text box' : 'Added text boxes');
+  return { annotationsAdded };
+}
+
+/**
+ * Remove all highlights previously added by `addHighlights`.
+ * @param {ScribeDoc} doc
+ */
+export function clearHighlights(doc) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, null);
+  for (let p = 0; p < doc.annotations.pages.length; p++) {
+    doc.annotations.pages[p] = doc.annotations.pages[p]
+      .filter((a) => a.type === 'freetext' || !a.groupId?.startsWith(GROUP_PREFIX));
+  }
+  doc.docHistory.recordAnnots(undoSnap, 'Removed highlights');
+}
+
+/** Text-markup annotation type tags sharing the /QuadPoints pipeline. A missing `type` is a legacy highlight. */
+export const TEXT_MARKUP_ANNOT_TYPES = new Set(['highlight', 'underline', 'strikeout']);
+
+/** Annotation type tags emitted as vector shapes. */
+export const SHAPE_ANNOT_TYPES = new Set(['square', 'circle', 'line', 'polygon', 'polyline']);
+
+/**
+ * @typedef {Object} ShapeSpec
+ * @property {number} page - Page index (0-based).
+ * @property {'square'|'circle'|'line'|'polygon'|'polyline'} type
+ * @property {bbox} [bbox] - 'square'/'circle': rect/ellipse bounds in page coords (top-left origin).
+ * @property {[number, number, number, number]} [points] - 'line': [x1, y1, x2, y2] in page coords.
+ * @property {number[]} [vertices] - 'polygon'/'polyline': flat [x1, y1, ...] in page coords.
+ * @property {string} [borderColor='#ff0000']
+ * @property {string} [fillColor] - Omitted = outline only.
+ * @property {number} [opacity=1]
+ * @property {number} [borderWidth=1]
+ * @property {string} [comment]
+ */
+
+/**
+ * Add vector shape annotations at fixed page positions.
+ * @param {ScribeDoc} doc
+ * @param {Array<ShapeSpec>} shapes
+ * @returns {{ shapesAdded: number }}
+ */
+export function addShapes(doc, shapes) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, shapes.map((s) => s.page));
+  let shapesAdded = 0;
+  for (const shape of shapes) {
+    if (!SHAPE_ANNOT_TYPES.has(shape.type)) {
+      throw new Error(`Unknown shape annotation type: ${shape.type}`);
+    }
+    if ((shape.type === 'square' || shape.type === 'circle') && !shape.bbox) {
+      throw new Error(`A '${shape.type}' annotation must specify bbox.`);
+    }
+    if (shape.type === 'line' && (!shape.points || shape.points.length !== 4)) {
+      throw new Error("A 'line' annotation must specify points [x1, y1, x2, y2].");
+    }
+    if ((shape.type === 'polygon' || shape.type === 'polyline')
+      && (!shape.vertices || shape.vertices.length < 4 || shape.vertices.length % 2 !== 0)) {
+      throw new Error(`A '${shape.type}' annotation must specify an even-length vertices array.`);
+    }
+    if (!doc.annotations.pages[shape.page]) continue;
+
+    const style = {
+      borderColor: shape.borderColor || '#ff0000',
+      fillColor: shape.fillColor,
+      opacity: shape.opacity ?? 1,
+      borderWidth: shape.borderWidth ?? 1,
+      comment: shape.comment,
+    };
+    if (shape.type === 'line') {
+      doc.annotations.pages[shape.page].push({ type: 'line', points: [...shape.points], ...style });
+    } else if (shape.type === 'polygon' || shape.type === 'polyline') {
+      doc.annotations.pages[shape.page].push({ type: shape.type, vertices: [...shape.vertices], ...style });
+    } else {
+      doc.annotations.pages[shape.page].push({
+        type: shape.type,
+        bbox: {
+          left: shape.bbox.left, top: shape.bbox.top, right: shape.bbox.right, bottom: shape.bbox.bottom,
+        },
+        ...style,
+      });
+    }
+    shapesAdded++;
+  }
+  doc.docHistory.recordAnnots(undoSnap, shapes.length === 1 ? 'Added shape' : 'Added shapes');
+  return { shapesAdded };
+}
+
+/**
+ * Remove all shape annotations added by `addShapes`.
+ * @param {ScribeDoc} doc
+ */
+export function clearShapes(doc) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, null);
+  for (let p = 0; p < doc.annotations.pages.length; p++) {
+    doc.annotations.pages[p] = doc.annotations.pages[p].filter((a) => !SHAPE_ANNOT_TYPES.has(a.type));
+  }
+  doc.docHistory.recordAnnots(undoSnap, 'Removed shapes');
+}
+
+/**
+ * @typedef {Object} TextAnnotSpec
+ * @property {number} page - Page index (0-based).
+ * @property {number} x - Icon left in page coords (top-left origin).
+ * @property {number} y - Icon top in page coords.
+ * @property {string} [comment] - Annotation body; '' when omitted.
+ * @property {string} [color] - Icon color '#rrggbb'.
+ * @property {string} [author]
+ * @property {string} [createdAt] - UTC ISO-8601.
+ * @property {AnnotationReply[]} [replies] - Reply thread under the comment, oldest first.
+ * @property {boolean} [open] - Whether the popup opens by default; false when omitted.
+ */
+
+/**
+ * Add freestanding /Text annotations at fixed page positions.
+ * @param {ScribeDoc} doc
+ * @param {Array<TextAnnotSpec>} textAnnots
+ * @returns {{ added: number }}
+ */
+export function addTextAnnots(doc, textAnnots) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, textAnnots.map((t) => t.page));
+  let added = 0;
+  for (const spec of textAnnots) {
+    if (!doc.annotations.pages[spec.page]) continue;
+    /** @type {AnnotationText} */
+    const annot = {
+      type: 'text',
+      bbox: {
+        left: spec.x, top: spec.y, right: spec.x + TEXT_ANNOT_ICON_PX, bottom: spec.y + TEXT_ANNOT_ICON_PX,
+      },
+      comment: spec.comment || '',
+      open: spec.open ?? false,
+    };
+    if (spec.color) annot.color = spec.color;
+    if (spec.author) annot.author = spec.author;
+    if (spec.createdAt) annot.createdAt = spec.createdAt;
+    if (spec.replies && spec.replies.length > 0) annot.replies = spec.replies.map((r) => ({ ...r }));
+    doc.annotations.pages[spec.page].push(annot);
+    added += 1;
+  }
+  doc.docHistory.recordAnnots(undoSnap, textAnnots.length === 1 ? 'Added note' : 'Added notes');
+  return { added };
+}
+
+/**
+ * Remove all freestanding /Text annotations added by `addTextAnnots`.
+ * @param {ScribeDoc} doc
+ */
+export function clearTextAnnots(doc) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, null);
+  for (let p = 0; p < doc.annotations.pages.length; p++) {
+    doc.annotations.pages[p] = doc.annotations.pages[p].filter((a) => a.type !== 'text');
+  }
+  doc.docHistory.recordAnnots(undoSnap, 'Removed notes');
+}
+
+/**
+ * @typedef {Object} RedactionSpec
+ * @property {number} page - Page index (0-based).
+ * @property {bbox} [bbox] - Region mode: rect to redact, page coords (top-left origin, same frame as OCR words).
+ * @property {string} [text] - Quote mode: marks every occurrence of this text on the page.
+ *   Matching is whole-word (an occurrence inside a longer word marks that whole word).
+ */
+
+/**
+ * Add redaction marks to the document.
+ *
+ * Marks are annotations: reviewable and deletable until export, and saved as-is in `.scribe` files.
+ * Every non-`.scribe` export removes the marked content from the output rather than covering it.
+ *
+ * A `bbox` spec produces one mark group; a `text` spec produces one group per occurrence.
+ *
+ * @param {ScribeDoc} doc
+ * @param {Array<RedactionSpec>} redactions
+ * @returns {{ marksAdded: number, groups: Array<{ page: number, groupId: string, bbox: bbox }> }}
+ */
+export function addRedactions(doc, redactions) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, redactions.map((r) => r.page));
+  // Continue numbering above every existing rd-N group so ids stay unique across
+  // calls and across a .scribe restore. (Imported PDF /Redact marks use _pdf_* ids.)
+  let groupN = 0;
+  for (const pageAnnots of doc.annotations.pages) {
+    for (const annot of pageAnnots) {
+      if (annot.type !== 'redact') continue;
+      const m = /^rd-(\d+)$/.exec(annot.groupId);
+      if (m) groupN = Math.max(groupN, Number(m[1]) + 1);
+    }
+  }
+
+  let marksAdded = 0;
+  /** @type {Array<{ page: number, groupId: string, bbox: bbox }>} */
+  const groups = [];
+
+  for (const spec of redactions) {
+    const pageAnnots = doc.annotations.pages[spec.page];
+    if (!pageAnnots) continue;
+    if (!spec.bbox && !spec.text) throw new Error('Each redaction must specify either bbox or text.');
+    if (spec.bbox && spec.text) throw new Error('A redaction must specify bbox or text, not both.');
+
+    if (spec.bbox) {
+      const groupId = `rd-${groupN++}`;
+      const bbox = {
+        left: spec.bbox.left, top: spec.bbox.top, right: spec.bbox.right, bottom: spec.bbox.bottom,
+      };
+      pageAnnots.push({ type: 'redact', bbox, groupId });
+      marksAdded++;
+      groups.push({ page: spec.page, groupId, bbox: { ...bbox } });
+      continue;
+    }
+
+    const pageObj = doc.ocr.active[spec.page];
+    if (!pageObj) continue;
+    /** @type {Map<string, OcrWord>} */
+    const wordsById = new Map();
+    for (const word of ocr.getPageWords(pageObj)) wordsById.set(word.id, word);
+
+    for (const match of ocr.getDocMatches(spec.text, [pageObj])) {
+      const groupId = `rd-${groupN++}`;
+      /** @type {Array<bbox>} */
+      const groupBboxes = [];
+      // One rect per run of adjacent same-line words, unioned in the line's orientation frame (where word bboxes live) before mapping to page space.
+      /** @type {?{ line: OcrLine, lastIdx: number, bbox: bbox }} */
+      let run = null;
+      for (const id of match.wordIds) {
+        const word = wordsById.get(id);
+        if (!word) continue;
+        const idx = word.line.words.indexOf(word);
+        if (run && word.line === run.line && idx === run.lastIdx + 1) {
+          run.bbox.left = Math.min(run.bbox.left, word.bbox.left);
+          run.bbox.top = Math.min(run.bbox.top, word.bbox.top);
+          run.bbox.right = Math.max(run.bbox.right, word.bbox.right);
+          run.bbox.bottom = Math.max(run.bbox.bottom, word.bbox.bottom);
+          run.lastIdx = idx;
+          continue;
+        }
+        if (run) groupBboxes.push(bboxToPageSpace(run.bbox, run.line.orientation, pageObj.dims));
+        run = { line: word.line, lastIdx: idx, bbox: { ...word.bbox } };
+      }
+      if (run) groupBboxes.push(bboxToPageSpace(run.bbox, run.line.orientation, pageObj.dims));
+
+      for (const bbox of groupBboxes) {
+        pageAnnots.push({ type: 'redact', bbox, groupId });
+        marksAdded++;
+      }
+      if (groupBboxes.length > 0) {
+        groups.push({ page: spec.page, groupId, bbox: calcBboxUnion(groupBboxes) });
+      }
+    }
+  }
+
+  doc.docHistory.recordAnnots(undoSnap, 'Marked for redaction');
+  return { marksAdded, groups };
+}
+
+/**
+ * @typedef {Object} LinkSpec
+ * @property {number} page - Page index (0-based).
+ * @property {bbox} bbox - Clickable region, page coords (top-left origin, same frame as OCR words).
+ * @property {string} [uri] - External URL target.
+ * @property {{ pageIndex: number, yFrac?: number, view?: Array<string|number|null> }} [dest] - Internal page target.
+ *   `view` is the raw PDF destination tail to write on export, defaulting to a page-level `['Fit']`.
+ *   `yFrac` positions in-app navigation and is not written to the PDF unless carried by `view`.
+ */
+
+/**
+ * Add link annotations to the document.
+ *
+ * Each spec targets either an external URL (`uri`) or an internal page jump (`dest`), never both.
+ *
+ * @param {ScribeDoc} doc
+ * @param {Array<LinkSpec>} links
+ * @returns {{ linksAdded: number }}
+ */
+export function addLinks(doc, links) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, links.map((l) => l.page));
+  let linksAdded = 0;
+  for (const spec of links) {
+    const pageAnnots = doc.annotations.pages[spec.page];
+    if (!pageAnnots) continue;
+    if (!spec.uri && !spec.dest) throw new Error('Each link must specify either uri or dest.');
+    if (spec.uri && spec.dest) throw new Error('A link must specify uri or dest, not both.');
+    const bbox = {
+      left: spec.bbox.left, top: spec.bbox.top, right: spec.bbox.right, bottom: spec.bbox.bottom,
+    };
+    if (spec.uri) {
+      pageAnnots.push({ type: 'link', bbox, uri: spec.uri });
+    } else {
+      /** @type {OutlineDest} */
+      const dest = { pageIndex: spec.dest.pageIndex, view: Array.isArray(spec.dest.view) ? [...spec.dest.view] : ['Fit'] };
+      if (spec.dest.yFrac !== undefined) dest.yFrac = spec.dest.yFrac;
+      pageAnnots.push({ type: 'link', bbox, dest });
+    }
+    linksAdded++;
+  }
+  doc.docHistory.recordAnnots(undoSnap, links.length === 1 ? 'Added link' : 'Added links');
+  return { linksAdded };
+}
+
+/**
+ * Remove link annotations.
+ * @param {ScribeDoc} doc
+ * @param {{ page?: number }} [filter] - Omit to remove every link.
+ *   `page` narrows to one page.
+ */
+export function removeLinks(doc, filter) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, filter?.page != null ? [filter.page] : null);
+  for (let p = 0; p < doc.annotations.pages.length; p++) {
+    if (filter?.page != null && filter.page !== p) continue;
+    doc.annotations.pages[p] = doc.annotations.pages[p].filter((a) => a.type !== 'link');
+  }
+  doc.docHistory.recordAnnots(undoSnap, 'Removed links');
+}
+
+/**
+ * Remove redaction marks.
+ * @param {ScribeDoc} doc
+ * @param {{ page?: number, groupId?: string }} [filter] - Omit to remove every mark.
+ *   `page` narrows to one page, `groupId` to one mark group.
+ */
+export function removeRedactions(doc, filter) {
+  const undoSnap = doc.docHistory.snapshotAnnots(doc.annotations, filter?.page != null ? [filter.page] : null);
+  for (let p = 0; p < doc.annotations.pages.length; p++) {
+    if (filter?.page != null && filter.page !== p) continue;
+    doc.annotations.pages[p] = doc.annotations.pages[p]
+      .filter((a) => a.type !== 'redact' || (filter?.groupId != null && a.groupId !== filter.groupId));
+  }
+  doc.docHistory.recordAnnots(undoSnap, 'Removed redaction marks');
+}

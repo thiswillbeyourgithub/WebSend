@@ -1,5 +1,3 @@
-/* eslint-disable no-bitwise */
-
 /**
  * Loads an image from a given URL and sets it to a specified HTML element.
  *
@@ -26,9 +24,7 @@ export async function loadImageElem(src, elem) {
 }
 
 export function imageStrToBlob(imgStr) {
-  const imgData = new Uint8Array(atob(imgStr.split(',')[1])
-    .split('')
-    .map((c) => c.charCodeAt(0)));
+  const imgData = base64ToBytes(imgStr);
 
   const imgBlob = new Blob([imgData], { type: 'application/octet-stream' });
 
@@ -58,7 +54,12 @@ export const importImageFileToBase64 = async (file) => new Promise((resolve, rej
   if (file instanceof ArrayBuffer) {
     const imageUint8 = new Uint8Array(file);
     const format = detectImageFormat(imageUint8);
-    const binary = String.fromCharCode(...imageUint8);
+    // `String.fromCharCode(...arr)` throws RangeError above ~125k bytes.
+    const chunkSize = 8192;
+    let binary = '';
+    for (let i = 0; i < imageUint8.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, imageUint8.subarray(i, i + chunkSize));
+    }
     resolve(`data:image/${format};base64,${btoa(binary)}`);
     return;
   }
@@ -80,10 +81,12 @@ export const importImageFileToBase64 = async (file) => new Promise((resolve, rej
   }
 
   if (typeof process !== 'undefined') {
-    if (!file?.name) reject(new Error('Invalid input. Must be a FileNode or ArrayBuffer.'));
+    if (!file?.name || typeof file.arrayBuffer !== 'function') {
+      reject(new Error('Invalid input. Must be a FileNode or ArrayBuffer.'));
+      return;
+    }
     const format = file.name.match(/jpe?g$/i) ? 'jpeg' : 'png';
-    // @ts-ignore
-    resolve(`data:image/${format};base64,${file.fileData.toString('base64')}`);
+    file.arrayBuffer().then((imageBuffer) => resolve(`data:image/${format};base64,${Buffer.from(imageBuffer).toString('base64')}`), reject);
     return;
   }
 

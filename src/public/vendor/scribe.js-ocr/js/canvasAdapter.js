@@ -1,45 +1,117 @@
-import { imageStrToBlob } from './utils/imageUtils.js';
+import { base64ToBytes, imageStrToBlob } from './utils/imageUtils.js';
+import { registerFallbackFonts } from './fallbackFonts.js';
 
 export class ca {
-  /** @type {import('canvaskit-wasm').CanvasKit} */
-  static CanvasKit;
+  static CanvasNode;
 
-  static getCanvasKit = async () => {
-    if (typeof process === 'undefined') {
-      throw new Error('getCanvasKit is only available in Node.js');
-    } else {
-      if (!ca.CanvasKit) {
-        // This weirdness is required for types to work for some reason.
-        // https://stackoverflow.com/a/69694837
-        const canvasKitImport = await import('canvaskit-wasm');
-        const CanvasKitInit = canvasKitImport.default;
-        ca.CanvasKit = await CanvasKitInit();
+  static _initPromise = null;
+
+  /**
+   * Load Node.js canvas module.
+   * Must be called at least once before any canvas operations in Node.
+   */
+  static getCanvasNode = async () => {
+    if (typeof process !== 'undefined') {
+      if (!ca._initPromise) {
+        ca._initPromise = (async () => {
+          ca.CanvasNode = await import('@scribe.js/canvas');
+          globalThis.ImageData = ca.CanvasNode.ImageData;
+          globalThis.DOMMatrix = ca.CanvasNode.DOMMatrix;
+          await registerFallbackFonts(ca.CanvasNode);
+          return ca.CanvasNode;
+        })();
       }
-      return ca.CanvasKit;
+      return ca._initPromise;
     }
+    return undefined;
+  };
+
+  static getCanvasNodeSync = () => {
+    if (!ca.CanvasNode) throw new Error('@scribe.js/canvas not initialized — call await ca.getCanvasNode() first');
+    return ca.CanvasNode;
   };
 
   /**
-   *
+   * Create a canvas. Sync — @scribe.js/canvas must already be loaded in Node.js.
+   * @param {number} width
+   * @param {number} height
+   */
+  static makeCanvas = (width, height) => {
+    if (typeof process !== 'undefined') {
+      return ca.getCanvasNodeSync().createCanvas(width, height);
+    }
+    return new OffscreenCanvas(width, height);
+  };
+
+  /**
    * @param {number} width
    * @param {number} height
    */
   static createCanvas = async (width, height) => {
-    if (typeof process === 'undefined') {
-      return new OffscreenCanvas(width, height);
+    if (typeof process !== 'undefined') {
+      if (!width || !height || width <= 0 || height <= 0) {
+        throw new Error(`Invalid canvas size: ${width}x${height}`);
+      }
+      const CanvasNode = await ca.getCanvasNode();
+      return CanvasNode.createCanvas(width, height);
     }
-    if (!width || !height || width <= 0 || height <= 0) {
-      throw new Error(`Invalid canvas size: ${width}x${height}`);
-    }
-    const canvasKit = await ca.getCanvasKit();
-    return canvasKit.MakeCanvas(width, height);
+    return new OffscreenCanvas(width, height);
   };
 
   /**
-   * Handles various image formats, always returns a ImageBitmap.
+   * Synchronously release a drawable's native resources.
+   * @param {*} d
+   */
+  static closeDrawable = (d) => {
+    if (!d) return;
+    if (typeof d.dispose === 'function') { d.dispose(); return; }
+    if (typeof d.close === 'function') d.close();
+  };
+
+  /**
+   * Decode raw image bytes (JPEG, PNG, etc.) into a drawable for `ctx.drawImage()`.
+   * Browser: creates Blob + createImageBitmap.
+   * Node: @scribe.js/canvas's loadImage which accepts a Buffer / Uint8Array.
+   * @param {Uint8Array} data - Raw image bytes
+   */
+  static createImageBitmapFromData = async (data) => {
+    if (typeof process !== 'undefined') {
+      const CanvasNode = ca.getCanvasNodeSync();
+      return CanvasNode.loadImage(Buffer.from(data));
+    }
+    return createImageBitmap(new Blob([data]));
+  };
+
+  /**
+   * Create a drawable from an ImageData object.
+   * Browser: createImageBitmap(imageData).
+   * Node: putImageData onto a fresh Canvas — @scribe.js/canvas drawImage
+   * accepts Canvas directly so we can return the canvas itself.
+   * @param {ImageData} imgData
+   */
+  static createImageBitmapFromImageData = async (imgData) => {
+    // Chrome's createImageBitmap(imgData) is slower than wrapping the ImageData through a canvas first,
+    // so never call it on the ImageData directly.
+    const canvas = ca.makeCanvas(imgData.width, imgData.height);
+    canvas.getContext('2d').putImageData(imgData, 0, 0);
+    return typeof process !== 'undefined' ? canvas : createImageBitmap(canvas);
+  };
+
+  /**
+   * Create a drawable from a canvas (snapshot).
+   * Browser: createImageBitmap(canvas).
+   * Node: pass through — @scribe.js/canvas drawImage accepts Canvas directly.
+   * @param {*} canvas
+   */
+  static createImageBitmapFromCanvas = async (canvas) => {
+    if (typeof process !== 'undefined') return canvas;
+    return createImageBitmap(canvas);
+  };
+
+  /**
+   * Handles various image formats, always returns something drawable.
    *
-   * @param {string|ImageBitmap|Promise<string>|Promise<ImageBitmap>} img
-   * @returns {Promise<ImageBitmap>}
+   * @param {string|*|Promise<string>|Promise<*>} img
    */
   static getImageBitmap = async (img) => {
     img = await img;
@@ -47,50 +119,90 @@ export class ca {
     if (img === null) throw new Error('Input is null');
 
     if (typeof img === 'string') {
-      if (typeof process === 'undefined') {
-        const imgBlob = imageStrToBlob(img);
-        const imgBit = await createImageBitmap(imgBlob);
-        return imgBit;
+      if (typeof process !== 'undefined') {
+        const CanvasNode = await ca.getCanvasNode();
+        return CanvasNode.loadImage(Buffer.from(base64ToBytes(img)));
       }
-
-      const imgData = new Uint8Array(atob(img.split(',')[1])
-        .split('')
-        .map((c) => c.charCodeAt(0)));
-
-      const canvasKit = await ca.getCanvasKit();
-
-      const imgBit = await canvasKit.MakeImageFromEncoded(imgData);
-      return imgBit;
+      const imgBlob = imageStrToBlob(img);
+      return createImageBitmap(imgBlob);
     }
-
-    // In Node.js the input is assumed to be already compatible with the `canvas.drawImage` method.
-    // Additionally, `ImageBitmap` does not exist within the Node canvas package.
-    // Second condition exists for type detection purposes.
-    if (!(typeof process === 'undefined') && (typeof img !== 'string') && (typeof img !== 'number')) return img;
 
     return img;
   };
 
-  static dummyCanvasPromise = ca.createCanvas(1, 1);
+  /**
+   * Composite key `${fontFaceName}:${fontFaceStyle}:${fontFaceWeight}` →
+   * `{ fontKey, fontFaceName }`.
+   * @type {Map<string, {fontKey: *, fontFaceName: string}>|null}
+   */
+  static _registeredFonts = null;
 
   /**
+   * Register a font from raw bytes. Callers must pass stable family names
+   * for the same bytes (embedded: `_pdf_d${docId}_f${fontObjNum}` via
+   * `pdfFontFamilyName`; substitutes: `_scribe_*`) to avoid re-registration.
    *
    * @param {FontContainerFont} fontObj
    */
   static registerFontObj = async (fontObj) => {
-    if (typeof process === 'undefined') {
-      throw new Error('registerFontObj is only available in Node.js');
-    } else {
-      const dummyCanvas = await ca.dummyCanvasPromise;
-
-      const fs = await import('node:fs');
-      const fontBuffer = typeof fontObj.src === 'string' ? fs.readFileSync(fontObj.src) : fontObj.src;
-
-      dummyCanvas.loadFont(fontBuffer, {
-        family: fontObj.fontFaceName,
+    if (typeof process !== 'undefined') {
+      const CanvasNode = await ca.getCanvasNode();
+      if (!ca._registeredFonts) ca._registeredFonts = new Map();
+      const dedupKey = `${fontObj.fontFaceName}:${fontObj.fontFaceStyle}:${fontObj.fontFaceWeight}`;
+      if (ca._registeredFonts.has(dedupKey)) return;
+      const fontBuffer = typeof fontObj.src === 'string'
+        ? (await import('node:fs')).readFileSync(fontObj.src)
+        : Buffer.from(fontObj.src);
+      const weight = fontObj.fontFaceWeight === 'bold' ? 700 : 400;
+      const fontKey = CanvasNode.GlobalFonts.register(fontBuffer, fontObj.fontFaceName, {
         style: fontObj.fontFaceStyle,
-        weight: fontObj.fontFaceWeight,
+        weight,
       });
+      ca._registeredFonts.set(dedupKey, { fontKey, fontFaceName: fontObj.fontFaceName });
+    }
+  };
+
+  /**
+   * Unregister every font scoped to the given owning document id.
+   * Matches the two docId-namespaced naming schemes the project uses: optimized fonts named
+   * `<family> Opt d${docId}` and embedded PDF fonts prefixed `_pdf_d${docId}_`.
+   * Process-global `_scribe_*` substitute aliases and other docs' fonts are left untouched.
+   * @param {number} docId
+   */
+  static unregisterFontsForDoc = (docId) => {
+    const optSuffix = ` Opt d${docId}`;
+    const pdfPrefix = `_pdf_d${docId}_`;
+    ca.unregisterFontsMatching((name) => name.endsWith(optSuffix) || name.startsWith(pdfPrefix));
+  };
+
+  /**
+   * Bulk-unregister every font whose family name matches `predicate`.
+   * `_scribe_*` substitute aliases are process-global; callers should
+   * scope their predicate so those are not removed.
+   * Prefer `unregisterFontsForDoc` for the common "release a doc's fonts" case.
+   *
+   * @param {(name: string) => boolean} predicate - receives the font family
+   *   name, i.e. the `fontFaceName` portion of the composite dedup key.
+   */
+  static unregisterFontsMatching = (predicate) => {
+    if (typeof process !== 'undefined') {
+      if (!ca._registeredFonts) return;
+      const toRemove = [];
+      for (const [dedupKey, value] of ca._registeredFonts.entries()) {
+        if (predicate(value.fontFaceName)) toRemove.push(dedupKey);
+      }
+      if (toRemove.length === 0) return;
+      const CanvasNode = ca.getCanvasNodeSync();
+      const keys = [];
+      for (const dedupKey of toRemove) {
+        const v = ca._registeredFonts.get(dedupKey);
+        if (v && v.fontKey) keys.push(v.fontKey);
+        ca._registeredFonts.delete(dedupKey);
+      }
+      if (keys.length > 0) CanvasNode.GlobalFonts.removeBatch(keys);
+      if (typeof CanvasNode.GlobalFonts.clearRetired === 'function') {
+        CanvasNode.GlobalFonts.clearRetired();
+      }
     }
   };
 }

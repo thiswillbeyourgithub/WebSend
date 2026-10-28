@@ -1,102 +1,155 @@
-import { inputData, opt } from './containers/app.js';
-import { ocrAll, ocrAllRaw } from './containers/dataContainer.js';
-import { ImageCache } from './containers/imageContainer.js';
-import { convertOCR } from './recognizeConvert.js';
+import { scribeDocDefaults } from './containers/scribeDocDefaults.js';
+import { loadBuiltInFontsRaw, loadChiSimFont } from './fontContainerMain.js';
+import { addCircularRefsDataTables } from './objects/layoutObjects.js';
+import { determinePdfType, applyDocParagraphLayout, promoteContinuationTables } from './pdf/parsePdfDoc.js';
+import { assignPageLineNums } from './import/assignPageLineNums.js';
+import { computeRequiresOCR, hasBrokenFontRun } from './pdf/ocrPageSelection.js';
+import { findXrefOffset, parseXref, getPageObjects } from './pdf/parsePdfUtils.js';
+import { ObjectCache } from './pdf/objectCache.js';
+
+/** @typedef {import('./containers/scribeDoc.js').ScribeDoc} ScribeDoc */
 
 /**
- * Extract raw text content from currently loaded PDF.
- * Reports whether PDF is text-native, contains invisible OCR text, or is image-only.
+ * Extract and parse text from this document's loaded PDF.
+ * @param {ScribeDoc} doc
+ * @param {Object} [options]
+ * @param {typeof scribeDocDefaults.usePDFText} [options.usePDFText]
+ *    How to use the extracted native/OCR text. Defaults to `scribeDocDefaults.usePDFText`.
+ * @param {boolean} [options.keepPDFTextAlways]
+ *    Always convert and retain the PDF text even if it would otherwise be discarded.
+ *    Defaults to `scribeDocDefaults.keepPDFTextAlways`.
+ * @param {boolean} [options.supplemental]
+ *    Another source already owns the active text layer, so the parsed text is retained beside it rather than replacing it.
  */
-const extractInternalPDFTextRaw = async () => {
-  const muPDFScheduler = await ImageCache.getMuPDFScheduler();
+export async function extractInternalPDFText(doc, options = {}) {
+  if (!doc.images.pdfData) throw new Error('No PDF data loaded');
 
-  const pdfContentStats = {
-    /** Total number of letters in the source PDF. */
-    letterCountTotal: 0,
-    /** Total number of visible letters in the source PDF. */
-    letterCountVis: 0,
-    /** Total number of pages with 100+ letters in the source PDF. */
-    pageCountTotalText: 0,
-    /** Total number of pages with 100+ visible letters in the source PDF. */
-    pageCountVisText: 0,
+  const usePDFText = options.usePDFText ?? scribeDocDefaults.usePDFText;
+  const keepPDFTextAlways = options.keepPDFTextAlways ?? scribeDocDefaults.keepPDFTextAlways;
+  const supplemental = options.supplemental ?? false;
+
+  const pdfScheduler = await doc.images.getPdfScheduler();
+  const pageCount = doc.images.pageCount;
+
+  const pageDPI = doc.images.pdfDims300.map((x) => 300 * Math.min(x.width, 3500) / x.width);
+  // Dispatch parse jobs in a rolling window rather than staging every page at once: the scheduler runs same-tier jobs FIFO,
+  // so a fully staged backlog would starve every render queued behind it (e.g. thumbnails during a deferred import) until the last page parses.
+  // The window is sized to keep all workers saturated while still letting other jobs interleave.
+  const workerCount = pdfScheduler.workers?.length || 1;
+  /** @type {Array<Awaited<ReturnType<typeof pdfScheduler.parsePdfPage>>>} */
+  const pageResults = new Array(pageCount);
+  let nextPage = 0;
+  const pump = async () => {
+    while (nextPage < pageCount) {
+      const i = nextPage++;
+      pageResults[i] = await pdfScheduler.parsePdfPage({ pageIndex: i, dpi: pageDPI[i] });
+    }
   };
+  await Promise.all(Array.from({ length: Math.min(Math.max(workerCount * 2, 4), pageCount || 1) }, pump));
 
-  const stextArr = /** @type {Array<string>} */ ([]);
-  const pageDPI = ImageCache.pdfDims300.map((x) => 300 * Math.min(x.width, 3500) / x.width);
-  const resArr = pageDPI.map(async (x, i) => {
-    // While using `pageTextJSON` would save some parsing, unfortunately that format only includes line-level granularity.
-    // The XML format is the only built-in mupdf format that includes character-level granularity.
-    const res = await muPDFScheduler.pageText({
-      page: i + 1, dpi: x, format: 'xml', calcStats: true,
-    });
-    pdfContentStats.letterCountTotal += res.letterCountTotal;
-    pdfContentStats.letterCountVis += res.letterCountVis;
-    if (res.letterCountTotal >= 100) pdfContentStats.pageCountTotalText++;
-    if (res.letterCountVis >= 100) pdfContentStats.pageCountVisText++;
-    stextArr[i] = res.content;
-  });
-  await Promise.all(resArr);
+  doc.inputData.pageStats = pageResults.map((r) => r.pageStats || null);
 
-  /** @type {"image" | "text" | "ocr"} */
-  let type = 'image';
+  doc.inputData.requiresOCR = computeRequiresOCR(doc.inputData.pageStats);
 
-  // Determine whether the PDF is text-native, image-only, or image + OCR.
-  {
-    // The PDF is considered text-native if:
-    // (1) The total number of visible letters is at least 100 per page on average.
-    // (2) The total number of visible letters is at least 90% of the total number of letters.
-    // (3) The total number of pages with 100+ visible letters is at least half of the total number of pages.
-    if (pdfContentStats.letterCountTotal >= ImageCache.pageCount * 100
-      && pdfContentStats.letterCountVis >= pdfContentStats.letterCountTotal * 0.9
-      && pdfContentStats.pageCountVisText >= ImageCache.pageCount / 2) {
-      type = 'text';
-      // The PDF is considered ocr-native if:
-      // (1) The total number of letters is at least 100 per page on average.
-      // (2) The total number of letters is at least half of the total number of letters.
-    } else if (pdfContentStats.letterCountTotal >= ImageCache.pageCount * 100
-      && pdfContentStats.pageCountTotalText >= ImageCache.pageCount / 2) {
-      type = 'ocr';
-      // Otherwise, the PDF is considered image-native.
-      // This includes both literally image-only PDFs, as well as PDFs that have invalid encodings or other issues that prevent valid text extraction.
-    } else {
-      type = 'image';
+  const { type } = determinePdfType(pageResults.map((r) => r.pageStats), pageCount);
+  doc.inputData.pdfType = type;
+
+  // Restored .scribe annotations may embed page-edit remaps and user deletions a fresh lift cannot reflect, so re-merging would duplicate kept entries and resurrect deleted ones.
+  if (!doc.annotations.restored) {
+    // The same widget object can be listed on several pages, but it is one field.
+    const seenFieldRefs = new Set();
+    for (let i = 0; i < pageCount; i++) {
+      const parsed = (pageResults[i].annotations || []).filter((a) => {
+        if (a.type !== 'field' || a.srcRef == null) return true;
+        if (seenFieldRefs.has(a.srcRef)) return false;
+        seenFieldRefs.add(a.srcRef);
+        return true;
+      });
+      const existing = doc.annotations.pages[i];
+      // Merge rather than overwrite: the user may have added annotations (e.g. a highlight) while the deferred extraction was in flight.
+      // Parsed annotations come first, matching document order.
+      doc.annotations.pages[i] = existing && existing.length ? [...parsed, ...existing] : parsed;
     }
   }
 
-  return { contentRaw: stextArr, content: /** @type {?Array<OcrPage>} */ (null), type };
-};
+  const extractPDFTextNative = usePDFText.native.main || usePDFText.native.supp;
+  const extractPDFTextOCR = usePDFText.ocr.main || usePDFText.ocr.supp;
 
-/**
- * Extract and parse text from currently loaded PDF.
- */
-export const extractInternalPDFText = async () => {
-  const extractPDFTextNative = opt.usePDFText.native.main || opt.usePDFText.native.supp;
-  const extractPDFTextOCR = opt.usePDFText.ocr.main || opt.usePDFText.ocr.supp;
+  /** @type {{ content: ?Array<OcrPage>, type: string }} */
+  const res = { content: null, type };
 
-  const res = await extractInternalPDFTextRaw();
-
-  inputData.pdfType = res.type;
-  ocrAllRaw.pdf = res.contentRaw;
-
-  if (!opt.keepPDFTextAlways) {
-    if (!extractPDFTextOCR && res.type === 'ocr') return res;
-
-    if (!extractPDFTextNative && res.type === 'text') return res;
+  if (!keepPDFTextAlways) {
+    if (!extractPDFTextOCR && type === 'ocr') return res;
+    if (!extractPDFTextNative && type === 'text') return res;
   }
 
-  ocrAll.pdf = Array(ImageCache.pageCount);
+  doc.ocr.pdf = pageResults.map((result) => result.pageObj);
 
-  const isMainData = (res.type === 'text' && opt.usePDFText.native.main)
-    || (res.type === 'ocr' && opt.usePDFText.ocr.main);
+  // An edited session carries updated entries a fresh parse cannot know about, so the restored ones win.
+  for (let i = 0; i < pageCount; i++) {
+    doc.nativeText.pages[i] = { ...(pageResults[i].nativeText || {}), ...(doc.nativeText.pages[i] || {}) };
+    /** @type {PageFillShapes} */
+    const shapes = {
+      squares: pageResults[i].fillSquares,
+      marks: pageResults[i].fillMarks,
+      marksOverflow: pageResults[i].fillMarksOverflow,
+      images: pageResults[i].fillImages,
+      paths: pageResults[i].fillPaths,
+      pathsIneligible: pageResults[i].fillPathsIneligible,
+      glyphBoxes: pageResults[i].fillGlyphBoxes,
+    };
+    doc.fillShapes.pages[i] = (shapes.squares?.length || shapes.marks?.length || shapes.images?.length
+      || shapes.paths?.length || shapes.pathsIneligible || shapes.glyphBoxes?.length) ? shapes : null;
+  }
+
+  // Overwrites the per-page assignParagraphs result the workers assigned: no worker sees the whole document.
+  try {
+    const arr = doc.images.pdfData instanceof Uint8Array ? doc.images.pdfData : new Uint8Array(doc.images.pdfData);
+    const objCache = new ObjectCache(arr, parseXref(arr, findXrefOffset(arr)));
+    const rawPages = getPageObjects(objCache);
+    // Passing whole results would also hand over `dataTablePage`, which this path has never fed to the table-region pass.
+    applyDocParagraphLayout(objCache, arr, rawPages, pageResults.map(({ pageObj, wordSignals }) => ({ pageObj, wordSignals })), type);
+  } catch { /* */ }
+
+  assignPageLineNums(doc.ocr.pdf);
+
+  doc.tableLinkSuggestions = promoteContinuationTables(pageResults);
+
+  const tablePages = pageResults.map((result) => result.dataTablePage);
+  addCircularRefsDataTables(tablePages);
+  for (let i = 0; i < tablePages.length; i++) {
+    // An accompanying OCR file may carry its own tables, which the parse must not overwrite.
+    if (Object.keys(doc.layoutDataTables.pages[i]?.tables || {}).length === 0) doc.layoutDataTables.pages[i] = tablePages[i];
+  }
+
+  const fontPromiseArr = [loadBuiltInFontsRaw()];
+  if (pageResults.some((r) => r.langSet && r.langSet.has('chi_sim'))) {
+    fontPromiseArr.push(loadChiSimFont());
+  }
+  await Promise.all(fontPromiseArr);
+
+  // An image-based verdict can mean too little text rather than unreadable text.
+  const stats = doc.inputData.pageStats || [];
+  const parsedLayerTrusted = type === 'image'
+    && stats.some((s) => s && (s.printableVis || 0) > 0)
+    && stats.every((s) => !s || ((s.invisibleTextChars || 0) === 0 && (s.control || 0) === 0 && !hasBrokenFontRun(s)));
+  const isMainData = !supplemental
+    && ((type === 'text' && usePDFText.native.main)
+      || (type === 'ocr' && usePDFText.ocr.main)
+      || (parsedLayerTrusted && usePDFText.native.main));
+
+  for (let n = 0; n < doc.ocr.pdf.length; n++) {
+    if (isMainData && doc.ocr.pdf[n] && doc.pageMetrics[n]) {
+      doc.pageMetrics[n].angle = doc.ocr.pdf[n].angle;
+    }
+    doc.inputData.xmlMode[n] = true;
+  }
 
   if (isMainData) {
-    ocrAllRaw.active = ocrAllRaw.pdf;
-    ocrAll.active = ocrAll.pdf;
+    doc.ocr.active = doc.ocr.pdf;
   }
 
-  await convertOCR(ocrAllRaw.pdf, isMainData, 'stext', 'pdf', false);
-
-  res.content = ocrAll.pdf;
+  res.content = doc.ocr.pdf;
 
   return res;
-};
+}

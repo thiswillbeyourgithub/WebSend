@@ -249,7 +249,7 @@ The protections listed in [Security Features](#security-features) below address 
 - **Receiver collections**: photos are auto-grouped per sender batch and shown as "Document N" sections, supporting drag-and-drop reorder and per-collection PDF/ZIP export
 - **Document cropping**: perspective-corrected 4-corner crop tool, shared between sender and receiver via a single `crop-modal.js` module so the logic isn't duplicated. On both sides the handles auto-position on the detected document the first time an image is cropped, and restore the previous crop position on a re-crop; cropping is non-destructive (the handles can be dragged back out to undo)
 - **Export modal**: download received images as PDF or ZIP, with optional B&W (Otsu thresholding) and **OCR** producing a searchable PDF (scribe.js + Tesseract WASM). OCR runs in a background queue as photos arrive (status badge per card), then assembles cached results at export time. OCR uses LSTM-only mode and downscales large images to 2000px for recognition to keep it usable in a browser, while preserving original image quality in the final PDF
-- **Per-PDF actions**: when an incoming file is a PDF, dedicated buttons let you re-export it as a ZIP of page images or as a re-OCR'd searchable PDF (rendered with bundled MuPDF)
+- **Per-PDF actions**: when an incoming file is a PDF, dedicated buttons let you re-export it as a ZIP of page images or as a re-OCR'd searchable PDF (rendered with scribe.js's bundled PDF renderer)
 - **PDF export**: hand-crafted minimal PDF 1.4 generator, no dependencies (one page per JPEG, page sized to image)
 - **ZIP export**: client-zip (preloaded in background)
 - **B&W document mode**: Otsu's automatic binarization for crisp scanned documents
@@ -444,7 +444,7 @@ sudo ufw-docker allow coturn 49161/udp
 - **Web Crypto API** -- ECDH key exchange + AES-256-GCM encryption
 - **WebRTC** -- peer-to-peer data channels
 - **jsQR / qrcode.js** -- QR code scanning and generation
-- **scribe.js-ocr / Tesseract WASM / MuPDF** -- OCR and PDF rendering, all vendored
+- **scribe.js-ocr / Tesseract WASM** -- OCR and PDF rendering, all vendored
 - **client-zip** -- streaming ZIP generation in the browser
 - **eruda** -- on-demand mobile devtools console (loaded only via `?debug=1` or DEV badge)
 - **coturn** -- optional TURN relay server (can reuse an existing instance)
@@ -481,7 +481,7 @@ All client-side libraries are vendored directly in the repository (no CDN at run
 | [qrcode.js](https://github.com/soldair/node-qrcode) | 1.5.4 | MIT | QR code generation |
 | [jsQR](https://github.com/cozmo/jsQR) | 1.4.0 | Apache-2.0 | QR code scanning |
 | [client-zip](https://github.com/Touffy/client-zip) | 2.5.1 | MIT | ZIP export |
-| [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (preloaded in background; bundles Tesseract WASM and MuPDF) |
+| [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.17.0 | AGPL-3.0 | OCR engine (preloaded in background; bundles Tesseract WASM and its own PDF renderer) |
 | [Tesseract trained data](https://github.com/tesseract-ocr/tessdata) | — | Apache-2.0 | `eng` + `fra` language models, served locally |
 | [eruda](https://github.com/liriliri/eruda) | 3.4.3 | MIT | Mobile devtools console (on-demand) |
 | [Express.js](https://expressjs.com) | ^5.0.0 | MIT | Server-side HTTP framework |

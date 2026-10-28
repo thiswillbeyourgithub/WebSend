@@ -1,5 +1,3 @@
-import { opt } from '../containers/app.js';
-import { pageMetricsAll } from '../containers/dataContainer.js';
 import { assignParagraphs } from '../utils/reflowPars.js';
 
 /**
@@ -7,35 +5,47 @@ import { assignParagraphs } from '../utils/reflowPars.js';
  *
  * @param {Object} params
  * @param {Array<OcrPage>} params.ocrCurrent -
+ * @param {?Array<number>} [params.pageArr=null] - Array of 0-based page indices to include. Overrides minpage/maxpage when provided.
  * @param {number} [params.minpage=0] - The first page to include in the document.
  * @param {number} [params.maxpage=-1] - The last page to include in the document.
  * @param {boolean} [params.reflowText=false] - Remove line breaks within what appears to be the same paragraph.
  * @param {?Array<string>} [params.wordIds=null] - An array of word IDs to include in the document.
- *    If omitted, all words are included.
+ * @param {?Array<PageMetrics>} [params.pageMetrics=null] - Page metrics for the document being exported.
+ *   Required when reflow or preserveSpacing is enabled. If omitted, all words are included.
  * @param {boolean} [params.lineNumbers=false] - Prepend `page:line` numbers to each line (e.g. `0:5  text`).
  *    When enabled, reflowText is ignored.
+ * @param {boolean} [params.preserveSpacing=false] - Pad words with spaces based on their horizontal
+ *    position in the document, preserving column alignment. Useful for table extraction.
+ * @param {?import('../containers/scribeDoc.js').ScribeDoc} [params.doc=null] - Owning document.
+ *    Required when `params.doc.progressHandler` should receive per-page export events.
  */
 export function writeText({
-  ocrCurrent, minpage = 0, maxpage = -1, reflowText = false, wordIds = null, lineNumbers = false,
+  ocrCurrent, pageArr = null, minpage = 0, maxpage = -1, reflowText = false,
+  wordIds = null, lineNumbers = false, preserveSpacing = false, pageMetrics = null, doc = null,
 }) {
   let textStr = '';
 
-  if (maxpage === -1) maxpage = ocrCurrent.length - 1;
+  if (!pageArr) {
+    if (maxpage === -1) maxpage = ocrCurrent.length - 1;
+    pageArr = [];
+    for (let i = minpage; i <= maxpage; i++) pageArr.push(i);
+  }
 
   let newLine = false;
 
   // lineNumbers mode is incompatible with reflowText
-  const doReflow = reflowText && !lineNumbers;
+  const doReflow = reflowText && !lineNumbers && !preserveSpacing;
 
-  for (let g = minpage; g <= maxpage; g++) {
+  // Character width of the full page when preserveSpacing is on.
+  const lineWidth = 120;
+
+  for (const g of pageArr) {
     if (!ocrCurrent[g] || ocrCurrent[g].lines.length === 0) continue;
 
     const pageObj = ocrCurrent[g];
+    const pageWidth = preserveSpacing && pageMetrics[g] ? pageMetrics[g].dims.width : 0;
 
-    if (doReflow && (!pageObj.textSource || !['textract', 'abbyy', 'google_vision', 'azure_doc_intel', 'docx'].includes(pageObj.textSource))) {
-      const angle = pageMetricsAll[g].angle || 0;
-      assignParagraphs(pageObj, angle);
-    }
+    if (doReflow && pageObj.pars.length === 0) assignParagraphs(pageObj, pageMetrics[g].angle || 0);
 
     let parCurrent = pageObj.lines[0].par;
 
@@ -49,6 +59,9 @@ export function writeText({
         newLine = true;
       }
 
+      let currentPos = 0;
+      const prefixLen = lineNumbers ? `${g}:${h}  `.length : 0;
+
       for (let i = 0; i < lineObj.words.length; i++) {
         const wordObj = lineObj.words[i];
         if (!wordObj) continue;
@@ -56,10 +69,23 @@ export function writeText({
         if (wordIds && !wordIds.includes(wordObj.id)) continue;
 
         if (newLine) {
-          textStr = `${textStr}\n`;
+          textStr += '\n';
           if (lineNumbers) textStr += `${g}:${h}  `;
+          currentPos = prefixLen;
+        } else if (preserveSpacing && pageWidth > 0) {
+          const targetPos = prefixLen + Math.round(wordObj.bbox.left / pageWidth * lineWidth);
+          const padding = Math.max(1, targetPos - currentPos);
+          textStr += ' '.repeat(padding);
+          currentPos = targetPos + wordObj.text.length;
         } else if (h > 0 || g > 0 || i > 0) {
-          textStr = `${textStr} `;
+          textStr += ' ';
+        }
+
+        if (newLine && preserveSpacing && pageWidth > 0) {
+          const targetPos = prefixLen + Math.round(wordObj.bbox.left / pageWidth * lineWidth);
+          const padding = Math.max(0, targetPos - currentPos);
+          textStr += ' '.repeat(padding);
+          currentPos = targetPos + wordObj.text.length;
         }
 
         newLine = false;
@@ -67,7 +93,7 @@ export function writeText({
         textStr += wordObj.text;
       }
     }
-    opt.progressHandler({ n: g, type: 'export', info: { } });
+    doc?.progressHandler({ n: g, type: 'export', info: { } });
   }
 
   return textStr;

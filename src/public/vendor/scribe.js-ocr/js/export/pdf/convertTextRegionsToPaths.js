@@ -1,0 +1,3006 @@
+import {
+  getPageContentStreams, findFormXObjects, parseHiddenOCMCNames, isFormOCHidden,
+} from '../../pdf/parsePdfUtils.js';
+import { parsePageImages, parseImageObject } from '../../pdf/parsePdfImages.js';
+import { _imageInfoToBitmap, _buildPngDataUrl } from '../../pdf/renderPdfPage.js';
+import { createImageXObjectPng } from './writePdfImages.js';
+import { ca } from '../../canvasAdapter.js';
+import { base64ToBytes } from '../../utils/imageUtils.js';
+import {
+  bytesToLatin1, extractDict,
+  resolveNumArray, resolveNumValue, parseDictEntries, matMul, decodeTextCodes, mergeResources,
+} from '../../pdf/pdfPrimitives.js';
+import {
+  tokenizeContentStream, serializeContentToken,
+} from '../../pdf/contentStream.js';
+import { parsePageFonts } from '../../pdf/fonts/parsePdfFonts.js';
+import {
+  glyphEmBoxHitsRects, imageDrawMatchesDelete, pathDrawMatchesDelete,
+} from '../../pdf/pageGeometry.js';
+import { aglLookup } from '../../pdf/fonts/standardEncodings.js';
+import { encodeStreamObject } from './writePdfStreams.js';
+import { applyTextPatchRecords, textPatchesTarget } from '../../pdf/textPatch.js';
+import opentype from '../../font-parser/src/index.js';
+import { standardNames } from '../../font-parser/src/encoding.js';
+import { parseCFFSummary } from '../../font-parser/src/cff.js';
+import { loadBuiltInFontsRaw, loadDingbatsFont, loadSymbolFont } from '../../fontContainerMain.js';
+import { GlobalFonts } from '../../containers/fontContainer.js';
+import {
+  base14ToBuiltInFont, cssFamilyToBuiltInFont, genericToBuiltInFont, cssGenericForFontObj,
+} from '../../pdf/fonts/base14Substitution.js';
+import { standardFontToCSS } from '../../pdf/fonts/standardFontMetrics.js';
+
+/** @typedef {import('../../font-parser/src/path.js').PathCommand} PathCommand */
+
+/**
+ * Return the loaded supplemental opentype font backing a Base14 symbol family, or null.
+ * The renderer substitutes ZapfDingbats with the built-in Dingbats face and Symbol with StandardSymbolsPS.
+ * @param {string} family
+ * @returns {opentypeFont | null}
+ */
+function builtInSuppFontFor(family) {
+  if (family === 'Dingbats') return GlobalFonts.supp?.dingbats?.opentype || null;
+  if (family === 'StandardSymbolsPS') return GlobalFonts.supp?.symbol?.opentype || null;
+  return null;
+}
+
+/**
+ * Preload the built-in symbol substitute faces a set of fonts will need.
+ * The glyph resolver is synchronous, so it sees only faces already loaded into `GlobalFonts.supp`.
+ * @param {Iterable<any>} fontInfos
+ */
+async function preloadSymbolSubstituteFonts(fontInfos) {
+  let needDingbats = false;
+  let needSymbol = false;
+  for (const fi of fontInfos) {
+    if (!fi || (fi.type0?.fontFile || fi.type1?.fontFile)) continue; // embedded: not substituted
+    if (!(fi.type1 || fi.type0)) continue;
+    const sub = base14ToBuiltInFont(fi.baseName, { bold: !!fi.bold, italic: !!fi.italic });
+    if (sub?.family === 'Dingbats') needDingbats = true;
+    else if (sub?.family === 'StandardSymbolsPS') needSymbol = true;
+  }
+  const jobs = [];
+  if (needDingbats && !GlobalFonts.supp?.dingbats) jobs.push(loadDingbatsFont().catch(() => {}));
+  if (needSymbol && !GlobalFonts.supp?.symbol) jobs.push(loadSymbolFont().catch(() => {}));
+  if (jobs.length > 0) await Promise.all(jobs);
+}
+
+// Ops that change how queued converted glyphs would paint (colour/alpha via gs, dash, miter, join/cap).
+// Arriving inside a text object with converts pending, they force a bounce-flush so the glyphs keep their show-time paint state.
+// `w` is exempt: queued stroke widths are carried per entry.
+const PAINT_STATE_OPS = new Set(['g', 'G', 'rg', 'RG', 'k', 'K', 'sc', 'SC', 'scn', 'SCN', 'cs', 'CS', 'gs', 'd', 'M', 'j', 'J']);
+
+// Path construction and paint ops, used by vector-path redaction to catch characters drawn directly as vector paths.
+const PATH_CONSTRUCTION_OPS = new Set(['m', 'l', 'c', 'v', 'y', 're', 'h']);
+const PATH_PAINT_OPS = new Set(['S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'n']);
+
+const PDF_PATH_DECIMALS = 3;
+// Transformation-matrix components need more decimals than path coordinates.
+// A glyph `cm` inside a 0.001-milliscaled form has scale ~0.0154, and 3-decimal rounding (0.015)
+// is a 2.5% error that the renderer's accumulated relative-`cm` chain drifts across a converted line.
+const PDF_MATRIX_DECIMALS = 8;
+
+/**
+ * Format a number for PDF output, stripping trailing zeros.
+ * @param {number} n
+ * @param {number} [decimals] Fixed decimal places (default `PDF_PATH_DECIMALS`).
+ */
+function fmt(n, decimals = PDF_PATH_DECIMALS) {
+  if (!Number.isFinite(n)) return '0';
+  if (Number.isInteger(n)) return String(n);
+  const r = n.toFixed(decimals);
+  return r.replace(/\.?0+$/, '');
+}
+
+/**
+ * Format a value with no decimal places.
+ *
+ * @param {number|undefined} n
+ */
+function fmtInt(n) {
+  if (n == null || !Number.isFinite(n)) return '0';
+  return String(Math.round(n));
+}
+
+/**
+ * Detect font file type from the first few bytes.
+ * @param {Uint8Array} fontFile
+ * @returns {'truetype' | 'cff' | 'type1' | null}
+ */
+function detectFontFileType(fontFile) {
+  if (!fontFile || fontFile.length < 4) return null;
+  const b0 = fontFile[0];
+  const b1 = fontFile[1];
+  const b2 = fontFile[2];
+  const b3 = fontFile[3];
+  if (b0 === 0x00 && b1 === 0x01 && b2 === 0x00 && b3 === 0x00) return 'truetype';
+  if (b0 === 0x74 && b1 === 0x72 && b2 === 0x75 && b3 === 0x65) return 'truetype';
+  if (b0 === 0x4F && b1 === 0x54 && b2 === 0x54 && b3 === 0x4F) return 'cff';
+  if (b0 === 0x25 && b1 === 0x21) return 'type1';
+  if (b0 === 0x80) return 'type1';
+  if (b0 === 0x01) return 'cff';
+  return null;
+}
+
+/**
+ * Glyph outlines + metrics for one embedded or substitute font.
+ *
+ * @typedef {{
+ *   glyphs: any,
+ *   unitsPerEm: number,
+ *   fontType: string,
+ *   fontMatrix?: number[],
+ *   cmap?: { glyphIndexMap?: Record<number, number>, byteToGlyphIndex?: number[], platformID?: number, encodingID?: number } | null,
+ *   nameToGid?: Map<string, number> | null,
+ *   unicodeToGid?: Map<number, number> | null,
+ *   cffCharCodeToGid?: Map<number, number> | null,
+ *   cffCidToGid?: Map<number, number> | null,
+ *   substituteFont?: any,
+ * }} LoadedFontOutlines
+ */
+
+/**
+ * Load a glyph set + units-per-em + cmap glyph-index-map for an embedded font.
+ * Returns null when the font cannot be loaded.
+ *
+ * @param {Uint8Array} fontFile
+ * @returns {LoadedFontOutlines | null}
+ */
+export function loadGlyphsForOutlines(fontFile) {
+  const fontType = detectFontFileType(fontFile);
+  if (fontType === 'truetype') {
+    try {
+      const buf = fontFile.buffer.slice(fontFile.byteOffset, fontFile.byteOffset + fontFile.byteLength);
+      const data = new DataView(buf);
+      const bytes = new Uint8Array(buf);
+      const numTables = data.getUint16(4);
+      /** @type {Record<string, { offset: number, length: number }>} */
+      const dir = {};
+      for (let i = 0; i < numTables; i++) {
+        const off = 12 + i * 16;
+        const tag = String.fromCharCode(bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]);
+        dir[tag.trim()] = { offset: data.getUint32(off + 8), length: data.getUint32(off + 12) };
+      }
+      if (!dir.head || !dir.maxp || !dir.loca || !dir.glyf) return null;
+      const head = opentype.parseHeadTable(data, dir.head.offset);
+      const maxp = opentype.parseMaxpTable(data, dir.maxp.offset);
+      const loca = opentype.parseLocaTable(data, dir.loca.offset, maxp.numGlyphs, head.indexToLocFormat === 0);
+      /** @type {{ unitsPerEm: number, numGlyphs: number, tables: any, glyphs?: any }} */
+      const shell = { unitsPerEm: head.unitsPerEm, numGlyphs: maxp.numGlyphs, tables: {} };
+      shell.glyphs = opentype.parseGlyfTable(data, dir.glyf.offset, loca, shell);
+      let cmap = null;
+      if (dir.cmap) {
+        try {
+          cmap = opentype.parseCmapTable(data, dir.cmap.offset);
+        } catch {
+          cmap = null;
+        }
+      }
+      let nameToGid = null;
+      const postEntry = dir.post;
+      if (postEntry) {
+        try {
+          const post = opentype.parsePostTable(data, postEntry.offset);
+          if (post.glyphNameIndex) {
+            nameToGid = new Map();
+            for (let gid = 0; gid < post.glyphNameIndex.length; gid++) {
+              const nameIdx = post.glyphNameIndex[gid];
+              const name = nameIdx < standardNames.length
+                ? standardNames[nameIdx]
+                : post.names[nameIdx - standardNames.length];
+              if (typeof name === 'string' && name && !nameToGid.has(name)) nameToGid.set(name, gid);
+            }
+          }
+        } catch {
+          nameToGid = null;
+        }
+      }
+      let unicodeToGid = null;
+      if (nameToGid) {
+        unicodeToGid = new Map();
+        for (const [name, gid] of nameToGid) {
+          const uni = aglLookup(name);
+          if (uni && uni.length > 0) {
+            const cp = uni.codePointAt(0);
+            if (cp != null && !unicodeToGid.has(cp)) unicodeToGid.set(cp, gid);
+          }
+        }
+      }
+      const ttUpem = head.unitsPerEm > 0 ? head.unitsPerEm : 1000;
+      return {
+        glyphs: shell.glyphs,
+        unitsPerEm: ttUpem,
+        fontMatrix: [1 / ttUpem, 0, 0, 1 / ttUpem, 0, 0],
+        fontType: 'truetype',
+        cmap,
+        nameToGid,
+        unicodeToGid,
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (fontType === 'cff') {
+    try {
+      const buf = fontFile.buffer.slice(fontFile.byteOffset, fontFile.byteOffset + fontFile.byteLength);
+      const dv = new DataView(buf);
+      /** @type {{tables: any, encoding: any, isCIDFont: boolean, unitsPerEm: number, cffEncoding?: any, glyphs?: any}} */
+      const shell = {
+        tables: {}, encoding: null, isCIDFont: false, unitsPerEm: 1000,
+      };
+      opentype.parseCFFTable(dv, 0, shell);
+      const top = shell.tables.cff?.topDict;
+      const fm = top?.fontMatrix;
+      const fdArr = top?._fdArray;
+      const fdFm = (shell.isCIDFont && fdArr && fdArr.length > 0) ? fdArr[0].fontMatrix : null;
+      const effFm = (fdFm && fdFm[0] > 0 && fdFm[0] < 1) ? fdFm : fm;
+      const upem = effFm && effFm[0] > 0 && effFm[0] < 1 ? Math.round(1 / effFm[0]) : 1000;
+      shell.unitsPerEm = upem;
+      // Italic CFF fonts encode the slant in `fm[2]`, so a uniform `[1/upem 0 0 1/upem 0 0]` diagonal would re-emit them upright.
+      const fontMatrix = (Array.isArray(effFm) && effFm.length === 6)
+        ? effFm.slice() : [1 / upem, 0, 0, 1 / upem, 0, 0];
+      let nameToGid = null;
+      const charset = shell.tables.cff?.charset;
+      if (Array.isArray(charset)) {
+        nameToGid = new Map();
+        for (let gid = 0; gid < charset.length; gid++) {
+          if (charset[gid] && !nameToGid.has(charset[gid])) nameToGid.set(charset[gid], gid);
+        }
+      }
+      // parsePdfFonts skips its StandardEncoding fallback for FontFile3 fonts when /Encoding is absent, leaving charCodeToGlyphName empty.
+      // For format-0/1 encodings, encoding[code] is the encoded-glyph index where 0 = the first non-.notdef glyph, so add 1 to get the GID.
+      let cffCharCodeToGid = null;
+      const cffEnc = shell.cffEncoding;
+      if (cffEnc && cffEnc.encoding && Array.isArray(charset)) {
+        cffCharCodeToGid = new Map();
+        for (let code = 0; code < 256; code++) {
+          const v = cffEnc.encoding[code];
+          if (typeof v === 'number') {
+            cffCharCodeToGid.set(code, v + 1);
+          } else if (typeof v === 'string' && v) {
+            const gid = charset.indexOf(v);
+            if (gid >= 0) cffCharCodeToGid.set(code, gid);
+          }
+        }
+      }
+      // In CID-keyed CFF (CIDFontType0C) the charset holds CIDs, not standard-string indices, so the glyph names built into nameToGid above are wrong.
+      let cffCidToGid = null;
+      if (shell.isCIDFont) {
+        const m = parseCFFSummary(fontFile).cidToGID;
+        if (m && m.size > 0) cffCidToGid = m;
+      }
+      return {
+        glyphs: shell.glyphs,
+        unitsPerEm: upem,
+        fontMatrix,
+        fontType: 'cff',
+        cmap: null,
+        nameToGid,
+        cffCharCodeToGid,
+        cffCidToGid,
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (fontType === 'type1') {
+    try {
+      const parsed = opentype.parseType1Font(fontFile);
+      if (!parsed || !parsed.glyphs || parsed.glyphs.size === 0) return null;
+      const fm = parsed.fontMatrix;
+      if (!fm || fm.length !== 6 || !(fm[0] > 0) || !(fm[3] > 0)) return null;
+      const upem = Math.round(1 / fm[0]);
+      // Italic Type1 fonts encode the slant in `fm[2]`, so a uniform `[1/upem 0 0 1/upem 0 0]` diagonal would render them upright.
+      const fontMatrix = fm.slice();
+      /** @type {Array<any>} */
+      const glyphsArr = [];
+      const nameToGid = new Map();
+      const notdef = parsed.glyphs.get('.notdef') || { path: { commands: [] } };
+      glyphsArr.push(notdef);
+      nameToGid.set('.notdef', 0);
+      for (const [name, glyph] of parsed.glyphs) {
+        if (name === '.notdef') continue;
+        nameToGid.set(name, glyphsArr.length);
+        glyphsArr.push(glyph);
+      }
+      return {
+        glyphs: { get: (/** @type {number} */ i) => glyphsArr[i], length: glyphsArr.length },
+        unitsPerEm: upem,
+        fontMatrix,
+        fontType: 'type1',
+        cmap: null,
+        nameToGid,
+      };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Convert font-parser Path commands (font-unit space, Y up) to a PDF path operator string.
+ *
+ * @param {ReadonlyArray<PathCommand>} commands
+ */
+function pathCommandsToOps(commands) {
+  let out = '';
+  let cx = 0;
+  let cy = 0;
+  let startX = 0;
+  let startY = 0;
+  // Type3 glyph coords can be fractional (< 1), where rounding to integers would destroy the outline.
+  let needsFraction = false;
+  for (let i = 0; i < commands.length && !needsFraction; i++) {
+    const c = commands[i];
+    if (c.type === 'M' || c.type === 'L') {
+      if ((c.x !== 0 && Math.abs(c.x) < 1) || (c.y !== 0 && Math.abs(c.y) < 1)) needsFraction = true;
+    } else if (c.type === 'C') {
+      const vs = [c.x1, c.y1, c.x2, c.y2, c.x, c.y];
+      for (const v of vs) if (v !== 0 && Math.abs(v) < 1) { needsFraction = true; break; }
+    } else if (c.type === 'Q') {
+      const vs = [c.x1, c.y1, c.x, c.y];
+      for (const v of vs) if (v !== 0 && Math.abs(v) < 1) { needsFraction = true; break; }
+    }
+  }
+  const f = needsFraction ? fmt : fmtInt;
+  for (let i = 0; i < commands.length; i++) {
+    const c = commands[i];
+    if (c.type === 'M') {
+      out += `${f(c.x)} ${f(c.y)} m\n`;
+      cx = c.x; cy = c.y;
+      startX = c.x; startY = c.y;
+    } else if (c.type === 'L') {
+      out += `${f(c.x)} ${f(c.y)} l\n`;
+      cx = c.x; cy = c.y;
+    } else if (c.type === 'C') {
+      out += `${f(c.x1)} ${f(c.y1)} ${f(c.x2)} ${f(c.y2)} ${f(c.x)} ${f(c.y)} c\n`;
+      cx = c.x; cy = c.y;
+    } else if (c.type === 'Q') {
+      const c1x = cx + (2 / 3) * (c.x1 - cx);
+      const c1y = cy + (2 / 3) * (c.y1 - cy);
+      const c2x = c.x + (2 / 3) * (c.x1 - c.x);
+      const c2y = c.y + (2 / 3) * (c.y1 - c.y);
+      out += `${f(c1x)} ${f(c1y)} ${f(c2x)} ${f(c2y)} ${f(c.x)} ${f(c.y)} c\n`;
+      cx = c.x; cy = c.y;
+    } else if (c.type === 'Z') {
+      out += 'h\n';
+      cx = startX; cy = startY;
+    }
+  }
+  return out;
+}
+
+/**
+ * True when a text-show operand carries at least one string byte.
+ * @param {{type: string, value: any} | undefined} operand
+ * @returns {boolean}
+ */
+function operandHasBytes(operand) {
+  if (!operand) return false;
+  if (operand.type === 'string' || operand.type === 'hexstring') return operand.value.length > 0;
+  if (operand.type === 'array') {
+    return operand.value.some((/** @type {{type: string, value: any}} */ t) => (t.type === 'string' || t.type === 'hexstring') && t.value.length > 0);
+  }
+  return false;
+}
+
+/**
+ * Flatten a text-show operand into an ordered list of byte-codes and TJ spacers.
+ *
+ * @param {{type: string, value: any}} operand
+ * @param {string} op - 'Tj' | 'TJ' | "'" | '"' (the last two flatten like Tj)
+ * @param {ReadonlyArray<{bytes: number, low: number, high: number}> | null} codespaceRanges
+ * @returns {Array<{type: 'code', value: number, numBytes: number} | {type: 'spacer', value: number}>}
+ */
+function flattenTextOperandTyped(operand, op, codespaceRanges) {
+  /** @type {Array<{type: 'code', value: number, numBytes: number} | {type: 'spacer', value: number}>} */
+  const out = [];
+  const consumeBytes = (bytes) => {
+    for (const { charCode, numBytes } of decodeTextCodes(bytes, codespaceRanges, 1)) {
+      out.push({ type: 'code', value: charCode, numBytes });
+    }
+  };
+  if (op === 'TJ') {
+    if (operand.type !== 'array') return out;
+    for (const elem of operand.value) {
+      if (elem.type === 'number') {
+        out.push({ type: 'spacer', value: elem.value });
+      } else if (elem.type === 'hexstring') {
+        let bytes = '';
+        for (let j = 0; j + 1 < elem.value.length; j += 2) {
+          bytes += String.fromCharCode(parseInt(elem.value.substr(j, 2), 16));
+        }
+        consumeBytes(bytes);
+      } else if (elem.type === 'string') {
+        consumeBytes(elem.value);
+      }
+    }
+  } else if (operand.type === 'hexstring') {
+    let bytes = '';
+    for (let j = 0; j + 1 < operand.value.length; j += 2) {
+      bytes += String.fromCharCode(parseInt(operand.value.substr(j, 2), 16));
+    }
+    consumeBytes(bytes);
+  } else if (operand.type === 'string') {
+    consumeBytes(operand.value);
+  }
+  return out;
+}
+
+/**
+ * Encode a code value back to a PDF hexstring fragment.
+ * @param {number} code
+ * @param {number} numBytes
+ */
+function codeToHex(code, numBytes) {
+  if (numBytes === 1) return (code & 0xFF).toString(16).padStart(2, '0').toUpperCase();
+  return ((code >> 8) & 0xFF).toString(16).padStart(2, '0').toUpperCase()
+    + (code & 0xFF).toString(16).padStart(2, '0').toUpperCase();
+}
+
+/**
+ * Rewrite a page content stream replacing per-glyph text-show operations inside the supplied bboxes with inline outline fills (`q cm cm <ops> f Q`).
+ *
+ * A text object whose every show converted (or carried no string bytes) is removed wholly: no BT/ET, no text state or positioning ops, no spacer TJs.
+ * Text objects that keep any bytes (region miss, gated Tr mode, unresolvable glyph, invisible-text layers) retain the full skeleton so the kept shows stay positioned.
+ *
+ * @param {string} streamText
+ * @param {Map<string, FontBinding>} fontsByTag
+ * @param {ReadonlyArray<ReadonlyArray<number>>} bboxes - Page-relative user-space bboxes [x0,y0,x1,y1]
+ * @param {GlyphResolver} resolver
+ * @param {{ initialCtm?: number[], parentXobjects?: Map<string, number> | null,
+ *   targetFontObjNums?: Set<number> | null,
+ *   initialLineWidth?: number | null, initialDashActive?: boolean, initialMiterLimit?: number | null,
+ *   extGStates?: Map<string, {lw?: number, dash?: boolean, ml?: number}> | null,
+ *   initialTextState?: {tc: number, tw: number, tz: number, tl: number, tr: number, ts: number} | null,
+ *   hiddenOCMCNames?: Set<string> | null, humanReadable?: boolean }} [opts]
+ *   - `initialCtm`: starting CTM (defaults to identity).
+ *     Used when recursing into a Form XObject so the form's content is hit-tested in page user space.
+ *   - `parentXobjects`: in-scope Form XObject names -> objNum, used to identify Do calls that target a Form XObject for recursive conversion.
+ *     Records appear in `formInvocations` on the return value.
+ *   - `targetFontObjNums`: font object numbers whose glyphs are always converted (broken-Type3 fonts), independent of `bboxes`.
+ *   - `initialLineWidth`/`initialDashActive`/`initialMiterLimit`: pen state at stream start.
+ *     Page streams start from the spec defaults (1 / false / 10).
+ *     A recursed form inherits its caller's state as recorded at the Do site, with null meaning unknown (Tr 1/2 shows then stay verbatim).
+ *   - `extGStates`: in-scope /ExtGState name -> stroke-relevant params, applied by `gs` ops.
+ *     An unknown name degrades the pen state to unknown.
+ * @returns {{ ok: true, text: string, changed: boolean,
+ *   usedXobj: Map<string, {fontObjNum: number, glyphIndex: number,
+ *     bbox: {xMin: number, yMin: number, xMax: number, yMax: number},
+ *     formMatrix: number[], pathCommands: Array<any>,
+ *     paintMode: string, evenOdd: boolean}>,
+ *   skipped: Array<{fontObjNum: number, charCode: number, reason: string}>,
+ *   formInvocations: Array<{name: string, formObjNum: number, ctm: number[],
+ *     lw: number | null, dashActive: boolean, ml: number | null,
+ *     textState: {tc: number, tw: number, tz: number, tl: number, tr: number, ts: number}}> }
+ *   | { ok: false, reason: string }}
+ *
+ * @typedef {{ fontObjNum: number, widths: Map<number, number>, defaultWidth: number,
+ *   verticalMode: boolean, codespaceRanges: ReadonlyArray<{bytes: number, low: number, high: number}> | null,
+ *   charCodeToCID: Map<number, number> | null, isType0: boolean, isType3?: boolean }} FontBinding
+ *
+ * @typedef {(arg: { fontObjNum: number, charCode: number }) => { glyphIndex: number, formMatrix: number[],
+ *   pathCommands: Array<any>, bbox: {xMin: number, yMin: number, xMax: number, yMax: number},
+ *   paintMode?: string, evenOdd?: boolean, subAdvanceEm?: number } | { error: string }} GlyphResolver
+ */
+export function rewritePageContentForRegions(streamText, fontsByTag, bboxes, resolver, opts = {}) {
+  const initialCtm = opts.initialCtm || [1, 0, 0, 1, 0, 0];
+  const parentXobjects = opts.parentXobjects || null;
+  const parentImages = opts.parentImages || null;
+  const targetFontObjNums = opts.targetFontObjNums || null;
+  const extGStates = opts.extGStates || null;
+  // A glyph overlapping any redaction rect (page user space) is dropped and replaced by an advance-mimicking spacer, never converted to a path.
+  // Where a glyph also falls inside `bboxes`, redaction wins.
+  const redactBboxes = opts.redactBboxes || null;
+  const redactActive = !!(redactBboxes && redactBboxes.length > 0);
+  const imageDeletes = opts.imageDeletes && opts.imageDeletes.length > 0 ? opts.imageDeletes : null;
+  const pathDeletes = opts.pathDeletes && opts.pathDeletes.length > 0 ? opts.pathDeletes : null;
+  // A text-edit patch targets a Form XObject below this stream, so every placement is aliased and recursed into like a redacted one.
+  const formPatchActive = !!opts.formPatchActive;
+  const textDropActive = redactActive;
+  const markedContentProps = opts.markedContentProps || null;
+  const commentGlyphs = !!opts.humanReadable;
+  // Redaction and path deletion always tokenize, since they must see vector path ops, which this regex deliberately ignores.
+  // Text edits always tokenize too, since `'`/`"` shows would slip past the regex.
+  if (!textDropActive && !imageDeletes && !pathDeletes && !/\bT[jJ]\b|\bDo\b/.test(streamText)) {
+    return {
+      ok: true,
+      text: streamText,
+      changed: false,
+      usedXobj: new Map(),
+      skipped: [],
+      formInvocations: [],
+      imageInvocations: [],
+      verbatimImageNames: new Set(),
+      imageDeleteDroppedNames: new Set(),
+      imageDeleteKeptNames: new Set(),
+      imageDeleteDroppedObjNums: new Set(),
+      finalCtm: initialCtm.slice(),
+    };
+  }
+  const tokens = tokenizeContentStream(streamText);
+  /** @type {Array<{type: string, value: any}>} */
+  const operandBuf = [];
+  /** @type {string[]} */
+  const out = [];
+
+  let inBT = false;
+  let btStart = -1;
+  /** @type {Array<[number, number]>} */
+  let btPersist = [];
+  let btKept = false;
+  let btSnap = {
+    tc: 0, tw: 0, tz: 100, tl: 0, tr: 0, ts: 0, fontTag: /** @type {string | null} */ (null), fontSize: 0,
+  };
+  let tm = [1, 0, 0, 1, 0, 0];
+  let tlm = [1, 0, 0, 1, 0, 0];
+  // Forms inherit text state at the Do site (section 9.3.1), so without these seeds a form relying on an inherited leading collapses every T*/'/" line break onto one baseline.
+  const its = opts.initialTextState || null;
+  let tc = its ? its.tc : 0;
+  let tw = its ? its.tw : 0;
+  let tz = its ? its.tz : 100;
+  let tl = its ? its.tl : 0;
+  let tr = its ? its.tr : 0;
+  let ts = its ? its.ts : 0;
+  const hiddenOCMCNames = opts.hiddenOCMCNames || null;
+  /** @type {boolean[]} */
+  const mcHiddenStack = [];
+  let ocHidden = false;
+  /** @type {string | null} */
+  let currentFontTag = null;
+  let currentFontSize = 0;
+  let ctm = initialCtm.slice();
+  // A null width or miter limit means unknown, not absent, so the defaults apply only to a missing option.
+  /** @type {number | null} */
+  let lw = opts.initialLineWidth === undefined ? 1 : opts.initialLineWidth;
+  let dashActive = !!opts.initialDashActive;
+  /** @type {number | null} */
+  let ml = opts.initialMiterLimit === undefined ? 10 : opts.initialMiterLimit;
+
+  /**
+   * @type {Array<{tc: number, tw: number, tz: number, tl: number, tr: number, ts: number,
+   *   fontTag: string|null, fontSize: number, ctm: number[], lw: number|null, dashActive: boolean, ml: number|null}>}
+   */
+  const gsStack = [];
+
+  /**
+   * Converted glyphs deferred to the next ET or graphics-state op, then emitted as inline outline fills.
+   * @type {Array<{xobjTag: string, M: number[], strokeW?: number}>}
+   */
+  let pendingConverts = [];
+
+  /**
+   * @type {Map<string, {fontObjNum: number, glyphIndex: number,
+   *   bbox: {xMin: number, yMin: number, xMax: number, yMax: number}, formMatrix: number[],
+   *   pathCommands: Array<any>, paintMode: string, evenOdd: boolean}>}
+   */
+  const usedXobj = new Map();
+  /**
+   * Inline outline body (`pathCommandsToOps` output plus the paint operator) per shape tag.
+   * @type {Map<string, string>}
+   */
+  const inlineBodyByTag = new Map();
+  /** @type {Array<{fontObjNum: number, charCode: number, reason: string}>} */
+  const skipped = [];
+
+  /**
+   * @type {Array<{name: string, formObjNum: number, ctm: number[], lw: number|null,
+   *   dashActive: boolean, ml: number|null,
+   *   textState: {tc: number, tw: number, tz: number, tl: number, tr: number, ts: number}}>}
+   */
+  const formInvocations = [];
+  let changed = false;
+
+  function emitVerbatim(opVal) {
+    for (let i = 0; i < operandBuf.length; i++) {
+      out.push(serializeContentToken(operandBuf[i]));
+      out.push(i + 1 < operandBuf.length ? ' ' : '\n');
+    }
+    if (operandBuf.length === 0 || !out[out.length - 1].endsWith('\n')) {
+      if (operandBuf.length > 0) out[out.length - 1] = ' ';
+    }
+    out.push(opVal);
+    out.push('\n');
+    operandBuf.length = 0;
+  }
+
+  /**
+   * Emit an op verbatim and, inside a text object, record its output range so text-object removal retains it.
+   * Use it for ops whose effect outlives ET (colour, general graphics state, marked content, Do), never for text ops.
+   * @param {string} opVal
+   */
+  function emitPersistVerbatim(opVal) {
+    const s = out.length;
+    emitVerbatim(opVal);
+    if (inBT && btStart >= 0) btPersist.push([s, out.length]);
+  }
+
+  /**
+   * Emit the queued converted glyphs as inline outline fills, grouped by shape.
+   *
+   * Each glyph gets its own `q <M> cm <fontMatrix> cm <ops> <paint> Q` block, so every cm applies from the same base CTM and placements cannot drift across the run.
+   * Queued glyphs are non-overlapping and share one colour within a flush (any colour op bounce-flushes first), so reordering them is safe.
+   *
+   * Must run at ET and before any graphics-state change (q/Q/cm/Do).
+   */
+  function flushPendingConverts() {
+    if (pendingConverts.length === 0) return;
+    const persistStart = out.length;
+    // Bucket by shape tag, preserving first-seen order, so identical outline bodies land back-to-back for the deflate window to dedup.
+    /** @type {string[]} */
+    const order = [];
+    /** @type {Map<string, Array<{xobjTag: string, M: number[], strokeW?: number}>>} */
+    const buckets = new Map();
+    for (const c of pendingConverts) {
+      let bucket = buckets.get(c.xobjTag);
+      if (!bucket) {
+        bucket = [];
+        buckets.set(c.xobjTag, bucket);
+        order.push(c.xobjTag);
+      }
+      bucket.push(c);
+    }
+    for (const tag of order) {
+      const info = usedXobj.get(tag);
+      if (!info) continue;
+      const fm = (Array.isArray(info.formMatrix) && info.formMatrix.length === 6)
+        ? info.formMatrix : [0.001, 0, 0, 0.001, 0, 0];
+      const fmCm = `${fmt(fm[0], PDF_MATRIX_DECIMALS)} ${fmt(fm[1], PDF_MATRIX_DECIMALS)} ${fmt(fm[2], PDF_MATRIX_DECIMALS)} ${fmt(fm[3], PDF_MATRIX_DECIMALS)} ${fmt(fm[4], PDF_MATRIX_DECIMALS)} ${fmt(fm[5], PDF_MATRIX_DECIMALS)} cm\n`;
+      let body = inlineBodyByTag.get(tag);
+      if (body === undefined) {
+        const pm = info.paintMode || 'fill';
+        let paintOp;
+        if (pm === 'stroke') paintOp = 'S';
+        else if (pm === 'fillStroke') paintOp = info.evenOdd ? 'B*' : 'B';
+        else paintOp = info.evenOdd ? 'f*' : 'f';
+        body = `${pathCommandsToOps(info.pathCommands)}${paintOp}\n`;
+        inlineBodyByTag.set(tag, body);
+      }
+      for (const c of buckets.get(tag)) {
+        if (commentGlyphs) out.push(`%${tag}\n`);
+        out.push('q\n');
+        // The pen width is glyph-space and was computed at queue time, so a later source `w` cannot skew it.
+        if (c.strokeW !== undefined) out.push(`${fmt(c.strokeW, PDF_MATRIX_DECIMALS)} w\n`);
+        const M = c.M;
+        out.push(`${fmt(M[0], PDF_MATRIX_DECIMALS)} ${fmt(M[1], PDF_MATRIX_DECIMALS)} ${fmt(M[2], PDF_MATRIX_DECIMALS)} ${fmt(M[3], PDF_MATRIX_DECIMALS)} ${fmt(M[4], PDF_MATRIX_DECIMALS)} ${fmt(M[5], PDF_MATRIX_DECIMALS)} cm\n`);
+        out.push(fmCm);
+        out.push(body);
+        out.push('Q\n');
+      }
+    }
+    pendingConverts = [];
+    // A flush inside BT (from bounceFlushInBT, or a tolerated q/Q/cm/Do mid-object) is painted output rather than text skeleton, so removal must keep it.
+    if (inBT && btStart >= 0) btPersist.push([persistStart, out.length]);
+  }
+
+  /**
+   * Flush pending glyph converts from inside a text object.
+   */
+  function bounceFlushInBT() {
+    // Paths are illegal inside a text object, so the flush must sit outside BT/ET.
+    out.push('ET\n');
+    flushPendingConverts();
+    out.push('BT\n');
+    restoreTextPosition();
+  }
+
+  /**
+   * Re-establish the walker's text position after a fresh BT.
+   * @param {number[]} [targetTm] - Text matrix to restore to.
+   */
+  function restoreTextPosition(targetTm = tm) {
+    // Tm restores the line matrix and a numeric TJ then reaches the mid-line target, because a second Tm would clobber tlm and shift every later T*/'/" break.
+    out.push(`${fmt(tlm[0], PDF_MATRIX_DECIMALS)} ${fmt(tlm[1], PDF_MATRIX_DECIMALS)} ${fmt(tlm[2], PDF_MATRIX_DECIMALS)} ${fmt(tlm[3], PDF_MATRIX_DECIMALS)} ${fmt(tlm[4], PDF_MATRIX_DECIMALS)} ${fmt(tlm[5], PDF_MATRIX_DECIMALS)} Tm\n`);
+    const deltaUx = targetTm[4] - tlm[4];
+    const deltaUy = targetTm[5] - tlm[5];
+    if (Math.abs(deltaUx) > 1e-6 || Math.abs(deltaUy) > 1e-6) {
+      const det = tlm[0] * tlm[3] - tlm[1] * tlm[2];
+      const fontScale = currentFontSize * tz / 100;
+      if (Math.abs(det) > 1e-9 && fontScale > 0) {
+        const textDx = (deltaUx * tlm[3] - deltaUy * tlm[2]) / det;
+        const textDy = (-deltaUx * tlm[1] + deltaUy * tlm[0]) / det;
+        const binding = currentFontTag ? fontsByTag.get(currentFontTag) : null;
+        const leadAxis = binding && binding.verticalMode ? textDy : textDx;
+        const offAxis = binding && binding.verticalMode ? textDx : textDy;
+        if (Math.abs(offAxis) < 1e-6 && Math.abs(leadAxis) > 1e-6) {
+          out.push(`[${fmt(-leadAxis * 1000 / fontScale)}] TJ\n`);
+        }
+      }
+    }
+  }
+
+  /**
+   * @param {number[]} mat
+   * @param {FontBinding} binding
+   * @param {number} code
+   * @param {number} numBytes
+   */
+  function advanceMatrixForGlyph(mat, binding, code, numBytes) {
+    const widthSrc = binding.isType0 && binding.charCodeToCID
+      ? (binding.charCodeToCID.get(code) ?? code)
+      : code;
+    const rawWidth = binding.widths.get(widthSrc) ?? binding.defaultWidth;
+    const glyphWidth = rawWidth / 1000 * currentFontSize;
+    const isWordSpace = numBytes === 1 && code === 0x20;
+    if (binding.verticalMode) {
+      const vAdvance = (-currentFontSize + tc + (isWordSpace ? tw : 0)) * tz / 100;
+      mat[4] += vAdvance * mat[2];
+      mat[5] += vAdvance * mat[3];
+    } else {
+      const advance = (glyphWidth + tc + (isWordSpace ? tw : 0)) * tz / 100;
+      mat[4] += advance * mat[0];
+      mat[5] += advance * mat[1];
+    }
+  }
+  /**
+   * @param {number[]} mat
+   * @param {FontBinding} binding
+   * @param {number} value
+   */
+  function applySpacerToMatrix(mat, binding, value) {
+    const adj = value / 1000 * currentFontSize * tz / 100;
+    if (binding.verticalMode) {
+      mat[4] -= adj * mat[2];
+      mat[5] -= adj * mat[3];
+    } else {
+      mat[4] -= adj * mat[0];
+      mat[5] -= adj * mat[1];
+    }
+  }
+
+  /**
+   * Numeric TJ spacer that displaces tm by the same amount a glyph of the given code would.
+   * tlm is unaffected, so subsequent Td/Tm computations match the unconverted original.
+   * @param {FontBinding} binding
+   * @param {number} code
+   * @param {number} numBytes
+   * @returns {number}
+   */
+  function spacerForGlyphMimic(binding, code, numBytes) {
+    // Equating the glyph advance `(W/1000 * fontSize + tc + tw_if_space) * tz/100` with the spacer advance `-s/1000 * fontSize * tz/100` cancels tz, so it is absent below.
+    if (currentFontSize === 0) return 0;
+    const isWordSpace = numBytes === 1 && code === 0x20;
+    if (binding.verticalMode) {
+      return (currentFontSize - tc - (isWordSpace ? tw : 0)) * 1000 / currentFontSize;
+    }
+    const widthSrc = binding.isType0 && binding.charCodeToCID
+      ? (binding.charCodeToCID.get(code) ?? code)
+      : code;
+    const W = binding.widths.get(widthSrc) ?? binding.defaultWidth;
+    const tcTwAdd = tc + (isWordSpace ? tw : 0);
+    return -W - 1000 * tcTwAdd / currentFontSize;
+  }
+
+  /** @type {Map<string, string>} */
+  const redactFormAliases = new Map();
+  // Image invocations whose placed rect crosses a redact rect, aliased for the pixel scrub.
+  /** @type {Array<{alias: string, name: string, objNum: number, ctm: number[]}>} */
+  const imageInvocations = [];
+  // A name that also paints outside every rect lands here, so its original /XObject entry survives the scrub.
+  /** @type {Set<string>} */
+  const verbatimImageNames = new Set();
+  // The same name can be dropped at one placement and kept at another, so the driver prunes a /XObject entry only when no kept placement remains.
+  /** @type {Set<string>} */
+  const imageDeleteDroppedNames = new Set();
+  /** @type {Set<string>} */
+  const imageDeleteKeptNames = new Set();
+  /** @type {Set<number>} */
+  const imageDeleteDroppedObjNums = new Set();
+
+  // Buffered vector path (redact or path-delete mode, outside BT): serialized construction ops plus the CTM-mapped AABB of every control point, so the paint op can decide the drop.
+  /** @type {string[]} */
+  let pathBuf = [];
+  let pathIsClip = false;
+  let pathBboxKnown = true;
+  // Command count under the parser's expansion, where `re` counts 5 and a shorthand curve counts 1.
+  // A deletePath site carries the parser's count as an identity signal, so this one must match it.
+  let pathCmdCount = 0;
+  let pbx0 = Infinity; let pby0 = Infinity; let pbx1 = -Infinity; let pby1 = -Infinity;
+  const resetPathBuf = () => {
+    pathBuf = []; pathIsClip = false; pathBboxKnown = true; pathCmdCount = 0;
+    pbx0 = Infinity; pby0 = Infinity; pbx1 = -Infinity; pby1 = -Infinity;
+  };
+  const flushPathBufVerbatim = () => {
+    for (const s of pathBuf) out.push(s);
+    resetPathBuf();
+  };
+
+  for (const tok of tokens) {
+    if (tok.type !== 'operator') {
+      if (imageDeletes && tok.type === 'inlineImage') {
+        let dropDelete = false;
+        for (const g of imageDeletes) {
+          if (imageDrawMatchesDelete(ctm, g, null)) { dropDelete = true; break; }
+        }
+        if (dropDelete) {
+          skipped.push({ fontObjNum: -1, charCode: -1, reason: 'imagedelete-dropped-inline-image' });
+          changed = true;
+          continue;
+        }
+      }
+      // A partial scrub would have to decode arbitrary inline-image filters, so the whole token goes and over-redacts, which is the safe side.
+      if (redactActive && tok.type === 'inlineImage') {
+        let ix0 = Infinity; let iy0 = Infinity; let ix1 = -Infinity; let iy1 = -Infinity;
+        for (const [u, v] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+          const gx = u * ctm[0] + v * ctm[2] + ctm[4];
+          const gy = u * ctm[1] + v * ctm[3] + ctm[5];
+          ix0 = Math.min(ix0, gx); iy0 = Math.min(iy0, gy); ix1 = Math.max(ix1, gx); iy1 = Math.max(iy1, gy);
+        }
+        if (redactBboxes.some((b) => ix0 < b[2] && ix1 > b[0] && iy0 < b[3] && iy1 > b[1])) {
+          skipped.push({ fontObjNum: -1, charCode: -1, reason: 'redact-dropped-inline-image' });
+          changed = true;
+          continue;
+        }
+      }
+      operandBuf.push(tok);
+      continue;
+    }
+    const op = tok.value;
+
+    // Bounce-flush before a paint-state change so the queued glyphs paint with their show-time state.
+    if (inBT && pendingConverts.length > 0 && PAINT_STATE_OPS.has(op)) bounceFlushInBT();
+
+    // Vector-path redaction and path deletion run only outside BT, since paths are illegal inside a text object.
+    // A nonconforming in-BT path stays verbatim, and redaction's raster black box still covers it.
+    if ((redactActive || pathDeletes) && !inBT) {
+      if (PATH_CONSTRUCTION_OPS.has(op)) {
+        const numsNeeded = op === 'c' ? 6 : (op === 'v' || op === 'y' || op === 're' ? 4 : (op === 'h' ? 0 : 2));
+        if (numsNeeded > 0) {
+          if (operandBuf.length >= numsNeeded && operandBuf.slice(-numsNeeded).every((t) => t.type === 'number')) {
+            const vals = operandBuf.slice(-numsNeeded).map((t) => t.value);
+            /** @type {Array<[number, number]>} */
+            let pts;
+            if (op === 're') {
+              pts = [[vals[0], vals[1]], [vals[0] + vals[2], vals[1]], [vals[0], vals[1] + vals[3]], [vals[0] + vals[2], vals[1] + vals[3]]];
+            } else {
+              pts = [];
+              for (let k = 0; k < vals.length; k += 2) pts.push([vals[k], vals[k + 1]]);
+            }
+            for (const [x, y] of pts) {
+              const gx = x * ctm[0] + y * ctm[2] + ctm[4];
+              const gy = x * ctm[1] + y * ctm[3] + ctm[5];
+              pbx0 = Math.min(pbx0, gx); pby0 = Math.min(pby0, gy);
+              pbx1 = Math.max(pbx1, gx); pby1 = Math.max(pby1, gy);
+            }
+            pathCmdCount += op === 're' ? 5 : 1;
+          } else {
+            pathBboxKnown = false;
+          }
+        } else {
+          pathCmdCount += 1;
+        }
+        const opnd = operandBuf.map(serializeContentToken).join(' ');
+        pathBuf.push(opnd.length > 0 ? `${opnd} ${op}\n` : `${op}\n`);
+        operandBuf.length = 0;
+        continue;
+      }
+      if (op === 'W' || op === 'W*') {
+        // Never drop a clip-participating path: removing it would reveal content, not remove it.
+        pathIsClip = true;
+        const opnd = operandBuf.map(serializeContentToken).join(' ');
+        pathBuf.push(opnd.length > 0 ? `${opnd} ${op}\n` : `${op}\n`);
+        operandBuf.length = 0;
+        continue;
+      }
+      if (PATH_PAINT_OPS.has(op)) {
+        const intersects = pathBboxKnown && redactActive
+          && redactBboxes.some((b) => pbx0 < b[2] && pbx1 > b[0] && pby0 < b[3] && pby1 > b[1]);
+        const closes = op === 's' || op === 'b' || op === 'b*';
+        let deleteHit = false;
+        if (pathDeletes && pathBboxKnown && op !== 'n' && pathBuf.length > 0) {
+          const paint = (op === 'S' || op === 's') ? 's' : (op === 'f' || op === 'F' || op === 'f*') ? 'f' : 'fs';
+          const commands = pathCmdCount + (closes ? 1 : 0);
+          for (const g of pathDeletes) {
+            if (pathDrawMatchesDelete([pbx0, pby0, pbx1, pby1], g, paint, commands)) { deleteHit = true; break; }
+          }
+        }
+        if (!pathBboxKnown && pathBuf.length > 0) {
+          // Keeping an unverifiable path is safe: redaction's raster box still covers the rect, and a missed path delete is visible and recoverable.
+          skipped.push({ fontObjNum: -1, charCode: -1, reason: redactActive ? 'redact-unverifiable-path' : 'path-delete-unverifiable-path' });
+        }
+        if (op !== 'n' && !pathIsClip && (intersects || deleteHit) && pathBuf.length > 0) {
+          resetPathBuf();
+          operandBuf.length = 0;
+          changed = true;
+          continue;
+        }
+        if (op !== 'n' && pathIsClip && deleteHit && pathBuf.length > 0) {
+          // Degrading the paint op to a no-paint op keeps the clip while the ink goes.
+          // Close-variant paints close before painting, so `h` keeps the closed outline in the clip.
+          flushPathBufVerbatim();
+          out.push(closes ? 'h n\n' : 'n\n');
+          operandBuf.length = 0;
+          changed = true;
+          continue;
+        }
+        flushPathBufVerbatim();
+        emitVerbatim(op);
+        continue;
+      }
+      if (pathBuf.length > 0) {
+        // A nonconforming stream can interleave other ops mid-path, so flush the buffer verbatim first.
+        flushPathBufVerbatim();
+      }
+    }
+
+    if (op === 'q') {
+      flushPendingConverts();
+      gsStack.push({
+        tc, tw, tz, tl, tr, ts, fontTag: currentFontTag, fontSize: currentFontSize, ctm: ctm.slice(), lw, dashActive, ml,
+      });
+      emitPersistVerbatim(op);
+      continue;
+    }
+    if (op === 'Q') {
+      flushPendingConverts();
+      const s = gsStack.pop();
+      if (s) {
+        tc = s.tc;
+        tw = s.tw;
+        tz = s.tz;
+        tl = s.tl;
+        tr = s.tr;
+        ts = s.ts;
+        currentFontTag = s.fontTag; currentFontSize = s.fontSize;
+        ctm = s.ctm;
+        lw = s.lw;
+        dashActive = s.dashActive;
+        ml = s.ml;
+      }
+      emitPersistVerbatim(op);
+      continue;
+    }
+    if (op === 'cm') {
+      flushPendingConverts();
+      if (operandBuf.length >= 6) {
+        const m = operandBuf.slice(operandBuf.length - 6).map((t) => t.value);
+        ctm = matMul(m, ctm);
+      }
+      emitPersistVerbatim(op);
+      continue;
+    }
+
+    // Pen-state ops, tracked for Tr 1/2 conversion.
+    // No flush: queued stroke entries carry their width from queue time, and colour-class state was never flushed on (pre-existing, shared with the fill path).
+    if (op === 'w') {
+      const v = operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number'
+        ? operandBuf[operandBuf.length - 1].value : NaN;
+      lw = Number.isFinite(v) && v >= 0 ? v : null;
+      emitPersistVerbatim(op);
+      continue;
+    }
+    if (op === 'd') {
+      if (operandBuf.length >= 2 && operandBuf[operandBuf.length - 2].type === 'array') {
+        dashActive = operandBuf[operandBuf.length - 2].value.length > 0;
+      }
+      emitPersistVerbatim(op);
+      continue;
+    }
+    if (op === 'M') {
+      const v = operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number'
+        ? operandBuf[operandBuf.length - 1].value : NaN;
+      ml = Number.isFinite(v) ? v : null;
+      emitPersistVerbatim(op);
+      continue;
+    }
+    if (op === 'gs') {
+      // A known ExtGState applies only the stroke-relevant keys it sets.
+      // An unknown one degrades the pen state to unknown, so Tr 1/2 shows stay verbatim until an explicit `w` restores knowledge.
+      const nameTok = operandBuf.length >= 1 ? operandBuf[operandBuf.length - 1] : null;
+      if (nameTok && nameTok.type === 'name') {
+        const known = extGStates ? extGStates.get(nameTok.value) : undefined;
+        if (known) {
+          if (typeof known.lw === 'number') lw = known.lw;
+          if (typeof known.ml === 'number') ml = known.ml;
+          if (typeof known.dash === 'boolean') dashActive = known.dash;
+        } else {
+          lw = null;
+          ml = null;
+        }
+      }
+      emitPersistVerbatim(op);
+      continue;
+    }
+
+    if (op === 'BT') {
+      inBT = true;
+      tm = [1, 0, 0, 1, 0, 0];
+      tlm = [1, 0, 0, 1, 0, 0];
+      btStart = out.length;
+      btPersist = [];
+      btKept = false;
+      btSnap = {
+        tc, tw, tz, tl, tr, ts, fontTag: currentFontTag, fontSize: currentFontSize,
+      };
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'ET') {
+      inBT = false;
+      if (btStart >= 0 && !btKept) {
+        // Later text objects inherit Tc/Tw/Tz/TL/Tf/Tr/Ts, so a setter dropped with this skeleton has to be replayed.
+        const dropped = out.length - btStart;
+        /** @type {string[]} */
+        const persistOps = [];
+        for (const [s, e] of btPersist) { for (let i = s; i < e; i++) persistOps.push(out[i]); }
+        out.length = btStart;
+        for (const p of persistOps) out.push(p);
+        if (tc !== btSnap.tc) out.push(`${fmt(tc)} Tc\n`);
+        if (tw !== btSnap.tw) out.push(`${fmt(tw)} Tw\n`);
+        if (tz !== btSnap.tz) out.push(`${fmt(tz)} Tz\n`);
+        if (tl !== btSnap.tl) out.push(`${fmt(tl)} TL\n`);
+        if (ts !== btSnap.ts) out.push(`${fmt(ts)} Ts\n`);
+        if (tr !== btSnap.tr) out.push(`${tr} Tr\n`);
+        if ((currentFontTag !== btSnap.fontTag || currentFontSize !== btSnap.fontSize) && currentFontTag) {
+          out.push(`/${currentFontTag} ${fmt(currentFontSize)} Tf\n`);
+        }
+        // A bare `BT` push counts 2 entries, so `dropped > 2` means the object held real content.
+        // Removing an empty BT/ET pair changes no semantics and must not force a rewrite.
+        if (dropped > 2) changed = true;
+        operandBuf.length = 0;
+        btStart = -1;
+        btPersist = [];
+        flushPendingConverts();
+        continue;
+      }
+      btStart = -1;
+      btPersist = [];
+      btKept = false;
+      emitVerbatim(op);
+      flushPendingConverts();
+      continue;
+    }
+
+    if (op === 'Tf') {
+      if (operandBuf.length >= 2) {
+        const nameTok = operandBuf[operandBuf.length - 2];
+        const sizeTok = operandBuf[operandBuf.length - 1];
+        if (nameTok && nameTok.type === 'name') currentFontTag = nameTok.value;
+        if (sizeTok && sizeTok.type === 'number') currentFontSize = sizeTok.value;
+      }
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'Tc') {
+      if (operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number') tc = operandBuf[operandBuf.length - 1].value;
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'Tw') {
+      if (operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number') tw = operandBuf[operandBuf.length - 1].value;
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'Tz') {
+      if (operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number') tz = operandBuf[operandBuf.length - 1].value;
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'TL') {
+      if (operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number') tl = operandBuf[operandBuf.length - 1].value;
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'Tr') {
+      if (operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number') tr = operandBuf[operandBuf.length - 1].value;
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'Ts') {
+      if (operandBuf.length >= 1 && operandBuf[operandBuf.length - 1].type === 'number') ts = operandBuf[operandBuf.length - 1].value;
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'Tm') {
+      if (operandBuf.length >= 6) {
+        tm = operandBuf.slice(operandBuf.length - 6).map((t) => t.value);
+        tlm = tm.slice();
+      }
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'Td') {
+      if (operandBuf.length >= 2) {
+        const tx = operandBuf[operandBuf.length - 2].value;
+        const ty = operandBuf[operandBuf.length - 1].value;
+        tlm = [tlm[0], tlm[1], tlm[2], tlm[3],
+          tx * tlm[0] + ty * tlm[2] + tlm[4],
+          tx * tlm[1] + ty * tlm[3] + tlm[5]];
+        tm = tlm.slice();
+      }
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'TD') {
+      if (operandBuf.length >= 2) {
+        const tx = operandBuf[operandBuf.length - 2].value;
+        const ty = operandBuf[operandBuf.length - 1].value;
+        tl = -ty;
+        tlm = [tlm[0], tlm[1], tlm[2], tlm[3],
+          tx * tlm[0] + ty * tlm[2] + tlm[4],
+          tx * tlm[1] + ty * tlm[3] + tlm[5]];
+        tm = tlm.slice();
+      }
+      emitVerbatim(op);
+      continue;
+    }
+    if (op === 'T*') {
+      const tx = 0;
+      const ty = -tl;
+      tlm = [tlm[0], tlm[1], tlm[2], tlm[3],
+        tx * tlm[0] + ty * tlm[2] + tlm[4],
+        tx * tlm[1] + ty * tlm[3] + tlm[5]];
+      tm = tlm.slice();
+      emitVerbatim(op);
+      continue;
+    }
+
+    if (op === 'Do') {
+      // Record the invocation for the orchestrator to recurse into. CTM is captured before any state change.
+      // The form's /Resources lookup happens in the orchestrator; we just track (name, current ctm) here.
+      flushPendingConverts();
+      // Deletion is checked before the redaction alias below, so a draw that is both deleted and redacted is removed outright instead of replaced by a scrubbed copy.
+      if (imageDeletes && parentImages && operandBuf.length >= 1) {
+        const nameTok = operandBuf[operandBuf.length - 1];
+        if (nameTok && nameTok.type === 'name' && parentImages.has(nameTok.value)) {
+          const imgObjNum = /** @type {number} */ (parentImages.get(nameTok.value));
+          let dropDelete = false;
+          for (const g of imageDeletes) {
+            if (imageDrawMatchesDelete(ctm, g, imgObjNum)) { dropDelete = true; break; }
+          }
+          if (dropDelete) {
+            operandBuf.pop();
+            imageDeleteDroppedNames.add(nameTok.value);
+            imageDeleteDroppedObjNums.add(imgObjNum);
+            skipped.push({ fontObjNum: -1, charCode: -1, reason: 'imagedelete-dropped-image' });
+            changed = true;
+            continue;
+          }
+          imageDeleteKeptNames.add(nameTok.value);
+        }
+      }
+      // Image XObject under redaction: alias a placement that intersects a redact rect (the orchestrator swaps in a pixel-scrubbed copy); a non-intersecting placement keeps the original.
+      if (redactActive && parentImages && operandBuf.length >= 1) {
+        const nameTok = operandBuf[operandBuf.length - 1];
+        if (nameTok && nameTok.type === 'name' && parentImages.has(nameTok.value)) {
+          let ix0 = Infinity; let iy0 = Infinity; let ix1 = -Infinity; let iy1 = -Infinity;
+          for (const [u, v] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+            const gx = u * ctm[0] + v * ctm[2] + ctm[4];
+            const gy = u * ctm[1] + v * ctm[3] + ctm[5];
+            ix0 = Math.min(ix0, gx); iy0 = Math.min(iy0, gy); ix1 = Math.max(ix1, gx); iy1 = Math.max(iy1, gy);
+          }
+          if (redactBboxes.some((b) => ix0 < b[2] && ix1 > b[0] && iy0 < b[3] && iy1 > b[1])) {
+            const key = `I:${nameTok.value} ${ctm.join(' ')}`;
+            let alias = redactFormAliases.get(key);
+            if (!alias) {
+              alias = `ScrRdI${redactFormAliases.size}`;
+              redactFormAliases.set(key, alias);
+              imageInvocations.push({
+                alias, name: nameTok.value, objNum: /** @type {number} */ (parentImages.get(nameTok.value)), ctm: ctm.slice(),
+              });
+            }
+            operandBuf[operandBuf.length - 1] = { type: 'name', value: alias };
+            changed = true;
+          } else {
+            verbatimImageNames.add(nameTok.value);
+          }
+          emitPersistVerbatim(op);
+          continue;
+        }
+      }
+      if (parentXobjects && operandBuf.length >= 1) {
+        const nameTok = operandBuf[operandBuf.length - 1];
+        if (nameTok && nameTok.type === 'name') {
+          const formObjNum = parentXobjects.get(nameTok.value);
+          if (typeof formObjNum === 'number') {
+            // The same form placed at several CTMs may intersect a rect at only one placement, so recursing once per name would bake that placement's rewrite into all of them.
+            let alias = null;
+            if (textDropActive || imageDeletes || pathDeletes || formPatchActive) {
+              const key = `${nameTok.value}\u0000${ctm.join(' ')}`;
+              alias = redactFormAliases.get(key);
+              if (!alias) {
+                alias = `ScrRdF${redactFormAliases.size}`;
+                redactFormAliases.set(key, alias);
+              }
+              operandBuf[operandBuf.length - 1] = { type: 'name', value: alias };
+              changed = true;
+            }
+            formInvocations.push({
+              name: nameTok.value,
+              alias,
+              formObjNum,
+              ctm: ctm.slice(),
+              lw,
+              dashActive,
+              ml,
+              // Text state inherited by the form's content (section 9.3.1): a form that sets none of its own relies on these.
+              // Leading (tl) is the one that bites: content breaking lines with T*/'/" collapses to one baseline without it.
+              // Tm/Tlm are excluded (they reset at BT).
+              textState: {
+                tc,
+                tw,
+                tz,
+                tl,
+                tr,
+                ts,
+              },
+            });
+          }
+        }
+      }
+      emitPersistVerbatim(op);
+      continue;
+    }
+
+    // Marked-content nesting drives OCG visibility.
+    if (op === 'BDC' || op === 'BMC') {
+      /** @type {boolean} */
+      let nowHidden = ocHidden;
+      if (!nowHidden && op === 'BDC' && hiddenOCMCNames && hiddenOCMCNames.size > 0
+          && operandBuf.length >= 2) {
+        const tagTok = operandBuf[operandBuf.length - 2];
+        const propTok = operandBuf[operandBuf.length - 1];
+        if (tagTok && tagTok.type === 'name' && tagTok.value === 'OC'
+            && propTok && propTok.type === 'name' && hiddenOCMCNames.has(propTok.value)) {
+          nowHidden = true;
+        }
+      }
+      // Property lists can carry the wrapped text in readable form (/ActualText, /Alt, /E), so re-emitting them verbatim would leave struck text extractable.
+      // A span's true extent is only knowable from the shows it wraps, so the scrub is page-wide.
+      let opOut = op;
+      if (textDropActive && op === 'BDC' && operandBuf.length >= 2) {
+        const tagTok = operandBuf[operandBuf.length - 2];
+        const propTok = operandBuf[operandBuf.length - 1];
+        const sensitiveRe = /\/(ActualText|Alt|E)(?![0-9A-Za-z._#-])/;
+        if (tagTok && tagTok.type === 'name' && tagTok.value !== 'OC' && propTok) {
+          let dictText = propTok.type === 'dict' ? propTok.value
+            : (propTok.type === 'name' && markedContentProps ? markedContentProps.get(propTok.value) : undefined);
+          if (dictText !== undefined && sensitiveRe.test(dictText)) {
+            for (const key of ['ActualText', 'Alt', 'E']) {
+              const keyRe = new RegExp(`/${key}(?![0-9A-Za-z._#-])`);
+              for (let from = 0; from < dictText.length;) {
+                const rel = dictText.slice(from).search(keyRe);
+                if (rel === -1) break;
+                const start = from + rel;
+                let p = start + 1 + key.length;
+                while (p < dictText.length && /\s/.test(dictText[p])) p++;
+                let end = -1;
+                if (dictText[p] === '(') {
+                  // Parens may nest unescaped inside a literal string.
+                  let depth = 0;
+                  for (let q = p; q < dictText.length; q++) {
+                    const ch = dictText[q];
+                    if (ch === '\\') { q++; continue; }
+                    if (ch === '(') depth++;
+                    else if (ch === ')') { depth--; if (depth === 0) { end = q + 1; break; } }
+                  }
+                } else if (dictText[p] === '<' && dictText[p + 1] !== '<') {
+                  const gt = dictText.indexOf('>', p);
+                  if (gt !== -1) end = gt + 1;
+                } else {
+                  const ref = /^\d+\s+\d+\s+R(?![0-9A-Za-z])/.exec(dictText.slice(p));
+                  if (ref) end = p + ref[0].length;
+                }
+                if (end === -1) { from = start + 1; continue; }
+                dictText = dictText.slice(0, start) + dictText.slice(end);
+                from = 0;
+              }
+            }
+            // An indirect ref is illegal inside a content stream, so a dict still holding one cannot be re-emitted inline.
+            if (sensitiveRe.test(dictText) || /(^|[^0-9A-Za-z])\d+\s+\d+\s+R(?![0-9A-Za-z])/.test(dictText)) {
+              operandBuf.length -= 1;
+              opOut = 'BMC';
+            } else {
+              operandBuf[operandBuf.length - 1] = { type: 'dict', value: dictText };
+            }
+            changed = true;
+          } else if (dictText === undefined && propTok.type === 'name' && redactActive) {
+            operandBuf.length -= 1;
+            opOut = 'BMC';
+            changed = true;
+          }
+        }
+      }
+      mcHiddenStack.push(nowHidden);
+      ocHidden = nowHidden;
+      emitPersistVerbatim(opOut);
+      continue;
+    }
+    if (op === 'EMC') {
+      if (mcHiddenStack.length > 0) mcHiddenStack.pop();
+      ocHidden = mcHiddenStack.length > 0 && mcHiddenStack[mcHiddenStack.length - 1];
+      emitPersistVerbatim(op);
+      continue;
+    }
+
+    const isTextShow = op === 'Tj' || op === 'TJ' || op === "'" || op === '"';
+    if (!isTextShow) {
+      // Colour, marked-content, path, and unknown ops all act on state that outlives the text object, so they survive removal.
+      emitPersistVerbatim(op);
+      continue;
+    }
+
+    const binding = currentFontTag ? fontsByTag.get(currentFontTag) : null;
+
+    // '"' (and "'") move to next line before showing. '"' also sets Tw and Tc.
+    let aw = null;
+    let ac = null;
+    if (op === '"' && operandBuf.length >= 3) {
+      aw = operandBuf[operandBuf.length - 3].value;
+      ac = operandBuf[operandBuf.length - 2].value;
+      tw = aw;
+      tc = ac;
+    }
+    if (op === "'" || op === '"') {
+      const tx = 0;
+      const ty = -tl;
+      tlm = [tlm[0], tlm[1], tlm[2], tlm[3],
+        tx * tlm[0] + ty * tlm[2] + tlm[4],
+        tx * tlm[1] + ty * tlm[3] + tlm[5]];
+      tm = tlm.slice();
+    }
+
+    const operand = operandBuf[operandBuf.length - 1];
+    // Type3 CharProcs paint themselves and modes other than 3/7 do not stroke them (section 9.3.6), so Type3 runs under Tr 1/2 stay verbatim.
+    /** @type {'stroke' | 'fillStroke' | null} */
+    let strokeMode = null;
+    let verbatimReason = null;
+    if (tr === 1 || tr === 2) {
+      if (binding && binding.isType3) verbatimReason = 'type3-stroke-unsupported';
+      else if (lw === null) verbatimReason = 'stroke-unknown-linewidth';
+      else if (dashActive) verbatimReason = 'stroke-dash-unsupported';
+      else strokeMode = tr === 1 ? 'stroke' : 'fillStroke';
+    } else if (tr >= 4 && tr <= 7) {
+      verbatimReason = `unsupported-tr-mode:${tr}`;
+    }
+    // Redaction and text edits also process the shows the conversion path leaves verbatim (OC-hidden, Tr 3, Tr>=4).
+    // Their bytes are extractable regardless of visibility, so glyphs inside a rect must drop.
+    const canConvert = !ocHidden && (tr === 0 || strokeMode !== null);
+
+    // Converting an OC-hidden show to paths would make hidden content always visible, so it stays verbatim.
+    if (!binding || !operand || (!textDropActive && (ocHidden || (tr !== 0 && strokeMode === null)))) {
+      // A show whose font failed to parse has uncomputable glyph geometry, so this fails closed.
+      // The whole show drops when its start origin falls inside a rect grown by a line-height margin.
+      if (textDropActive && operand && !binding) {
+        const originMat = matMul(tm, ctm);
+        const pad = currentFontSize > 0 ? currentFontSize * 2 : 24;
+        let hitRedact = false;
+        for (const b of redactBboxes || []) {
+          if (originMat[4] >= b[0] - pad && originMat[4] <= b[2] + pad && originMat[5] >= b[1] - pad && originMat[5] <= b[3] + pad) { hitRedact = true; break; }
+        }
+        if (hitRedact) {
+          // No advance can be replayed without widths, but later absolute positioning (Tm/Td/TD/T*) re-anchors, so only same-object relative text drifts.
+          skipped.push({ fontObjNum: -1, charCode: -1, reason: 'redact-dropped-unresolved-font-show' });
+          changed = true;
+          operandBuf.length = 0;
+          continue;
+        }
+        skipped.push({ fontObjNum: -1, charCode: -1, reason: redactActive ? 'redact-unverifiable-font' : 'textedit-unverifiable-font' });
+      }
+      if (binding && operand && verbatimReason) {
+        skipped.push({ fontObjNum: binding.fontObjNum, charCode: -1, reason: verbatimReason });
+      }
+      // Replay the verbatim show's advance onto tm so a later converted run in the same BT lands after the kept text instead of overlapping it.
+      if (binding && operand) {
+        const vcs = binding.codespaceRanges || (binding.isType0 ? [{ bytes: 2, low: 0, high: 0xFFFF }] : null);
+        for (const elem of flattenTextOperandTyped(operand, op === '"' ? 'Tj' : op, vcs)) {
+          if (elem.type === 'spacer') applySpacerToMatrix(tm, binding, elem.value);
+          else advanceMatrixForGlyph(tm, binding, elem.value, elem.numBytes);
+        }
+      }
+      // The kept bytes still render or stay selectable, so the enclosing text object cannot be removed.
+      // Tr 3 counts too, since invisible text is the selectable layer over a scanned page.
+      if (inBT && operandHasBytes(operand)) btKept = true;
+      emitVerbatim(op);
+      continue;
+    }
+
+    if (!inBT) {
+      return { ok: false, reason: 'text-show-outside-BT' };
+    }
+
+    const csRanges = binding.codespaceRanges
+      || (binding.isType0 ? [{ bytes: 2, low: 0, high: 0xFFFF }] : null);
+    const flattened = flattenTextOperandTyped(operand, op === '"' ? 'Tj' : op, csRanges);
+    const trmPrefix = [currentFontSize * tz / 100, 0, 0, currentFontSize, 0, ts];
+
+    /** @type {Array<{kind: 'glyph', code: number, numBytes: number} | {kind: 'spacer', value: number}>} */
+    const outputElems = [];
+    let anyConvert = false;
+    // The 2x2 of trmPrefix * tm is translation-invariant across the run, so the pen width and anisotropy ratio computed on the first resolved glyph hold for every glyph.
+    /** @type {number | null} */
+    let runStrokeW = null;
+    /** @type {string | null} */
+    let runStrokeBad = null;
+    let runStrokePad = 0;
+
+    for (const elem of flattened) {
+      if (elem.type === 'spacer') {
+        outputElems.push({ kind: 'spacer', value: elem.value });
+        applySpacerToMatrix(tm, binding, elem.value);
+        continue;
+      }
+      const code = elem.value;
+      const numBytes = elem.numBytes;
+      const trm = matMul(trmPrefix, matMul(tm, ctm));
+      const userX = trm[4];
+      const userY = trm[5];
+
+      let didConvert = false;
+
+      // The renderer suppresses edited glyphs on screen with the same em-box test, so screen and export agree per glyph.
+      if (textDropActive) {
+        const widthSrc = binding.isType0 && binding.charCodeToCID
+          ? (binding.charCodeToCID.get(code) ?? code)
+          : code;
+        const advEm = (binding.widths.get(widthSrc) ?? binding.defaultWidth) / 1000;
+        // The redaction hit test never consults the resolver, so glyphs in unembedded or broken fonts still drop.
+        const dropHit = redactActive && glyphEmBoxHitsRects(trm, advEm, !!binding.verticalMode, /** @type {Array<[number, number, number, number]>} */ (redactBboxes));
+        if (dropHit) {
+          didConvert = true;
+          outputElems.push({ kind: 'spacer', value: spacerForGlyphMimic(binding, code, numBytes) });
+          anyConvert = true;
+        }
+      }
+
+      let inBbox = false;
+      if (!didConvert && canConvert) {
+        for (const b of bboxes) {
+          if (userX >= b[0] && userX <= b[2] && userY >= b[1] && userY <= b[3]) {
+            inBbox = true;
+            break;
+          }
+        }
+      }
+      const fontTargeted = !didConvert && canConvert && targetFontObjNums !== null && targetFontObjNums.has(binding.fontObjNum);
+      if (inBbox || fontTargeted) {
+        const res = resolver({ fontObjNum: binding.fontObjNum, charCode: code });
+        if ('error' in res) {
+          if (res.error === 'empty-path') {
+            // A numeric spacer matching the advance takes the residual whitespace a viewer would otherwise extract from this TJ.
+            didConvert = true;
+            outputElems.push({ kind: 'spacer', value: spacerForGlyphMimic(binding, code, numBytes) });
+            anyConvert = true;
+          } else {
+            skipped.push({ fontObjNum: binding.fontObjNum, charCode: code, reason: res.error });
+          }
+        } else {
+          /** @type {number | undefined} */
+          let strokeW;
+          if (strokeMode) {
+            if (runStrokeW === null && runStrokeBad === null) {
+              const gm = (Array.isArray(res.formMatrix) && res.formMatrix.length === 6)
+                ? res.formMatrix : [0.001, 0, 0, 0.001, 0, 0];
+              const fm = matMul(gm, matMul(trmPrefix, tm));
+              const det = fm[0] * fm[3] - fm[1] * fm[2];
+              const k = Math.sqrt(Math.abs(det));
+              // Singular values of the 2x2: sigma^2 = (t +/- sqrt(t^2 - 4*det^2))/2.
+              // The pen circle is drawn in glyph space, so anisotropy (Tz, strong skew) maps it to an ellipse the original user-space pen never had.
+              // Ratio > 1.4 (sigmaMax^2/sigmaMin^2 > 1.96) leaves the run verbatim.
+              const t = fm[0] * fm[0] + fm[1] * fm[1] + fm[2] * fm[2] + fm[3] * fm[3];
+              const disc = Math.sqrt(Math.max(0, t * t - 4 * det * det));
+              runStrokePad = Math.abs(gm[0]) > 1e-12 ? 1 / Math.abs(gm[0]) : 1000;
+              if (!Number.isFinite(k) || k < 1e-9 || lw === null) {
+                runStrokeBad = 'stroke-degenerate-matrix';
+              } else if ((t + disc) > 1.96 * (t - disc)) {
+                runStrokeBad = 'stroke-anisotropic-matrix';
+              } else if ((Math.max(ml ?? 10, 10) * (lw / k)) / 2 > runStrokePad) {
+                // Miter spikes can reach (miterLimit*w)/2 past the outline.
+                // The one-em BBox pad below must cover them, and the form is cached first-build-wins so the pad cannot grow per invocation.
+                runStrokeBad = 'stroke-width-exceeds-bbox';
+              } else {
+                runStrokeW = lw / k;
+              }
+            }
+            if (runStrokeBad !== null) {
+              // The glyph falls through to literal text below, which still renders in mode `tr`.
+              skipped.push({ fontObjNum: binding.fontObjNum, charCode: code, reason: runStrokeBad });
+            } else if (runStrokeW !== null) {
+              strokeW = runStrokeW;
+            }
+          }
+          if (!strokeMode || strokeW !== undefined) {
+            didConvert = true;
+            const suffix = strokeMode === 'stroke' ? 's' : (strokeMode === 'fillStroke' ? 'b' : '');
+            const xobjTag = `TGP${binding.fontObjNum}g${res.glyphIndex}${suffix}`;
+            if (!usedXobj.has(xobjTag)) {
+              // Stroke-form BBoxes get a one-em pad per side: the BBox clips form content and the pen extends past the outline.
+              // Pad a copy, since res.bbox belongs to the resolver.
+              const bbox = strokeMode
+                ? {
+                  xMin: res.bbox.xMin - runStrokePad,
+                  yMin: res.bbox.yMin - runStrokePad,
+                  xMax: res.bbox.xMax + runStrokePad,
+                  yMax: res.bbox.yMax + runStrokePad,
+                }
+                : res.bbox;
+              usedXobj.set(xobjTag, {
+                fontObjNum: binding.fontObjNum,
+                glyphIndex: res.glyphIndex,
+                bbox,
+                formMatrix: res.formMatrix,
+                pathCommands: res.pathCommands,
+                paintMode: strokeMode || res.paintMode || 'fill',
+                evenOdd: !!res.evenOdd,
+              });
+            }
+            let M = matMul(trmPrefix, tm);
+            // Substitute fonts: squeeze the glyph horizontally to the PDF /Widths advance, mirroring the renderer's hScale.
+            // The substitute's formMatrix is uniform-diagonal, so it commutes with an x-scale and the correction folds into M's first column (no extra cm, shape dedup preserved).
+            // Above 2x the ratio is not trusted and the correction is dropped, as the renderer does for non-embedded fonts.
+            if (res.subAdvanceEm) {
+              const ws = binding.isType0 && binding.charCodeToCID
+                ? (binding.charCodeToCID.get(code) ?? code) : code;
+              const W = binding.widths.get(ws) ?? binding.defaultWidth;
+              if (W > 0) {
+                let hScale = (W / 1000) / res.subAdvanceEm;
+                if (hScale > 2.0) hScale = 1;
+                if (Number.isFinite(hScale) && hScale > 0 && hScale !== 1) {
+                  M = [M[0] * hScale, M[1] * hScale, M[2], M[3], M[4], M[5]];
+                }
+              }
+            }
+            pendingConverts.push(strokeW !== undefined ? { xobjTag, M, strokeW } : { xobjTag, M });
+            outputElems.push({ kind: 'spacer', value: spacerForGlyphMimic(binding, code, numBytes) });
+            anyConvert = true;
+          }
+        }
+      }
+
+      if (!didConvert) {
+        outputElems.push({ kind: 'glyph', code, numBytes });
+      }
+      advanceMatrixForGlyph(tm, binding, code, numBytes);
+    }
+
+    if (!anyConvert) {
+      if (operandHasBytes(operand)) btKept = true;
+      emitVerbatim(op);
+      continue;
+    }
+    changed = true;
+    if (outputElems.some((e) => e.kind === 'glyph')) btKept = true;
+
+    // Verbatim positioning ops and advance-mimicking spacer TJs have already reproduced the original tm, so the output position equals this show's start.
+    // The TJ therefore goes out in place, with no ET/BT bounce and no Tm re-emit.
+    // ' and " advance to the next line (and " sets Tw/Tc) as part of the op being replaced, so emit those state effects explicitly.
+    if (op === "'") {
+      out.push('T*\n');
+    } else if (op === '"' && aw !== null && ac !== null) {
+      out.push(`${fmt(aw)} Tw\n`);
+      out.push(`${fmt(ac)} Tc\n`);
+      out.push('T*\n');
+    }
+
+    const emitTJ = (elems) => {
+      const parts = [];
+      let hex = '';
+      for (const e of elems) {
+        if (e.kind === 'glyph') {
+          hex += codeToHex(e.code, e.numBytes);
+        } else {
+          if (hex) { parts.push(`<${hex}>`); hex = ''; }
+          parts.push(fmt(e.value));
+        }
+      }
+      if (hex) parts.push(`<${hex}>`);
+      if (parts.length > 0) out.push(`[${parts.join(' ')}] TJ\n`);
+    };
+
+    emitTJ(outputElems);
+    operandBuf.length = 0;
+  }
+
+  flushPendingConverts();
+  flushPathBufVerbatim();
+  if (operandBuf.length > 0) {
+    for (const o of operandBuf) out.push(`${serializeContentToken(o)} `);
+  }
+
+  return {
+    ok: true,
+    text: changed ? out.join('') : streamText,
+    changed,
+    usedXobj,
+    skipped,
+    formInvocations,
+    imageInvocations,
+    verbatimImageNames,
+    imageDeleteDroppedNames,
+    imageDeleteKeptNames,
+    imageDeleteDroppedObjNums,
+    finalCtm: ctm,
+  };
+}
+
+/**
+ * Compute a glyph bounding box in font-unit space.
+ * @param {ReadonlyArray<PathCommand>} commands
+ */
+function bboxFromCommands(commands) {
+  let xMin = Infinity;
+  let yMin = Infinity;
+  let xMax = -Infinity;
+  let yMax = -Infinity;
+  const accept = (/** @type {number} */ x, /** @type {number} */ y) => {
+    if (typeof x !== 'number' || typeof y !== 'number') return;
+    if (x < xMin) xMin = x;
+    if (x > xMax) xMax = x;
+    if (y < yMin) yMin = y;
+    if (y > yMax) yMax = y;
+  };
+  for (const c of commands) {
+    if (c.type === 'M' || c.type === 'L') accept(c.x, c.y);
+    else if (c.type === 'C') {
+      accept(c.x1, c.y1);
+      accept(c.x2, c.y2);
+      accept(c.x, c.y);
+    } else if (c.type === 'Q') {
+      accept(c.x1, c.y1);
+      accept(c.x, c.y);
+    }
+  }
+  if (!Number.isFinite(xMin)) {
+    return {
+      xMin: 0, yMin: 0, xMax: 0, yMax: 0,
+    };
+  }
+  return {
+    xMin, yMin, xMax, yMax,
+  };
+}
+
+/**
+ * Resolve charCode -> glyphIndex for a parsed PDF FontInfo + a font's cmap.
+ *
+ * @param {any} fontInfo - FontInfo from parsePageFonts
+ * @param {number} charCode - the decoded code from the content stream
+ * @param {LoadedFontOutlines | null} loaded
+ * @returns {number | null}
+ */
+export function charCodeToGlyphIndex(fontInfo, charCode, loaded) {
+  if (fontInfo.type0) {
+    const cid = fontInfo.charCodeToCID
+      ? (fontInfo.charCodeToCID.get(charCode) ?? charCode)
+      : charCode;
+    // For CIDFontType0C the CFF charset stores CIDs, not GIDs.
+    // CID is not GID even when the PDF declares /Identity for CIDToGIDMap, because subsetting reorders glyphs.
+    if (loaded?.cffCidToGid) {
+      const gid = loaded.cffCidToGid.get(cid);
+      if (gid != null) return gid;
+    }
+    const map = fontInfo.type0.cidToGidMap;
+    if (map === 'identity' || !map) return cid;
+    if (map instanceof Uint8Array) {
+      const off = cid * 2;
+      if (off + 1 >= map.length) return 0;
+      return (map[off] << 8) | map[off + 1];
+    }
+    return cid;
+  }
+  if (loaded?.nameToGid && fontInfo.charCodeToGlyphName) {
+    const gname = fontInfo.charCodeToGlyphName.get(charCode);
+    if (gname) {
+      const gid = loaded.nameToGid.get(gname);
+      if (gid != null) return gid;
+      const uniMatch = /^uni([0-9A-Fa-f]{4})$/.exec(gname) || /^u([0-9A-Fa-f]{4,6})$/.exec(gname);
+      if (uniMatch && loaded.cmap?.glyphIndexMap) {
+        const cp = parseInt(uniMatch[1], 16);
+        const g = loaded.cmap.glyphIndexMap[cp];
+        if (g > 0) return g;
+      }
+    }
+  }
+  const cmap = loaded && loaded.cmap;
+  // For a format-0 (single-byte) cmap, prefer the raw byteToGlyphIndex array over glyphIndexMap.
+  // glyphIndexMap re-keys its 0x80..0xFF half by Mac-Roman Unicode, mapping those byte codes to the wrong glyph.
+  if (cmap && Array.isArray(cmap.byteToGlyphIndex) && charCode >= 0 && charCode < 256) {
+    const g = cmap.byteToGlyphIndex[charCode];
+    if (g != null && g > 0) return g;
+  }
+  // When /Differences does not name the code, its identity comes only from /ToUnicode, and the raw (1,0) Mac cmap below would map the byte to an unrelated Mac-Roman glyph.
+  if (loaded?.unicodeToGid && fontInfo.toUnicode && !fontInfo.charCodeToGlyphName?.get(charCode)) {
+    const uniStr = fontInfo.toUnicode.get(charCode);
+    if (uniStr && uniStr.length > 0) {
+      const cp = uniStr.codePointAt(0);
+      const gid = cp != null ? loaded.unicodeToGid.get(cp) : undefined;
+      if (gid != null && gid > 0) return gid;
+    }
+  }
+  const gim = cmap && cmap.glyphIndexMap;
+  if (gim) {
+    if (gim[charCode] != null && gim[charCode] > 0) return gim[charCode];
+    if (gim[0xF000 | charCode] != null && gim[0xF000 | charCode] > 0) return gim[0xF000 | charCode];
+    const uniStr = fontInfo.toUnicode && fontInfo.toUnicode.get(charCode);
+    if (uniStr && uniStr.length > 0) {
+      const cp = uniStr.codePointAt(0);
+      if (cp != null && gim[cp] != null && gim[cp] > 0) return gim[cp];
+    }
+  }
+  if (loaded?.cffCharCodeToGid) {
+    const gid = loaded.cffCharCodeToGid.get(charCode);
+    if (gid != null) return gid;
+  }
+  // Returning charCode as a GID can look correct for TrueType subsets where charCode == GID, but breaks CFF/Type1C without /Encoding.
+  return null;
+}
+
+/**
+ * @typedef {object} ConversionState
+ * @property {Map<number, ReturnType<typeof loadGlyphsForOutlines>>} fontGlyphsCache
+ *   Loaded glyph outlines, keyed by source font objNum.
+ * @property {Set<number>} inProgress
+ *   Form objNums currently on the recursion stack.
+ * @property {Map<string, number>} formCloneByKey
+ *   Cloned Form XObject dedup, keyed by `${origObjNum}|${contentHash}|${redirectsHash}`.
+ *   Lets pages sharing the same form with identical CTM reuse one clone object.
+ * @property {Map<string, number>} type3GlyphIndexByKey
+ *   Stable ordinal per Type3 (fontObjNum, glyphName), so the existing `TGP{font}g{gid}` Form-XObject dedup keys the same Type3 glyph the same way across pages.
+ */
+
+/**
+ * Build a fresh document-wide cache state shared across `convertSinglePageForRegions` calls.
+ * @returns {ConversionState}
+ */
+export function createConversionState() {
+  return {
+    fontGlyphsCache: new Map(),
+    inProgress: new Set(),
+    formCloneByKey: new Map(),
+    type3GlyphIndexByKey: new Map(),
+    // Dict texts the rebuild's reference trace must include for redaction.
+    // The form clones' originals are deliberately untraced, but the clones still reference live fonts and images.
+    /** @type {string[]} */
+    redactTraceTexts: [],
+    // Scrubbed-image copies, keyed by source objNum + the unit-space regions painted.
+    /** @type {Map<string, number>} */
+    imageScrubCache: new Map(),
+  };
+}
+
+/**
+ * One Type3 CharProc, parsed to drawable path data.
+ *
+ * @typedef {{ commands: PathCommand[], provablyEmpty?: boolean, isD1?: boolean,
+ *   paintMode?: string, evenOdd?: boolean }} Type3Glyph
+ */
+
+/**
+ * Parsed PDF font descriptor from `parsePageFonts` (the subset consumed during conversion).
+ *
+ * @typedef {{
+ *   baseName: string,
+ *   bold?: boolean,
+ *   italic?: boolean,
+ *   charCodeToGlyphName?: Map<number, string> | null,
+ *   encodingUnicode?: Map<number, string> | null,
+ *   toUnicode?: Map<number, string> | null,
+ *   type0?: { fontFile?: Uint8Array | null } | null,
+ *   type1?: { fontFile?: Uint8Array | null } | null,
+ *   type3?: { encoding: { [charCode: number]: string }, fontMatrix: number[],
+ *     glyphs: { [glyphName: string]: Type3Glyph } } | null,
+ * }} FontInfo
+ */
+
+/**
+ * Build a glyph resolver closure for the conversion state.
+ *
+ * @param {Map<number, FontInfo>} fontInfoByObjNum - Shared map: fontObjNum -> FontInfo.
+ *   Mutated as fonts from forms are encountered.
+ * @param {ReturnType<typeof createConversionState>} state
+ * @returns {GlyphResolver}
+ */
+function buildResolver(fontInfoByObjNum, state) {
+  return ({ fontObjNum, charCode }) => {
+    const fi = fontInfoByObjNum.get(fontObjNum);
+    if (!fi) return { error: 'font-not-found' };
+
+    if (fi.type3) {
+      const glyphName = fi.type3.encoding[charCode];
+      if (!glyphName) return { error: 'type3-no-encoding' };
+      const glyph = fi.type3.glyphs[glyphName];
+      if (!glyph) return { error: 'type3-no-glyph' };
+      const commands = glyph.commands;
+      if (!commands || commands.length === 0) {
+        // Zero path commands only proves the glyph is empty when the CharProc is provably empty, meaning every operator is non-marking (see parseType3Font).
+        // Bitmap glyphs (inline ImageMask, Do), nested text, shadings, and unreadable CharProcs all parse to zero commands while still able to paint, so dropping them erases visible text.
+        if (!glyph.provablyEmpty) return { error: 'type3-no-moveto' };
+        // A genuinely empty CharProc draws nothing, so report it as `empty-path` and let the caller drop it to a numeric spacer.
+        // Producers such as Adobe "Print to PDF" encode inter-word spaces this way, often with a broken oversized FontBBox, so leaving them verbatim hijacks text selection.
+        return { error: 'empty-path' };
+      }
+      // A bitmapped Type3 CharProc has no real path data, but `parseGlyphStreamPaths` can still surface stray `h`/`Z` tokens from misread binary inline-image bytes.
+      // Requiring a moveto keeps those from converting as an empty-looking path.
+      if (!commands.some((c) => c.type === 'M')) {
+        return { error: 'type3-no-moveto' };
+      }
+      // A d1 CharProc is monochromatic and takes its colour from the graphics state (PDF 32000-2 section 9.6.4), so a fill inside the form picks up the caller's fill colour and round-trips.
+      // d0 supplies its own colours, which parseGlyphStreamPaths drops, and d1 with stroke/fillStroke would source the caller's separate stroke colour, so neither converts.
+      if (!glyph.isD1) return { error: 'type3-d0-colour-not-preserved' };
+      const pm = glyph.paintMode;
+      if (pm === 'stroke' || pm === 'fillStroke') {
+        return { error: `type3-d1-${pm}-colour-mismatch` };
+      }
+      const key = `${fontObjNum}|${glyphName}`;
+      let glyphIndex = state.type3GlyphIndexByKey.get(key);
+      if (glyphIndex == null) {
+        glyphIndex = state.type3GlyphIndexByKey.size;
+        state.type3GlyphIndexByKey.set(key, glyphIndex);
+      }
+      // Derive the bbox from the path commands, not from `glyph.bbox`.
+      // The two come from different walks of the CharProc (`parseGlyphStream` vs `parseGlyphStreamPaths`) and land in different coordinate spaces when the CharProc scales with cm.
+      const bbox = bboxFromCommands(commands);
+      return {
+        glyphIndex,
+        formMatrix: fi.type3.fontMatrix,
+        pathCommands: commands,
+        bbox,
+        paintMode: 'fill',
+        evenOdd: !!glyph.evenOdd,
+      };
+    }
+
+    let loaded;
+    if (state.fontGlyphsCache.has(fontObjNum)) {
+      loaded = state.fontGlyphsCache.get(fontObjNum);
+    } else {
+      let fontFile = null;
+      if (fi.type0 && fi.type0.fontFile) fontFile = fi.type0.fontFile;
+      else if (fi.type1 && fi.type1.fontFile) fontFile = fi.type1.fontFile;
+      loaded = fontFile ? loadGlyphsForOutlines(fontFile) : null;
+      // A fully unembedded font (no FontFile at all) gets our built-in outlines, as every viewer already does.
+      // An embedded-but-unparseable program has a fontFile, so it fails this gate and keeps the skip-tail behavior.
+      if (!loaded && !fontFile && (fi.type1 || fi.type0) && GlobalFonts.raw) {
+        // Resolve the substitute family via the same cascade the renderer uses for non-embedded fonts (registerNonEmbeddedFont), so the outlines match the baseline render.
+        const hints = { bold: !!fi.bold, italic: !!fi.italic };
+        const sub = base14ToBuiltInFont(fi.baseName, hints)
+          || cssFamilyToBuiltInFont(standardFontToCSS(fi.baseName || '') || '', hints)
+          || genericToBuiltInFont(cssGenericForFontObj(fi), hints);
+        if (sub) {
+          const styleKey = sub.variant === 'BoldItalic' ? 'boldItalic'
+            : (sub.variant === 'Bold' ? 'bold' : (sub.variant === 'Italic' ? 'italic' : 'normal'));
+          const fam = GlobalFonts.raw[sub.family];
+          // The Base14 symbol faces (Dingbats, StandardSymbolsPS) live in `supp`, not `raw`, so fall back to builtInSuppFontFor below.
+          let subFont = (fam?.[styleKey] || fam?.normal)?.opentype;
+          if (!subFont) subFont = builtInSuppFontFor(sub.family) || undefined;
+          if (subFont?.glyphs && subFont.unitsPerEm > 0) {
+            loaded = {
+              glyphs: subFont.glyphs,
+              unitsPerEm: subFont.unitsPerEm,
+              fontMatrix: [1 / subFont.unitsPerEm, 0, 0, 1 / subFont.unitsPerEm, 0, 0],
+              fontType: 'substitute',
+              substituteFont: subFont,
+            };
+          }
+        }
+      }
+      state.fontGlyphsCache.set(fontObjNum, loaded);
+    }
+    if (!loaded) return { error: 'font-not-embedded-or-unsupported' };
+    let glyphIndex;
+    if (loaded.fontType === 'substitute') {
+      // Drawing identity comes from the PDF encoding, not /ToUnicode, so the glyph name leads and the Unicode maps are only fallbacks.
+      let uni = null;
+      const gname = fi.charCodeToGlyphName ? fi.charCodeToGlyphName.get(charCode) : null;
+      if (gname) {
+        uni = aglLookup(gname) || null;
+        if (!uni) {
+          const m = /^uni([0-9A-Fa-f]{4})$/.exec(gname) || /^u([0-9A-Fa-f]{4,6})$/.exec(gname);
+          if (m) uni = String.fromCodePoint(parseInt(m[1], 16));
+        }
+      }
+      if (!uni && fi.encodingUnicode) uni = fi.encodingUnicode.get(charCode) || null;
+      if (!uni && fi.toUnicode) uni = fi.toUnicode.get(charCode) || null;
+      if (!uni || uni.length === 0) {
+        // A control byte (C0 0x00-0x1F or DEL 0x7F) with no glyph-name/Unicode mapping paints nothing, so drop it to an advance-only spacer rather than residual selectable text.
+        if (charCode < 0x20 || charCode === 0x7f) return { error: 'empty-path' };
+        return { error: 'substitute-no-unicode' };
+      }
+      const cp = uni.codePointAt(0);
+      glyphIndex = cp != null ? loaded.substituteFont.charToGlyphIndex(String.fromCodePoint(cp)) : 0;
+      if (!glyphIndex || glyphIndex <= 0) return { error: 'substitute-missing-glyph' };
+    } else {
+      glyphIndex = charCodeToGlyphIndex(fi, charCode, loaded);
+    }
+    if (glyphIndex == null || glyphIndex < 0 || glyphIndex >= loaded.glyphs.length) {
+      return { error: `no-glyph-${glyphIndex}` };
+    }
+    let glyph;
+    try {
+      glyph = loaded.glyphs.get(glyphIndex);
+    } catch (e) {
+      return { error: `glyph-load-failed:${String(e?.message || e)}` };
+    }
+    if (!glyph || !glyph.path || !glyph.path.commands) {
+      return { error: 'no-path-commands' };
+    }
+    const commands = glyph.path.commands;
+    if (commands.length === 0) {
+      return { error: 'empty-path' };
+    }
+    const upem = (typeof loaded.unitsPerEm === 'number' && loaded.unitsPerEm > 0
+      && Number.isFinite(loaded.unitsPerEm)) ? loaded.unitsPerEm : 1000;
+    const inv = 1 / upem;
+    const formMatrix = (Array.isArray(loaded.fontMatrix) && loaded.fontMatrix.length === 6)
+      ? loaded.fontMatrix : [inv, 0, 0, inv, 0, 0];
+    // A substitute font's outline carries its own natural advance, not the PDF's /Widths, so report that advance for the caller to correct with.
+    const subAdvanceEm = (loaded.fontType === 'substitute'
+      && typeof glyph.advanceWidth === 'number' && glyph.advanceWidth > 0)
+      ? glyph.advanceWidth / upem : undefined;
+    return {
+      glyphIndex,
+      formMatrix,
+      pathCommands: commands,
+      bbox: bboxFromCommands(commands),
+      subAdvanceEm,
+    };
+  };
+}
+
+/**
+ * Add a container's fonts (parsed from its /Resources) into the shared fontInfoByObjNum and into a per-container fontsByTag map.
+ *
+ * @param {Map<string, any>} pdfFontInfos - Output of parsePageFonts.
+ * @param {Map<string, FontBinding>} fontsByTag - Mutated: adds container fonts.
+ * @param {Map<number, any>} fontInfoByObjNum - Mutated: adds container fonts.
+ */
+function mergeContainerFonts(pdfFontInfos, fontsByTag, fontInfoByObjNum) {
+  for (const [tag, fi] of pdfFontInfos) {
+    if (typeof fi.fontObjNum !== 'number') continue;
+    fontsByTag.set(tag, {
+      fontObjNum: fi.fontObjNum,
+      widths: fi.widths,
+      defaultWidth: fi.defaultWidth,
+      verticalMode: !!fi.verticalMode,
+      codespaceRanges: fi.codespaceRanges,
+      charCodeToCID: fi.charCodeToCID,
+      isType0: !!fi.isCIDFont || !!fi.type0,
+      isType3: !!fi.type3,
+    });
+    if (!fontInfoByObjNum.has(fi.fontObjNum)) fontInfoByObjNum.set(fi.fontObjNum, fi);
+  }
+}
+
+/**
+ * Add to `into` the object numbers of Type3 fonts with broken ToUnicode, whose glyphs are converted to paths so their gibberish PUA text stops being selectable.
+ *
+ * @param {Map<number, any>} fontInfoByObjNum
+ * @param {Set<number>} into - Mutated: broken-Type3 font object numbers added.
+ */
+function collectBrokenType3FontObjNums(fontInfoByObjNum, into) {
+  const FILLER_MIN = 3;
+  for (const [objNum, fi] of fontInfoByObjNum) {
+    if (into.has(objNum) || !fi || !fi.type3 || !fi.toUnicode) continue;
+    const enc = fi.type3.encoding || {};
+    const glyphs = fi.type3.glyphs || {};
+    /** @param {number} cc */
+    const glyphOf = (cc) => glyphs[enc[cc]];
+    // Count outline reuse so producer .notdef boxes (one outline across many slots) are not mistaken for genuinely-unresolved characters.
+    const hashCount = new Map();
+    for (const [cc] of fi.toUnicode) {
+      const g = glyphOf(cc);
+      if (g && g.pathHash) hashCount.set(g.pathHash, (hashCount.get(g.pathHash) || 0) + 1);
+    }
+    for (const [cc, str] of fi.toUnicode) {
+      if (str == null || str === '') continue;
+      const cp = str.codePointAt(0);
+      if (cp === 0xFFFD) { into.add(objNum); break; }
+      if (cp < 0xE000 || cp > 0xF8FF) continue;
+      const g = glyphOf(cc);
+      const isFiller = g && g.pathHash && (hashCount.get(g.pathHash) || 0) >= FILLER_MIN;
+      if (!isFiller) { into.add(objNum); break; }
+    }
+  }
+}
+
+/**
+ * Stable string hash (djb2). Used for clone dedup fingerprints.
+ * @param {string} s
+ */
+function djb2(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+/**
+ * Build the dedup key for a cloned Form XObject.
+ * Two invocations with the same key produce byte-identical clone objects, so a single clone is shared.
+ *
+ * @param {number} origObjNum
+ * @param {string} text - Rewritten content stream text.
+ * @param {Map<string, number>} xobjEntries - Per-glyph form entries this clone references.
+ * @param {Map<string, number>} formClonesByName - Nested-form redirects this clone references.
+ */
+function makeCloneDedupKey(origObjNum, text, xobjEntries, formClonesByName) {
+  const sortedX = [...xobjEntries.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([k, v]) => `${k}=${v}`).join('\n');
+  const sortedF = [...formClonesByName.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([k, v]) => `${k}=${v}`).join('\n');
+  return `${origObjNum}|${djb2(text)}|${djb2(sortedX)}|${djb2(sortedF)}`;
+}
+
+/**
+ * Resolve an object's /Resources to its literal `<<...>>` dict text, following an indirect reference if present.
+ * Returns null when the object has no /Resources of its own, which is legal: a Form XObject may omit it and inherit its parent's (PDF spec 7.8.3).
+ *
+ * @param {string} objText
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @returns {string | null}
+ */
+function resolveResourcesText(objText, objCache) {
+  const idx = objText.indexOf('/Resources');
+  if (idx === -1) return null;
+  let p = idx + '/Resources'.length;
+  while (p < objText.length && /\s/.test(objText[p])) p++;
+  if (objText.startsWith('<<', p)) return extractDict(objText, p);
+  const ref = /^(\d+)\s+\d+\s+R/.exec(objText.slice(p));
+  if (ref) {
+    const resolved = objCache.getObjectText(Number(ref[1]));
+    if (resolved) {
+      const t = resolved.trim();
+      return t.startsWith('<<') ? t : `<<${t}>>`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract the named marked-content property lists (/Properties) from a resources dict text, as raw dict text per name.
+ *
+ * @param {string | null} resourcesText
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @returns {Map<string, string>}
+ */
+function parseMarkedContentProps(resourcesText, objCache) {
+  /** @type {Map<string, string>} */
+  const out = new Map();
+  if (!resourcesText) return out;
+  const idx = resourcesText.indexOf('/Properties');
+  if (idx === -1) return out;
+  let p = idx + '/Properties'.length;
+  while (p < resourcesText.length && /\s/.test(resourcesText[p])) p++;
+  let dictText = null;
+  if (resourcesText.startsWith('<<', p)) {
+    dictText = extractDict(resourcesText, p);
+  } else {
+    const ref = /^(\d+)\s+\d+\s+R/.exec(resourcesText.slice(p));
+    if (ref && objCache) {
+      const resolved = objCache.getObjectText(Number(ref[1]));
+      if (resolved) {
+        const ds = resolved.indexOf('<<');
+        if (ds !== -1) dictText = extractDict(resolved, ds);
+      }
+    }
+  }
+  if (!dictText) return out;
+  for (const entry of parseDictEntries(dictText.slice(2, -2))) {
+    let propText = entry.valueText;
+    const ref = /^(\d+)\s+\d+\s+R$/.exec(propText.trim());
+    if (ref) {
+      const resolved = objCache ? objCache.getObjectText(Number(ref[1])) : null;
+      if (!resolved) continue;
+      const ds = resolved.indexOf('<<');
+      if (ds === -1) continue;
+      propText = extractDict(resolved, ds);
+    }
+    if (propText && propText.trim().startsWith('<<')) out.set(entry.key, propText.trim());
+  }
+  return out;
+}
+
+/**
+ * Extract the stroke-relevant ExtGState parameters (/LW, /ML, /D) from a resources dict text.
+ *
+ * @param {string | null} resourcesText
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @returns {Map<string, {lw?: number, dash?: boolean, ml?: number}>}
+ */
+function parseExtGStates(resourcesText, objCache) {
+  /** @type {Map<string, {lw?: number, dash?: boolean, ml?: number}>} */
+  const out = new Map();
+  if (!resourcesText) return out;
+  const idx = resourcesText.indexOf('/ExtGState');
+  if (idx === -1) return out;
+  let p = idx + '/ExtGState'.length;
+  while (p < resourcesText.length && /\s/.test(resourcesText[p])) p++;
+  let dictText = null;
+  if (resourcesText.startsWith('<<', p)) {
+    dictText = extractDict(resourcesText, p);
+  } else {
+    const ref = /^(\d+)\s+\d+\s+R/.exec(resourcesText.slice(p));
+    if (ref && objCache) {
+      const resolved = objCache.getObjectText(Number(ref[1]));
+      if (resolved) {
+        const ds = resolved.indexOf('<<');
+        if (ds !== -1) dictText = extractDict(resolved, ds);
+      }
+    }
+  }
+  if (!dictText) return out;
+  for (const entry of parseDictEntries(dictText.slice(2, -2))) {
+    let gsText = entry.valueText;
+    const ref = /^(\d+)\s+\d+\s+R$/.exec(gsText.trim());
+    if (ref) {
+      const resolved = objCache ? objCache.getObjectText(Number(ref[1])) : null;
+      if (!resolved) continue;
+      const ds = resolved.indexOf('<<');
+      if (ds === -1) continue;
+      gsText = extractDict(resolved, ds);
+    }
+    /** @type {{lw?: number, dash?: boolean, ml?: number}} */
+    const rec = {};
+    const lwV = resolveNumValue(gsText, 'LW', objCache, Number.NaN);
+    if (!Number.isNaN(lwV)) {
+      if (!Number.isFinite(lwV) || lwV < 0) continue;
+      rec.lw = lwV;
+    }
+    const mlV = resolveNumValue(gsText, 'ML', objCache, Number.NaN);
+    if (Number.isFinite(mlV)) rec.ml = mlV;
+    const dM = /\/D\s*\[\s*\[([^\]]*)\]/.exec(gsText);
+    if (dM) rec.dash = /\S/.test(dM[1]);
+    out.set(entry.name, rec);
+  }
+  return out;
+}
+
+/**
+ * Build the dict-extras string (everything between `<<` and `/Length`) for a cloned Form XObject.
+ * Preserves the original dict's keys verbatim except /Length and /Filter, which are re-emitted fresh, and /Resources, which is rebuilt to splice in per-glyph entries and nested-form redirects.
+ *
+ * @param {string} originalFormObjText - `N 0 obj\n<<...>>\nstream\n...\nendobj`
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @param {Map<string, number>} perGlyphXobjEntries - tag -> objNum for per-glyph forms used inside.
+ * @param {Map<string, number>} nestedFormRedirects - name -> cloneObjNum for nested forms invoked inside.
+ * @param {string | null} inheritedResourcesText - The parent scope's /Resources dict text, used as the clone's /Resources base when the original form has none of its own.
+ * @param {?Set<string>} [dropXObjectNames] - Original form names the clone's /XObject subdict drops.
+ * @param {?Map<string, number>} [fontEntries] - `/Tag` to font object of the substitute faces a text patch of this form draws with.
+ * @returns {string}
+ */
+function buildClonedFormDictExtras(originalFormObjText, objCache, perGlyphXobjEntries, nestedFormRedirects, inheritedResourcesText, dropXObjectNames = null, fontEntries = null) {
+  const dictStart = originalFormObjText.indexOf('<<');
+  if (dictStart === -1) return '';
+  const dictText = extractDict(originalFormObjText, dictStart);
+  // encodeStreamObject re-emits /Length and /Filter fresh.
+  const dictBody = dictText.startsWith('<<') && dictText.endsWith('>>')
+    ? dictText.slice(2, -2)
+    : dictText;
+  let body = parseDictEntries(dictBody)
+    .filter((e) => e.name !== 'Length' && e.name !== 'Filter')
+    .map((e) => `/${e.name} ${e.valueText}`)
+    .join('\n');
+
+  let entriesStr = '';
+  for (const [tag, on] of perGlyphXobjEntries) entriesStr += `/${tag} ${on} 0 R\n`;
+  for (const [name, on] of nestedFormRedirects) entriesStr += `/${name} ${on} 0 R\n`;
+
+  const resIdx = body.indexOf('/Resources');
+  // A form that omits /Resources inherits its parent's (PDF spec 7.8.3), and the clone's own explicit /Resources severs that inheritance.
+  // Seeding from the inherited dict keeps the images and fonts the form drew that way from dropping out of the clone.
+  let resourcesDictText = resIdx === -1 ? (inheritedResourcesText || '') : '';
+  let beforeRes = body;
+  let afterRes = '';
+  if (resIdx !== -1) {
+    let p = resIdx + '/Resources'.length;
+    while (p < body.length && /\s/.test(body[p])) p++;
+    if (body.startsWith('<<', p)) {
+      const sub = extractDict(body, p);
+      resourcesDictText = sub;
+      beforeRes = body.slice(0, resIdx).trimEnd();
+      afterRes = body.slice(p + sub.length);
+    } else {
+      const refMatch = /^(\d+)\s+\d+\s+R/.exec(body.slice(p));
+      if (refMatch) {
+        const resolved = objCache.getObjectText(Number(refMatch[1]));
+        if (resolved) {
+          const trimmed = resolved.trim();
+          resourcesDictText = trimmed.startsWith('<<') ? trimmed : `<<${trimmed}>>`;
+        }
+        beforeRes = body.slice(0, resIdx).trimEnd();
+        afterRes = body.slice(p + refMatch[0].length);
+      }
+    }
+  }
+  // Under per-site aliasing, the aliased original form names must disappear from the clone's /XObject subdict.
+  // A surviving entry would keep the unredacted nested original referenced (and copied into the output) though no content invokes it.
+  if (dropXObjectNames && dropXObjectNames.size > 0 && resourcesDictText && resourcesDictText.startsWith('<<')) {
+    const resBody = resourcesDictText.slice(2, -2);
+    const xobjIdx = resBody.indexOf('/XObject');
+    if (xobjIdx !== -1) {
+      let p2 = xobjIdx + '/XObject'.length;
+      while (p2 < resBody.length && /\s/.test(resBody[p2])) p2++;
+      /** @type {?string} */
+      let subBody = null;
+      let endIdx = p2;
+      if (resBody.startsWith('<<', p2)) {
+        const sub = extractDict(resBody, p2);
+        subBody = sub.slice(2, -2);
+        endIdx = p2 + sub.length;
+      } else {
+        const refMatch = /^(\d+)\s+\d+\s+R/.exec(resBody.slice(p2));
+        if (refMatch) {
+          const resolved = objCache.getObjectText(Number(refMatch[1]));
+          if (resolved) {
+            const ds = resolved.indexOf('<<');
+            if (ds !== -1) subBody = extractDict(resolved, ds).slice(2, -2);
+          }
+          endIdx = p2 + refMatch[0].length;
+        }
+      }
+      if (subBody !== null) {
+        const kept = parseDictEntries(subBody).filter((e) => !dropXObjectNames.has(e.name));
+        const inner = kept.map((e) => `/${e.name} ${e.valueText}`).join(' ');
+        resourcesDictText = `<<${resBody.slice(0, xobjIdx)}/XObject<<${inner}>>${resBody.slice(endIdx)}>>`;
+      }
+    }
+  }
+
+  let fontsStr = '';
+  for (const [name, on] of fontEntries || []) fontsStr += `${name} ${on} 0 R\n`;
+  const mergedResources = mergeResources(resourcesDictText || '<<>>', fontsStr, '', objCache, entriesStr);
+  body = `${beforeRes}\n/Resources ${mergedResources}\n${afterRes.trimStart()}`;
+
+  return body.trim();
+}
+
+/**
+ * Scrub redaction regions out of an image XObject: decode to a canvas, paint the regions black, re-encode as PNG-in-Flate, and push the copy as a new object.
+ * Any failure falls back to a 1x1 black image; whatever the encoding, the redacted pixels must never survive.
+ *
+ * @param {object} params
+ * @param {number} params.objNum - Source image XObject.
+ * @param {?Array<[number, number, number, number]>} params.unitRects - Regions in the image's unit space (u right, v up, per the PDF image placement square); null forces the fallback.
+ * @param {import('../../pdf/objectCache.js').ObjectCache} params.objCache
+ * @param {() => number} params.allocObjNum
+ * @param {(obj: {objNum: number, content: any}) => void} params.pushObj
+ * @param {boolean} params.humanReadable
+ * @returns {Promise<{objNum: number, fallback: boolean}>}
+ */
+async function scrubImageXObject({
+  objNum, unitRects, objCache, allocObjNum, pushObj, humanReadable,
+}) {
+  let newObjNum = null;
+  try {
+    // Load the Node canvas module (also installs globalThis.ImageData, which the decode below needs); a no-op in the browser.
+    // Must not depend on a prior render having run.
+    await ca.getCanvasNode();
+    if (unitRects && unitRects.length > 0) {
+      const objText = objCache.getObjectText(objNum);
+      const info = objText ? parseImageObject(objText, objNum, objCache) : null;
+      // ImageMask pixels are fill-colour stencils; re-encoding as RGB would change semantics, so masks take the fail-closed fallback below.
+      const bitmap = (info && !info.imageMask)
+        ? await _imageInfoToBitmap(info, objCache)
+        : null;
+      if (bitmap && bitmap.width > 0 && bitmap.height > 0) {
+        const w = bitmap.width;
+        const h = bitmap.height;
+        const canvas = await ca.createCanvas(w, h);
+        const ctx = /** @type {OffscreenCanvasRenderingContext2D} */ (canvas.getContext('2d'));
+        ctx.drawImage(bitmap, 0, 0);
+        ctx.fillStyle = '#000000';
+        for (const [u0, v0, u1, v1] of unitRects) {
+          // Image rows run top-down while the placement square's v runs up.
+          const x0 = Math.max(0, Math.floor(u0 * w) - 1);
+          const x1 = Math.min(w, Math.ceil(u1 * w) + 1);
+          const y0 = Math.max(0, Math.floor((1 - v1) * h) - 1);
+          const y1 = Math.min(h, Math.ceil((1 - v0) * h) + 1);
+          if (x1 > x0 && y1 > y0) ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+        }
+        const imageData = ctx.getImageData(0, 0, w, h);
+        // imageInfoToBitmap bakes any /SMask into the alpha channel, which the PNG re-encode strips, so a companion /SMask is re-emitted when any transparency survives.
+        // The painted regions are opaque by construction, destroying any text-shaped alpha inside them.
+        let hasAlpha = false;
+        for (let i = 3; i < imageData.data.length; i += 4) {
+          if (imageData.data[i] !== 255) { hasAlpha = true; break; }
+        }
+        let smaskObjNum = null;
+        if (hasAlpha) {
+          const alphaData = new ImageData(w, h);
+          for (let i = 0; i < imageData.data.length; i += 4) {
+            const a = imageData.data[i + 3];
+            alphaData.data[i] = a; alphaData.data[i + 1] = a; alphaData.data[i + 2] = a; alphaData.data[i + 3] = 255;
+          }
+          const smaskPng = base64ToBytes(await _buildPngDataUrl(alphaData, 'gray'));
+          smaskObjNum = allocObjNum();
+          pushObj({ objNum: smaskObjNum, content: createImageXObjectPng(smaskObjNum, smaskPng.buffer, undefined, humanReadable) });
+        }
+        const pngBytes = base64ToBytes(await _buildPngDataUrl(imageData, 'color'));
+        newObjNum = allocObjNum();
+        let obj = createImageXObjectPng(newObjNum, pngBytes.buffer, undefined, humanReadable);
+        if (smaskObjNum !== null) {
+          const smaskEntry = `/SMask ${smaskObjNum} 0 R\n`;
+          if (typeof obj === 'string') obj = obj.replace('>>\nstream\n', `${smaskEntry}>>\nstream\n`);
+          else obj = { ...obj, header: obj.header.replace('>>\nstream\n', `${smaskEntry}>>\nstream\n`) };
+        }
+        pushObj({ objNum: newObjNum, content: obj });
+        ca.closeDrawable(bitmap);
+      }
+    }
+  } catch {
+    newObjNum = null;
+  }
+  if (newObjNum !== null) return { objNum: newObjNum, fallback: false };
+  const fallbackObjNum = allocObjNum();
+  const streamStr = '000000>';
+  pushObj({
+    objNum: fallbackObjNum,
+    content: `${fallbackObjNum} 0 obj\n<</Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/ASCIIHexDecode/Length ${streamStr.length}>>\nstream\n${streamStr}\nendstream\nendobj\n\n`,
+  });
+  return { objNum: fallbackObjNum, fallback: true };
+}
+
+/**
+ * Point every aliased image invocation at a scrubbed copy (see the Do handler in the walk), and mark fully-replaced original names for removal from the container's /XObject dict.
+ * Shared by the page- and form-level orchestrators.
+ *
+ * @param {object} params
+ * @param {Array<{alias: string, name: string, objNum: number, ctm: number[]}>} params.imageInvocations
+ * @param {Set<string>} params.verbatimImageNames
+ * @param {ReadonlyArray<ReadonlyArray<number>>} params.redactBboxes
+ * @param {ReturnType<typeof createConversionState>} params.state
+ * @param {import('../../pdf/objectCache.js').ObjectCache} params.objCache
+ * @param {() => number} params.allocObjNum
+ * @param {(obj: {objNum: number, content: any}) => void} params.pushObj
+ * @param {boolean} params.humanReadable
+ * @param {Map<string, number>} params.aliasEntries - alias -> objNum entries (rides the formClones channel).
+ * @param {Set<string>} params.droppedNames - original names to remove from the /XObject dict.
+ * @param {Array<{fontObjNum: number, charCode: number, reason: string}>} params.skipped
+ */
+async function applyImageRedactions({
+  imageInvocations, verbatimImageNames, redactBboxes, state, objCache, allocObjNum, pushObj, humanReadable,
+  aliasEntries, droppedNames, skipped,
+}) {
+  /** @type {Map<number, {unitRects: Array<[number, number, number, number]>, aliases: Set<string>, degenerate: boolean}>} */
+  const perObj = new Map();
+  for (const inv of imageInvocations) {
+    let rec = perObj.get(inv.objNum);
+    if (!rec) {
+      rec = { unitRects: [], aliases: new Set(), degenerate: false };
+      perObj.set(inv.objNum, rec);
+    }
+    rec.aliases.add(inv.alias);
+    const [a, b, c, d, e, f] = inv.ctm;
+    const det = a * d - b * c;
+    if (!Number.isFinite(det) || Math.abs(det) < 1e-12) {
+      rec.degenerate = true;
+      continue;
+    }
+    // Inverse placement: user space -> the image's unit square.
+    const ia = d / det; const ib = -b / det; const ic = -c / det; const id = a / det;
+    const ie = (c * f - d * e) / det; const iff = (b * e - a * f) / det;
+    for (const r of redactBboxes) {
+      let u0 = Infinity; let v0 = Infinity; let u1 = -Infinity; let v1 = -Infinity;
+      for (const [x, y] of [[r[0], r[1]], [r[2], r[1]], [r[0], r[3]], [r[2], r[3]]]) {
+        const u = ia * x + ic * y + ie;
+        const v = ib * x + id * y + iff;
+        u0 = Math.min(u0, u); v0 = Math.min(v0, v); u1 = Math.max(u1, u); v1 = Math.max(v1, v);
+      }
+      u0 = Math.max(0, u0); v0 = Math.max(0, v0); u1 = Math.min(1, u1); v1 = Math.min(1, v1);
+      if (u1 > u0 && v1 > v0) rec.unitRects.push([u0, v0, u1, v1]);
+    }
+  }
+  for (const [imgObjNum, rec] of perObj) {
+    const key = `${imgObjNum}|${rec.degenerate ? 'degenerate' : rec.unitRects.map((r) => r.map((v) => v.toFixed(4)).join(',')).sort().join(';')}`;
+    let scrubbed = state.imageScrubCache.get(key);
+    if (scrubbed == null) {
+      const res = await scrubImageXObject({
+        objNum: imgObjNum, unitRects: rec.degenerate ? null : rec.unitRects, objCache, allocObjNum, pushObj, humanReadable,
+      });
+      scrubbed = res.objNum;
+      if (res.fallback) skipped.push({ fontObjNum: -1, charCode: -1, reason: 'redact-image-fallback-black' });
+      state.imageScrubCache.set(key, scrubbed);
+    }
+    for (const alias of rec.aliases) aliasEntries.set(alias, scrubbed);
+  }
+  for (const inv of imageInvocations) {
+    // Only drop an original name when NO placement kept it: a non-intersecting site still invokes the original by its source name.
+    if (!verbatimImageNames.has(inv.name)) droppedNames.add(inv.name);
+  }
+}
+
+/**
+ * Recursively rewrite a Form XObject's content stream for path conversion.
+ *
+ * If the form has no convertible glyphs, returns the original objNum unchanged.
+ * If the form has changes, allocates a clone (deduped via state.formCloneByKey)
+ * and returns the clone's objNum.
+ *
+ * @param {object} params
+ * @param {number} params.formObjNum
+ * @param {number[]} params.ctm - CTM at the time of the Do call.
+ * @param {Map<string, FontBinding>} params.parentFontsByTag - Caller's font scope.
+ * @param {Map<number, any>} params.fontInfoByObjNum - Shared font info map.
+ * @param {GlyphResolver} params.resolver
+ * @param {ReadonlyArray<ReadonlyArray<number>>} params.bboxes
+ * @param {Set<number> | null} [params.targetFontObjNums] - Broken-Type3 font object numbers,
+ *   extended with this form's fonts so glyphs drawn inside it convert too.
+ * @param {ReturnType<typeof createConversionState>} params.state
+ * @param {import('../../pdf/objectCache.js').ObjectCache} params.objCache
+ * @param {() => number} params.allocObjNum
+ * @param {(obj: {objNum: number, content: any}) => void} params.pushObj
+ * @param {boolean} params.humanReadable
+ * @param {string | null} [params.parentResourcesText] - The enclosing scope's /Resources dict text,
+ *   which this form inherits when it has none of its own.
+ * @param {number | null} [params.initialLineWidth] - Pen width at the recorded Do site
+ *   (null = unknown; Tr 1/2 shows inside then stay verbatim).
+ * @param {boolean} [params.initialDashActive]
+ * @param {number | null} [params.initialMiterLimit]
+ * @param {{tc: number, tw: number, tz: number, tl: number, tr: number, ts: number} | null} [params.initialTextState]
+ *   - Text state (incl. leading) inherited from the Do site,
+ *     so the form's line breaks and glyph advances match the original.
+ * @param {?Array<[number, number, number, number]>} [params.redactBboxes] - User-space rects whose content is destructively removed.
+ * @param {?Array<{rect: [number, number, number, number], sites: Array<{objNum: ?number, rect: [number, number, number, number]}>, tol: number}>} [params.imageDeletes]
+ * @param {?Array<{rect: [number, number, number, number], sites: Array<{rect: [number, number, number, number], paint: string, commands: number}>, tol: number}>} [params.pathDeletes]
+ * @param {?Array<TextPatch>} [params.textPatches]
+ * @param {string} [params.formPath]
+ * @param {?Map<string, number>} [params.editFontRefs]
+ * @returns {Promise<{ changed: boolean, cloneObjNum: number,
+ *   skipped: Array<{fontObjNum: number, charCode: number, reason: string}>, deletedImageObjNums?: Set<number> }>}
+ */
+async function rewriteFormContentForRegions({
+  formObjNum, ctm, parentFontsByTag, fontInfoByObjNum, resolver,
+  bboxes, targetFontObjNums = null, state, objCache, allocObjNum, pushObj, humanReadable,
+  parentResourcesText = null, initialLineWidth = null, initialDashActive = false, initialMiterLimit = null,
+  initialTextState = null, redactBboxes = null, imageDeletes = null, pathDeletes = null,
+  textPatches = null, formPath = '', editFontRefs = null,
+}) {
+  const redactActive = !!(redactBboxes && redactBboxes.length > 0);
+  /** @type {TextPatchStream} */
+  const formStream = { kind: 'form', path: formPath };
+  const formPatched = textPatchesTarget(textPatches, formStream);
+  const formPatchActive = !!textPatches && textPatches.some((r) => r.stream.kind === 'form' && r.stream.path.startsWith(`${formPath}/`));
+  const editActive = formPatched || formPatchActive;
+  const imageDeleteActive = !!(imageDeletes && imageDeletes.length > 0);
+  const pathDeleteActive = !!(pathDeletes && pathDeletes.length > 0);
+  if (state.inProgress.has(formObjNum)) {
+    return { changed: false, cloneObjNum: formObjNum, skipped: [] };
+  }
+  state.inProgress.add(formObjNum);
+  try {
+    const formObjText = objCache.getObjectText(formObjNum);
+    if (!formObjText || !/\/Subtype\s*\/Form\b/.test(formObjText)) {
+      if (redactActive && !formObjText) throw new Error('Cannot apply redactions: a Form XObject could not be read.');
+      if (editActive && !formObjText) throw new Error('Cannot apply text edits: a Form XObject could not be read.');
+      if (pathDeleteActive && !formObjText) throw new Error('Cannot apply path deletions: a Form XObject could not be read.');
+      return { changed: false, cloneObjNum: formObjNum, skipped: [] };
+    }
+
+    // An OC-hidden form never paints, but its text still extracts, so redaction and text edits must recurse into it anyway.
+    const offOCGs = typeof objCache.getOffOCGs === 'function' ? objCache.getOffOCGs() : new Set();
+    if (offOCGs.size > 0 && isFormOCHidden(formObjText, offOCGs, objCache) && !redactActive && !editActive) {
+      return { changed: false, cloneObjNum: formObjNum, skipped: [] };
+    }
+
+    // Resources this form's content can see: its own when present, else what it inherits from the enclosing scope.
+    // Nested forms inherit this same effective dict.
+    const effectiveResources = resolveResourcesText(formObjText, objCache) || parentResourcesText;
+
+    let formMatrix = [1, 0, 0, 1, 0, 0];
+    const nums = resolveNumArray(formObjText, 'Matrix', objCache);
+    if (nums && nums.length === 6 && nums.every(Number.isFinite)) formMatrix = nums;
+    const effectiveCtm = matMul(formMatrix, ctm);
+
+    let streamBytes;
+    try { streamBytes = objCache.getStreamBytes(formObjNum); } catch { streamBytes = null; }
+    if (!streamBytes) {
+      if (redactActive) throw new Error('Cannot apply redactions: a Form XObject stream could not be read.');
+      if (editActive) throw new Error('Cannot apply text edits: a Form XObject stream could not be read.');
+      if (pathDeleteActive) throw new Error('Cannot apply path deletions: a Form XObject stream could not be read.');
+      return { changed: false, cloneObjNum: formObjNum, skipped: [] };
+    }
+    const streamText = formPatched ? applyTextPatchRecords(bytesToLatin1(streamBytes), textPatches, formStream).text : bytesToLatin1(streamBytes);
+
+    const fontsByTag = new Map(parentFontsByTag);
+    let formFontInfos;
+    try {
+      formFontInfos = parsePageFonts(formObjText, objCache);
+    } catch {
+      formFontInfos = new Map();
+    }
+    if (formFontInfos && formFontInfos.size > 0) {
+      mergeContainerFonts(formFontInfos, fontsByTag, fontInfoByObjNum);
+      // Pick up any broken-Type3 fonts this form introduces (shared set).
+      if (targetFontObjNums) collectBrokenType3FontObjNums(fontInfoByObjNum, targetFontObjNums);
+      // Load built-in symbol faces a form-local Dingbats/Symbol font needs.
+      await preloadSymbolSubstituteFonts(formFontInfos.values());
+    }
+
+    const formXobjectsByName = new Map();
+    for (const [name, info] of findFormXObjects(formObjText, objCache)) {
+      formXobjectsByName.set(name, info.objNum);
+    }
+
+    /** @type {?Map<string, number>} */
+    let formImagesByName = null;
+    if (redactActive || imageDeleteActive) {
+      formImagesByName = new Map();
+      try {
+        for (const [name, info] of parsePageImages(formObjText, objCache, { recurseForms: false }).images) {
+          if (info && typeof info.objNum === 'number') formImagesByName.set(name, info.objNum);
+        }
+      } catch { formImagesByName = new Map(); }
+    }
+
+    const smResult = rewritePageContentForRegions(streamText, fontsByTag, bboxes, resolver, {
+      initialCtm: effectiveCtm,
+      parentXobjects: formXobjectsByName,
+      parentImages: formImagesByName,
+      targetFontObjNums,
+      redactBboxes,
+      imageDeletes,
+      pathDeletes,
+      formPatchActive,
+      initialLineWidth,
+      initialDashActive,
+      initialMiterLimit,
+      initialTextState,
+      extGStates: parseExtGStates(effectiveResources, objCache),
+      markedContentProps: parseMarkedContentProps(effectiveResources, objCache),
+      hiddenOCMCNames: offOCGs.size > 0 ? parseHiddenOCMCNames(formObjText, objCache, offOCGs) : null,
+      humanReadable,
+    });
+    if (!smResult.ok) {
+      if (redactActive) throw new Error(`Cannot apply redactions: Form XObject rewrite failed (${smResult.reason}).`);
+      if (editActive) throw new Error(`Cannot apply text edits: Form XObject rewrite failed (${smResult.reason}).`);
+      if (imageDeleteActive) throw new Error(`Cannot apply image deletions: Form XObject rewrite failed (${smResult.reason}).`);
+      if (pathDeleteActive) throw new Error(`Cannot apply path deletions: Form XObject rewrite failed (${smResult.reason}).`);
+      return { changed: false, cloneObjNum: formObjNum, skipped: [] };
+    }
+
+    /** @type {Map<string, number>} */
+    const nestedFormClones = new Map();
+    const skipped = smResult.skipped.slice();
+    /** @type {Set<number>} */
+    const deletedImageObjNums = new Set();
+    /** @type {?Set<string>} */
+    let nestedRedactedNames = null;
+    if (redactActive || editActive || imageDeleteActive || pathDeleteActive) {
+      // Per-site recursion, mirroring convertSinglePageForRegions (see the Do aliasing).
+      nestedRedactedNames = new Set();
+      for (const inv of smResult.formInvocations) {
+        if (!inv.alias) continue;
+        nestedRedactedNames.add(inv.name);
+        if (nestedFormClones.has(inv.alias)) continue;
+        const r = await rewriteFormContentForRegions({
+          formObjNum: inv.formObjNum,
+          ctm: inv.ctm,
+          parentFontsByTag: fontsByTag,
+          fontInfoByObjNum,
+          resolver,
+          bboxes,
+          targetFontObjNums,
+          redactBboxes,
+          imageDeletes,
+          pathDeletes,
+          textPatches,
+          formPath: `${formPath}/${inv.name}`,
+          editFontRefs,
+          state,
+          objCache,
+          allocObjNum,
+          pushObj,
+          humanReadable,
+          parentResourcesText: effectiveResources,
+          initialLineWidth: inv.lw,
+          initialDashActive: inv.dashActive,
+          initialMiterLimit: inv.ml,
+          initialTextState: inv.textState,
+        });
+        if (r.skipped && r.skipped.length > 0) skipped.push(...r.skipped);
+        if (r.deletedImageObjNums) for (const o of r.deletedImageObjNums) deletedImageObjNums.add(o);
+        nestedFormClones.set(inv.alias, r.cloneObjNum);
+      }
+      for (const name of smResult.imageDeleteDroppedNames || []) {
+        if (!(smResult.imageDeleteKeptNames && smResult.imageDeleteKeptNames.has(name))) nestedRedactedNames.add(name);
+      }
+      for (const o of smResult.imageDeleteDroppedObjNums || []) deletedImageObjNums.add(o);
+      if (smResult.imageInvocations && smResult.imageInvocations.length > 0) {
+        await applyImageRedactions({
+          imageInvocations: smResult.imageInvocations,
+          verbatimImageNames: smResult.verbatimImageNames || new Set(),
+          redactBboxes,
+          state,
+          objCache,
+          allocObjNum,
+          pushObj,
+          humanReadable,
+          aliasEntries: nestedFormClones,
+          droppedNames: nestedRedactedNames,
+          skipped,
+        });
+      }
+    } else {
+      // One recursion per form name, like the first-ctm-wins dedup.
+      // Pen state baked into the shared clone's `w` values would be a rendering error if invocations disagree, so disagreement degrades it to unknown.
+      const invByName = new Map();
+      for (const inv of smResult.formInvocations) {
+        const prev = invByName.get(inv.name);
+        if (!prev) {
+          invByName.set(inv.name, {
+            formObjNum: inv.formObjNum, ctm: inv.ctm, lw: inv.lw, dashActive: inv.dashActive, ml: inv.ml, textState: inv.textState,
+          });
+        } else if (prev.lw !== inv.lw || prev.dashActive !== inv.dashActive || prev.ml !== inv.ml) {
+          prev.lw = null;
+          prev.ml = null;
+        }
+      }
+      for (const [invName, inv] of invByName) {
+        const r = await rewriteFormContentForRegions({
+          formObjNum: inv.formObjNum,
+          ctm: inv.ctm,
+          parentFontsByTag: fontsByTag,
+          fontInfoByObjNum,
+          resolver,
+          bboxes,
+          targetFontObjNums,
+          state,
+          objCache,
+          allocObjNum,
+          pushObj,
+          humanReadable,
+          parentResourcesText: effectiveResources,
+          initialLineWidth: inv.lw,
+          initialDashActive: inv.dashActive,
+          initialMiterLimit: inv.ml,
+          initialTextState: inv.textState,
+        });
+        if (r.skipped && r.skipped.length > 0) skipped.push(...r.skipped);
+        if (r.changed && r.cloneObjNum !== inv.formObjNum) {
+          nestedFormClones.set(invName, r.cloneObjNum);
+        }
+      }
+    }
+
+    if (!smResult.changed && nestedFormClones.size === 0 && !formPatched) {
+      return {
+        changed: false, cloneObjNum: formObjNum, skipped, deletedImageObjNums,
+      };
+    }
+
+    // The converted glyphs are inlined into smResult.text, so the clone needs no per-glyph /XObject entries of its own.
+    /** @type {Map<string, number>} */
+    const perGlyphEntries = new Map();
+
+    const cloneText = smResult.changed ? smResult.text : streamText;
+    const dedupKey = makeCloneDedupKey(formObjNum, cloneText, perGlyphEntries, nestedFormClones);
+    const cached = state.formCloneByKey.get(dedupKey);
+    if (cached != null) {
+      return {
+        changed: true, cloneObjNum: cached, skipped, deletedImageObjNums,
+      };
+    }
+    const cloneObjNum = allocObjNum();
+    // A patched form's clone declares the faces its patch draws with, since a reader need not inherit the page's fonts into a form.
+    const dictExtras = buildClonedFormDictExtras(formObjText, objCache, perGlyphEntries, nestedFormClones, parentResourcesText, nestedRedactedNames, formPatched ? editFontRefs : null);
+    const cloneContent = await encodeStreamObject(cloneObjNum, cloneText, { humanReadable, dictExtras });
+    pushObj({ objNum: cloneObjNum, content: cloneContent });
+    state.formCloneByKey.set(dedupKey, cloneObjNum);
+    // The rebuild's reference trace never traces the original form dict for redacted content, since that would copy the unredacted original.
+    // The clone's own dict text is traced instead: it references the fonts/images/nested clones the content still needs.
+    if ((redactActive || editActive || imageDeleteActive || pathDeleteActive) && Array.isArray(state.redactTraceTexts)) state.redactTraceTexts.push(dictExtras);
+    return {
+      changed: true, cloneObjNum, skipped, deletedImageObjNums,
+    };
+  } finally {
+    state.inProgress.delete(formObjNum);
+  }
+}
+
+/**
+ * Rewrites a single page's content stream, replacing text-show operators inside the supplied bboxes with glyphs drawn as paths.
+ * The caller must encode the returned text into a stream object and merge `xobjEntries` and `formClones` into the page's /Resources.
+ *
+ * @param {object} params
+ * @param {string} params.streamText - Merged content stream text for the page.
+ * @param {string} params.pageObjText
+ * @param {ReadonlyArray<ReadonlyArray<number>>} params.bboxes - Page-relative user-space bboxes.
+ * @param {ReturnType<typeof createConversionState>} params.state
+ * @param {import('../../pdf/objectCache.js').ObjectCache} params.objCache
+ * @param {() => number} params.allocObjNum
+ * @param {(obj: {objNum: number, content: any}) => void} params.pushObj
+ * @param {boolean} params.humanReadable
+ * @param {boolean} [params.convertBrokenType3ToPaths] - When true, convert every glyph drawn by a broken-ToUnicode Type3 font to paths.
+ * @param {?Array<[number, number, number, number]>} [params.redactBboxes] - User-space rects whose content is destructively removed.
+ * @param {?Array<{rect: [number, number, number, number], sites: Array<{objNum: ?number, rect: [number, number, number, number]}>, tol: number}>} [params.imageDeletes]
+ * @param {?Array<{rect: [number, number, number, number], sites: Array<{rect: [number, number, number, number], paint: string, commands: number}>, tol: number}>} [params.pathDeletes]
+ * @param {?Array<TextPatch>} [params.textPatches] - The page's records, whose page-stream edits the caller has already applied to `streamText`.
+ * @param {?Map<string, number>} [params.editFontRefs]
+ * @returns {Promise<{
+ *   changed: boolean,
+ *   text?: string,
+ *   xobjEntries?: Map<string, number>,
+ *   formClones?: Map<string, number>,
+ *   skipped?: Array<{fontObjNum: number, charCode: number, reason: string}>,
+ *   redactedFormNames?: Set<string> | null,
+ *   deletedImageObjNums?: Set<number>,
+ *   deletedImageNames?: Set<string>,
+ * }>}
+ */
+export async function convertSinglePageForRegions({
+  streamText, pageObjText, bboxes, state, objCache, allocObjNum, pushObj, humanReadable,
+  convertBrokenType3ToPaths = false, redactBboxes = null, imageDeletes = null, pathDeletes = null, textPatches = null, editFontRefs = null,
+}) {
+  const redactActive = !!(redactBboxes && redactBboxes.length > 0);
+  const formPatchActive = !!textPatches && textPatches.some((r) => r.stream.kind === 'form');
+  const editActive = formPatchActive;
+  const imageDeleteActive = !!(imageDeletes && imageDeletes.length > 0);
+  const pathDeleteActive = !!(pathDeletes && pathDeletes.length > 0);
+  // Bbox-driven conversion needs at least one region.
+  // Broken-Type3 conversion runs font-scoped with no regions, so it relaxes the empty-bbox early-out.
+  if ((!bboxes || bboxes.length === 0) && !convertBrokenType3ToPaths && !redactActive && !editActive && !imageDeleteActive && !pathDeleteActive) return { changed: false };
+  const safeBboxes = bboxes || [];
+
+  // Unembedded fonts convert via built-in substitute outlines (see the resolver).
+  // If the built-ins cannot load (e.g. a bundler stripped the font assets),
+  // substitution is silently unavailable and such runs keep the skip-tail behavior instead of failing the whole export.
+  await loadBuiltInFontsRaw().catch(() => {});
+
+  /** @type {Map<string, any>} */
+  let pageFontInfos;
+  try {
+    pageFontInfos = parsePageFonts(pageObjText, objCache);
+  } catch {
+    // Redaction and content edits must not silently keep the content they were meant to remove.
+    if (redactActive) throw new Error('Cannot apply redactions: the page fonts could not be parsed.');
+    if (editActive) throw new Error('Cannot apply text edits: the page fonts could not be parsed.');
+    if (imageDeleteActive) throw new Error('Cannot apply image deletions: the page fonts could not be parsed.');
+    if (pathDeleteActive) throw new Error('Cannot apply path deletions: the page fonts could not be parsed.');
+    return { changed: false };
+  }
+  if (!pageFontInfos) pageFontInfos = new Map();
+
+  /** @type {Map<string, FontBinding>} */
+  const fontsByTag = new Map();
+  /** @type {Map<number, any>} */
+  const fontInfoByObjNum = new Map();
+  mergeContainerFonts(pageFontInfos, fontsByTag, fontInfoByObjNum);
+  // Bring in the built-in symbol faces (Dingbats/StandardSymbolsPS) this page needs before building the synchronous resolver.
+  // Form-introduced symbol fonts are covered by the matching preload in rewriteFormContentForRegions.
+  await preloadSymbolSubstituteFonts(fontInfoByObjNum.values());
+
+  // Broken-Type3 target set is shared (by reference) with the form recursion,
+  // so glyphs drawn inside Form XObjects are covered as each form's fonts are merged.
+  /** @type {Set<number> | null} */
+  const targetFontObjNums = convertBrokenType3ToPaths ? new Set() : null;
+  if (targetFontObjNums) collectBrokenType3FontObjNums(fontInfoByObjNum, targetFontObjNums);
+
+  const resolver = buildResolver(fontInfoByObjNum, state);
+
+  /** @type {Map<string, number>} */
+  const pageXobjectsByName = new Map();
+  for (const [name, info] of findFormXObjects(pageObjText, objCache)) {
+    pageXobjectsByName.set(name, info.objNum);
+  }
+
+  // Page-level forms that omit their own /Resources inherit the page's, so pass it down.
+  const pageResourcesText = resolveResourcesText(pageObjText, objCache);
+
+  // A redacted or content-edited page runs the walk even with no fonts or Form XObjects, since skipping it would silently keep content that must be removed.
+  // Redaction also strips path and image content.
+  if (fontsByTag.size === 0 && pageXobjectsByName.size === 0 && !redactActive && !editActive && !imageDeleteActive && !pathDeleteActive) return { changed: false };
+
+  /** @type {?Map<string, number>} */
+  let pageImagesByName = null;
+  if (redactActive || imageDeleteActive) {
+    pageImagesByName = new Map();
+    try {
+      for (const [name, info] of parsePageImages(pageObjText, objCache, { recurseForms: false }).images) {
+        if (info && typeof info.objNum === 'number') pageImagesByName.set(name, info.objNum);
+      }
+    } catch { pageImagesByName = new Map(); }
+  }
+
+  const offOCGs = typeof objCache.getOffOCGs === 'function' ? objCache.getOffOCGs() : new Set();
+  const smResult = rewritePageContentForRegions(streamText, fontsByTag, safeBboxes, resolver, {
+    parentXobjects: pageXobjectsByName,
+    parentImages: pageImagesByName,
+    targetFontObjNums,
+    redactBboxes,
+    imageDeletes,
+    pathDeletes,
+    formPatchActive,
+    extGStates: parseExtGStates(pageResourcesText, objCache),
+    markedContentProps: parseMarkedContentProps(pageResourcesText, objCache),
+    hiddenOCMCNames: offOCGs.size > 0 ? parseHiddenOCMCNames(pageObjText, objCache, offOCGs) : null,
+    humanReadable,
+  });
+  if (!smResult.ok) {
+    if (redactActive) throw new Error(`Cannot apply redactions: page content rewrite failed (${smResult.reason}).`);
+    if (editActive) throw new Error(`Cannot apply text edits: page content rewrite failed (${smResult.reason}).`);
+    if (imageDeleteActive) throw new Error(`Cannot apply image deletions: page content rewrite failed (${smResult.reason}).`);
+    if (pathDeleteActive) throw new Error(`Cannot apply path deletions: page content rewrite failed (${smResult.reason}).`);
+    return { changed: false };
+  }
+
+  /** @type {Map<string, number>} */
+  const formClones = new Map();
+  const skipped = smResult.skipped.slice();
+  /** @type {Set<number>} */
+  const deletedImageObjNums = new Set();
+  /** @type {Set<string>} */
+  const deletedImageNames = new Set();
+  /** @type {?Set<string>} */
+  let redactedFormNames = null;
+  if (redactActive || editActive || imageDeleteActive || pathDeleteActive) {
+    // Per-site recursion (see the aliasing at the Do handler): each invocation carries its own CTM, and its alias resolves to that site's clone or to the original when nothing changed.
+    // Content-hash dedup in the clone cache collapses sites whose rewrites are identical.
+    redactedFormNames = new Set();
+    for (const inv of smResult.formInvocations) {
+      if (!inv.alias) continue;
+      redactedFormNames.add(inv.name);
+      if (formClones.has(inv.alias)) continue;
+      const r = await rewriteFormContentForRegions({
+        formObjNum: inv.formObjNum,
+        ctm: inv.ctm,
+        parentFontsByTag: fontsByTag,
+        fontInfoByObjNum,
+        resolver,
+        bboxes: safeBboxes,
+        targetFontObjNums,
+        redactBboxes,
+        imageDeletes,
+        pathDeletes,
+        textPatches,
+        formPath: inv.name,
+        editFontRefs,
+        state,
+        objCache,
+        allocObjNum,
+        pushObj,
+        humanReadable,
+        parentResourcesText: pageResourcesText,
+        initialLineWidth: inv.lw,
+        initialDashActive: inv.dashActive,
+        initialMiterLimit: inv.ml,
+        initialTextState: inv.textState,
+      });
+      if (r.skipped && r.skipped.length > 0) skipped.push(...r.skipped);
+      if (r.deletedImageObjNums) for (const o of r.deletedImageObjNums) deletedImageObjNums.add(o);
+      formClones.set(inv.alias, r.cloneObjNum);
+    }
+    for (const name of smResult.imageDeleteDroppedNames || []) {
+      if (!(smResult.imageDeleteKeptNames && smResult.imageDeleteKeptNames.has(name))) {
+        redactedFormNames.add(name);
+        deletedImageNames.add(name);
+      }
+    }
+    for (const o of smResult.imageDeleteDroppedObjNums || []) deletedImageObjNums.add(o);
+    if (smResult.imageInvocations && smResult.imageInvocations.length > 0) {
+      await applyImageRedactions({
+        imageInvocations: smResult.imageInvocations,
+        verbatimImageNames: smResult.verbatimImageNames || new Set(),
+        redactBboxes,
+        state,
+        objCache,
+        allocObjNum,
+        pushObj,
+        humanReadable,
+        aliasEntries: formClones,
+        droppedNames: redactedFormNames,
+        skipped,
+      });
+    }
+  } else {
+    // One recursion per form name (first-ctm-wins).
+    // Pen state baked into the shared clone's `w` values would be a rendering error if invocations disagree, so disagreement degrades it to unknown.
+    const invByName = new Map();
+    for (const inv of smResult.formInvocations) {
+      const prev = invByName.get(inv.name);
+      if (!prev) {
+        invByName.set(inv.name, {
+          formObjNum: inv.formObjNum, ctm: inv.ctm, lw: inv.lw, dashActive: inv.dashActive, ml: inv.ml, textState: inv.textState,
+        });
+      } else if (prev.lw !== inv.lw || prev.dashActive !== inv.dashActive || prev.ml !== inv.ml) {
+        prev.lw = null;
+        prev.ml = null;
+      }
+    }
+    for (const [invName, inv] of invByName) {
+      const r = await rewriteFormContentForRegions({
+        formObjNum: inv.formObjNum,
+        ctm: inv.ctm,
+        parentFontsByTag: fontsByTag,
+        fontInfoByObjNum,
+        resolver,
+        bboxes: safeBboxes,
+        targetFontObjNums,
+        state,
+        objCache,
+        allocObjNum,
+        pushObj,
+        humanReadable,
+        parentResourcesText: pageResourcesText,
+        initialLineWidth: inv.lw,
+        initialDashActive: inv.dashActive,
+        initialMiterLimit: inv.ml,
+        initialTextState: inv.textState,
+      });
+      if (r.skipped && r.skipped.length > 0) skipped.push(...r.skipped);
+      if (r.changed && r.cloneObjNum !== inv.formObjNum) {
+        formClones.set(invName, r.cloneObjNum);
+      }
+    }
+  }
+
+  const pageText = smResult.changed ? smResult.text : streamText;
+
+  if (!smResult.changed && formClones.size === 0) {
+    return { changed: false, skipped };
+  }
+
+  // Glyphs are inlined into the page text, so no per-glyph Form XObjects are emitted.
+  /** @type {Map<string, number>} */
+  const xobjEntries = new Map();
+
+  return {
+    changed: true,
+    text: pageText,
+    xobjEntries,
+    formClones,
+    skipped,
+    redactedFormNames,
+    deletedImageObjNums,
+    deletedImageNames,
+  };
+}
+
+/**
+ * Convert text inside the listed regions on each page to glyph-outline Form XObjects, emitting a page-rewrite directive per affected page.
+ *
+ * @param {object} params
+ * @param {Array<{ objNum: number, objText: string }>} params.pages
+ * @param {ReadonlyArray<number>} params.pageIndices
+ * @param {Map<number, ReadonlyArray<ReadonlyArray<number>>>} params.regionsByPage
+ * @param {import('../../pdf/objectCache.js').ObjectCache} params.objCache
+ * @param {() => number} params.allocObjNum
+ * @param {(obj: {objNum: number, content: any}) => void} params.pushObj
+ * @param {boolean} params.humanReadable
+ */
+export async function convertTextRegionsToPaths({
+  pages, pageIndices, regionsByPage, objCache, allocObjNum, pushObj, humanReadable,
+}) {
+  const state = createConversionState();
+  /** @type {Map<number, { newContentObjNum: number, xobjEntries: Map<string, number>, formClones: Map<string, number> }>} */
+  const pageRewrites = new Map();
+  /** @type {Array<{pageIndex: number, items: Array<{fontObjNum: number, charCode: number, reason: string}>}>} */
+  const skippedReports = [];
+
+  for (const i of pageIndices) {
+    if (i >= pages.length) continue;
+    const bboxes = regionsByPage.get(i);
+    if (!bboxes || bboxes.length === 0) continue;
+    const pageInfo = pages[i];
+
+    const streams = getPageContentStreams(pageInfo.objText, objCache);
+    if (!streams || streams.length === 0) continue;
+    const merged = streams.join('\n');
+
+    const result = await convertSinglePageForRegions({
+      streamText: merged,
+      pageObjText: pageInfo.objText,
+      bboxes,
+      state,
+      objCache,
+      allocObjNum,
+      pushObj,
+      humanReadable,
+    });
+    if (result.skipped && result.skipped.length > 0) {
+      skippedReports.push({ pageIndex: i, items: result.skipped });
+    }
+    if (!result.changed) continue;
+
+    const newContentObjNum = allocObjNum();
+    const newContent = await encodeStreamObject(newContentObjNum, result.text, { humanReadable });
+    pushObj({ objNum: newContentObjNum, content: newContent });
+
+    pageRewrites.set(pageInfo.objNum, {
+      newContentObjNum,
+      xobjEntries: result.xobjEntries || new Map(),
+      formClones: result.formClones || new Map(),
+    });
+  }
+
+  return { pageRewrites, skippedReports };
+}

@@ -1,7 +1,7 @@
 {
   "type": "module",
   "dependencies": {
-    "canvaskit-wasm": "^0.39.1"
+    "@scribe.js/canvas": "^0.1.97-scribe.4"
   },
   "devDependencies": {
     "@types/node": "^20.11.20"

@@ -1,0 +1,212 @@
+import { findRootObjNum, findInfoObjNum } from './parsePdfUtils.js';
+import { resolveIntValue, resolveStringValue, resolveDictValue } from './pdfPrimitives.js';
+
+const BLOCK = new Set([
+  'P', 'H', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'Title', 'Caption', 'BlockQuote',
+  'Note', 'Footnote', 'Quote', 'Code', 'TOCI', 'Index', 'LI', 'Figure', 'Formula',
+]);
+
+/** Inline tags roll up to the nearest block ancestor, so styled runs and list labels/bodies (Lbl, LBody) stay in their paragraph. */
+const INLINE = new Set([
+  'Span', 'Link', 'Em', 'Strong', 'Reference', 'Annot', 'Sub', 'Sup', 'Ruby', 'Warichu',
+  'Lbl', 'LBody', 'BibEntry', 'Artifact',
+]);
+
+/** Producers whose tags are synthetic OCR output rather than authored structure: they tag scanned pages line by line, so their trees carry no paragraph boundaries and are excluded. */
+export const OCR_PRODUCER_RE = /paper\s*capture|luradocument|abbyy|finereader|kofax|readiris|omnipage|tesseract|scansoft|\bcapture\b/i;
+
+/**
+ * Extract the balanced-delimiter run starting at `start` (delimiters included), e.g. a `<<...>>` dict or `[...]` array.
+ * An unterminated run yields everything from `start` to the end.
+ * @param {string} s
+ * @param {number} start - Index of the first character of `open`.
+ * @param {string} open
+ * @param {string} close
+ */
+function extractBalanced(s, start, open, close) {
+  let depth = 0; let i = start;
+  while (i < s.length) {
+    if (s.startsWith(open, i)) { depth++; i += open.length; continue; }
+    if (s.startsWith(close, i)) { depth--; i += close.length; if (depth === 0) return s.slice(start, i); continue; }
+    i++;
+  }
+  return s.slice(start);
+}
+
+/**
+ * Tokenize a PDF array/dict body into ordered tokens: {ref}, {dict}, {arr}, {num}, {null}.
+ * @param {string} s
+ */
+function parseTokens(s) {
+  const out = []; let i = 0;
+  while (i < s.length) {
+    if (/\s/.test(s[i])) { i++; continue; }
+    if (s[i] === '<' && s[i + 1] === '<') { const d = extractBalanced(s, i, '<<', '>>'); out.push({ type: 'dict', text: d }); i += d.length; continue; }
+    if (s[i] === '[') { const a = extractBalanced(s, i, '[', ']'); out.push({ type: 'arr', text: a }); i += a.length; continue; }
+    const refM = /^(\d+)\s+\d+\s+R/.exec(s.slice(i));
+    if (refM) { out.push({ type: 'ref', num: Number(refM[1]) }); i += refM[0].length; continue; }
+    const numM = /^-?\d+/.exec(s.slice(i));
+    if (numM) { out.push({ type: 'num', val: Number(numM[0]) }); i += numM[0].length; continue; }
+    if (s.startsWith('null', i)) { out.push({ type: 'null' }); i += 4; continue; }
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Walk a PDF number tree (`/Nums` leaves, `/Kids` internal nodes) into a Map from number to value token.
+ * @param {import('./objectCache.js').ObjectCache} objCache
+ * @param {number} rootRef
+ */
+function buildNumberTree(objCache, rootRef) {
+  const out = new Map();
+  const seen = new Set();
+  function rec(objNum, depth) {
+    if (depth > 50 || seen.has(objNum)) return; seen.add(objNum);
+    const t = objCache.getObjectText(objNum); if (!t) return;
+    const numsM = /\/Nums\s*\[/.exec(t);
+    if (numsM) {
+      const body = extractBalanced(t, numsM.index + numsM[0].length - 1, '[', ']').slice(1, -1);
+      const toks = parseTokens(body);
+      for (let k = 0; k + 1 < toks.length; k += 2) if (toks[k].type === 'num') out.set(toks[k].val, toks[k + 1]);
+    }
+    const kidsM = /\/Kids\s*\[/.exec(t);
+    if (kidsM) {
+      const body = extractBalanced(t, kidsM.index + kidsM[0].length - 1, '[', ']');
+      const re = /(\d+)\s+\d+\s+R/g; let m;
+      while ((m = re.exec(body))) rec(Number(m[1]), depth + 1);
+    }
+  }
+  rec(rootRef, 0);
+  return out;
+}
+
+/**
+ * Read a document-information dictionary field as a best-effort latin1 string.
+ * Handles both literal `(...)` and hex `<...>` (UTF-16BE) forms.
+ * @param {import('./objectCache.js').ObjectCache} objCache
+ * @param {Uint8Array} pdfBytes
+ * @param {string} field - info-dict key without the leading slash (e.g. 'Producer', 'Creator').
+ */
+function readInfoField(objCache, pdfBytes, field) {
+  try {
+    const infoNum = findInfoObjNum(pdfBytes);
+    if (!infoNum) return '';
+    const info = objCache.getObjectText(infoNum) || '';
+    return resolveStringValue(info, field, objCache) ?? '';
+  } catch { /* best-effort */ }
+  return '';
+}
+
+/**
+ * Read the document `/Producer` string (best-effort, latin1).
+ * @param {import('./objectCache.js').ObjectCache} objCache
+ * @param {Uint8Array} pdfBytes
+ */
+export function readDocProducer(objCache, pdfBytes) {
+  return readInfoField(objCache, pdfBytes, 'Producer');
+}
+
+/**
+ * Microsoft Word, both its native PDF export and the Acrobat PDFMaker-for-Word plugin, tags exactly one struct element per Word paragraph, so the element boundary is the paragraph boundary.
+ * Matched against /Creator and /Producer (e.g. "Microsoft® Word 2016", "Acrobat PDFMaker 10.1 for Word").
+ */
+const WORD_AUTHORED_RE = /microsoft\W{0,3}word|pdfmaker\b[^()]*?\bfor\s+word/i;
+
+/**
+ * Best-effort: was this PDF authored by Microsoft Word (native export or the PDFMaker-for-Word plugin)?
+ * @param {import('./objectCache.js').ObjectCache} objCache
+ * @param {Uint8Array} pdfBytes
+ */
+export function docAuthoredByWord(objCache, pdfBytes) {
+  return WORD_AUTHORED_RE.test(readInfoField(objCache, pdfBytes, 'Creator'))
+    || WORD_AUTHORED_RE.test(readInfoField(objCache, pdfBytes, 'Producer'));
+}
+
+/**
+ * Build the per-page (pageIndex, MCID) to owning-block-element map for a tagged PDF.
+ *
+ * @param {import('./objectCache.js').ObjectCache} objCache
+ * @param {Uint8Array} pdfBytes
+ * @param {Array<{objNum: number, objText: string}>} pageObjs - page objects (index = page index).
+ * @returns {Map<string, {elemNum: number, tag: string}> | null} keyed by `${pageIndex}:${mcid}`, or null when the doc has no usable structure (no StructTreeRoot/ParentTree, or an OCR producer).
+ */
+export function buildStructElemMap(objCache, pdfBytes, pageObjs) {
+  const root = findRootObjNum(pdfBytes);
+  if (!root) return null;
+  const catText = objCache.getObjectText(root);
+  const strRef = /\/StructTreeRoot\s+(\d+)\s+\d+\s+R/.exec(catText || '');
+  if (!strRef) return null;
+  if (OCR_PRODUCER_RE.test(readDocProducer(objCache, pdfBytes))) return null;
+  const rootDict = objCache.getObjectText(Number(strRef[1]));
+  if (!rootDict) return null;
+
+  // RoleMap: custom tag to standard tag.
+  const roleMap = {};
+  const rmText = resolveDictValue(rootDict, 'RoleMap', objCache) || '';
+  if (rmText) { const re = /\/([A-Za-z0-9._]+)\s*\/([A-Za-z0-9._]+)/g; let m; while ((m = re.exec(rmText))) roleMap[m[1]] = m[2]; }
+  const mapTag = (s) => { if (!s) return '?'; let cur = s; const seen = new Set(); while (roleMap[cur] && !seen.has(cur)) { seen.add(cur); cur = roleMap[cur]; } return cur; };
+
+  const ptRef = /\/ParentTree\s+(\d+)\s+\d+\s+R/.exec(rootDict);
+  if (!ptRef) return null;
+  const parentTree = buildNumberTree(objCache, Number(ptRef[1]));
+  if (!parentTree.size) return null;
+
+  const tagOf = (objNum) => mapTag((/\/S\s*\/([A-Za-z0-9._]+)/.exec(objCache.getObjectText(objNum) || '') || [])[1] || '?');
+  const parentOf = (objNum) => { const m = /\/P\s+(\d+)\s+\d+\s+R/.exec(objCache.getObjectText(objNum) || ''); return m ? Number(m[1]) : null; };
+
+  const ownerCache = new Map();
+  /**
+   * Resolve an owning element up to its nearest BLOCK ancestor (through INLINE tags only).
+   * @param {number} objNum
+   */
+  function blockOwner(objNum) {
+    if (ownerCache.has(objNum)) return ownerCache.get(objNum);
+    /** @type {?number} */ let cur = objNum;
+    const seen = new Set(); let res = null;
+    while (cur != null && !seen.has(cur)) {
+      seen.add(cur);
+      const tag = tagOf(cur);
+      if (BLOCK.has(tag)) { res = { elemNum: cur, tag }; break; }
+      if (!INLINE.has(tag)) { res = { elemNum: objNum, tag: tagOf(objNum) }; break; } // grouping container: keep immediate owner
+      cur = parentOf(cur);
+    }
+    if (!res) res = { elemNum: objNum, tag: tagOf(objNum) };
+    ownerCache.set(objNum, res);
+    return res;
+  }
+
+  const map = new Map();
+  pageObjs.forEach((pg, pageIdx) => {
+    const sp = resolveIntValue(pg.objText || '', 'StructParents', objCache, -1);
+    if (sp === -1) return;
+    const valTok = parentTree.get(sp);
+    if (!valTok) return;
+    let arrText;
+    if (valTok.type === 'ref') arrText = objCache.getObjectText(valTok.num) || '';
+    else if (valTok.type === 'arr') arrText = valTok.text;
+    else return;
+    const inner = arrText.startsWith('[') ? arrText.slice(1, -1) : (/\[([\s\S]*)\]/.exec(arrText) || [, ''])[1];
+    parseTokens(inner).forEach((tk, mcid) => {
+      if (tk.type === 'ref' && tk.num != null) map.set(`${pageIdx}:${mcid}`, blockOwner(tk.num));
+    });
+  });
+  return map.size ? map : null;
+}
+
+/**
+ * Fill `structElemId` and `structElemTag` on each page's word signals, from the resolved element map.
+ * @param {Array<{wordSignals?: Map<OcrWord, PdfWordSignal>}|null>} results - parsed pages (index = page index).
+ * @param {Map<string, {elemNum: number, tag: string}>} elemMap
+ */
+export function resolveStructElems(results, elemMap) {
+  for (let n = 0; n < results.length; n++) {
+    const r = results[n];
+    if (!r || !r.wordSignals) continue;
+    for (const sig of r.wordSignals.values()) {
+      if (sig.mcid == null) continue;
+      const o = elemMap.get(`${n}:${sig.mcid}`);
+      if (o) { sig.structElemId = o.elemNum; sig.structElemTag = o.tag; }
+    }
+  }
+}

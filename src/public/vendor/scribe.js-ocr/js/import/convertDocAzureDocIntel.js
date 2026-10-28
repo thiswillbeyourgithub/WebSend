@@ -1,9 +1,21 @@
 import ocr from '../objects/ocrObjects.js';
 
-import { LayoutDataTablePage } from '../objects/layoutObjects.js';
+import { LayoutDataColumn, LayoutDataTable, LayoutDataTablePage } from '../objects/layoutObjects.js';
+import { calcBboxUnion } from '../utils/miscUtils.js';
+import { assignParagraphs } from '../utils/reflowPars.js';
 import { pass3 } from './convertPageShared.js';
 
 const debugMode = false;
+
+/** @type {Partial<Record<string, import('../objects/ocrObjects.js').ParType>>} */
+const parTypeByRole = {
+  title: 'title',
+  sectionHeading: 'title',
+  footnote: 'footnote',
+  pageHeader: 'header',
+  pageFooter: 'footer',
+  pageNumber: 'pagenum',
+};
 
 /**
  * @param {Object} params
@@ -23,6 +35,11 @@ export async function convertDocAzureDocIntel({ ocrStr, pageDims }) {
   }
 
   const analyzeResultPages = /** @type {AzureDocIntelPage[]} */ (ocrData.analyzeResult.pages);
+  const paragraphs = /** @type {AzureDocIntelParagraph[]} */ (ocrData.analyzeResult.paragraphs || []);
+
+  // Azure paragraph spans do not overlap, so the only span that can hold a line is the last one starting at or before it.
+  const parSpans = paragraphs.flatMap((par, parIndex) => (par.spans || []).map((span) => ({ offset: span.offset, end: span.offset + span.length, parIndex })))
+    .sort((a, b) => a.offset - b.offset);
 
   const resArr = [];
 
@@ -42,6 +59,7 @@ export async function convertDocAzureDocIntel({ ocrStr, pageDims }) {
       resArr.push({
         pageObj, charMetricsObj: {}, dataTables: new LayoutDataTablePage(n), warn,
       });
+      continue;
     }
 
     if (pageData.unit !== 'pixel') {
@@ -62,6 +80,9 @@ export async function convertDocAzureDocIntel({ ocrStr, pageDims }) {
         word.polygon = word.polygon.map((val, idx) => (idx % 2 === 0 ? val * pageDimsMult.width : val * pageDimsMult.height));
       });
     }
+
+    /** Index into `paragraphs` of each line in `pageObj.lines`, or -1 when no paragraph span holds the line. */
+    const lineParIndices = /** @type {number[]} */ ([]);
 
     for (let i = 0; i < pageData.lines.length; i++) {
       const lineWordsInput = /** @type {AzureDocIntelWord[]} */ ([]);
@@ -109,15 +130,8 @@ export async function convertDocAzureDocIntel({ ocrStr, pageDims }) {
           bottom: Math.max(...wordY),
         };
 
-        const wordPoly = {
-          tl: { x: wordData.polygon[0], y: wordData.polygon[1] },
-          tr: { x: wordData.polygon[2], y: wordData.polygon[3] },
-          br: { x: wordData.polygon[4], y: wordData.polygon[5] },
-          bl: { x: wordData.polygon[6], y: wordData.polygon[7] },
-        };
-
         const wordId = `word_${n + 1}_${pageObj.lines.length + 1}_${j + 1}`;
-        const wordObj = new ocr.OcrWord(lineObj, wordId, wordData.content, wordBbox, wordPoly);
+        const wordObj = new ocr.OcrWord(lineObj, wordId, wordData.content, wordBbox);
 
         wordObj.conf = Math.round((wordData.confidence || 0) * 100);
 
@@ -151,6 +165,16 @@ export async function convertDocAzureDocIntel({ ocrStr, pageDims }) {
         const ascHeight = lineHeight * 3 / 5;
         if (ascHeight > 0) lineObj.ascHeight = ascHeight;
 
+        const lineSpan = pageData.lines[i].spans[0];
+        let lo = 0;
+        let hi = parSpans.length - 1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (parSpans[mid].offset <= lineSpan.offset) lo = mid + 1; else hi = mid - 1;
+        }
+        const holdsLine = hi >= 0 && lineSpan.offset + lineSpan.length <= parSpans[hi].end;
+        lineParIndices.push(holdsLine ? parSpans[hi].parIndex : -1);
+
         pageObj.lines.push(lineObj);
       }
     }
@@ -158,13 +182,137 @@ export async function convertDocAzureDocIntel({ ocrStr, pageDims }) {
     const pageAngle = pageData.angle || 0;
     pageObj.angle = pageAngle;
 
+    if (pageObj.lines.length > 0 && lineParIndices.every((parIndex) => parIndex === -1)) {
+      // Azure output may carry no paragraphs, and the heuristic then groups the page's lines.
+      assignParagraphs(pageObj, pageAngle);
+    } else {
+      // A line outside every paragraph span forms a paragraph of its own.
+      /** @type {Map<number, OcrLine[]>} */
+      const linesByPar = new Map();
+      for (let i = 0; i < pageObj.lines.length; i++) {
+        const key = lineParIndices[i] >= 0 ? lineParIndices[i] : -1 - i;
+        const parLines = linesByPar.get(key);
+        if (parLines) parLines.push(pageObj.lines[i]); else linesByPar.set(key, [pageObj.lines[i]]);
+      }
+
+      for (const [key, parLines] of linesByPar) {
+        const parObj = new ocr.OcrPar(pageObj, calcBboxUnion(parLines.map((line) => line.bbox)));
+        parObj.lines = parLines;
+        for (const line of parLines) line.par = parObj;
+
+        const role = key >= 0 ? paragraphs[key].role : undefined;
+        parObj.reason = key >= 0 ? (role || 'paragraph') : 'line outside paragraphs';
+        const parType = role ? parTypeByRole[role] : undefined;
+        if (parType) parObj.type = parType;
+
+        pageObj.pars.push(parObj);
+      }
+    }
+
     // pass2(pageObj, 0);
     const langSet = pass3(pageObj);
 
-    const dataTables = new LayoutDataTablePage(n);
+    resArr.push({ pageObj, dataTables: null, langSet });
+  }
 
-    resArr.push({ pageObj, dataTables, langSet });
+  const tablesByPage = convertTableLayoutAzure(/** @type {AzureDocIntelTable[] | undefined} */ (ocrData.analyzeResult.tables), pageDims, analyzeResultPages);
+  for (let n = 0; n < resArr.length; n++) {
+    resArr[n].dataTables = tablesByPage.get(n) || new LayoutDataTablePage(n);
   }
 
   return resArr;
+}
+
+/**
+ * Convert Azure Document Intelligence table data into LayoutDataTable objects.
+ *
+ * @param {AzureDocIntelTable[]} [tables]
+ * @param {dims[]} pageDims
+ * @param {AzureDocIntelPage[]} pagesData
+ */
+function convertTableLayoutAzure(tables, pageDims, pagesData) {
+  /** @type {Map<number, LayoutDataTablePage>} */
+  const result = new Map();
+
+  if (!tables || tables.length === 0) return result;
+
+  for (const tableData of tables) {
+    const pageNumber = tableData.boundingRegions?.[0]?.pageNumber;
+    if (!pageNumber) continue;
+    const pageIdx = pageNumber - 1; // Azure is 1-indexed
+
+    if (!result.has(pageIdx)) {
+      result.set(pageIdx, new LayoutDataTablePage(pageIdx));
+    }
+    const tablesPage = result.get(pageIdx);
+
+    const table = new LayoutDataTable(tablesPage);
+    table.detectionMethod = 'azure_doc_intel';
+    const { rowCount } = tableData;
+
+    const pageData = pagesData[pageIdx];
+    const pageDimsN = pageDims[pageIdx];
+    let multW = 1;
+    let multH = 1;
+    if (pageData && pageDimsN && pageData.unit !== 'pixel') {
+      multW = pageDimsN.width / pageData.width;
+      multH = pageDimsN.height / pageData.height;
+    }
+
+    /** @type {Map<number, AzureDocIntelTableCell[]>} */
+    const cellsByRow = new Map();
+    for (const cell of tableData.cells) {
+      const rowCells = cellsByRow.get(cell.rowIndex);
+      if (rowCells) rowCells.push(cell); else cellsByRow.set(cell.rowIndex, [cell]);
+    }
+
+    // A table whose first row has no `columnHeader` cell is left unknown rather than ruled headerless.
+    let headerRows = 0;
+    while (headerRows < rowCount && (cellsByRow.get(headerRows) || []).some((cell) => cell.kind === 'columnHeader')) headerRows++;
+    if (headerRows > 0) table.headerRows = headerRows;
+
+    const firstRowCells = (cellsByRow.get(0) || []).sort((a, b) => a.columnIndex - b.columnIndex);
+
+    let tableTop = Infinity;
+    let tableBottom = -Infinity;
+    for (const cell of tableData.cells) {
+      const poly = cell.boundingRegions?.[0]?.polygon;
+      if (!poly) continue;
+      const yCoords = poly.filter((_, i) => i % 2 === 1).map((y) => y * multH);
+      tableTop = Math.min(tableTop, ...yCoords);
+      tableBottom = Math.max(tableBottom, ...yCoords);
+    }
+
+    for (const cell of firstRowCells) {
+      const poly = cell.boundingRegions?.[0]?.polygon;
+      if (!poly) continue;
+      const left = poly[0] * multW; // x1 (top-left)
+      const right = poly[2] * multW; // x2 (top-right)
+      table.boxes.push(new LayoutDataColumn({
+        left: Math.round(left),
+        top: Math.round(tableTop),
+        right: Math.round(right),
+        bottom: Math.round(tableBottom),
+      }, table));
+    }
+
+    table.rowBounds = [];
+    for (let r = 0; r < rowCount; r++) {
+      const rowCells = cellsByRow.get(r) || [];
+      let maxBottom = 0;
+      for (const cell of rowCells) {
+        const poly = cell.boundingRegions?.[0]?.polygon;
+        if (!poly) continue;
+        const bottom = Math.max(poly[5], poly[7]) * multH; // y3 or y4
+        if (bottom > maxBottom) maxBottom = bottom;
+      }
+      table.rowBounds.push(Math.round(maxBottom));
+    }
+
+    if (table.boxes.length > 0) {
+      tablesPage.tables.push(table);
+    }
+  }
+
+  return result;
 }

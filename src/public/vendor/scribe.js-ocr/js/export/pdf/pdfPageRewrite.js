@@ -1,0 +1,648 @@
+import {
+  extractDict, bytesToLatin1,
+  resolveIntValue, resolveNumValue, resolveNumArray, resolveNameValue, resolveArrayValue, resolveDictValue,
+} from '../../pdf/pdfPrimitives.js';
+import { stripText } from '../../pdf/contentStream.js';
+import { patchPageContents, textPatchesTarget } from '../../pdf/textPatch.js';
+import { annotIsModelManaged, annotIsLiftedReply, linkAnnotIsLifted } from '../../pdf/parsePdfAnnots.js';
+import { encodeStreamObject } from './writePdfStreams.js';
+import { convertSinglePageForRegions } from './convertTextRegionsToPaths.js';
+
+/**
+ * Parse /Contents from a page dict, returning an array of indirect references to
+ * content stream objects.
+ * @param {string} pageObjText
+ * @param {import('../../pdf/objectCache.js').ObjectCache} [objCache]
+ */
+export function parseExistingContents(pageObjText, objCache) {
+  const arrayMatch = /\/Contents\s*\[([\s\S]*?)\]/.exec(pageObjText);
+  if (arrayMatch) {
+    return [...arrayMatch[1].matchAll(/(\d+)\s+(\d+)\s+R/g)]
+      .map((m) => `${m[1]} ${m[2]} R`);
+  }
+  const singleMatch = /\/Contents\s+(\d+)\s+(\d+)\s+R/.exec(pageObjText);
+  if (singleMatch) {
+    const ref = `${singleMatch[1]} ${singleMatch[2]} R`;
+    if (objCache) {
+      const refText = objCache.getObjectText(Number(singleMatch[1]));
+      if (refText) {
+        const trimmed = refText.trim();
+        if (trimmed.startsWith('[')) {
+          return [...trimmed.matchAll(/(\d+)\s+(\d+)\s+R/g)].map((m) => `${m[1]} ${m[2]} R`);
+        }
+      }
+    }
+    return [ref];
+  }
+  return [];
+}
+
+/**
+ *
+ * @param {string[]} existingContentsRefs
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @param {() => number} allocObjNum
+ * @param {(obj: { objNum: number, content: string | Uint8Array | import('./writePdfStreams.js').PdfBinaryObject }) => void} pushObj
+ * @param {boolean} humanReadable
+ */
+export async function rewriteContentsStrippingInvisibleText(existingContentsRefs, objCache, allocObjNum, pushObj, humanReadable) {
+  if (existingContentsRefs.length === 0) return existingContentsRefs;
+  /** @type {string[]} */
+  const parts = [];
+  for (const ref of existingContentsRefs) {
+    const refMatch = /^(\d+)\s+\d+\s+R$/.exec(ref);
+    if (!refMatch) return existingContentsRefs;
+    let bytes;
+    try {
+      bytes = objCache.getStreamBytes(Number(refMatch[1]));
+    } catch {
+      bytes = null;
+    }
+    if (!bytes) return existingContentsRefs;
+    parts.push(bytesToLatin1(bytes));
+  }
+  const merged = parts.join('\n');
+  const { text, dropped } = stripText(merged, { mode: 'invisible' });
+  if (!dropped) return existingContentsRefs;
+  const newObjNum = allocObjNum();
+  const objBin = await encodeStreamObject(newObjNum, text, { humanReadable });
+  pushObj({ objNum: newObjNum, content: objBin });
+  return [`${newObjNum} 0 R`];
+}
+
+/**
+ * Strip invisible text and optionally convert per-glyph text inside the supplied user-space bboxes to vector paths via Form XObjects.
+ *
+ * The returned `xobjEntries` and `formClones` must be merged into the page's /Resources/XObject dict.
+ *
+ * @param {object} params
+ * @param {string[]} params.existingContentsRefs
+ * @param {string} params.pageObjText
+ * @param {ReadonlyArray<ReadonlyArray<number>> | null} params.bboxes
+ * @param {ReturnType<typeof import('./convertTextRegionsToPaths.js').createConversionState> | null} params.conversionState
+ * @param {import('../../pdf/objectCache.js').ObjectCache} params.objCache
+ * @param {() => number} params.allocObjNum
+ * @param {(obj: { objNum: number, content: string | Uint8Array | import('./writePdfStreams.js').PdfBinaryObject }) => void} params.pushObj
+ * @param {boolean} params.humanReadable
+ * @param {boolean} [params.convertBrokenType3ToPaths] - When true, convert all glyphs drawn by broken-ToUnicode Type3 fonts to paths.
+ * @param {?Array<[number, number, number, number]>} [params.redactBboxes] - User-space rects whose content (glyphs, paths, images) is destructively removed, independent of `bboxes`.
+ * @param {?Array<{rect: [number, number, number, number], sites: Array<{objNum: ?number, rect: [number, number, number, number]}>, tol: number}>} [params.imageDeletes]
+ *   An image draw is dropped when it falls inside an entry's rect and matches one of that entry's sites.
+ * @param {?Array<{rect: [number, number, number, number], sites: Array<{rect: [number, number, number, number], paint: string, commands: number}>, tol: number}>} [params.pathDeletes]
+ *   A painted path is dropped when its hull falls inside an entry's rect and agrees with a site's extent, paint kind, and command count.
+ * @param {?Array<TextPatch>} [params.textPatches]
+ * @param {?Map<string, number>} [params.editFontRefs] - `/Tag` to font object of each substitute face the page's patches draw with.
+ * @returns {Promise<{
+ *   refs: string[],
+ *   xobjEntries: Map<string, number>,
+ *   formClones: Map<string, number>,
+ *   skipped: Array<{fontObjNum: number, charCode: number, reason: string}>,
+ *   redactedFormNames?: ?Set<string>,
+ *   deletedImageObjNums?: Set<number>,
+ *   supersededContentObjNums?: number[],
+ * }>}
+ */
+export async function rewriteContentsStripAndConvert({
+  existingContentsRefs, pageObjText, bboxes, conversionState,
+  objCache, allocObjNum, pushObj, humanReadable, convertBrokenType3ToPaths = false,
+  redactBboxes = null, imageDeletes = null, pathDeletes = null, textPatches = null, editFontRefs = null,
+}) {
+  /** @type {Map<string, number>} */
+  const emptyXobj = new Map();
+  /** @type {Map<string, number>} */
+  const emptyFormClones = new Map();
+  if (existingContentsRefs.length === 0) {
+    return {
+      refs: existingContentsRefs, xobjEntries: emptyXobj, formClones: emptyFormClones, skipped: [],
+    };
+  }
+
+  /** @type {string[]} */
+  const parts = [];
+  let canMerge = true;
+  for (const ref of existingContentsRefs) {
+    const refMatch = /^(\d+)\s+\d+\s+R$/.exec(ref);
+    if (!refMatch) { canMerge = false; break; }
+    let bytes;
+    try {
+      bytes = objCache.getStreamBytes(Number(refMatch[1]));
+    } catch {
+      bytes = null;
+    }
+    if (!bytes) { canMerge = false; break; }
+    parts.push(bytesToLatin1(bytes));
+  }
+  if (!canMerge) {
+    // The pass-through return below is safe for conversion but for redaction or a content edit would ship content the user removed.
+    if (redactBboxes && redactBboxes.length > 0) {
+      throw new Error('Cannot apply redactions: a page content stream could not be read.');
+    }
+    if (textPatches && textPatches.length > 0) {
+      throw new Error('Cannot apply text edits: a page content stream could not be read.');
+    }
+    if (imageDeletes && imageDeletes.length > 0) {
+      throw new Error('Cannot apply image deletions: a page content stream could not be read.');
+    }
+    if (pathDeletes && pathDeletes.length > 0) {
+      throw new Error('Cannot apply path deletions: a page content stream could not be read.');
+    }
+    return {
+      refs: existingContentsRefs, xobjEntries: emptyXobj, formClones: emptyFormClones, skipped: [],
+    };
+  }
+
+  // Text-edit patches address bytes of this joined text, the same text the parser and the renderer patch, so they go in before anything else rewrites it.
+  const pagePatched = textPatchesTarget(textPatches, { kind: 'page' });
+  const formPatchActive = !!textPatches && textPatches.some((r) => r.stream.kind === 'form');
+  const merged = patchPageContents(parts, textPatches).text;
+  const { text: strippedText, dropped } = stripText(merged, { mode: 'invisible' });
+
+  // Silently skipping the redaction or edit would ship the content the user removed.
+  if (redactBboxes && redactBboxes.length > 0 && !conversionState) {
+    throw new Error('Cannot apply redactions: no conversion state was created for this page.');
+  }
+  if (formPatchActive && !conversionState) {
+    throw new Error('Cannot apply text edits: no conversion state was created for this page.');
+  }
+  if (imageDeletes && imageDeletes.length > 0 && !conversionState) {
+    throw new Error('Cannot apply image deletions: no conversion state was created for this page.');
+  }
+  if (pathDeletes && pathDeletes.length > 0 && !conversionState) {
+    throw new Error('Cannot apply path deletions: no conversion state was created for this page.');
+  }
+  const wantRedact = !!(redactBboxes && redactBboxes.length > 0) && !!conversionState;
+  const wantEdit = formPatchActive && !!conversionState;
+  const wantImageDelete = !!(imageDeletes && imageDeletes.length > 0) && !!conversionState;
+  const wantPathDelete = !!(pathDeletes && pathDeletes.length > 0) && !!conversionState;
+  const wantConvert = (((!!bboxes && bboxes.length > 0) || convertBrokenType3ToPaths) && !!conversionState) || wantRedact || wantEdit || wantImageDelete || wantPathDelete;
+  let workingText = strippedText;
+  /** @type {Map<string, number>} */
+  let xobjEntries = emptyXobj;
+  /** @type {Map<string, number>} */
+  let formClones = emptyFormClones;
+  /** @type {Array<{fontObjNum: number, charCode: number, reason: string}>} */
+  let skipped = [];
+  let converted = false;
+  /** @type {?Set<string>} */
+  let redactedFormNames = null;
+  /** @type {Set<number>} */
+  let deletedImageObjNums = new Set();
+  /** @type {Set<string>} */
+  let deletedImageNames = new Set();
+
+  if (wantConvert) {
+    const result = await convertSinglePageForRegions({
+      streamText: workingText,
+      pageObjText,
+      bboxes,
+      state: conversionState,
+      objCache,
+      allocObjNum,
+      pushObj,
+      humanReadable,
+      convertBrokenType3ToPaths,
+      redactBboxes,
+      imageDeletes,
+      pathDeletes,
+      textPatches,
+      editFontRefs,
+    });
+    if (result.skipped) skipped = result.skipped;
+    if (result.redactedFormNames) redactedFormNames = result.redactedFormNames;
+    if (result.deletedImageObjNums) deletedImageObjNums = result.deletedImageObjNums;
+    if (result.deletedImageNames) deletedImageNames = result.deletedImageNames;
+    if (result.changed) {
+      if (result.text !== undefined) workingText = result.text;
+      if (result.xobjEntries) xobjEntries = result.xobjEntries;
+      if (result.formClones) formClones = result.formClones;
+      converted = true;
+    }
+  }
+
+  if (!dropped && !converted && !pagePatched) {
+    return {
+      refs: existingContentsRefs, xobjEntries, formClones, skipped, redactedFormNames, deletedImageObjNums, deletedImageNames, supersededContentObjNums: [],
+    };
+  }
+
+  const newObjNum = allocObjNum();
+  const objBin = await encodeStreamObject(newObjNum, workingText, { humanReadable });
+  pushObj({ objNum: newObjNum, content: objBin });
+  const supersededContentObjNums = existingContentsRefs
+    .map((ref) => Number((/^(\d+)\s+\d+\s+R$/.exec(ref) || [])[1]))
+    .filter((n) => Number.isFinite(n));
+  return {
+    refs: [`${newObjNum} 0 R`], xobjEntries, formClones, skipped, redactedFormNames, deletedImageObjNums, deletedImageNames, supersededContentObjNums,
+  };
+}
+
+/**
+ * Resolve the effective /Resources dictionary for a page.
+ * Handles inline dicts, indirect references, and inherited resources.
+ * @param {string} pageObjText
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ */
+export function resolvePageResources(pageObjText, objCache) {
+  const resIdx = pageObjText.indexOf('/Resources');
+  if (resIdx >= 0) {
+    const afterRes = pageObjText.substring(resIdx + '/Resources'.length).trimStart();
+    if (afterRes.startsWith('<<')) {
+      const dictStart = pageObjText.indexOf('<<', resIdx);
+      return extractDict(pageObjText, dictStart);
+    }
+    const refMatch = /^(\d+)\s+\d+\s+R/.exec(afterRes);
+    if (refMatch) {
+      const resText = objCache.getObjectText(Number(refMatch[1]));
+      if (resText) {
+        const dictStart = resText.indexOf('<<');
+        if (dictStart >= 0) return extractDict(resText, dictStart);
+      }
+    }
+  }
+
+  const parentMatch = /\/Parent\s+(\d+)\s+\d+\s+R/.exec(pageObjText);
+  if (parentMatch) {
+    const parentText = objCache.getObjectText(Number(parentMatch[1]));
+    if (parentText) {
+      return resolvePageResources(parentText, objCache);
+    }
+  }
+
+  return '<<>>';
+}
+
+/**
+ * Returns true if the annot dict at `annotObjNum` is a /Subtype/Link whose
+ * destination resolves to a page object that is being dropped.
+ *
+ * @param {number} annotObjNum
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @param {Set<number>} keptPageObjNums
+ */
+export function annotLinkTargetsDroppedPage(annotObjNum, objCache, keptPageObjNums) {
+  const annotText = objCache.getObjectText(annotObjNum);
+  if (!annotText) return false;
+  if (!/\/Subtype\s*\/Link\b/.test(annotText)) return false;
+
+  const destArrayPage = (arrText) => {
+    const m = /^\s*\[\s*(\d+)\s+\d+\s+R\b/.exec(arrText);
+    return m ? Number(m[1]) : null;
+  };
+
+  /**
+   * Resolve a /Dest or /D value, given inline or as an indirect ref to a destination array, to its target page object number.
+   * Returns null for named destinations, which need a catalog name-tree lookup this skips.
+   * @param {string} annotBody
+   * @param {string} key
+   * @returns {number|null}
+   */
+  const resolveTargetPage = (annotBody, key) => {
+    const inlineArr = new RegExp(`/${key}\\s*(\\[[\\s\\S]*?\\])`).exec(annotBody);
+    if (inlineArr) return destArrayPage(inlineArr[1]);
+    const indirectRef = new RegExp(`/${key}\\s+(\\d+)\\s+\\d+\\s+R`).exec(annotBody);
+    if (indirectRef) {
+      const targetText = objCache.getObjectText(Number(indirectRef[1]));
+      if (targetText) return destArrayPage(targetText);
+    }
+    return null;
+  };
+
+  const directDestPage = resolveTargetPage(annotText, 'Dest');
+  if (directDestPage != null) return !keptPageObjNums.has(directDestPage);
+
+  const actionText = resolveDictValue(annotText, 'A', objCache);
+  if (actionText) {
+    if (!/\/S\s*\/GoTo\b/.test(actionText)) return false;
+    const actionDestPage = resolveTargetPage(actionText, 'D');
+    if (actionDestPage != null) return !keptPageObjNums.has(actionDestPage);
+  }
+
+  return false;
+}
+
+/**
+ * Resolve an inheritable numeric-array page attribute (/MediaBox, /CropBox)
+ * by walking the /Parent chain when the page dict itself lacks it.
+ * @param {string} pageObjText
+ * @param {string} key
+ * @param {import('../../pdf/objectCache.js').ObjectCache|null} objCache
+ * @returns {number[]|null}
+ */
+function resolveInheritedNumArray(pageObjText, key, objCache) {
+  let text = pageObjText;
+  for (let depth = 0; depth < 32 && text; depth++) {
+    const own = resolveNumArray(text, key, objCache, null);
+    if (own) return own;
+    if (!objCache) return null;
+    const parentMatch = /\/Parent\s+(\d+)\s+\d+\s+R/.exec(text);
+    if (!parentMatch) return null;
+    text = objCache.getObjectText(Number(parentMatch[1]));
+  }
+  return null;
+}
+
+/**
+ * Write a page's inherited /MediaBox, /CropBox and /Rotate into its dictionary text where the dictionary lacks its own.
+ * @param {string} pageText
+ * @param {{ mediaBox?: number[]|null, cropBox?: number[]|null, rotate?: number }} page - Values already resolved up the source's page tree.
+ * @returns {string}
+ */
+export function writeInheritedPageAttrs(pageText, page) {
+  let out = pageText;
+  const add = (/** @type {string} */ key, /** @type {string} */ value) => {
+    if (new RegExp(`/${key}\\b`).test(out)) return;
+    out = out.replace(/<<\s*/, `<</${key}${value} `);
+  };
+  if (page.mediaBox) add('MediaBox', `[${page.mediaBox.join(' ')}]`);
+  if (page.cropBox) add('CropBox', `[${page.cropBox.join(' ')}]`);
+  if (page.rotate) add('Rotate', ` ${page.rotate}`);
+  return out;
+}
+
+/**
+ * Resolve an inheritable integer page attribute (/Rotate) up the /Parent chain.
+ * @param {string} pageObjText
+ * @param {string} key
+ * @param {import('../../pdf/objectCache.js').ObjectCache|null} objCache
+ * @returns {number|null}
+ */
+function resolveInheritedInt(pageObjText, key, objCache) {
+  let text = pageObjText;
+  for (let depth = 0; depth < 32 && text; depth++) {
+    const own = resolveIntValue(text, key, objCache, NaN);
+    if (!Number.isNaN(own)) return own;
+    if (!objCache) return null;
+    const parentMatch = /\/Parent\s+(\d+)\s+\d+\s+R/.exec(text);
+    if (!parentMatch) return null;
+    text = objCache.getObjectText(Number(parentMatch[1]));
+  }
+  return null;
+}
+
+/**
+ * Compose a user rotation onto a page dict's /Rotate, resolving any inherited value.
+ * Used for kept pages rewritten in place (not rebuilt via `buildReplacementPageDict`).
+ * @param {string} pageObjText - The page dict body (`<<...>>`).
+ * @param {number} userRotation - Degrees to add (multiple of 90).
+ * @param {import('../../pdf/objectCache.js').ObjectCache|null} objCache
+ * @returns {string} `pageObjText` with /Rotate set to the composed value.
+ */
+export function composePageRotation(pageObjText, userRotation, objCache) {
+  if (!userRotation) return pageObjText;
+  const base = resolveInheritedInt(pageObjText, 'Rotate', objCache) || 0;
+  const composed = (((base + userRotation) % 360) + 360) % 360;
+  if (/\/Rotate\s+-?\d+/.test(pageObjText)) {
+    // Replacing only the leading number of a ref-valued /Rotate would leave `/Rotate <composed> 0 R` (a bogus ref) or a dangling `0 R` behind.
+    return pageObjText.replace(/\/Rotate\s+(?:\d+\s+\d+\s+R(?![0-9A-Za-z])|-?\d+)/, composed === 0 ? '' : `/Rotate ${composed}`);
+  }
+  if (composed === 0) return pageObjText;
+  return pageObjText.replace('<<', `<</Rotate ${composed} `);
+}
+
+/**
+ * Collect a page's /Annots refs, resolving an indirect array through the cache.
+ * @param {string} pageObjText
+ * @param {import('../../pdf/objectCache.js').ObjectCache|null} objCache
+ * @returns {string[]}
+ */
+function collectSourceAnnotRefs(pageObjText, objCache) {
+  const arrayText = resolveArrayValue(pageObjText, 'Annots', objCache);
+  return arrayText ? [...arrayText.matchAll(/(\d+\s+\d+\s+R)/g)].map((m) => m[1]) : [];
+}
+
+/**
+ * True when the importer lifted this annotation into the editable model.
+ * Export re-emits the lifted copy from there, so the source object must be dropped.
+ * @param {string} annotText
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @param {?{ nameDests: Map<string, string>, objNumToIndex: Map<number, number> }} linkDestInfo - Null keeps every source /Link, for a caller with no lifted links to re-emit.
+ * @returns {boolean}
+ */
+function annotIsLifted(annotText, objCache, linkDestInfo) {
+  return annotIsModelManaged(annotText, objCache) || annotIsLiftedReply(annotText, objCache)
+    || (!!linkDestInfo && linkAnnotIsLifted(annotText, objCache, linkDestInfo));
+}
+
+/**
+ * True when a page's source /Annots still holds annotations the importer lifted into the editable model.
+ * A page whose lifted annotations were all deleted has none left to re-emit, so nothing else marks it as changed.
+ * Copying it through verbatim would bring the deleted annotations back from the source array, so it must be rebuilt on this verdict alone.
+ * @param {string} pageObjText
+ * @param {import('../../pdf/objectCache.js').ObjectCache} objCache
+ * @param {?{ nameDests: Map<string, string>, objNumToIndex: Map<number, number> }} linkDestInfo
+ * @returns {boolean}
+ */
+export function pageHasLiftedSourceAnnots(pageObjText, objCache, linkDestInfo) {
+  return collectSourceAnnotRefs(pageObjText, objCache).some((ref) => {
+    const m = /^(\d+)\s+\d+\s+R$/.exec(ref);
+    if (!m) return false;
+    const annotText = objCache.getObjectText(Number(m[1]));
+    return !!annotText && annotIsLifted(annotText, objCache, linkDestInfo);
+  });
+}
+
+/**
+ * Rebuild a /Page dict with overlay additions.
+ *
+ * @param {number} objNum
+ * @param {string} originalObjText
+ * @param {string[]|null} newContentsArray - New /Contents refs. If null,
+ *   preserve the original /Contents (used for the annotation-only path
+ *   where no overlay content stream is being added).
+ * @param {number|null} resourcesObjNum - New /Resources object number. If
+ *   null, preserve the original /Resources entry verbatim.
+ * @param {number|null} [parentObjNum=null]
+ * @param {string[]} [extraAnnotRefs=[]] - Additional `N 0 R` refs to
+ *   append to the merged /Annots array.
+ * @param {import('../../pdf/objectCache.js').ObjectCache|null} [objCache=null]
+ *   Used to resolve an indirect /Annots array so source refs can be
+ *   inlined alongside new user-added refs.
+ * @param {?Set<number>} [keptPageObjNums=null] - When non-null (subset rebuild),
+ *   filter out source link annotations whose destination page is not in this set.
+ * @param {number} [userRotation=0] - User-applied rotation (multiple of 90) composed onto the page's /Rotate.
+ * @param {?Array<[number, number, number, number]>} [redactRects=null] - User-space redaction rects for this page.
+ *   Source annotations overlapping any rect, or whose geometry cannot be read, are dropped to avoid leaking redacted content.
+ * @param {?{ nameDests: Map<string, string>, objNumToIndex: Map<number, number> }} [linkDestInfo=null] - When non-null, source /Link annotations the importer lifted are dropped,
+ *   since export re-emits them from the document's annotations through `extraAnnotRefs`.
+ *   Null (a raw-bytes utility call with no lifted annotations to re-emit) keeps every source link verbatim.
+ * @param {?Set<number>} [dropAnnotObjNums=null] - Source annotation object numbers to omit from /Annots (flattened form widgets).
+ */
+export function buildReplacementPageDict(
+  objNum, originalObjText, newContentsArray, resourcesObjNum, parentObjNum = null,
+  extraAnnotRefs = [], objCache = null, keptPageObjNums = null, userRotation = 0,
+  redactRects = null, linkDestInfo = null, dropAnnotObjNums = null,
+) {
+  let dictStr = `${objNum} 0 obj\n<<`;
+  dictStr += '/Type/Page';
+
+  // Copy or override /Parent
+  if (parentObjNum !== null) {
+    dictStr += `/Parent ${parentObjNum} 0 R`;
+  } else {
+    const parentMatch = /\/Parent\s+(\d+\s+\d+\s+R)/.exec(originalObjText);
+    if (parentMatch) dictStr += `/Parent ${parentMatch[1]}`;
+  }
+
+  const mediaBox = resolveInheritedNumArray(originalObjText, 'MediaBox', objCache);
+  if (mediaBox) dictStr += `/MediaBox[${mediaBox.join(' ')}]`;
+
+  const cropBox = resolveInheritedNumArray(originalObjText, 'CropBox', objCache);
+  if (cropBox) dictStr += `/CropBox[${cropBox.join(' ')}]`;
+
+  const rot = resolveInheritedInt(originalObjText, 'Rotate', objCache);
+  if (userRotation) {
+    const composed = (((rot || 0) + userRotation) % 360 + 360) % 360;
+    if (composed !== 0) dictStr += `/Rotate ${composed}`;
+  } else if (rot !== null) {
+    dictStr += `/Rotate ${rot}`;
+  }
+
+  const annotsIndirectMatch = /\/Annots\s+(\d+)\s+\d+\s+R/.exec(originalObjText);
+  let sourceAnnotRefs = collectSourceAnnotRefs(originalObjText, objCache);
+  if (keptPageObjNums && objCache) {
+    sourceAnnotRefs = sourceAnnotRefs.filter((ref) => {
+      const m = /^(\d+)\s+\d+\s+R$/.exec(ref);
+      if (!m) return true;
+      return !annotLinkTargetsDroppedPage(Number(m[1]), objCache, keptPageObjNums);
+    });
+  }
+  if (redactRects && redactRects.length > 0 && objCache) {
+    sourceAnnotRefs = sourceAnnotRefs.filter((ref) => {
+      const m = /^(\d+)\s+\d+\s+R$/.exec(ref);
+      if (!m) return false;
+      const annotText = objCache.getObjectText(Number(m[1]));
+      if (!annotText) return false;
+      // /Rect and /QuadPoints share the redaction rects' user-space frame, so they compare directly.
+      const rectArr = resolveNumArray(annotText, 'Rect', objCache, null);
+      if (!rectArr || rectArr.length < 4) return false;
+      const rx0 = Math.min(rectArr[0], rectArr[2]);
+      const ry0 = Math.min(rectArr[1], rectArr[3]);
+      const rx1 = Math.max(rectArr[0], rectArr[2]);
+      const ry1 = Math.max(rectArr[1], rectArr[3]);
+      const boxes = [[rx0, ry0, rx1, ry1]];
+      const nums = resolveNumArray(annotText, 'QuadPoints', objCache, null);
+      if (nums) {
+        for (let q = 0; q + 7 < nums.length; q += 8) {
+          const xs = [nums[q], nums[q + 2], nums[q + 4], nums[q + 6]];
+          const ys = [nums[q + 1], nums[q + 3], nums[q + 5], nums[q + 7]];
+          boxes.push([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]);
+        }
+      }
+      return !boxes.some((b) => redactRects.some((r) => b[0] < r[2] && b[2] > r[0] && b[1] < r[3] && b[3] > r[1]));
+    });
+  }
+  if (dropAnnotObjNums && dropAnnotObjNums.size > 0) {
+    sourceAnnotRefs = sourceAnnotRefs.filter((ref) => {
+      const m = /^(\d+)\s+\d+\s+R$/.exec(ref);
+      return !m || !dropAnnotObjNums.has(Number(m[1]));
+    });
+  }
+  // The lifted annotations are re-emitted via `extraAnnotRefs`, so keeping a source copy would duplicate them on export.
+  if (objCache && sourceAnnotRefs.length > 0) {
+    sourceAnnotRefs = sourceAnnotRefs.filter((ref) => {
+      const m = /^(\d+)\s+\d+\s+R$/.exec(ref);
+      if (!m) return true;
+      const annotText = objCache.getObjectText(Number(m[1]));
+      return !annotText || !annotIsLifted(annotText, objCache, linkDestInfo);
+    });
+  }
+  if (extraAnnotRefs.length > 0 || sourceAnnotRefs.length > 0) {
+    if (extraAnnotRefs.length === 0 && annotsIndirectMatch && !objCache) {
+      dictStr += `/Annots ${annotsIndirectMatch[0].slice('/Annots'.length).trim()}`;
+    } else {
+      dictStr += `/Annots[${[...sourceAnnotRefs, ...extraAnnotRefs].join(' ')}]`;
+    }
+  }
+
+  const structParents = resolveIntValue(originalObjText, 'StructParents', objCache, NaN);
+  if (!Number.isNaN(structParents)) dictStr += `/StructParents ${structParents}`;
+
+  const tabs = resolveNameValue(originalObjText, 'Tabs', objCache);
+  if (tabs) dictStr += `/Tabs/${tabs}`;
+
+  const userUnit = resolveNumValue(originalObjText, 'UserUnit', objCache, NaN);
+  if (!Number.isNaN(userUnit)) dictStr += `/UserUnit ${userUnit}`;
+
+  // /Contents: new array or preserved original
+  if (newContentsArray !== null) {
+    dictStr += `/Contents[${newContentsArray.join(' ')}]`;
+  } else {
+    const contentsArrMatch = /\/Contents\s*\[([\s\S]*?)\]/.exec(originalObjText);
+    const contentsRefMatch = /\/Contents\s+(\d+\s+\d+\s+R)/.exec(originalObjText);
+    if (contentsArrMatch) dictStr += `/Contents[${contentsArrMatch[1].trim()}]`;
+    else if (contentsRefMatch) dictStr += `/Contents ${contentsRefMatch[1]}`;
+  }
+
+  // /Resources: new reference or preserved original (ref or inline dict)
+  if (resourcesObjNum !== null) {
+    dictStr += `/Resources ${resourcesObjNum} 0 R`;
+  } else {
+    const resRefMatch = /\/Resources\s+(\d+\s+\d+\s+R)/.exec(originalObjText);
+    if (resRefMatch) {
+      dictStr += `/Resources ${resRefMatch[1]}`;
+    } else {
+      const resInlineMatch = /\/Resources\s*<</.exec(originalObjText);
+      if (resInlineMatch) {
+        const dictStart = resInlineMatch.index + resInlineMatch[0].length - 2;
+        dictStr += `/Resources${extractDict(originalObjText, dictStart)}`;
+      }
+    }
+  }
+
+  dictStr += '>>\nendobj\n\n';
+  return dictStr;
+}
+
+/**
+ * Transform a pixel-space annotation's geometry into the coordinate frame the overlay's page uses.
+ *
+ * @param {Annotation} annot
+ * @param {number} scaleX
+ * @param {number} scaleY
+ * @param {number} tx
+ * @param {number} ty
+ * @param {number} [rotate] - the page's /Rotate (0|90|180|270); annotation coords are rotated back into unrotated MediaBox space.
+ * @param {number} [pageW] - unrotated MediaBox width (points), used for the 180/270 reflections.
+ * @param {number} [pageH] - unrotated MediaBox height (points), used for the 90/180 reflections.
+ * @param {number} [rotScale] - uniform reading-to-points scale for a quarter turn: the unrotated MediaBox width divided by the pixel frame's height.
+ * @returns {Annotation}
+ */
+export function overlayAnnotationBbox(annot, scaleX, scaleY, tx, ty, rotate = 0, pageW = 0, pageH = 0, rotScale = scaleX) {
+  // Map a reading-frame pixel (px, py) into the overlay page's frame: top-left origin, y-down, in unrotated MediaBox points.
+  // The parser's reading frame is the post-rotation display frame, and the page keeps its /Rotate on export.
+  // Rotated points are therefore mapped back into unrotated MediaBox space, where the viewer's /Rotate carries them onto the content.
+  // On a quarter turn the pixel frame's axes are swapped relative to the MediaBox, so scaleX/scaleY are cross-axis and rotScale is the single uniform scale used instead.
+  // Rotated pages are assumed to have a zero CropBox origin, as essentially all do.
+  const s = rotScale;
+  const mapPt = (px, py) => {
+    if (rotate === 90) return [py * s, pageH - px * s];
+    if (rotate === 270) return [pageW - py * s, px * s];
+    if (rotate === 180) return [pageW - px * scaleX, pageH - py * scaleY];
+    return [px * scaleX + tx, py * scaleY - ty];
+  };
+  const transformBbox = (b) => {
+    const [ax, ay] = mapPt(b.left, b.top);
+    const [bx, by] = mapPt(b.right, b.bottom);
+    return {
+      left: Math.min(ax, bx), right: Math.max(ax, bx), top: Math.min(ay, by), bottom: Math.max(ay, by),
+    };
+  };
+  const transformFlat = (arr) => {
+    const out = [];
+    for (let i = 0; i + 1 < arr.length; i += 2) { const [x, y] = mapPt(arr[i], arr[i + 1]); out.push(x, y); }
+    return out;
+  };
+  const out = { ...annot };
+  // Line/Polygon shapes carry geometry instead of a bbox.
+  if (annot.bbox) out.bbox = transformBbox(annot.bbox);
+  if (annot.quads) out.quads = annot.quads.map(transformBbox);
+  if (annot.points) out.points = transformFlat(annot.points);
+  if (annot.vertices) out.vertices = transformFlat(annot.vertices);
+  // FreeText font size lives in the same pixel frame as the bbox,
+  // so convert it to page points alongside the rect for the text to fit its box at any scale.
+  const fontScale = (rotate === 90 || rotate === 270) ? s : scaleY;
+  if (annot.type === 'freetext' && typeof annot.fontSize === 'number') out.fontSize = annot.fontSize * fontScale;
+  // A shape's stroke is a distance in that same pixel frame, so it converts with the geometry it outlines.
+  if (typeof annot.borderWidth === 'number') out.borderWidth = annot.borderWidth * fontScale;
+  return out;
+}

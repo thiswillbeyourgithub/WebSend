@@ -1,0 +1,1816 @@
+import scribe from '../../scribe.js';
+import { UiText, UiOcrWord } from './viewerWordObjects.js';
+
+/**
+ * Custom text selection for the read-only viewer, with no text in the DOM.
+ *
+ * The document already carries a complete geometric text model (page -> line -> word -> char, each with a bounding box, in reading order).
+ * This module treats a selection as what it is in that model: a contiguous interval of the page's linear character sequence.
+ * Every other operation is a projection of that interval.
+ * A caret is an index, a hit test is "nearest index to this point", copying is a substring,
+ * drawing is one rectangle per line the interval crosses, and highlighting is the set of words the interval touches.
+ */
+
+/** Distance (px, client space) from the scroll container's edge at which a drag starts autoscrolling. */
+const AUTOSCROLL_ZONE = 44;
+
+/** Autoscroll speed (px per frame) at a full `AUTOSCROLL_ZONE` of overshoot. */
+const AUTOSCROLL_MAX = 26;
+
+/** Two pointerdowns within this many ms and this many px of each other count as one multi-click gesture. */
+const MULTI_CLICK_MS = 450;
+const MULTI_CLICK_PX = 5;
+
+/** A touch held this long, within `TOUCH_HOLD_PX` of where it started, selects the word under it. */
+const TOUCH_HOLD_MS = 500;
+const TOUCH_HOLD_PX = 10;
+
+/**
+ * How far the selection rectangle extends past the last word when a line's trailing newline is selected, as a fraction of the rectangle's height.
+ * Matches the small sliver a browser paints for a fully-selected line rather than running out to the distant column edge.
+ */
+const NEWLINE_TAIL = 0.4;
+
+/** Selection granularity, set by click count and held for the rest of the drag. */
+const CHAR = 1;
+const WORD = 2;
+const LINE = 3;
+
+let selectionStyleSheetInjected = false;
+
+/** Inject the one-time selection stylesheet. */
+export function ensureSelectionStyleSheet() {
+  if (selectionStyleSheetInjected || typeof document === 'undefined') return;
+  selectionStyleSheetInjected = true;
+  const styleEl = document.createElement('style');
+  // multiply keeps glyphs at full contrast under the wash, unlike a translucent per-rect background, and matches how the highlight layer below already blends.
+  styleEl.textContent = '.scribe-layer-select{mix-blend-mode:multiply;pointer-events:none}'
+    + '.scribe-sel-rect{position:absolute;background:var(--scribe-sel,#a6c8ff)}'
+    + '.scribe-mark-rect{position:absolute;background:var(--scribe-match);border-radius:calc(2px / var(--scribe-zoom,1));transition:background-color .12s ease}'
+    + '.scribe-mark-rect.scribe-mark-active{background:var(--scribe-match-active)}'
+    + '@media (prefers-reduced-motion: reduce){.scribe-mark-rect{transition:none}}'
+    // The group is pointer-transparent and each handle re-enables hits, so the page still scrolls around the touch-selection grips.
+    // `--sel-handle-scale`, set to 1/zoom per render, holds the grips' drawn size constant on screen at any document zoom.
+    + '.scribe-layer-selhandles{pointer-events:none}'
+    + '.scribe-sel-handle{position:absolute;width:44px;height:44px;margin-left:-22px;pointer-events:auto;'
+    + 'touch-action:none;transform:scale(var(--sel-handle-scale,1));transform-origin:top center;cursor:grab;z-index:2}'
+    + '.scribe-sel-handle::after{content:"";position:absolute;left:50%;top:2px;width:17px;height:17px;'
+    + 'margin-left:-8.5px;border-radius:50% 50% 50% 50%;background:var(--scribe-accent,#3f76d6);'
+    + 'box-shadow:0 0 0 1.5px rgba(255,255,255,.9),0 1px 3px rgba(15,22,40,.35)}'
+    + '.scribe-sel-handle-start::after{border-top-right-radius:2px}'
+    + '.scribe-sel-handle-end::after{border-top-left-radius:2px}';
+  document.head.appendChild(styleEl);
+}
+
+const NO_ADJ = { x: 0, y: 0 };
+
+/**
+ * @typedef {object} LineEntry
+ * @property {OcrLine} line
+ * @property {Array<OcrWord>} words - Text-bearing words, in reading order.
+ * @property {Array<{left: number, right: number, top: number, bottom: number}>} boxes - Word boxes, de-skewed, in group-local space.
+ * @property {Array<number>} wordStart - Character offset of each word's first character.
+ * @property {Array<number>} dx - Per-word x shift applied by the page's de-skew adjustment.
+ * @property {number} start - Offset of the line's first character.
+ * @property {number} end - Offset just past its last character, where its newline sits.
+ * @property {number} orientation
+ * @property {{x: number, y: number}} adjL
+ * @property {{left: number, right: number, top: number, bottom: number}} lbox - Union of the line's word boxes, de-skewed and normalized, in `boxes` space.
+ *   Not `line.bbox`, which can be inverted, null, or offset from the glyphs.
+ * @property {{left: number, right: number, top: number, bottom: number}} band - The line's share of the page (see `_computeBands`).
+ * @property {number} rectTop
+ * @property {number} rectBottom
+ * @property {Array<?Float64Array>} edges - Per-word character x-edges, filled on first use.
+ */
+
+/**
+ * @typedef {object} SelPoint
+ * @property {number} n - Page index.
+ * @property {number} off - Character offset into that page's `PageTextIndex.text`.
+ */
+
+/**
+ * @typedef {object} SelRect
+ * @property {number} orientation
+ * @property {number} left
+ * @property {number} top
+ * @property {number} right
+ * @property {number} bottom
+ */
+
+/**
+ * Orders two selection points by page index, then by character offset within the page.
+ * @param {SelPoint} a
+ * @param {SelPoint} b
+ * @returns {number} Negative when `a` precedes `b`, positive when it follows, zero when equal.
+ */
+const cmpPoint = (a, b) => (a.n !== b.n ? a.n - b.n : a.off - b.off);
+
+/**
+ * A page's text as a linear character sequence, plus the geometry to map between offsets in that sequence and points on the page.
+ *
+ * Words in a line join with a single space and lines join with a newline, so every inter-word gap and line break owns exactly one offset,
+ * letting a selection carry a trailing space or line break into the clipboard.
+ *
+ * Geometry is stored in each line's *group-local* space, the unrotated page space its orientation group is drawn in,
+ * so the same numbers place a selection rectangle and answer a hit test.
+ */
+export class PageTextIndex {
+  /**
+   * @param {OcrPage} page
+   * @param {number} angle - Page skew angle in degrees, from `pageMetrics`.
+   * @param {dims} dims - Unrotated page dimensions.
+   * @param {DocFonts} docFonts - Consulted only when a word lacks usable per-character boxes.
+   */
+  constructor(page, angle, dims, docFonts) {
+    this.n = page.n;
+    /** Identity check for the cache: a page edit or reorder swaps this object out. */
+    this.page = page;
+    this.docFonts = docFonts;
+    /** The whole page as one string: selection offsets index into it. */
+    this.text = '';
+    /** @type {Array<LineEntry>} */
+    this.lines = [];
+    /** @type {Map<number, Array<number>>} Line indices per orientation, each in its own local space. */
+    this.byOrientation = new Map();
+
+    const imageRotated = Math.abs(angle ?? 0) > 0.05;
+
+    /** @param {{left: number, top: number, right: number, bottom: number}} b */
+    const finiteBox = (b) => !!b && Number.isFinite(b.left) && Number.isFinite(b.right)
+      && Number.isFinite(b.top) && Number.isFinite(b.bottom);
+    /** @param {{x: number, y: number}} adj */
+    const finiteAdj = (adj) => ((Number.isFinite(adj.x) && Number.isFinite(adj.y)) ? adj : NO_ADJ);
+
+    for (const line of page.lines) {
+      // A word with no finite box (OCR junk carrying null coordinates) cannot host a caret, so it is excluded from the index the way empty-text words are.
+      const words = line.words.filter((w) => w.text && finiteBox(w.bbox));
+      if (words.length === 0) continue;
+
+      // De-skew adjustments derive from the line/word geometry, so junk boxes elsewhere on the line can make them NaN.
+      // An unplaceable adjustment falls back to none rather than poisoning every box.
+      const adjL = imageRotated ? finiteAdj(scribe.utils.ocr.calcLineStartAngleAdj(line)) : NO_ADJ;
+      if (this.text) this.text += '\n';
+      const start = this.text.length;
+
+      const boxes = [];
+      const wordStart = [];
+      const dx = [];
+      const lbox = {
+        left: Infinity, right: -Infinity, top: Infinity, bottom: -Infinity,
+      };
+      for (const word of words) {
+        const adjW = imageRotated ? finiteAdj(scribe.utils.ocr.calcWordAngleAdj(word)) : NO_ADJ;
+        const shiftX = adjL.x + adjW.x;
+        const shiftY = adjL.y + adjW.y;
+        // Normalized, never trusted from the source: TeX-generated PDFs carry boxes with top/bottom (and occasionally left/right) swapped, which would invert the band arithmetic downstream.
+        const left = Math.min(word.bbox.left, word.bbox.right);
+        const right = Math.max(word.bbox.left, word.bbox.right);
+        const top = Math.min(word.bbox.top, word.bbox.bottom);
+        const bottom = Math.max(word.bbox.top, word.bbox.bottom);
+        boxes.push({
+          left: left + shiftX, right: right + shiftX, top: top + shiftY, bottom: bottom + shiftY,
+        });
+        lbox.left = Math.min(lbox.left, left + shiftX);
+        lbox.right = Math.max(lbox.right, right + shiftX);
+        lbox.top = Math.min(lbox.top, top + shiftY);
+        lbox.bottom = Math.max(lbox.bottom, bottom + shiftY);
+        dx.push(shiftX);
+        if (this.text.length > start) this.text += ' ';
+        wordStart.push(this.text.length);
+        this.text += word.text;
+      }
+
+      const li = this.lines.length;
+      this.lines.push({
+        line,
+        words,
+        boxes,
+        wordStart,
+        dx,
+        start,
+        end: this.text.length,
+        orientation: line.orientation,
+        adjL,
+        lbox,
+        band: {
+          left: 0, right: 0, top: 0, bottom: 0,
+        },
+        rectTop: 0,
+        rectBottom: 0,
+        edges: words.map(() => null),
+      });
+      const bucket = this.byOrientation.get(line.orientation);
+      if (bucket) bucket.push(li); else this.byOrientation.set(line.orientation, [li]);
+    }
+
+    for (const [orientation, indices] of this.byOrientation) {
+      const localW = orientation % 2 === 1 ? dims.height : dims.width;
+      const localH = orientation % 2 === 1 ? dims.width : dims.height;
+      this._computeBands(indices, localW, localH);
+    }
+  }
+
+  get length() { return this.text.length; }
+
+  /**
+   * Partition the page among one orientation's lines into bands that tile it with no dead zones, so a caret placed anywhere resolves to exactly one line.
+   * @param {Array<number>} indices
+   * @param {number} localW
+   * @param {number} localH
+   */
+  _computeBands(indices, localW, localH) {
+    // Left/right edges come first, from each line's column extent rather than its own box, so a drag past a short last line's final word still lands on it, not in a gap.
+    // Adjacent columns meet at the midpoint of their extents, so neither overhangs.
+    // The vertical pass then runs against those narrowed side spans, so an isolated line is bounded by the columns its span reaches over, not a page-wide slab.
+    // Text can run past the page box, so the partition covers the union of the page and its content.
+    // A band edge clamped to the page would leave the overflow strip owned by no line.
+    let extLeft = 0;
+    let extTop = 0;
+    let extRight = localW;
+    let extBottom = localH;
+    for (const i of indices) {
+      const b = this.lines[i].lbox;
+      extLeft = Math.min(extLeft, b.left);
+      extTop = Math.min(extTop, b.top);
+      extRight = Math.max(extRight, b.right);
+      extBottom = Math.max(extBottom, b.bottom);
+    }
+
+    /** @type {Map<number, {left: number, right: number}>} */
+    const colExtents = new Map();
+    for (const i of indices) {
+      const lb = this.lines[i].lbox;
+      // A short line x-overlaps its paragraph's full-width lines, so unioning the x-overlapping lines recovers the column width.
+      // The vertical window stops a distant two-column title from welding both columns into one extent.
+      const dilate = (lb.bottom - lb.top) * 3;
+
+      /** @type {Array<{left: number, right: number, top: number, bottom: number}>} Boxes of every line in the window, sorted by left. */
+      const win = [];
+      for (const j of indices) {
+        const mb = this.lines[j].lbox;
+        if (mb.top >= lb.bottom + dilate || mb.bottom <= lb.top - dilate) continue;
+        win.push(mb);
+      }
+      win.sort((a, b) => a.left - b.left);
+
+      /**
+       * Whether box `jb` overlaps two x-disjoint window lines, e.g. a footer or heading spanning a multi-column region.
+       * Such a line belongs to no column, so unioning it would weld both columns into one extent and shadow the later column.
+       * @param {{left: number, right: number}} jb
+       * @returns {boolean}
+       */
+      const bridges = (jb) => {
+        let minRight = Infinity;
+        for (const mb of win) {
+          if (mb === jb || mb.left >= jb.right || mb.right <= jb.left) continue;
+          if (mb.left >= minRight) return true;
+          minRight = Math.min(minRight, mb.right);
+        }
+        return false;
+      };
+
+      const ext = { left: lb.left, right: lb.right };
+      for (const mb of win) {
+        if (mb.left < lb.right && mb.right > lb.left && !bridges(mb)) {
+          ext.left = Math.min(ext.left, mb.left);
+          ext.right = Math.max(ext.right, mb.right);
+        }
+      }
+      colExtents.set(i, ext);
+    }
+
+    for (const i of indices) {
+      const lb = this.lines[i].lbox;
+      const col = /** @type {{left: number, right: number}} */ (colExtents.get(i));
+      const dilate = (lb.bottom - lb.top) * 3;
+      const band = {
+        left: extLeft, right: extRight, top: extTop, bottom: extBottom,
+      };
+      for (const j of indices) {
+        if (j === i) continue;
+        const mb = this.lines[j].lbox;
+        const mc = /** @type {{left: number, right: number}} */ (colExtents.get(j));
+        if (mb.top < lb.bottom + dilate && mb.bottom > lb.top - dilate) {
+          if (mc.left >= col.right) band.right = Math.min(band.right, (col.right + mc.left) / 2);
+          if (mc.right <= col.left) band.left = Math.max(band.left, (mc.right + col.left) / 2);
+        }
+      }
+      this.lines[i].band = band;
+    }
+
+    /** The line directly above / below each line, i.e. the one whose midpoint set that band edge. */
+    const above = new Map();
+    const below = new Map();
+    for (const i of indices) {
+      const entry = this.lines[i];
+      const lb = entry.lbox;
+      const { band } = entry;
+      for (const j of indices) {
+        if (j === i) continue;
+        const mb = this.lines[j].lbox;
+        if (mb.left < band.right && mb.right > band.left) {
+          if (mb.top >= lb.bottom && (lb.bottom + mb.top) / 2 < band.bottom) {
+            band.bottom = (lb.bottom + mb.top) / 2;
+            below.set(i, j);
+          }
+          if (mb.bottom <= lb.top && (mb.bottom + lb.top) / 2 > band.top) {
+            band.top = (mb.bottom + lb.top) / 2;
+            above.set(i, j);
+          }
+        }
+      }
+    }
+
+    /**
+     * How much whitespace a rectangle may paint beyond its glyphs before the gap counts as structure (a paragraph break) rather than leading.
+     * Averaged over the pair so both sides of a shared band edge agree: they either both take the edge (tiling) or both pull back symmetrically.
+     * @param {number} i
+     * @param {?number} j
+     * @returns {number}
+     */
+    const allowance = (i, j) => {
+      const h = (e) => (e.line.ascHeight > 0 ? e.line.ascHeight * 1.36 : (e.lbox.bottom - e.lbox.top));
+      const own = h(this.lines[i]);
+      return 0.75 * (j === undefined ? own : (own + h(this.lines[j])) / 2);
+    };
+
+    for (const i of indices) {
+      const entry = this.lines[i];
+      const lb = entry.lbox;
+      const { band } = entry;
+
+      const belowJ = below.get(i);
+      const gapBelow = belowJ === undefined ? Infinity : this.lines[belowJ].lbox.top - lb.bottom;
+      const budgetBelow = allowance(i, belowJ);
+      const aboveJ = above.get(i);
+      const gapAbove = aboveJ === undefined ? Infinity : lb.top - this.lines[aboveJ].lbox.bottom;
+      const budgetAbove = allowance(i, aboveJ);
+
+      const top = gapAbove <= budgetAbove ? band.top : Math.max(band.top, lb.top - budgetAbove / 2);
+      const bottom = gapBelow <= budgetBelow ? band.bottom : Math.min(band.bottom, lb.bottom + budgetBelow / 2);
+      entry.rectTop = top;
+      entry.rectBottom = bottom;
+      if (entry.rectBottom <= entry.rectTop) {
+        entry.rectTop = band.top;
+        entry.rectBottom = band.bottom;
+      }
+    }
+  }
+
+  /**
+   * The x of every character boundary of word `wi` on line `li`: `edges[k]` is the left edge of character `k`, and `edges[len]` the word's right edge.
+   *
+   * Per-character boxes from the PDF or OCR source are exact and are used whenever they line up with the word's text.
+   * Otherwise the font's advance widths are scaled to span the word box, which keeps the caret near the glyph it points at even when the source gave only a word box.
+   * Either way the result is forced non-decreasing and pinned to the box, so a caret search cannot walk off it.
+   * @param {number} li
+   * @param {number} wi
+   * @returns {Float64Array}
+   */
+  edges(li, wi) {
+    const entry = this.lines[li];
+    const cached = entry.edges[wi];
+    if (cached) return cached;
+
+    const word = entry.words[wi];
+    const box = entry.boxes[wi];
+    const len = word.text.length;
+    const shiftX = entry.dx[wi];
+    const out = new Float64Array(len + 1);
+
+    const { chars } = word;
+    if (chars && chars.length === len) {
+      for (let i = 0; i < len; i++) out[i] = chars[i].bbox.left + shiftX;
+      out[len] = chars[len - 1].bbox.right + shiftX;
+    } else {
+      /** @type {?Array<number>} */
+      let advances = null;
+      try {
+        const metrics = scribe.utils.calcWordMetrics(word, this.docFonts);
+        if (metrics.advanceArr.length === len) {
+          advances = metrics.advanceArr.map((a, i) => a + (metrics.kerningArr[i] || 0) + metrics.charSpacing);
+        }
+      } catch {
+        advances = null;
+      }
+      if (advances) {
+        let cum = 0;
+        for (let i = 0; i < len; i++) { out[i] = cum; cum += advances[i]; }
+        out[len] = cum;
+        const scale = cum > 0 ? (box.right - box.left) / cum : 0;
+        for (let i = 0; i <= len; i++) out[i] = box.left + out[i] * scale;
+      } else {
+        for (let i = 0; i <= len; i++) out[i] = box.left + (box.right - box.left) * (i / len);
+      }
+    }
+
+    out[0] = box.left;
+    out[len] = box.right;
+    for (let i = 1; i < len; i++) {
+      if (out[i] < out[i - 1]) out[i] = out[i - 1];
+      if (out[i] > box.right) out[i] = box.right;
+    }
+    entry.edges[wi] = out;
+    return out;
+  }
+
+  /**
+   * The word index on line `li` owning offset `off`.
+   * @param {number} li
+   * @param {number} off
+   * @returns {number}
+   */
+  wordForOffset(li, off) {
+    const { wordStart } = this.lines[li];
+    let wi = wordStart.length - 1;
+    while (wi > 0 && wordStart[wi] > off) wi--;
+    return wi;
+  }
+
+  /**
+   * The x of character offset `off`, which must lie on line `li`.
+   * @param {number} li
+   * @param {number} off
+   * @returns {number}
+   */
+  xForOffset(li, off) {
+    const entry = this.lines[li];
+    if (off <= entry.start) return entry.boxes[0].left;
+    if (off >= entry.end) return entry.boxes[entry.boxes.length - 1].right;
+    const wi = this.wordForOffset(li, off);
+    return this.edges(li, wi)[off - entry.wordStart[wi]];
+  }
+
+  /**
+   * The caret offset nearest x on line `li`.
+   * Inside a word this snaps to a character boundary.
+   * In the gap between two words it snaps to whichever word edge is closer, which is what decides whether the gap's space lands inside the selection.
+   * @param {number} li
+   * @param {number} x
+   * @returns {number}
+   */
+  offsetForX(li, x) {
+    const entry = this.lines[li];
+    const { boxes } = entry;
+    if (x <= boxes[0].left) return entry.start;
+    if (x >= boxes[boxes.length - 1].right) return entry.end;
+
+    for (let wi = 0; wi < boxes.length; wi++) {
+      const box = boxes[wi];
+      if (x < box.left) {
+        const prev = boxes[wi - 1];
+        const prevEnd = entry.wordStart[wi - 1] + entry.words[wi - 1].text.length;
+        return (x - prev.right) < (box.left - x) ? prevEnd : entry.wordStart[wi];
+      }
+      if (x <= box.right) {
+        const e = this.edges(li, wi);
+        let best = 0;
+        let bestDist = Infinity;
+        for (let k = 0; k < e.length; k++) {
+          const d = Math.abs(x - e[k]);
+          if (d < bestDist) { bestDist = d; best = k; }
+        }
+        return entry.wordStart[wi] + best;
+      }
+    }
+    return entry.end;
+  }
+
+  /**
+   * The line of the given orientation owning a local-space point, and the point's distance from that line's glyphs.
+   * The distance lets a caller choose between orientations on a mixed page.
+   * @param {number} orientation
+   * @param {number} x
+   * @param {number} y
+   * @returns {?{li: number, dist: number}}
+   */
+  lineAt(orientation, x, y) {
+    const indices = this.byOrientation.get(orientation);
+    if (!indices || indices.length === 0) return null;
+    // Bands can still overlap (a layout the extent pass misreads), so among containing bands the line with the nearest glyphs wins, not the one earliest in reading order.
+    // Reading order would let an earlier line's band permanently shadow a later line's own glyphs.
+    // Line boxes tie at zero when a skewed scan's staircasing makes each tall enough to swallow its neighbours, so the nearest word box breaks the tie.
+    // When the word boxes coincide too (duplicated OCR text), the nearest line midline breaks it.
+    let hit = -1;
+    let hitDist = Infinity;
+    let hitWord = Infinity;
+    let hitMid = Infinity;
+    for (const i of indices) {
+      const b = this.lines[i].band;
+      if (x < b.left || x > b.right || y < b.top || y > b.bottom) continue;
+      const ib = this.lines[i].lbox;
+      const ix = Math.max(ib.left - x, 0, x - ib.right);
+      const iy = Math.max(ib.top - y, 0, y - ib.bottom);
+      const d = ix * ix + iy * iy;
+      if (d > hitDist) continue;
+      let w = d;
+      if (d === 0) {
+        w = Infinity;
+        for (const wb of this.lines[i].boxes) {
+          const wx = Math.max(wb.left - x, 0, x - wb.right);
+          const wy = Math.max(wb.top - y, 0, y - wb.bottom);
+          w = Math.min(w, wx * wx + wy * wy);
+          if (w === 0) break;
+        }
+      }
+      const m = Math.abs(y - (ib.top + ib.bottom) / 2);
+      if (d < hitDist || w < hitWord || (w === hitWord && m < hitMid)) {
+        hitDist = d; hitWord = w; hitMid = m; hit = i;
+      }
+    }
+    // The bands tile the page, so a miss means the point is off the paper (a drag past the page edge).
+    // Equally-near bands (two stacked lines sharing an edge the point is straight below) tie on band distance, where the nearer glyphs decide, not index order.
+    if (hit < 0) {
+      let bestDist = Infinity;
+      let bestGlyph = Infinity;
+      for (const i of indices) {
+        const b = this.lines[i].band;
+        const bx = Math.max(b.left - x, 0, x - b.right);
+        const by = Math.max(b.top - y, 0, y - b.bottom);
+        const d = bx * bx + by * by;
+        if (d > bestDist) continue;
+        const ib = this.lines[i].lbox;
+        const ix = Math.max(ib.left - x, 0, x - ib.right);
+        const iy = Math.max(ib.top - y, 0, y - ib.bottom);
+        const g = ix * ix + iy * iy;
+        if (d < bestDist || g < bestGlyph) { bestDist = d; bestGlyph = g; hit = i; }
+      }
+    }
+    // Construction keeps all geometry finite, so this cannot fire.
+    // If data ever defeats that, an unresolvable point must degrade to "no caret", never to a crash mid-gesture.
+    if (hit < 0) return null;
+    const lb = this.lines[hit].lbox;
+    const gx = Math.max(lb.left - x, 0, x - lb.right);
+    const gy = Math.max(lb.top - y, 0, y - lb.bottom);
+    return { li: hit, dist: Math.hypot(gx, gy) };
+  }
+
+  /**
+   * The line index containing `off`.
+   * @param {number} off
+   * @returns {number}
+   */
+  lineForOffset(off) {
+    let lo = 0;
+    let hi = this.lines.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (this.lines[mid].start <= off) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  /**
+   * Grow `off` out to the bounds of the word or line it falls in, so a double- or triple-click drag keeps whole words (or whole lines) selected as it moves.
+   * @param {number} off
+   * @param {number} granularity - `CHAR`, `WORD`, or `LINE`.
+   * @returns {{start: number, end: number}}
+   */
+  expand(off, granularity) {
+    if (granularity === CHAR) return { start: off, end: off };
+    const li = this.lineForOffset(off);
+    const entry = this.lines[li];
+    if (granularity === WORD) {
+      const wi = this.wordForOffset(li, off);
+      return { start: entry.wordStart[wi], end: entry.wordStart[wi] + entry.words[wi].text.length };
+    }
+    return { start: entry.start, end: entry.end };
+  }
+
+  /**
+   * One rectangle per line the interval `[a, b)` crosses, each in its line's local space.
+   * @param {number} a
+   * @param {number} b
+   * @returns {Array<SelRect>}
+   */
+  rects(a, b) {
+    /** @type {Array<SelRect>} */
+    const out = [];
+    for (let li = 0; li < this.lines.length; li++) {
+      const entry = this.lines[li];
+      if (b <= entry.start || a > entry.end) continue;
+      const left = this.xForOffset(li, Math.max(a, entry.start));
+      // Past the last character sits the line's newline.
+      // Selecting it paints a short tail.
+      const right = b > entry.end
+        ? entry.boxes[entry.boxes.length - 1].right + (entry.rectBottom - entry.rectTop) * NEWLINE_TAIL
+        : this.xForOffset(li, b);
+      if (right <= left) continue;
+      out.push({
+        orientation: entry.orientation, left, right, top: entry.rectTop, bottom: entry.rectBottom,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Ids of the words the interval `[a, b)` touches.
+   * A word counts when the interval covers at least one of its characters, so a partial selection still highlights the whole word.
+   * @param {number} a
+   * @param {number} b
+   * @returns {Array<string>}
+   */
+  wordIds(a, b) {
+    const ids = [];
+    for (const entry of this.lines) {
+      if (b <= entry.start || a >= entry.end) continue;
+      for (let wi = 0; wi < entry.words.length; wi++) {
+        const ws = entry.wordStart[wi];
+        const we = ws + entry.words[wi].text.length;
+        if (a < we && b > ws) ids.push(entry.words[wi].id);
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * Rectangles and text for a columnar selection over `box`: one rectangle per line, spanning only the words the box touches.
+   * Lines join with newlines, so a table column copies as a column rather than as the interleaved reading-order text a linear selection would give.
+   * @param {number} orientation
+   * @param {{left: number, top: number, right: number, bottom: number}} box
+   * @returns {{rects: Array<SelRect>, text: string, ids: Array<string>}}
+   */
+  boxSelection(orientation, box) {
+    /** @type {Array<SelRect>} */
+    const rects = [];
+    const rows = [];
+    const ids = [];
+    for (const li of this.byOrientation.get(orientation) || []) {
+      const entry = this.lines[li];
+      let left = Infinity;
+      let right = -Infinity;
+      const texts = [];
+      for (let wi = 0; wi < entry.words.length; wi++) {
+        const wb = entry.boxes[wi];
+        if (!(wb.left < box.right && wb.right > box.left && wb.top < box.bottom && wb.bottom > box.top)) continue;
+        left = Math.min(left, wb.left);
+        right = Math.max(right, wb.right);
+        texts.push(entry.words[wi].text);
+        ids.push(entry.words[wi].id);
+      }
+      if (texts.length === 0) continue;
+      rects.push({
+        orientation, left, right, top: entry.rectTop, bottom: entry.rectBottom,
+      });
+      rows.push({ top: entry.rectTop, text: texts.join(' ') });
+    }
+    rows.sort((p, q) => p.top - q.top);
+    return { rects, text: rows.map((r) => r.text).join('\n'), ids };
+  }
+}
+
+/**
+ * Owns the viewer's text selection: the interval, the pointer and keyboard gestures that move it, the rectangles that draw it, and the text and words it yields.
+ */
+export class TextSelection {
+  /** @param {import('../viewer.js').ScribeViewer} viewer */
+  constructor(viewer) {
+    /** @type {'custom'} */
+    this.kind = 'custom';
+    this.viewer = viewer;
+
+    /** @type {Array<?PageTextIndex>} Per-page, built on demand, dropped when the page's text changes. */
+    this._index = [];
+
+    /**
+     * A linear selection is an interval of reading order.
+     * A box selection is a rectangle of one page.
+     * @type {?({kind: 'linear', start: SelPoint, end: SelPoint} | {kind: 'box', n: number, orientation: number, box: {left: number, top: number, right: number, bottom: number}})}
+     */
+    this.range = null;
+
+    /* eslint-disable-next-line max-len */
+    /** @type {?{anchor: ?SelPoint, granularity: number, pointerId: number, box: ?{n: number, orientation: number, x: number, y: number}, editWord?: ?import('./viewerWordObjects.js').UiOcrWord, linkArm?: ?AnnotationLink, touch?: boolean, clientYOffset?: number}} */
+    this._drag = null;
+
+    /** Last pointerdown, for the multi-click counter. */
+    this._lastDown = {
+      t: -1e9, x: 0, y: 0, count: 0,
+    };
+    /** Client coords of the drag pointer, kept live so the autoscroll tick can re-resolve the caret. */
+    this._dragClient = { x: 0, y: 0 };
+    /** @type {?number} */
+    this._autoScrollRaf = null;
+
+    /** @type {Array<Object<string, Array<HTMLDivElement>>>} Pooled selection rectangles, per page then orientation. */
+    this._rectPool = [];
+    /** @type {Array<?Map<string, HTMLDivElement>>} Per page, the match rects by the id of the first word they cover, kept across repaints. */
+    this._markPool = [];
+
+    /** A CSS cursor overriding the hover-derived one, set by the highlighter tool. @type {?string} */
+    this.cursorOverride = null;
+
+    /** True while the selection was made by touch, so its adjust handles render. */
+    this._handlesOn = false;
+    /** @type {?HTMLDivElement} */
+    this._handleStartElem = null;
+    /** @type {?HTMLDivElement} */
+    this._handleEndElem = null;
+    /** @type {Array<?Object<string, HTMLDivElement>>} Handle layer groups, keyed by page then orientation. */
+    this._handleGroups = [];
+
+    /** @type {?{wordId: string, rects: Array<HTMLDivElement>}} */
+    this._hlLift = null;
+    /** @type {?number} */
+    this._hoverRaf = null;
+
+    this._onPointerDown = this._onPointerDown.bind(this);
+    this._onHoverMove = this._onHoverMove.bind(this);
+    this._onDragMove = this._onDragMove.bind(this);
+    this._onDragEnd = this._onDragEnd.bind(this);
+    this._onKeyDown = this._onKeyDown.bind(this);
+    this._onCopy = this._onCopy.bind(this);
+    this._autoScrollTick = this._autoScrollTick.bind(this);
+  }
+
+  install() {
+    ensureSelectionStyleSheet();
+    const sc = this.viewer.scrollContainer;
+    sc.addEventListener('pointerdown', this._onPointerDown);
+    sc.addEventListener('pointermove', this._onHoverMove);
+    sc.addEventListener('keydown', this._onKeyDown);
+    document.addEventListener('copy', this._onCopy);
+    // Reachable by keyboard, so Ctrl+C / Ctrl+A / Escape have somewhere to land.
+    if (!sc.hasAttribute('tabindex')) sc.tabIndex = 0;
+    sc.style.outline = 'none';
+  }
+
+  destroy() {
+    const sc = this.viewer.scrollContainer;
+    if (sc) {
+      sc.removeEventListener('pointerdown', this._onPointerDown);
+      sc.removeEventListener('pointermove', this._onHoverMove);
+      sc.removeEventListener('keydown', this._onKeyDown);
+    }
+    document.removeEventListener('copy', this._onCopy);
+    this._endDrag();
+    this._hideHandles();
+    this._index.length = 0;
+    this._rectPool.length = 0;
+    this._markPool.length = 0;
+    this._handleGroups.length = 0;
+    this.range = null;
+  }
+
+  /**
+   * Page `n`'s text index, built on first use.
+   * Building is arithmetic over the OCR model (no fonts, no layout, no DOM), so any page can be indexed on demand, including one the viewer never rendered.
+   * @param {number} n
+   * @returns {?PageTextIndex}
+   */
+  index(n) {
+    const page = this.viewer.doc.ocr.active?.[n];
+    const cached = this._index[n];
+    if (cached && cached.page === page) return cached;
+    const metrics = this.viewer.doc.pageMetrics?.[n];
+    if (!page || !metrics || !metrics.dims) return null;
+    const built = new PageTextIndex(page, metrics.angle || 0, metrics.dims, this.viewer.doc.fonts);
+    if (built.lines.length === 0) return null;
+    this._index[n] = built;
+    return built;
+  }
+
+  /**
+   * Drop page `n`'s cached text index so the next `index(n)` rebuilds it.
+   * @param {number} n
+   */
+  invalidatePage(n) { this._index[n] = null; }
+
+  invalidateAll() {
+    this._index.length = 0;
+    this._rectPool.length = 0;
+    this._markPool.length = 0;
+    this._handleGroups.length = 0;
+    this._hideHandles();
+    this.range = null;
+  }
+
+  isEmpty() {
+    if (!this.range) return true;
+    if (this.range.kind === 'box') return this.range.box.right <= this.range.box.left;
+    return cmpPoint(this.range.start, this.range.end) >= 0;
+  }
+
+  clear() {
+    if (!this.range) return;
+    this.range = null;
+    if (this._handlesOn) {
+      this._handlesOn = false;
+      this._hideHandles();
+    }
+    this.viewer._touchCalloutHide?.();
+    this._renderAll();
+    if (this.viewer.onSelectionChange) this.viewer.onSelectionChange();
+  }
+
+  /**
+   * Whether the selection is at least partly inside the document viewport.
+   * @returns {boolean}
+   */
+  isInView() {
+    if (this.isEmpty()) return false;
+    const range = /** @type {NonNullable<typeof this.range>} */ (this.range);
+    const { viewer } = this;
+    const sc = viewer.scrollContainer;
+    if (!sc) return false;
+    const zoom = viewer.zoomLevel || 1;
+    const { clientWidth, clientHeight } = viewer._scrollMetrics();
+    const { scrollTop, scrollLeft } = sc;
+    const viewLeft = scrollLeft / zoom;
+    const viewRight = (scrollLeft + clientWidth) / zoom;
+    const viewTop = scrollTop / zoom;
+    const viewBottom = (scrollTop + clientHeight) / zoom;
+    const first = range.kind === 'box' ? range.n : range.start.n;
+    const last = range.kind === 'box' ? range.n : range.end.n;
+    for (let n = first; n <= last; n++) {
+      const top = viewer.getPageStop(n);
+      const dims = viewer.getDisplayDims(n);
+      if (top === null || !dims || top + dims.height < viewTop || top > viewBottom) continue;
+      const idx = this.index(n);
+      if (!idx) continue;
+      const rects = range.kind === 'box'
+        ? idx.boxSelection(range.orientation, range.box).rects
+        : idx.rects(n === range.start.n ? range.start.off : 0, n === range.end.n ? range.end.off : idx.length);
+      for (const rect of rects) {
+        let minX = Infinity; let maxX = -Infinity; let minY = Infinity; let maxY = -Infinity;
+        for (const [x, y] of [[rect.left, rect.top], [rect.right, rect.top], [rect.left, rect.bottom], [rect.right, rect.bottom]]) {
+          const p = viewer.localToContent(n, rect.orientation, x, y);
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+        }
+        if (maxX > viewLeft && minX < viewRight && maxY > viewTop && minY < viewBottom) return true;
+      }
+    }
+    return false;
+  }
+
+  /** Pages the selection touches, endpoints and everything between. @returns {Set<number>} */
+  pages() {
+    const out = new Set();
+    if (!this.range) return out;
+    if (this.range.kind === 'box') out.add(this.range.n);
+    else for (let n = this.range.start.n; n <= this.range.end.n; n++) out.add(n);
+    return out;
+  }
+
+  /** Select every page of the document, in reading order. */
+  selectAll() {
+    const pageCount = this.viewer.doc.ocr.active.length;
+    let first = 0;
+    while (first < pageCount && !this.index(first)) first++;
+    let last = pageCount - 1;
+    while (last >= first && !this.index(last)) last--;
+    if (last < first) return;
+    this.range = {
+      kind: 'linear',
+      start: { n: first, off: 0 },
+      end: { n: last, off: /** @type {PageTextIndex} */ (this.index(last)).length },
+    };
+    this._renderAll();
+    if (this.viewer.onSelectionChange) this.viewer.onSelectionChange();
+  }
+
+  /**
+   * The line under a client point.
+   * Every page point maps to its nearest line, so a line is returned even when the point is not over text.
+   * Gate calls on `isOverText`.
+   * When `accept` rejects the nearest line, other lines at the point are tried nearest-first.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @param {?(line: import('../../js/objects/ocrObjects.js').OcrLine) => boolean} [accept]
+   * @returns {?{n: number, line: import('../../js/objects/ocrObjects.js').OcrLine, lbox: bbox, rectTop: number, rectBottom: number, orientation: number, start: number, end: number}}
+   */
+  lineInfoAt(clientX, clientY, accept = null) {
+    const pt = this.pointAt(clientX, clientY);
+    if (!pt) return null;
+    const idx = this.index(pt.n);
+    if (!idx) return null;
+    let entry = idx.lines[idx.lineForOffset(pt.off)];
+    if (entry && accept && !accept(entry.line)) {
+      const { x, y } = this.viewer.clientToPage(clientX, clientY);
+      /** @type {?{e: LineEntry, dy: number}} */
+      let best = null;
+      for (const [orientation, indices] of idx.byOrientation) {
+        const local = this.viewer.pageToLocal(pt.n, orientation, x, y);
+        for (const li of indices) {
+          const e = idx.lines[li];
+          if (!accept(e.line)) continue;
+          const lb = e.lbox;
+          if (local.x < lb.left || local.x > lb.right) continue;
+          const dy = local.y < lb.top ? lb.top - local.y : (local.y > lb.bottom ? local.y - lb.bottom : 0);
+          if (dy > lb.bottom - lb.top) continue;
+          if (!best || dy < best.dy) best = { e, dy };
+        }
+      }
+      entry = best ? best.e : null;
+    }
+    if (!entry) return null;
+    return {
+      n: pt.n,
+      line: entry.line,
+      lbox: entry.lbox,
+      // The selection band's verticals, so a hover affordance can match what selecting will paint.
+      rectTop: entry.rectTop,
+      rectBottom: entry.rectBottom,
+      orientation: entry.orientation,
+      start: entry.start,
+      end: entry.end,
+    };
+  }
+
+  /**
+   * Select the whole line under a client point.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @param {boolean} [extend] - Grow the existing selection to include the line.
+   * @param {?(line: import('../../js/objects/ocrObjects.js').OcrLine) => boolean} [accept]
+   * @returns {boolean} Whether a line was selected.
+   */
+  selectLineAt(clientX, clientY, extend = false, accept = null) {
+    const info = this.lineInfoAt(clientX, clientY, accept);
+    if (!info) return false;
+    const lineStart = { n: info.n, off: info.start };
+    const lineEnd = { n: info.n, off: info.end };
+    if (extend && this.range && this.range.kind === 'linear') {
+      this.range = {
+        kind: 'linear',
+        start: cmpPoint(this.range.start, lineStart) <= 0 ? this.range.start : lineStart,
+        end: cmpPoint(this.range.end, lineEnd) >= 0 ? this.range.end : lineEnd,
+      };
+    } else {
+      this.range = { kind: 'linear', start: lineStart, end: lineEnd };
+    }
+    this._renderAll();
+    if (this.viewer.onSelectionChange) this.viewer.onSelectionChange();
+    return true;
+  }
+
+  /**
+   * The selected text.
+   * Within a page it is a plain substring of the page text, so word spacing and line breaks come from the model.
+   * Pages join with a blank line.
+   * Only newlines are stripped from a page's ends, since a selection may start or stop on a line break.
+   * @returns {string}
+   */
+  getText() {
+    if (!this.range) return '';
+    if (this.range.kind === 'box') {
+      const idx = this.index(this.range.n);
+      return idx ? idx.boxSelection(this.range.orientation, this.range.box).text : '';
+    }
+    const { start, end } = this.range;
+    const parts = [];
+    for (let n = start.n; n <= end.n; n++) {
+      const idx = this.index(n);
+      if (!idx) continue;
+      const a = n === start.n ? start.off : 0;
+      const b = n === end.n ? end.off : idx.length;
+      const text = idx.text.slice(a, b).replace(/^\n+/, '').replace(/\n+$/, '');
+      if (text) parts.push(text);
+    }
+    return parts.join('\n\n');
+  }
+
+  /**
+   * The viewer's word objects under the selection, for highlighting and the context menu.
+   * @returns {Array<import('./viewerWordObjects.js').UiOcrWord>}
+   */
+  getWords() {
+    // A collapsed caret selects nothing, but wordIds over its empty interval still returns the word it sits in.
+    if (!this.range || this.isEmpty()) return [];
+    /** @type {Array<import('./viewerWordObjects.js').UiOcrWord>} */
+    const out = [];
+    /** @param {number} n @param {Array<string>} ids */
+    const collect = (n, ids) => {
+      if (ids.length === 0) return;
+      const byId = this.viewer.ensureWordObjs(n);
+      for (const id of ids) {
+        const kw = byId.get(id);
+        if (kw) out.push(kw);
+      }
+    };
+    if (this.range.kind === 'box') {
+      const idx = this.index(this.range.n);
+      if (idx) collect(this.range.n, idx.boxSelection(this.range.orientation, this.range.box).ids);
+      return out;
+    }
+    const { start, end } = this.range;
+    for (let n = start.n; n <= end.n; n++) {
+      const idx = this.index(n);
+      if (!idx) continue;
+      const a = n === start.n ? start.off : 0;
+      const b = n === end.n ? end.off : idx.length;
+      collect(n, idx.wordIds(a, b));
+    }
+    return out;
+  }
+
+  // Hit testing
+
+  /**
+   * The caret nearest a client point, or null when the page has no text.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {?SelPoint}
+   */
+  pointAt(clientX, clientY) {
+    const { n, x, y } = this.viewer.clientToPage(clientX, clientY);
+    const idx = this.index(n);
+    if (!idx) return null;
+    /** @type {?{li: number, dist: number, localX: number}} */
+    let best = null;
+    for (const orientation of idx.byOrientation.keys()) {
+      const local = this.viewer.pageToLocal(n, orientation, x, y);
+      const hit = idx.lineAt(orientation, local.x, local.y);
+      if (!hit) continue;
+      if (!best || hit.dist < best.dist) best = { li: hit.li, dist: hit.dist, localX: local.x };
+    }
+    if (!best) return null;
+    return { n, off: idx.offsetForX(best.li, best.localX) };
+  }
+
+  /**
+   * The highlighted (or line-marked) word under a client point, if any.
+   * A word carrying both a fill and a line markup hits as the fill: the word box is one hover target, and the fill's card is the richer surface.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {?{kw: import('./viewerWordObjects.js').UiOcrWord, groupId: ?string, n: number, kind: ('highlight'|'line')}}
+   */
+  hitTestHighlight(clientX, clientY) {
+    const { n, x, y } = this.viewer.clientToPage(clientX, clientY);
+    const idx = this.index(n);
+    const words = this.viewer._wordObjs[n];
+    if (!idx || !words || words.length === 0) return null;
+    const wordObjs = this.viewer.ensureWordObjs(n);
+    for (const [orientation, indices] of idx.byOrientation) {
+      const local = this.viewer.pageToLocal(n, orientation, x, y);
+      for (const li of indices) {
+        const entry = idx.lines[li];
+        if (local.y < entry.rectTop || local.y > entry.rectBottom) continue;
+        for (let wi = 0; wi < entry.boxes.length; wi++) {
+          const box = entry.boxes[wi];
+          if (local.x < box.left || local.x > box.right) continue;
+          const kw = wordObjs.get(entry.words[wi].id);
+          if (kw && kw.highlightColor) {
+            return {
+              kw, groupId: kw.highlightGroupId || null, n, kind: 'highlight',
+            };
+          }
+          if (kw && kw.markupType) {
+            return {
+              kw, groupId: kw.markupGroupId || null, n, kind: 'line',
+            };
+          }
+          return null;
+        }
+        // renderHighlights fills the gap between adjacent words only when they share color, opacity, and group.
+        // Gate the gap hit on that same identity so the whitespace is clickable exactly where the band is drawn.
+        for (let wi = 0; wi + 1 < entry.boxes.length; wi++) {
+          if (local.x <= entry.boxes[wi].right || local.x >= entry.boxes[wi + 1].left) continue;
+          const kwA = wordObjs.get(entry.words[wi].id);
+          const kwB = wordObjs.get(entry.words[wi + 1].id);
+          if (kwA && kwB && kwA.highlightColor
+            && kwA.highlightColor === kwB.highlightColor
+            && kwA.highlightOpacity === kwB.highlightOpacity
+            && (kwA.highlightGroupId || '') === (kwB.highlightGroupId || '')) {
+            return {
+              kw: kwA, groupId: kwA.highlightGroupId || null, n, kind: 'highlight',
+            };
+          }
+          // A line-markup bar spans the space between its words, so the gap is part of the target.
+          if (kwA && kwB && kwA.markupType
+            && kwA.markupType === kwB.markupType
+            && kwA.markupColor === kwB.markupColor
+            && kwA.markupOpacity === kwB.markupOpacity
+            && (kwA.markupGroupId || '') === (kwB.markupGroupId || '')) {
+            return {
+              kw: kwA, groupId: kwA.markupGroupId || null, n, kind: 'line',
+            };
+          }
+          break;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The word under a client point, if the point is inside its box.
+   * This is the editing entry's hit test.
+   * Unlike `hitTestHighlight` it returns any word, highlighted or not.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {?import('./viewerWordObjects.js').UiOcrWord}
+   */
+  wordAt(clientX, clientY) {
+    const { n, x, y } = this.viewer.clientToPage(clientX, clientY);
+    const idx = this.index(n);
+    if (!idx) return null;
+    for (const [orientation, indices] of idx.byOrientation) {
+      const local = this.viewer.pageToLocal(n, orientation, x, y);
+      for (const li of indices) {
+        const entry = idx.lines[li];
+        if (local.y < entry.rectTop || local.y > entry.rectBottom) continue;
+        for (let wi = 0; wi < entry.boxes.length; wi++) {
+          const box = entry.boxes[wi];
+          if (local.x < box.left || local.x > box.right) continue;
+          return this.viewer.ensureWordObjs(n).get(entry.words[wi].id) ?? null;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Whether a client point is directly over a line's text, the region its selection rectangle would paint.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {boolean}
+   */
+  isOverText(clientX, clientY) {
+    const { n, x, y } = this.viewer.clientToPage(clientX, clientY);
+    const idx = this.index(n);
+    if (!idx) return false;
+    const margin = 2 / (this.viewer.zoomLevel || 1);
+    for (const [orientation, indices] of idx.byOrientation) {
+      const local = this.viewer.pageToLocal(n, orientation, x, y);
+      for (const li of indices) {
+        const entry = idx.lines[li];
+        // The bands tile the whole page for caret snapping, so testing them here would count every point as over text.
+        if (local.x >= entry.lbox.left - margin && local.x <= entry.lbox.right + margin
+          && local.y >= entry.rectTop - margin && local.y <= entry.rectBottom + margin) return true;
+      }
+    }
+    return false;
+  }
+
+  // Gestures
+
+  /** @param {PointerEvent} event */
+  _onPointerDown(event) {
+    // Non-primary buttons belong to the pan and the context menu.
+    if (event.button !== 0) return;
+    if (this.viewer.state.layoutMode || this.viewer.enableCanvasSelection) return;
+    // Nothing in Edit Graphics acts on text, so a press there belongs to that mode's own hit-testing.
+    if (this.viewer._graphicsEditActive) return;
+    if (event.target instanceof Element
+      && event.target.closest('.scribe-hl-cmark, .scribe-note-icon, .scribe-cmt-card, .scribe-field, .scribe-item, .scribe-redact-tab, .scribe-edit-text-tools, [contenteditable]')) return;
+
+    // A touch that moves is a pan, so a touch selection has to wait to see whether it holds still.
+    if (event.pointerType === 'touch') {
+      // In the phone layout's Edit Text mode a hold selects whole lines through the mode's own gesture, so the engine stands aside.
+      if (this.viewer._editTextActive && this.viewer._phoneUi) return;
+      this._armTouchHold(event);
+      return;
+    }
+
+    // A mouse selection replaces any touch-made one, and never shows grips or the callout.
+    if (this._handlesOn) {
+      this._handlesOn = false;
+      this._hideHandles();
+      this.viewer._touchCalloutHide?.();
+    }
+
+    const near = Math.abs(event.clientX - this._lastDown.x) < MULTI_CLICK_PX
+      && Math.abs(event.clientY - this._lastDown.y) < MULTI_CLICK_PX;
+    // `PointerEvent.detail` carries the click count only in Chrome, so the counter is kept here.
+    this._lastDown.count = (near && event.timeStamp - this._lastDown.t < MULTI_CLICK_MS) ? this._lastDown.count + 1 : 1;
+    this._lastDown.t = event.timeStamp;
+    this._lastDown.x = event.clientX;
+    this._lastDown.y = event.clientY;
+    const granularity = Math.min(this._lastDown.count, LINE);
+
+    const { n, x, y } = this.viewer.clientToPage(event.clientX, event.clientY);
+    const idx = this.index(n);
+    if (!idx) { this.clear(); return; }
+
+    if (event.altKey) {
+      // Alt+drag selects a rectangle of the page rather than a run of reading order: the right gesture for a table column, and one a linear DOM selection cannot express at all.
+      const orientation = idx.lines[0].orientation;
+      const local = this.viewer.pageToLocal(n, orientation, x, y);
+      this._drag = {
+        anchor: { n, off: 0 },
+        granularity: CHAR,
+        pointerId: event.pointerId,
+        box: {
+          n, orientation, x: local.x, y: local.y,
+        },
+      };
+      this.range = {
+        kind: 'box',
+        n,
+        orientation,
+        box: {
+          left: local.x, top: local.y, right: local.x, bottom: local.y,
+        },
+      };
+      this._renderAll();
+    } else {
+      // A single click arms link-following, which `_onDragEnd` confirms at release.
+      // Ctrl/Cmd still arms so the release confirm can apply the ask bypass.
+      const linkArm = (this._lastDown.count === 1 && !event.shiftKey)
+        ? this.viewer.linkAt(event.clientX, event.clientY) : null;
+      // Selectability matches the I-beam, so a dead-space press dismisses instead of snapping to the nearest caret.
+      if (!this.isOverText(event.clientX, event.clientY)) {
+        this.clear();
+        if (!linkArm) { this.viewer.scrollContainer.focus({ preventScroll: true }); return; }
+        // A link can sit over dead space, so its press still arms the release confirmation.
+        this._drag = {
+          anchor: null, granularity, pointerId: event.pointerId, box: null, editWord: null, linkArm,
+        };
+      } else {
+        const point = this.pointAt(event.clientX, event.clientY);
+        if (!point) { this.clear(); return; }
+        // A double-click captures the word to arm in-place editing, which `_onDragEnd` opens.
+        const editWord = (UiText.enableEditing && this._lastDown.count === 2 && !event.altKey)
+          ? this.wordAt(event.clientX, event.clientY) : null;
+        const clickWord = (UiText.enableEditing && this._lastDown.count === 1 && !event.altKey && !event.shiftKey)
+          ? this.wordAt(event.clientX, event.clientY) : null;
+        // Shift-click extends from the far end of the existing selection rather than restarting it.
+        let anchor = point;
+        if (event.shiftKey && this.range && this.range.kind === 'linear') {
+          anchor = cmpPoint(point, this.range.start) < 0 ? this.range.end : this.range.start;
+        }
+        this._drag = {
+          anchor, granularity, pointerId: event.pointerId, box: null, editWord, clickWord, linkArm,
+        };
+        this._setLinear(anchor, point, granularity);
+      }
+    }
+
+    this._dragClient = { x: event.clientX, y: event.clientY };
+    // Window-level, not pointer capture: capture would retarget the compatibility mouse events that the comment card and the middle-button pan still rely on.
+    window.addEventListener('pointermove', this._onDragMove);
+    window.addEventListener('pointerup', this._onDragEnd);
+    window.addEventListener('pointercancel', this._onDragEnd);
+    this.viewer.scrollContainer.focus({ preventScroll: true });
+  }
+
+  /**
+   * Start the press-and-hold that turns a stationary touch into a word selection.
+   * Moving first cancels it, leaving the touch to the viewer's own pan.
+   * Holding still selects the word and hands the rest of the gesture to `_onDragMove`, which extends the selection a word at a time.
+   * @param {PointerEvent} event
+   */
+  _armTouchHold(event) {
+    const start = { x: event.clientX, y: event.clientY, id: event.pointerId };
+    const cancel = () => {
+      clearTimeout(timer);
+      window.removeEventListener('pointermove', watch);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', cancel);
+    };
+    /** @param {PointerEvent} move */
+    const watch = (move) => {
+      if (move.pointerId !== start.id) return;
+      if (Math.hypot(move.clientX - start.x, move.clientY - start.y) > TOUCH_HOLD_PX) cancel();
+    };
+
+    /**
+     * A release before the hold timer fires is a tap: on the selection it reopens the callout, elsewhere it clears it.
+     * @param {PointerEvent} up
+     */
+    const onUp = (up) => {
+      cancel();
+      if (up.pointerId !== start.id) return;
+      if (Math.hypot(up.clientX - start.x, up.clientY - start.y) > TOUCH_HOLD_PX) return;
+      if (this.isEmpty()) return;
+      if (this.hitTestSelectionRects(up.clientX, up.clientY)) {
+        this.viewer._touchCalloutShow?.('selection');
+      } else {
+        this.clear();
+      }
+    };
+
+    const timer = setTimeout(() => {
+      cancel();
+      if (!this.isOverText(start.x, start.y)) return;
+      const point = this.pointAt(start.x, start.y);
+      if (!point) return;
+      // The callout opens only when the gesture ends, so hide it while the grips come up.
+      this._handlesOn = true;
+      this._ensureHandles();
+      this.viewer._touchCalloutHide?.();
+      this._drag = {
+        anchor: point, granularity: WORD, pointerId: start.id, box: null, touch: true,
+      };
+      this._dragClient = { x: start.x, y: start.y };
+      this._setLinear(point, point, WORD);
+      // The viewer pans on touchmove, but the flag above makes it stand down for the rest of this gesture.
+      window.addEventListener('pointermove', this._onDragMove);
+      window.addEventListener('pointerup', this._onDragEnd);
+      window.addEventListener('pointercancel', this._onDragEnd);
+    }, TOUCH_HOLD_MS);
+    window.addEventListener('pointermove', watch);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', cancel);
+  }
+
+  /** @param {PointerEvent} event */
+  _onDragMove(event) {
+    if (!this._drag || event.pointerId !== this._drag.pointerId) return;
+    // Apply the drag's y-offset and keep `_dragClient` in sync, so autoscroll re-resolves from the same lifted point.
+    const y = event.clientY + (this._drag.clientYOffset || 0);
+    this._dragClient = { x: event.clientX, y };
+    this._extendToClient(event.clientX, y);
+    if (this._autoScrollRaf === null && this._drag.anchor) this._autoScrollRaf = requestAnimationFrame(this._autoScrollTick);
+  }
+
+  /** @param {PointerEvent} event */
+  _onDragEnd(event) {
+    if (!this._drag || event.pointerId !== this._drag.pointerId) return;
+    const editWord = this._drag.editWord;
+    const clickWord = this._drag.clickWord;
+    const linkArm = this._drag.linkArm;
+    const wasTouch = !!this._drag.touch;
+    this._endDrag();
+    // A click on a word in Proof mode selects the word, the unit the mode's editing verbs and readings list act on.
+    if (clickWord && !linkArm && event.type === 'pointerup' && this.isEmpty()) {
+      const kwUp = this.wordAt(event.clientX, event.clientY);
+      if (kwUp && kwUp.word === clickWord.word) {
+        this.clear();
+        this.viewer.destroyControls(true);
+        this.viewer.CanvasSelection.addWords(kwUp);
+        UiOcrWord.addControls(kwUp);
+        kwUp.select();
+        UiOcrWord.updateUI();
+      }
+    }
+    // A touch drag ending on a non-empty selection opens its action callout.
+    if (wasTouch && !this.isEmpty()) this.viewer._touchCalloutShow?.('selection');
+    // A double-click's edit opens from the RELEASE, the moment a native `dblclick` fires and users are calibrated to.
+    // The pointer drifts a few px between the second press and its release, and at word zoom that drift is a character of caret placement,
+    // so the caret must be computed from that release, not the press.
+    // The edit opens only when the press and release land on the same word, mirroring `dblclick`'s same-target rule.
+    // A release on another word keeps the word-drag selection instead.
+    if (editWord && event.type === 'pointerup') {
+      const kwUp = this.wordAt(event.clientX, event.clientY);
+      if (kwUp && kwUp.word === editWord.word) {
+        UiText._lastPointerClient = { x: event.clientX, y: event.clientY };
+        this.clear();
+        UiText.addTextInput(kwUp);
+      }
+    }
+    // Region containment, not exact coordinates, lets a real click's few-px drift still land on the armed link.
+    if (linkArm && event.type === 'pointerup' && this.isEmpty()
+      && this.viewer.linkAt(event.clientX, event.clientY) === linkArm) {
+      this.viewer._linkActivate(linkArm, event);
+    }
+    if (this.viewer.onSelectionChange) this.viewer.onSelectionChange();
+  }
+
+  /**
+   * Whether a pointer gesture is currently moving the selection.
+   * @returns {boolean}
+   */
+  isDragging() { return !!this._drag; }
+
+  /**
+   * The handle layer group for page `n` / `orientation`, created and cached on first use.
+   * @param {number} n
+   * @param {number} orientation
+   * @returns {?HTMLDivElement}
+   */
+  _handleGroup(n, orientation) {
+    if (!this._handleGroups[n]) this._handleGroups[n] = {};
+    if (!this._handleGroups[n][orientation]) {
+      const pc = this.viewer._ensurePageContainer(n);
+      if (!pc) return null;
+      // A sibling of the select layer, so the grips escape its multiply-blend and pointer-events:none.
+      const group = this.viewer.createGroup(n, orientation);
+      if (!group) return null;
+      group.style.zIndex = '3';
+      group.classList.add('scribe-layer-selhandles');
+      this._handleGroups[n][orientation] = group;
+      pc.appendChild(group);
+    }
+    return this._handleGroups[n][orientation];
+  }
+
+  /** Build the two grip elements once, each wired to start a drag anchored at the opposite end. */
+  _ensureHandles() {
+    if (this._handleStartElem) return;
+    /** @param {'start'|'end'} which */
+    const make = (which) => {
+      const el = document.createElement('div');
+      el.className = `scribe-sel-handle scribe-sel-handle-${which}`;
+      el.addEventListener('pointerdown', (event) => {
+        if (!this.range || this.range.kind !== 'linear') return;
+        event.preventDefault();
+        event.stopPropagation();
+        // A grip drag reuses the engine's drag, anchored at the far end so the pointer resolves the moving end at character granularity.
+        // The grip sits below its text line, so `clientYOffset` lifts the resolved point a grip-height.
+        // Without the lift, a grip drag would select the line beneath the one being adjusted.
+        const far = which === 'start' ? this.range.end : this.range.start;
+        this._drag = {
+          anchor: { n: far.n, off: far.off }, granularity: CHAR, pointerId: event.pointerId, box: null, touch: true, clientYOffset: -24,
+        };
+        this._dragClient = { x: event.clientX, y: event.clientY };
+        this.viewer._touchCalloutHide?.();
+        window.addEventListener('pointermove', this._onDragMove);
+        window.addEventListener('pointerup', this._onDragEnd);
+        window.addEventListener('pointercancel', this._onDragEnd);
+      });
+      return el;
+    };
+    this._handleStartElem = make('start');
+    this._handleEndElem = make('end');
+  }
+
+  /** Detach both grips from the document. */
+  _hideHandles() {
+    this._handleStartElem?.remove();
+    this._handleEndElem?.remove();
+  }
+
+  /**
+   * Client-space bounding rect of the rendered selection rectangles, or null if none are visible, for anchoring floating UI.
+   * @returns {?{left: number, top: number, right: number, bottom: number}}
+   */
+  selectionClientRect() {
+    let left = Infinity; let top = Infinity; let right = -Infinity; let bottom = -Infinity;
+    for (const pool of this._rectPool) {
+      if (!pool) continue;
+      for (const divs of Object.values(pool)) {
+        for (const div of divs) {
+          if (div.style.display === 'none' || !div.isConnected) continue;
+          const r = div.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) continue;
+          left = Math.min(left, r.left);
+          top = Math.min(top, r.top);
+          right = Math.max(right, r.right);
+          bottom = Math.max(bottom, r.bottom);
+        }
+      }
+    }
+    return left === Infinity ? null : {
+      left, top, right, bottom,
+    };
+  }
+
+  /**
+   * Whether a client point lands on one of the rendered selection rectangles.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {boolean}
+   */
+  hitTestSelectionRects(clientX, clientY) {
+    for (const pool of this._rectPool) {
+      if (!pool) continue;
+      for (const divs of Object.values(pool)) {
+        for (const div of divs) {
+          if (div.style.display === 'none' || !div.isConnected) continue;
+          const r = div.getBoundingClientRect();
+          if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  _endDrag() {
+    this._drag = null;
+    if (this._autoScrollRaf !== null) cancelAnimationFrame(this._autoScrollRaf);
+    this._autoScrollRaf = null;
+    window.removeEventListener('pointermove', this._onDragMove);
+    window.removeEventListener('pointerup', this._onDragEnd);
+    window.removeEventListener('pointercancel', this._onDragEnd);
+  }
+
+  /**
+   * Move the focus end of the drag to a client point.
+   * The autoscroll tick calls this with an unchanged pointer position each frame: the content has moved under it, so the caret advances.
+   * @param {number} clientX
+   * @param {number} clientY
+   */
+  _extendToClient(clientX, clientY) {
+    const drag = this._drag;
+    if (!drag) return;
+    if (drag.box) {
+      const page = this.viewer.clientToPage(clientX, clientY);
+      const local = this.viewer.pageToLocal(drag.box.n, drag.box.orientation, page.x, page.y);
+      this.range = {
+        kind: 'box',
+        n: drag.box.n,
+        orientation: drag.box.orientation,
+        box: {
+          left: Math.min(drag.box.x, local.x),
+          right: Math.max(drag.box.x, local.x),
+          top: Math.min(drag.box.y, local.y),
+          bottom: Math.max(drag.box.y, local.y),
+        },
+      };
+      this._renderAll();
+      if (this.viewer.onSelectionChange) this.viewer.onSelectionChange();
+      return;
+    }
+    if (!drag.anchor) return;
+    const point = this.pointAt(clientX, clientY);
+    if (point) this._setLinear(drag.anchor, point, drag.granularity);
+  }
+
+  /**
+   * Order the anchor and focus carets, widen each to the gesture's granularity, and redraw.
+   * @param {SelPoint} anchor
+   * @param {SelPoint} focus
+   * @param {number} granularity
+   */
+  _setLinear(anchor, focus, granularity) {
+    const anchorIdx = this.index(anchor.n);
+    const focusIdx = this.index(focus.n);
+    if (!anchorIdx || !focusIdx) return;
+    const anchorRange = anchorIdx.expand(anchor.off, granularity);
+    const focusRange = focusIdx.expand(focus.off, granularity);
+    this.range = cmpPoint(anchor, focus) <= 0
+      ? { kind: 'linear', start: { n: anchor.n, off: anchorRange.start }, end: { n: focus.n, off: focusRange.end } }
+      : { kind: 'linear', start: { n: focus.n, off: focusRange.start }, end: { n: anchor.n, off: anchorRange.end } };
+    this._renderAll();
+    if (this.viewer.onSelectionChange) this.viewer.onSelectionChange();
+  }
+
+  /**
+   * Scroll while the drag pointer sits near or past a viewport edge, then re-resolve the caret at the unchanged pointer position.
+   */
+  _autoScrollTick() {
+    this._autoScrollRaf = null;
+    if (!this._drag) return;
+    const sc = this.viewer.scrollContainer;
+    const rect = sc.getBoundingClientRect();
+    /**
+     * Convert a signed overshoot into a scroll delta that ramps linearly and caps at AUTOSCROLL_MAX.
+     * @param {number} over Signed overshoot past the inner edge of the autoscroll zone.
+     * @returns {number} Signed scroll delta.
+     */
+    const speed = (over) => Math.sign(over) * Math.min(AUTOSCROLL_MAX, (Math.abs(over) / AUTOSCROLL_ZONE) * AUTOSCROLL_MAX);
+    const overY = Math.max(0, this._dragClient.y - (rect.bottom - AUTOSCROLL_ZONE))
+      || Math.min(0, this._dragClient.y - (rect.top + AUTOSCROLL_ZONE));
+    const overX = Math.max(0, this._dragClient.x - (rect.right - AUTOSCROLL_ZONE))
+      || Math.min(0, this._dragClient.x - (rect.left + AUTOSCROLL_ZONE));
+    if (overX || overY) {
+      sc.scrollTop += speed(overY);
+      sc.scrollLeft += speed(overX);
+      this._extendToClient(this._dragClient.x, this._dragClient.y);
+    }
+    this._autoScrollRaf = requestAnimationFrame(this._autoScrollTick);
+  }
+
+  /**
+   * Cursor feedback and highlight hover, derived from geometry rather than from a pointer target.
+   * @param {PointerEvent} event
+   */
+  _onHoverMove(event) {
+    if (this._drag || this._hoverRaf !== null) return;
+    const { clientX, clientY } = event;
+    this._hoverRaf = requestAnimationFrame(() => {
+      this._hoverRaf = null;
+      const hit = this.hitTestHighlight(clientX, clientY);
+      const wordId = hit ? hit.kw.word.id : null;
+      if ((this._hlLift?.wordId ?? null) !== wordId) {
+        if (this._hlLift) for (const rect of this._hlLift.rects) rect.classList.remove('scribe-hl-hover');
+        this._hlLift = null;
+        if (hit) {
+          /** @type {Array<HTMLDivElement>} */
+          const rects = [];
+          if (hit.groupId) {
+            // A group can span pages (a selection highlighted across a page break), so gather every page's bands.
+            for (const map of this.viewer._highlightRectsByGroup) {
+              const arr = map && map.get(hit.groupId);
+              if (arr) rects.push(...arr);
+            }
+          } else if (hit.kind === 'line' && hit.kw.markupRectElem) {
+            rects.push(hit.kw.markupRectElem);
+          } else if (hit.kw.highlightRectElem) {
+            rects.push(hit.kw.highlightRectElem);
+          }
+          for (const rect of rects) rect.classList.add('scribe-hl-hover');
+          this._hlLift = { wordId: /** @type {string} */ (wordId), rects };
+        }
+        if (this.viewer.onHighlightHover) this.viewer.onHighlightHover(hit ? hit.groupId : null);
+      }
+
+      let cursor = '';
+      if (this.cursorOverride) cursor = this.cursorOverride;
+      else if (hit) cursor = 'pointer';
+      else if (this.viewer.linkAt(clientX, clientY)) cursor = 'pointer';
+      else if (this.isOverText(clientX, clientY)) cursor = 'text';
+      if (this.viewer.scrollContainer.style.cursor !== cursor) this.viewer.scrollContainer.style.cursor = cursor;
+    });
+  }
+
+  // Keyboard and clipboard
+
+  /** @param {KeyboardEvent} event */
+  _onKeyDown(event) {
+    const mod = event.ctrlKey || event.metaKey;
+    if (mod && (event.key === 'c' || event.key === 'C')) {
+      if (this.isEmpty()) return;
+      const text = this.getText();
+      if (!text) return;
+      // Suppressing the key's default also suppresses the `copy` event it would raise, so `_onCopy` does not write the clipboard a second time.
+      event.preventDefault();
+      navigator.clipboard?.writeText(text);
+    } else if (mod && (event.key === 'a' || event.key === 'A')) {
+      // In the table Preview Export this key belongs to the cell selection, and selecting every word would paint a document-wide selection over the sheet.
+      if (this.viewer.state.tablePreview) return;
+      event.preventDefault();
+      this.selectAll();
+    } else if (event.key === 'Escape' && !this.isEmpty()) {
+      event.preventDefault();
+      this.clear();
+    }
+  }
+
+  /**
+   * Serve a copy the browser initiated itself (its Edit menu, or a synthesized `ClipboardEvent`) from the custom selection.
+   * Keyboard copy is handled in `_onKeyDown` and never reaches here.
+   * @param {ClipboardEvent} event
+   */
+  _onCopy(event) {
+    if (this.isEmpty() || !event.clipboardData || event.defaultPrevented) return;
+    // The listener is on `document`, so with several viewers on the page only the one whose UI holds focus answers.
+    // `outerElem` includes the owning app's controls, so a click on its toolbar does not orphan the selection's copy.
+    const active = document.activeElement;
+    const owner = this.viewer.outerElem || this.viewer.elem;
+    if (active && active !== document.body && !owner?.contains(active)) return;
+    const text = this.getText();
+    if (!text) return;
+    event.clipboardData.setData('text/plain', text);
+    event.preventDefault();
+  }
+
+  // Rendering
+
+  /**
+   * Redraw the selection on every page that has a container.
+   * Pages built later call `renderPage` themselves.
+   */
+  _renderAll() {
+    for (let n = 0; n < this.viewer.pageContainerArr.length; n++) {
+      if (this.viewer.pageContainerArr[n]) this.renderPage(n);
+    }
+  }
+
+  /**
+   * Draw page `n`'s selection rectangles, reusing pooled `<div>`s.
+   *
+   * A screenful of selected text is a few dozen rectangles, so the layer is rewritten in full on every drag frame at no measurable cost.
+   * @param {number} n
+   */
+  renderPage(n) {
+    const pool = this._rectPool[n] || (this._rectPool[n] = {});
+    /** @type {Object<string, Array<SelRect>>} */
+    const wanted = {};
+    /** @type {?Array<SelRect>} This page's rectangles in reading order, kept for grip placement below. */
+    let pageRects = null;
+
+    if (!this.isEmpty()) {
+      const idx = this.index(n);
+      const range = /** @type {NonNullable<typeof this.range>} */ (this.range);
+      if (idx) {
+        /** @type {Array<SelRect>} */
+        let rects = [];
+        if (range.kind === 'box') {
+          if (range.n === n) rects = idx.boxSelection(range.orientation, range.box).rects;
+        } else if (n >= range.start.n && n <= range.end.n) {
+          const a = n === range.start.n ? range.start.off : 0;
+          const b = n === range.end.n ? range.end.off : idx.length;
+          rects = idx.rects(a, b);
+        }
+        pageRects = rects;
+        for (const rect of rects) (wanted[rect.orientation] || (wanted[rect.orientation] = [])).push(rect);
+      }
+    }
+
+    for (const key of new Set([...Object.keys(pool), ...Object.keys(wanted)])) {
+      const rects = wanted[key] || [];
+      const divs = pool[key] || (pool[key] = []);
+      if (rects.length === 0 && divs.length === 0) continue;
+      const group = this.viewer.getSelectGroup(n, Number(key));
+      if (!group) continue;
+      while (divs.length < rects.length) {
+        const div = document.createElement('div');
+        div.className = 'scribe-sel-rect';
+        group.appendChild(div);
+        divs.push(div);
+      }
+      for (let i = 0; i < divs.length; i++) {
+        const div = divs[i];
+        if (i >= rects.length) { div.style.display = 'none'; continue; }
+        const rect = rects[i];
+        div.style.display = '';
+        div.style.left = `${rect.left}px`;
+        div.style.top = `${rect.top}px`;
+        div.style.width = `${rect.right - rect.left}px`;
+        div.style.height = `${rect.bottom - rect.top}px`;
+      }
+    }
+
+    // Placing the grips here means they follow the selection rectangles across every re-render (drag, zoom, selection change).
+    // The start grip sits under the first rectangle on the range's start page, the end grip under the last on its end page.
+    if (this._handlesOn && this.range && this.range.kind === 'linear' && !this.isEmpty() && pageRects && pageRects.length > 0) {
+      this._ensureHandles();
+      const scale = `${1 / (this.viewer.zoomLevel || 1)}`;
+      /**
+       * @param {HTMLDivElement} el @param {SelRect} rect @param {number} x
+       */
+      const place = (el, rect, x) => {
+        const group = this._handleGroup(n, rect.orientation);
+        if (!group) return;
+        if (el.parentElement !== group) group.appendChild(el);
+        el.style.left = `${x}px`;
+        el.style.top = `${rect.bottom}px`;
+        el.style.setProperty('--sel-handle-scale', scale);
+      };
+      if (n === this.range.start.n && this._handleStartElem) place(this._handleStartElem, pageRects[0], pageRects[0].left);
+      if (n === this.range.end.n && this._handleEndElem) {
+        const last = pageRects[pageRects.length - 1];
+        place(this._handleEndElem, last, last.right);
+      }
+    }
+  }
+
+  /**
+   * Forget page `n`'s pooled rectangles and handle layer, whose elements went away with its layer.
+   * @param {number} n
+   */
+  destroyPage(n) {
+    this._rectPool[n] = {};
+    this._markPool[n] = null;
+    this._handleGroups[n] = null;
+  }
+
+  /**
+   * Draw page `n`'s search-match rectangles.
+   * Match state lives on the word objects (`viewerSearch` sets it), which have no span to paint a background onto.
+   * The words of one match on one line share a rectangle.
+   * @param {number} n
+   */
+  renderMarks(n) {
+    const pool = this._markPool[n] || (this._markPool[n] = new Map());
+    const keep = new Set();
+    const words = this.viewer._wordObjs[n];
+    if (words && words.length) {
+      // Which match each word belongs to, so adjacent words of two different matches keep their own rectangles.
+      const matchOf = new Map();
+      this.viewer._searchState.matchList.forEach((m, i) => { for (const id of m.wordIds) matchOf.set(id, i); });
+      const air = 1 / (this.viewer.zoomLevel || 1);
+      /** @type {?{key: string, line: import('../../js/objects/ocrObjects.js').OcrLine, member: number|string, active: boolean, left: number, right: number, top: number, bottom: number}} */
+      let run = null;
+      const flush = () => {
+        if (!run) return;
+        const group = this.viewer.getSelectGroup(n, run.line.orientation);
+        // Reused across repaints so the active match's color can transition.
+        let div = pool.get(run.key);
+        if (!div || div.parentNode !== group) {
+          if (div) div.remove();
+          div = document.createElement('div');
+          pool.set(run.key, div);
+          if (group) group.appendChild(div);
+        }
+        div.className = run.active ? 'scribe-mark-rect scribe-mark-active' : 'scribe-mark-rect';
+        Object.assign(div.style, {
+          left: `${run.left - air}px`,
+          top: `${run.top - air}px`,
+          width: `${run.right - run.left + 2 * air}px`,
+          height: `${run.bottom - run.top + 2 * air}px`,
+        });
+        keep.add(run.key);
+        run = null;
+      };
+      for (const kw of words) {
+        // A span-backed word (visible display modes) paints its own match background, so a mark rect on top would double-tint it.
+        if ((!kw.activeMatch && !kw.fillBox) || kw.el) {
+          flush();
+          continue;
+        }
+        const member = matchOf.has(kw.word.id) ? matchOf.get(kw.word.id) : 'citation';
+        const left = kw.x() - (kw.word.visualCoords ? kw.leftSideBearing : 0);
+        const right = left + kw.width();
+        // Em offsets, not `fontAscentPx`/`fontDescentPx`, which vary by font and overstate the ink.
+        // 0.25 em below the baseline clears typical descenders.
+        const top = kw.yActual - kw.fontSize * 0.72;
+        const bottom = kw.yActual + kw.fontSize * 0.25;
+        if (run && run.line === kw.word.line && run.member === member && run.active === kw.activeMatch) {
+          run.left = Math.min(run.left, left);
+          run.right = Math.max(run.right, right);
+          run.top = Math.min(run.top, top);
+          run.bottom = Math.max(run.bottom, bottom);
+        } else {
+          flush();
+          run = {
+            key: kw.word.id, line: kw.word.line, member, active: kw.activeMatch, left, right, top, bottom,
+          };
+        }
+      }
+      flush();
+    }
+    for (const [key, div] of pool) {
+      if (keep.has(key)) continue;
+      div.remove();
+      pool.delete(key);
+    }
+  }
+}

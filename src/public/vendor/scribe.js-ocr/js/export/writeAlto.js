@@ -1,5 +1,3 @@
-import { opt } from '../containers/app.js';
-import { pageMetricsAll } from '../containers/dataContainer.js';
 import ocr from '../objects/ocrObjects.js';
 
 /**
@@ -50,13 +48,24 @@ function tesseractToISO6392(tesseractLang) {
  * Exports OCR data to ALTO XML format (v2.0)
  * @param {Object} params
  * @param {Array<OcrPage>} params.ocrData - OCR data to export
+ * @param {?Array<number>} [params.pageArr=null] - Array of 0-based page indices to include. Overrides minValue/maxValue when provided.
  * @param {number} [params.minValue] - First page to export (inclusive)
  * @param {number} [params.maxValue] - Last page to export (inclusive)
+ * @param {?Array<PageMetrics>} [params.pageMetrics=null] - Page metrics for the document being
+ *   exported; supplies dimensions for pages missing from the OCR data.
+ * @param {?import('../containers/scribeDoc.js').ScribeDoc} [params.doc=null] - Owning document for
+ *    progress reporting.
  * @returns {string} ALTO XML formatted string
  */
-export function writeAlto({ ocrData, minValue, maxValue }) {
-  if (minValue === null || minValue === undefined) minValue = 0;
-  if (maxValue === null || maxValue === undefined || maxValue < 0) maxValue = ocrData.length - 1;
+export function writeAlto({
+  ocrData, pageArr = null, minValue, maxValue, pageMetrics = null, doc = null,
+}) {
+  if (!pageArr) {
+    if (minValue === null || minValue === undefined) minValue = 0;
+    if (maxValue === null || maxValue === undefined || maxValue < 0) maxValue = ocrData.length - 1;
+    pageArr = [];
+    for (let i = minValue; i <= maxValue; i++) pageArr.push(i);
+  }
 
   const stylesMap = new Map();
   let styleIdCounter = 0;
@@ -76,7 +85,7 @@ export function writeAlto({ ocrData, minValue, maxValue }) {
     return stylesMap.get(key).id;
   }
 
-  for (let i = minValue; i <= maxValue; i++) {
+  for (const i of pageArr) {
     const pageObj = ocrData[i];
     if (!pageObj) continue;
 
@@ -117,7 +126,7 @@ export function writeAlto({ ocrData, minValue, maxValue }) {
 
   altoOut += '<Layout>\n';
 
-  for (let pageIndex = minValue; pageIndex <= maxValue; pageIndex++) {
+  for (const pageIndex of pageArr) {
     const pageObj = ocrData[pageIndex];
 
     let pageHeight = 0;
@@ -125,9 +134,9 @@ export function writeAlto({ ocrData, minValue, maxValue }) {
     if (pageObj) {
       pageHeight = pageObj.dims.height;
       pageWidth = pageObj.dims.width;
-    } else if (pageMetricsAll[pageIndex]) {
-      pageHeight = pageMetricsAll[pageIndex].dims.height;
-      pageWidth = pageMetricsAll[pageIndex].dims.width;
+    } else if (pageMetrics[pageIndex]) {
+      pageHeight = pageMetrics[pageIndex].dims.height;
+      pageWidth = pageMetrics[pageIndex].dims.width;
     }
 
     altoOut += `<Page ID="Page${pageIndex + 1}" PHYSICAL_IMG_NR="${pageIndex + 1}" HEIGHT="${pageHeight}" WIDTH="${pageWidth}">\n`;
@@ -303,7 +312,7 @@ export function writeAlto({ ocrData, minValue, maxValue }) {
     altoOut += '</PrintSpace>\n';
     altoOut += '</Page>\n';
 
-    opt.progressHandler({ n: pageIndex, type: 'export', info: {} });
+    doc?.progressHandler({ n: pageIndex, type: 'export', info: {} });
   }
 
   altoOut += '</Layout>\n';

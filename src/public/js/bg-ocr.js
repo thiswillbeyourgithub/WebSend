@@ -314,8 +314,8 @@
                     if (bgOcrAbortController.signal.aborted) { logger.info(`[BG-OCR] Aborted for image #${idx + 1}`); continue; }
 
                     // Clone OCR result data — use structuredClone to handle circular refs
-                    const pageData = bgOcrScribe.data.ocr.active[0];
-                    const metrics = bgOcrScribe.data.pageMetrics[0];
+                    const pageData = bgOcrScribe.doc.ocr.active[0];
+                    const metrics = bgOcrScribe.doc.pageMetrics[0];
                     const clonedPage = structuredClone(pageData);
                     const clonedMetrics = structuredClone(metrics);
 
@@ -324,7 +324,7 @@
 
                     logger.success(`[BG-OCR] Completed for image #${idx + 1}`);
 
-                    // Reset scribe state for next image (drops handle if scribe only supports terminate)
+                    // Reset scribe state for next image (false means the handle was disposed meanwhile)
                     const stillAlive = await bgOcrScribe.reset();
                     if (!stillAlive) bgOcrScribe = null;
                 } catch (e) {

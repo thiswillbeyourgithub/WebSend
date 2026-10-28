@@ -1,0 +1,5002 @@
+// Toolbar building blocks shared by the viewer and editor apps: the icon-button and separator
+// primitives and the three-zone shell, the toolbar-resident controls (page navigation, zoom, find),
+// and the shared control stylesheet injected once per app.
+import { ScribeViewer } from '../../viewer.js';
+import {
+  findText, nextMatch, prevMatch, goToMatch, searchDoc,
+} from '../viewerSearch.js';
+import {
+  MENU_PLATE_CSS, MENU_ROW_CSS, MENU_ROW_NOICON_CSS, MENU_SEP_CSS,
+} from './menuStyles.js';
+import { createDropdown } from './dropdown.js';
+import { shortcutLabel } from '../platform.js';
+import { barIcon } from './icons.js';
+
+/**
+ * Build a round icon button matching the control stylesheet's `.cr-icon-button`.
+ * Suppresses the default mousedown (so clicking a button never steals canvas selection focus).
+ * @param {string} label - Tooltip text and accessible name.
+ * @param {string} svgInnerHTML - SVG markup for the glyph.
+ * @param {string} [ariaLabel] - Accessible name, if different from `label`.
+ * @returns {HTMLSpanElement}
+ */
+export function makeIconButton(label, svgInnerHTML, ariaLabel) {
+  const el = document.createElement('span');
+  el.className = 'cr-icon-button';
+  el.dataset.tip = label;
+  el.role = 'button';
+  el.tabIndex = 0;
+  el.ariaLabel = ariaLabel ?? label;
+
+  const icon = document.createElement('span');
+  icon.className = 'cr-icon';
+  icon.innerHTML = svgInnerHTML;
+  el.appendChild(icon);
+
+  el.addEventListener('mousedown', (e) => e.preventDefault());
+  return el;
+}
+
+/** @returns {HTMLSpanElement} A thin vertical toolbar separator. */
+export function makeSeparator() {
+  const sep = document.createElement('span');
+  sep.className = 'vertical-separator';
+  return sep;
+}
+
+const TIME_FMT = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
+const WEEKDAY_FMT = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+const MONTH_DAY_FMT = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+const MONTH_DAY_YEAR_FMT = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+const FULL_FMT = new Intl.DateTimeFormat(undefined, { dateStyle: 'long', timeStyle: 'short' });
+
+/**
+ * Render a timestamp at the specificity its age warrants.
+ * A time today, a weekday for the rest of the week, then month and day, then month, day, and year.
+ * @param {string} iso - UTC ISO-8601 instant.
+ * @param {number} [now] - Epoch ms to measure the age against.
+ * @returns {string} Empty when the timestamp is missing or unparseable.
+ */
+export function formatTimestamp(iso, now = Date.now()) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const nowDate = new Date(now);
+  // Counting whole local days rather than elapsed ms keeps the tier right when a daylight-saving shift makes the day 23 hours long.
+  const days = Math.floor(Date.UTC(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate()) / 86400000)
+    - Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000);
+  if (days === 0) return TIME_FMT.format(d);
+  if (days >= 1 && days <= 6) return WEEKDAY_FMT.format(d);
+  return d.getFullYear() === nowDate.getFullYear() ? MONTH_DAY_FMT.format(d) : MONTH_DAY_YEAR_FMT.format(d);
+}
+
+/**
+ * Fill an element with a timestamp.
+ * The full date and time goes in the element's title.
+ * Leaves the element untouched when the timestamp is missing or unparseable.
+ * @param {HTMLElement} elem
+ * @param {string} iso - UTC ISO-8601 instant.
+ * @param {string} [prefix] - Separator text drawn ahead of the timestamp.
+ */
+export function setTimestamp(elem, iso, prefix = '') {
+  const text = formatTimestamp(iso);
+  if (!text) return;
+  elem.textContent = prefix + text;
+  elem.title = FULL_FMT.format(new Date(iso));
+}
+
+/**
+ * Build the three-zone toolbar shell. The caller fills `start`, `center`, and `end`.
+ * @param {string} rootClass - The owning app's root class (used for the toolbar's scoped class).
+ * @param {number} toolbarHeight - Bar height in px.
+ * @param {number} iconSize - Icon size in px (sets the bar's line-height).
+ * @returns {{ toolbarElem: HTMLDivElement, toolbarElemStart: HTMLDivElement, center: HTMLDivElement, toolbarElemEnd: HTMLDivElement }}
+ */
+export function makeToolbarShell(rootClass, toolbarHeight, iconSize) {
+  const toolbarElem = document.createElement('div');
+  toolbarElem.className = `${rootClass}-toolbar`;
+  toolbarElem.style.width = '100%';
+  toolbarElem.style.height = `${toolbarHeight}px`;
+  toolbarElem.style.boxSizing = 'border-box';
+  toolbarElem.style.alignItems = 'center';
+  toolbarElem.style.color = 'var(--scribe-ink)';
+  toolbarElem.style.display = 'flex';
+  toolbarElem.style.position = 'relative';
+  // The toolbar is a stacking context, so its dropdowns can never out-stack a sibling overlay.
+  // This must stay above the library surface at z-index 30, or the app menu opens invisibly behind it.
+  toolbarElem.style.zIndex = '40';
+  toolbarElem.style.lineHeight = `${iconSize}px`;
+  toolbarElem.style.backgroundColor = 'var(--scribe-surface)';
+  // The bottom rule is an inset shadow because a border would leave the default bar 39px to center its 28px buttons in, putting every icon half a pixel low.
+  toolbarElem.style.boxShadow = 'inset 0 -1px 0 var(--scribe-line)';
+
+  const toolbarElemStart = document.createElement('div');
+  toolbarElemStart.style.flex = '1';
+
+  const center = document.createElement('div');
+
+  const toolbarElemEnd = document.createElement('div');
+  toolbarElemEnd.style.flex = '1';
+  toolbarElemEnd.style.display = 'flex';
+  toolbarElemEnd.style.justifyContent = 'flex-end';
+  toolbarElemEnd.style.alignItems = 'center';
+  toolbarElemEnd.style.paddingRight = '8px';
+
+  toolbarElem.appendChild(toolbarElemStart);
+  toolbarElem.appendChild(center);
+  toolbarElem.appendChild(toolbarElemEnd);
+
+  return {
+    toolbarElem, toolbarElemStart, center, toolbarElemEnd,
+  };
+}
+
+/**
+ * Wrap SVG in a stroked icon for the mode control's 17px slots.
+ * One unit of its 17-unit grid is one pixel, so 1-unit strokes centered on half units cover whole pixels.
+ * @param {string} inner - Path/shape markup.
+ * @returns {string} The SVG markup for the icon.
+ */
+const modeIcon = (inner) => `<svg viewBox="0 0 17 17" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;display:block;width:100%;height:100%;" aria-hidden="true">${inner}</svg>`;
+
+/**
+ * Wrap SVG in a stroked icon for the app menu's 16px slots.
+ * One unit of its 16-unit grid is one pixel, so 1-unit strokes centered on half units cover whole pixels.
+ * @param {string} inner - Path/shape markup.
+ * @returns {string} The SVG markup for the icon.
+ */
+const appMenuIcon = (inner) => `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;display:block;width:100%;height:100%;" aria-hidden="true">${inner}</svg>`;
+
+/**
+ * Wrap SVG shape markup in a stroked icon matching the app's 24-grid line icons, for 24px buttons.
+ * @param {string} inner - Path/shape markup.
+ * @returns {string} The SVG markup for the icon.
+ */
+const lineIcon = (inner) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;display:block;width:100%;height:100%;" aria-hidden="true">${inner}</svg>`;
+
+export const EDIT_PAGES_SVG = modeIcon('<rect x="2.5" y="2.5" width="5" height="7"/><rect x="9.5" y="7.5" width="5" height="7"/>'
+  + '<path d="M9.5 3.5H13M7.5 13.5H4"/><path d="M13 2l2 1.5-2 1.5zM4 12l-2 1.5 2 1.5z" fill="currentColor" stroke="none"/>');
+
+/** Scan corners around a letterform, for the Recognize Text mode. */
+export const RECOGNIZE_SVG = modeIcon('<path d="M2.5 5.5v-2a1 1 0 0 1 1-1h2M11.5 2.5h2a1 1 0 0 1 1 1v2M14.5 11.5v2a1 1 0 0 1-1 1h-2M5.5 14.5h-2a1 1 0 0 1-1-1v-2"/>'
+  + '<path d="M6.5 10.5v-4h4v4M6.5 8.5h4"/>');
+
+const TAB_PREV_SVG = lineIcon('<path d="M15 6l-6 6 6 6"/>');
+const TAB_NEXT_SVG = lineIcon('<path d="M9 6l6 6-6 6"/>');
+
+/**
+ * Build prev/next buttons and the page-number input group, wired to `scribe.displayPage`.
+ * @param {import('../../viewer.js').ScribeViewer} scribe
+ * @returns {{ prevElem: HTMLSpanElement, nextElem: HTMLSpanElement, pageInputGroup: HTMLDivElement, pageNumElem: HTMLInputElement, pageCountElem: HTMLSpanElement }}
+ */
+export function createPageNav(scribe) {
+  const prevElem = makeIconButton('Previous page', barIcon('prev'));
+  const nextElem = makeIconButton('Next page', barIcon('next'));
+  delete prevElem.dataset.tip;
+  delete nextElem.dataset.tip;
+
+  const pageInputGroup = document.createElement('div');
+  pageInputGroup.className = 'btn-group';
+  pageInputGroup.style.display = 'inline-flex';
+  pageInputGroup.style.verticalAlign = 'middle';
+  // Center the items on the cross axis so the "/" text node and page-count span align with the input's vertically centered value.
+  // Under the default stretch they top-align their glyphs and the "/ N" total rides visibly higher than the page number.
+  pageInputGroup.style.alignItems = 'center';
+
+  const pageNumElem = document.createElement('input');
+  pageNumElem.type = 'text';
+  pageNumElem.className = 'form-control btn-sm';
+  pageNumElem.name = 'pageNum';
+  pageNumElem.autocomplete = 'off';
+  // Widths in this group are whole pixels, or every control after it in the centered cluster lands on a fraction.
+  pageNumElem.style.width = '44px';
+  pageNumElem.style.display = 'inline-block';
+  pageNumElem.style.fontVariantNumeric = 'tabular-nums';
+
+  const pageCountElem = document.createElement('span');
+  pageCountElem.style.display = 'inline-block';
+  pageCountElem.style.minWidth = '34px';
+  pageCountElem.style.textAlign = 'left';
+  pageCountElem.style.fontSize = '13px';
+  pageCountElem.style.fontVariantNumeric = 'tabular-nums';
+  pageCountElem.style.paddingLeft = '0.5rem';
+
+  const pageSepElem = document.createElement('span');
+  pageSepElem.className = 'scribe-page-sep';
+  pageSepElem.textContent = '/';
+  pageInputGroup.appendChild(pageNumElem);
+  pageInputGroup.appendChild(pageSepElem);
+  pageInputGroup.appendChild(pageCountElem);
+
+  /**
+   * @param {HTMLElement} btn
+   * @param {number} dir - -1 for previous (slide left), 1 for next (slide right).
+   */
+  const slideIcon = (btn, dir) => {
+    const icon = btn.querySelector('.cr-icon');
+    if (!icon || !icon.animate) return;
+    icon.animate(
+      [{ transform: 'translateX(0)' }, { transform: `translateX(${dir * 2}px)`, offset: 0.5 }, { transform: 'translateX(0)' }],
+      { duration: 220, easing: 'cubic-bezier(.4, 0, .2, 1)' },
+    );
+  };
+
+  // Step by row, not page, so in two-page view "next" always moves the view (the facing page is already on screen).
+  nextElem.addEventListener('click', () => { slideIcon(nextElem, 1); scribe.displayPage(scribe.rowStep(scribe.state.cp.n, 1), true, false); });
+  prevElem.addEventListener('click', () => { slideIcon(prevElem, -1); scribe.displayPage(scribe.rowStep(scribe.state.cp.n, -1), true, false); });
+  pageNumElem.addEventListener('keyup', (event) => {
+    if (event.key === 'Enter') scribe.displayPage(parseInt(pageNumElem.value, 10) - 1, true, false);
+  });
+
+  return {
+    prevElem, nextElem, pageInputGroup, pageNumElem, pageCountElem,
+  };
+}
+
+/**
+ * Build the zoom-out/zoom-in control group, wired to `scribe.zoom` about the stage center.
+ * @param {import('../../viewer.js').ScribeViewer} scribe
+ * @returns {{ zoomControls: HTMLSpanElement, zoomInElem: HTMLSpanElement, zoomOutElem: HTMLSpanElement }}
+ */
+export function createZoomControls(scribe) {
+  const zoomControls = document.createElement('span');
+  zoomControls.style.display = 'inline-flex';
+  zoomControls.style.alignItems = 'center';
+  const zoomOutElem = makeIconButton('Zoom out', barIcon('zoomOut'));
+  const zoomInElem = makeIconButton('Zoom in', barIcon('zoomIn'));
+
+  zoomControls.appendChild(zoomOutElem);
+  zoomControls.appendChild(zoomInElem);
+
+  zoomInElem.addEventListener('click', () => scribe.zoom(1.1, scribe.getViewportCenter()));
+  zoomOutElem.addEventListener('click', () => scribe.zoom(0.9, scribe.getViewportCenter()));
+
+  return { zoomControls, zoomInElem, zoomOutElem };
+}
+
+/**
+ * Build the rotate-left/rotate-right control group, wired to `scribe.rotatePage` on the current page.
+ * @param {import('../../viewer.js').ScribeViewer} scribe
+ * @returns {{ rotateControls: HTMLSpanElement, rotateLeftElem: HTMLSpanElement, rotateRightElem: HTMLSpanElement }}
+ */
+export function createRotateControls(scribe) {
+  const rotateControls = document.createElement('span');
+  // Laid out like the zoom pair, by class because the overflow fit clears the inline display to show the pair again.
+  // As an inline span its buttons would ride the text baseline, a quarter pixel below the others.
+  rotateControls.classList.add('scribe-rotate-pair');
+  const rotateLeftElem = makeIconButton('Rotate left', barIcon('rotateLeft'));
+  const rotateRightElem = makeIconButton('Rotate right', barIcon('rotateRight'));
+
+  rotateControls.appendChild(rotateLeftElem);
+  rotateControls.appendChild(rotateRightElem);
+
+  /**
+   * Play a brief rotation animation on `btn`'s icon.
+   * @param {HTMLElement} btn
+   * @param {number} dir - -1 for rotate-left (counter-clockwise), 1 for rotate-right.
+   */
+  const nudgeIcon = (btn, dir) => {
+    const icon = btn.querySelector('.cr-icon');
+    if (!icon || !icon.animate) return;
+    icon.animate(
+      [{ transform: 'rotate(0deg)' }, { transform: `rotate(${dir * 22}deg)`, offset: 0.5 }, { transform: 'rotate(0deg)' }],
+      { duration: 240, easing: 'cubic-bezier(.4, 0, .2, 1)' },
+    );
+  };
+
+  rotateLeftElem.addEventListener('click', () => { nudgeIcon(rotateLeftElem, -1); scribe.rotatePage(scribe.state.cp.n, -90); });
+  rotateRightElem.addEventListener('click', () => { nudgeIcon(rotateRightElem, 1); scribe.rotatePage(scribe.state.cp.n, 90); });
+
+  return { rotateControls, rotateLeftElem, rotateRightElem };
+}
+
+let printing = false;
+
+/**
+ * Export `scribe.doc` to PDF and hand it to the browser's print dialog.
+ * @param {import('../../viewer.js').ScribeViewer} scribe
+ * @param {object} [opts]
+ * @param {?Array<number>} [opts.pageArr=null] - 0-based page indices to print; null prints the whole document.
+ * @returns {Promise<boolean>} Whether the print dialog was opened.
+ */
+async function printDocument(scribe, { pageArr = null } = {}) {
+  const doc = scribe?.doc;
+  if (!doc || printing) return false;
+  printing = true;
+  try {
+    // Match the editor's Export defaults: keep the original page content and append edits as an invisible layer,
+    // so print fidelity equals what a saved PDF would show.
+    const options = { displayMode: 'invis', addOverlay: true };
+    if (pageArr) options.pageArr = pageArr;
+    const bytes = await doc.exportData('pdf', options);
+
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+
+    // Safari does not reliably print a PDF loaded in an iframe via contentWindow.print().
+    // Open the PDF in a new tab instead (the originating click is a user gesture, so this is not pop-up-blocked)
+    // and let the user print from there.
+    const isSafari = typeof navigator !== 'undefined'
+      && /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
+    if (isSafari) {
+      window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      return true;
+    }
+
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.position = 'fixed';
+    iframe.style.left = '-10000px';
+    iframe.style.top = '0';
+    iframe.style.width = '1px';
+    iframe.style.height = '1px';
+    iframe.style.border = '0';
+
+    // `afterprint` is unreliable across browsers, so a timeout backstops the cleanup.
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      URL.revokeObjectURL(url);
+      iframe.remove();
+    };
+
+    iframe.addEventListener('load', () => {
+      const win = iframe.contentWindow;
+      if (!win) { cleanup(); return; }
+      win.addEventListener('afterprint', cleanup);
+      try {
+        win.focus();
+        win.print();
+      } catch (err) {
+        console.error('print() failed:', err);
+        cleanup();
+      }
+    }, { once: true });
+
+    // Set src before attaching. A srcless iframe, once connected, fires a load for its initial about:blank document,
+    // which would consume this one-shot listener and print a blank page.
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    setTimeout(cleanup, 60000);
+    return true;
+  } catch (err) {
+    console.error('Print failed:', err);
+    return false;
+  } finally {
+    printing = false;
+  }
+}
+
+// Drawn for the app menu's 16px slots, since pdf-viewer.js hides the bar's Print button.
+export const PRINT_SVG = appMenuIcon('<path d="M4.5 5.5v-3h7v3M4.5 11.5h-1a1 1 0 0 1-1-1v-2a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1h-1M4.5 9.5h7v4h-7z"/>');
+
+/**
+ * Build the print control and its Ctrl/Cmd+P shortcut, wired to export the current document and open the browser print dialog.
+ * @param {import('../../viewer.js').ScribeViewer} scribe
+ * @param {HTMLElement} rootElem - The app's root element (used to scope the Ctrl/Cmd+P shortcut).
+ * @returns {{ printControls: HTMLSpanElement, printElem: HTMLSpanElement, installPrintShortcut: () => (() => void) }}
+ */
+export function createPrintControls(scribe, rootElem) {
+  const printControls = document.createElement('span');
+  const printElem = makeIconButton('Print', PRINT_SVG);
+  printControls.appendChild(printElem);
+
+  // Show a busy state while the export runs (a large document takes a moment to assemble).
+  const print = async () => {
+    if (printElem.classList.contains('busy')) return;
+    printElem.classList.add('busy');
+    try {
+      await printDocument(scribe);
+    } finally {
+      printElem.classList.remove('busy');
+    }
+  };
+
+  printElem.addEventListener('click', print);
+
+  /**
+   * Install the document-level Ctrl/Cmd+P shortcut that prints (scoped by keyboardScope),
+   * in place of the browser's default print-the-whole-page behavior.
+   * @returns {() => void} A cleanup function that removes the listener.
+   */
+  function installPrintShortcut() {
+    const handler = (event) => {
+      if (!((event.key === 'p' || event.key === 'P') && (event.ctrlKey || event.metaKey) && !event.altKey)) return;
+      if (scribe.opt.keyboardScope === 'off') return;
+      const target = event.target instanceof Node ? event.target : null;
+      const insideThis = !!(target && rootElem.contains(target));
+      const isActive = ScribeViewer.getActiveViewer() === scribe;
+      const inScope = scribe.opt.keyboardScope === 'global' ? isActive : (insideThis || isActive);
+      if (!inScope) return;
+      event.preventDefault();
+      print();
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }
+
+  return { printControls, printElem, installPrintShortcut };
+}
+
+// Drawn for the app menu's 16px slots, since pdf-viewer.js hides the bar's Open button.
+export const OPEN_SVG = appMenuIcon('<path d="M2.5 4.5a1 1 0 0 1 1-1h2l1 1h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1Z"/>');
+
+export const RECENT_SVG = appMenuIcon('<circle cx="7.5" cy="7.5" r="5"/><path d="M7.5 4.5v3l2 2"/>');
+
+/**
+ * Build the "Open" control: a button (and a hidden multi-file input) that hands the chosen files to `onFiles`,
+ * plus a scoped Ctrl/Cmd+O shortcut that opens the same picker.
+ * @param {import('../../viewer.js').ScribeViewer} scribe
+ * @param {HTMLElement} rootElem - The app's root element (used to scope the Ctrl/Cmd+O shortcut).
+ * @param {(files: File[]) => void} onFiles - Called with the chosen files.
+ * @returns {{ openControls: HTMLSpanElement, openElem: HTMLSpanElement, installOpenShortcut: () => (() => void) }}
+ */
+export function createOpenControls(scribe, rootElem, onFiles) {
+  const openControls = document.createElement('span');
+  const openElem = makeIconButton('Open', OPEN_SVG);
+  openControls.appendChild(openElem);
+
+  const inputElem = document.createElement('input');
+  inputElem.type = 'file';
+  inputElem.multiple = true;
+  inputElem.style.display = 'none';
+  openControls.appendChild(inputElem);
+
+  openElem.addEventListener('click', () => inputElem.click());
+  inputElem.addEventListener('change', () => {
+    if (inputElem.files && inputElem.files.length > 0) onFiles([...inputElem.files]);
+    // Clear so picking the same file again still fires `change`.
+    inputElem.value = '';
+  });
+
+  /**
+   * Install the document-level Ctrl/Cmd+O shortcut that opens the file picker (scoped by keyboardScope),
+   * in place of the browser's default open behavior.
+   * @returns {() => void} A cleanup function that removes the listener.
+   */
+  function installOpenShortcut() {
+    const handler = (event) => {
+      if (!((event.key === 'o' || event.key === 'O') && (event.ctrlKey || event.metaKey) && !event.altKey)) return;
+      if (scribe.opt.keyboardScope === 'off') return;
+      const target = event.target instanceof Node ? event.target : null;
+      const insideThis = !!(target && rootElem.contains(target));
+      const isActive = ScribeViewer.getActiveViewer() === scribe;
+      const inScope = scribe.opt.keyboardScope === 'global' ? isActive : (insideThis || isActive);
+      if (!inScope) return;
+      event.preventDefault();
+      inputElem.click();
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }
+
+  return { openControls, openElem, installOpenShortcut };
+}
+
+/**
+ * Build the far-left app menu: a hamburger button whose dropdown collects document- and app-level actions.
+ * The viewer seeds it with its own actions (Open, Print), and the returned extension API lets the editor append more (Combine, Split, a dark-mode toggle) without knowing the menu internals.
+ * @param {string} rootClass - The owning app's root class, unused today but kept for symmetry with the other factories.
+ * @returns {{
+ *   menuWrap: HTMLSpanElement, triggerElem: HTMLSpanElement, menuElem: HTMLDivElement,
+ *   addAction: (label: string, iconSvg: string, onClick: () => void, accel?: string) => HTMLDivElement,
+ *   addToggle: (label: string, iconSvg: string, getState: () => boolean, onToggle: () => void) => { item: HTMLDivElement, sync: () => void },
+ *   addSubmenu: (label: string, iconSvg: string) => { wrap: HTMLDivElement, setItems: (rows: Array<'sep' | { label: string, onClick: () => void, onRemove?: () => void }>) => void },
+ *   addSeparator: () => HTMLDivElement, close: () => void, destroy: () => void,
+ * }}
+ */
+// eslint-disable-next-line no-unused-vars
+export function createAppMenu(rootClass) {
+  const menuWrap = document.createElement('span');
+  menuWrap.className = 'scribe-app-menu-wrap';
+
+  const triggerElem = makeIconButton('Menu', barIcon('menu'));
+  const menuElem = document.createElement('div');
+  menuElem.className = 'scribe-app-menu';
+  menuElem.style.display = 'none';
+  menuWrap.append(triggerElem, menuElem);
+
+  /** @type {Array<() => void>} Toggle-item sync functions. */
+  const toggleSyncs = [];
+  const dropdown = createDropdown({
+    show: () => {
+      for (const sync of toggleSyncs) sync();
+      menuElem.style.display = 'block';
+      triggerElem.classList.add('active');
+      return menuElem;
+    },
+    hide: () => {
+      menuElem.style.display = 'none';
+      triggerElem.classList.remove('active');
+      for (const w of menuElem.querySelectorAll('.scribe-app-menu-subwrap.sub-open')) w.classList.remove('sub-open');
+    },
+    rows: '.scribe-app-menu-item',
+  });
+  dropdown.attachTrigger(triggerElem);
+
+  const makeRow = (label, iconSvg) => {
+    const item = document.createElement('div');
+    item.className = 'scribe-app-menu-item';
+    item.role = 'button';
+    item.tabIndex = 0;
+    const ic = document.createElement('span');
+    ic.className = 'scribe-app-menu-ic';
+    ic.innerHTML = iconSvg;
+    item.append(ic, document.createTextNode(label));
+    item.addEventListener('mousedown', (e) => e.preventDefault());
+    return item;
+  };
+
+  const addAction = (label, iconSvg, onClick, accel) => {
+    const item = makeRow(label, iconSvg);
+    if (accel) {
+      const accelElem = document.createElement('span');
+      accelElem.className = 'scribe-app-menu-accel';
+      accelElem.textContent = accel;
+      item.appendChild(accelElem);
+    }
+    item.addEventListener('click', (e) => { e.stopPropagation(); dropdown.close(); onClick(); });
+    menuElem.appendChild(item);
+    return item;
+  };
+
+  const addSubmenu = (label, iconSvg) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'scribe-app-menu-subwrap';
+    const row = makeRow(label, iconSvg);
+    const chev = document.createElement('span');
+    chev.className = 'scribe-app-menu-subchev';
+    chev.textContent = '›';
+    row.appendChild(chev);
+    const sub = document.createElement('div');
+    sub.className = 'scribe-app-menu scribe-app-menu-sub';
+    wrap.append(row, sub);
+    // Click as well as hover, for keyboards and touch.
+    row.addEventListener('click', (e) => { e.stopPropagation(); wrap.classList.toggle('sub-open'); });
+    wrap.addEventListener('mouseenter', () => wrap.classList.add('sub-open'));
+    wrap.addEventListener('mouseleave', () => wrap.classList.remove('sub-open'));
+    const setItems = (rows) => {
+      sub.textContent = '';
+      for (const r of rows) {
+        if (r === 'sep') {
+          const sep = document.createElement('div');
+          sep.className = 'scribe-app-menu-sep';
+          sub.appendChild(sep);
+          continue;
+        }
+        const item = document.createElement('div');
+        item.className = 'scribe-app-menu-item';
+        item.role = 'button';
+        item.tabIndex = 0;
+        item.textContent = r.label;
+        item.addEventListener('mousedown', (e) => e.preventDefault());
+        item.addEventListener('click', (e) => { e.stopPropagation(); dropdown.close(); r.onClick(); });
+        if (r.onRemove) {
+          // The removal leaves the menu open, so the list can be pruned in one visit.
+          const x = document.createElement('button');
+          x.type = 'button';
+          x.className = 'scribe-app-menu-x';
+          x.textContent = '×';
+          x.title = 'Remove from the list';
+          x.ariaLabel = `Remove ${r.label} from the list`;
+          x.addEventListener('mousedown', (e) => e.preventDefault());
+          x.addEventListener('click', (e) => { e.stopPropagation(); r.onRemove(); });
+          item.appendChild(x);
+        }
+        sub.appendChild(item);
+      }
+      // An empty submenu hides its whole row rather than opening onto nothing.
+      wrap.style.display = rows.length ? '' : 'none';
+    };
+    setItems([]);
+    menuElem.appendChild(wrap);
+    return { wrap, setItems };
+  };
+
+  const addToggle = (label, iconSvg, getState, onToggle) => {
+    const item = makeRow(label, iconSvg);
+    item.classList.add('scribe-app-menu-toggle');
+    const sw = document.createElement('span');
+    sw.className = 'scribe-app-menu-switch';
+    item.appendChild(sw);
+    const sync = () => item.classList.toggle('on', !!getState());
+    // Toggling leaves the menu open so the switch is seen to flip.
+    item.addEventListener('click', (e) => { e.stopPropagation(); onToggle(); sync(); });
+    menuElem.appendChild(item);
+    toggleSyncs.push(sync);
+    sync();
+    return { item, sync };
+  };
+
+  const addSeparator = () => {
+    const sep = document.createElement('div');
+    sep.className = 'scribe-app-menu-sep';
+    menuElem.appendChild(sep);
+    return sep;
+  };
+
+  return {
+    menuWrap, triggerElem, menuElem, addAction, addToggle, addSubmenu, addSeparator, close: dropdown.close, destroy: dropdown.destroy,
+  };
+}
+
+const DRAG_THRESHOLD = 5;
+const AUTOSCROLL_EDGE = 24;
+const AUTOSCROLL_SPEED = 6;
+const TAB_FADE_WIDTH = 24;
+
+/**
+ * Where a dragged tab would land: a region of the strip and a position among that region's other tabs.
+ * @typedef {{region: 'group'|'loose', atIndex: number}} TabDrop
+ */
+
+/**
+ * Another tab during a tab drag: its element, its lane position and width before the drag, and its index in the tab list.
+ * @typedef {{tabElem: HTMLElement, x: number, w: number, index: number}} TabPlace
+ */
+
+/**
+ * The lane positions of one arrangement during a tab drag.
+ * @typedef {Object} TabPositions
+ * @property {Map<HTMLElement, number>} pos - Each other tab's left edge in lane coordinates.
+ * @property {?number} slotX - The opened slot's left edge, null when no slot is open.
+ * @property {number} groupW - The folder group's width.
+ * @property {number} gapW - The spacer's width, 0 when either side of it is empty.
+ * @property {number} looseX - Where the freestanding tabs start.
+ * @property {number} looseW - The freestanding tabs' total width.
+ */
+
+/**
+ * A press on a tab in the strip, from the press through the drag it may become.
+ * @typedef {Object} TabDrag
+ * @property {HTMLElement} tabElem - The pressed tab.
+ * @property {number} from - The pressed tab's index in the tab list.
+ * @property {number} startX - Pointer clientX at the press.
+ * @property {number} startY - Pointer clientY at the press.
+ * @property {number} lastX - Last pointer clientX, so edge auto-scroll can re-derive the drop under a still pointer.
+ * @property {number} lastY
+ * @property {boolean} started - Whether the press has crossed the threshold into a drag.
+ * @property {boolean} inGroup - Whether the tab is one of the folder's.
+ * @property {number} w - The tab's width.
+ * @property {number} grabDX - Offset of the grab point within the tab.
+ * @property {{group: Array<TabPlace>, loose: Array<TabPlace>}} statics - Every other tab, by region.
+ * @property {boolean} grouped - Whether the strip shows a folder group.
+ * @property {number} groupX - The group's left edge in lane coordinates.
+ * @property {number} gapW - The spacer's width before the drag.
+ * @property {number} contentW - The lane's scroll width before the drag.
+ * @property {?TabDrop} drop - Where the tab would land, null until the first move.
+ * @property {boolean} crossing - Whether a freestanding tab is over the folder group, where dropping copies it into the folder.
+ * @property {?TabPositions} positions - The arrangement last applied.
+ * @property {number} autoDir - Edge auto-scroll direction (-1, 0, 1).
+ * @property {number} rafId - Auto-scroll animation-frame handle.
+ */
+
+/**
+ * Build the document tab strip: one tab per open document, each with a close button, for switching between them.
+ * @param {object} cfg
+ * @param {(index: number) => void} cfg.onSelect - Called when a tab is clicked.
+ * @param {(index: number) => void} cfg.onClose - Called when a tab's close button is clicked.
+ * @param {(index: number) => void} cfg.onCloseOthers - Called when the context menu's "Close Others" is picked, with the tab to keep.
+ * @param {(from: number, to: number) => void} [cfg.onMove] - Called when a drag reorders a tab: remove it at `from`, then insert it at `to`.
+ * @param {(from: number, to: number) => void} [cfg.onCopyInto] - Called when a freestanding tab is dropped into the folder group, with the same indices as `onMove`.
+ * @param {(index: number) => Array<{label: string, onPick: () => void}>} [cfg.extraMenuItems] - Rows appended to a tab's context menu after a separator.
+ * @returns {{ tabStripElem: HTMLDivElement,
+ *   render: (tabs: Array<{ name: string, asleep?: boolean, waking?: boolean }>, activeIndex: number, group?: {grouped: boolean, inGroup: (tab: Object) => boolean}) => void,
+ *   addPinnedTab: (elem: HTMLElement) => void, removePinnedTab: (elem: HTMLElement) => void, pinnedCount: () => number, setPinnedActive: (on: boolean) => void,
+ *   showTabNote: (index: number, message: string, options?: {actionLabel?: string, onAction?: () => void}) => void }}
+ */
+export function createTabStrip({
+  onSelect, onClose, onCloseOthers, onMove, onCopyInto, extraMenuItems,
+}) {
+  const tabStripElem = document.createElement('div');
+  tabStripElem.className = 'scribe-tab-strip';
+
+  const laneElem = document.createElement('div');
+  laneElem.className = 'scribe-tab-lane';
+  // The fades sit on the lane's own edges, so neither can run under a pinned tab or an arrow.
+  const laneWrap = document.createElement('div');
+  laneWrap.className = 'scribe-tab-lane-wrap';
+  const fadeLeft = document.createElement('span');
+  fadeLeft.className = 'scribe-tab-fade left';
+  const fadeRight = document.createElement('span');
+  fadeRight.className = 'scribe-tab-fade right';
+  laneWrap.append(fadeLeft, laneElem, fadeRight);
+
+  /**
+   * @param {string} icon
+   * @param {string} label
+   * @param {number} dir
+   * @returns {{wrap: HTMLDivElement, paddle: HTMLSpanElement}}
+   */
+  const makePaddle = (icon, label, dir) => {
+    const wrap = document.createElement('div');
+    wrap.className = `scribe-tab-paddle-wrap ${dir < 0 ? 'left' : 'right'}`;
+    const paddle = document.createElement('span');
+    paddle.className = 'scribe-tab-paddle';
+    paddle.innerHTML = `<span class="scribe-tab-icon">${icon}</span>`;
+    paddle.role = 'button';
+    paddle.tabIndex = 0;
+    paddle.title = label;
+    paddle.ariaLabel = label;
+    // As with the toolbar's buttons, a press never takes focus from the document.
+    paddle.addEventListener('mousedown', (event) => event.preventDefault());
+    paddle.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      paddle.click();
+    });
+    paddle.addEventListener('click', () => {
+      if (paddle.classList.contains('disabled')) return;
+      // iOS Safari does not clamp smooth programmatic scrolls, so edge taps would strand the lane on blank space past the tabs.
+      const target = Math.max(0, Math.min(
+        laneElem.scrollWidth - laneElem.clientWidth,
+        laneElem.scrollLeft + dir * laneElem.clientWidth * 0.8,
+      ));
+      laneElem.scrollTo({ left: target });
+    });
+    const sep = document.createElement('span');
+    sep.className = 'scribe-tab-paddle-sep';
+    wrap.append(...(dir < 0 ? [paddle, sep] : [sep, paddle]));
+    return { wrap, paddle };
+  };
+  const prev = makePaddle(TAB_PREV_SVG, 'Scroll tabs left', -1);
+  const next = makePaddle(TAB_NEXT_SVG, 'Scroll tabs right', 1);
+  tabStripElem.append(prev.wrap, laneWrap, next.wrap);
+
+  // A vertical wheel scrolls the lane horizontally (trackpad horizontal deltas already work natively).
+  laneElem.addEventListener('wheel', (event) => {
+    if (event.deltaY && !event.deltaX) {
+      laneElem.scrollLeft += event.deltaY;
+      event.preventDefault();
+    }
+  }, { passive: false });
+
+  /** @type {?HTMLSpanElement} */
+  let pinnedWrap = null;
+  /** @type {?HTMLSpanElement} */
+  let groupElem = null;
+  /** @type {?HTMLSpanElement} */
+  let gapElem = null;
+
+  const syncEdges = () => {
+    const overflowing = tabStripElem.classList.contains('overflowing');
+    const hiddenLeft = overflowing && laneElem.scrollLeft > 0.5;
+    const hiddenRight = overflowing && laneElem.scrollLeft < laneElem.scrollWidth - laneElem.clientWidth - 0.5;
+    prev.paddle.classList.toggle('disabled', !hiddenLeft);
+    prev.paddle.ariaDisabled = String(!hiddenLeft);
+    next.paddle.classList.toggle('disabled', !hiddenRight);
+    next.paddle.ariaDisabled = String(!hiddenRight);
+    fadeLeft.classList.toggle('on', hiddenLeft);
+    fadeRight.classList.toggle('on', hiddenRight);
+    const laneRect = laneElem.getBoundingClientRect();
+    const groupRect = groupElem && groupElem.childElementCount > 0 ? groupElem.getBoundingClientRect() : null;
+    // An arrow carries the folder's bar only while folder tabs sit at its edge of the lane.
+    prev.wrap.classList.toggle('group-bridge', !!groupRect && groupRect.right > laneRect.left + 1);
+    next.wrap.classList.toggle('group-bridge', !!groupRect && groupRect.right > laneRect.right + 1);
+  };
+  laneElem.addEventListener('scroll', syncEdges, { passive: true });
+
+  const syncOverflow = () => {
+    // Measured against the room the tabs have without the arrows, so the arrows never keep themselves shown.
+    const room = tabStripElem.clientWidth - (pinnedWrap ? pinnedWrap.offsetWidth : 0);
+    tabStripElem.classList.toggle('overflowing', laneElem.scrollWidth > room + 1);
+    syncEdges();
+  };
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(syncOverflow).observe(laneElem);
+
+  /**
+   * Mount `elem` as a pinned tab ahead of the scroll lane, after any tabs already pinned.
+   * The caller owns the tab's `active` class, and the strip lights only pinned tabs that carry it.
+   * @param {HTMLElement} elem
+   */
+  function addPinnedTab(elem) {
+    if (!pinnedWrap) {
+      pinnedWrap = document.createElement('span');
+      pinnedWrap.className = 'scribe-tab-pin';
+      const sep = document.createElement('span');
+      sep.className = 'scribe-tab-pin-sep';
+      pinnedWrap.appendChild(sep);
+      tabStripElem.insertBefore(pinnedWrap, tabStripElem.firstChild);
+    }
+    pinnedWrap.insertBefore(elem, pinnedWrap.lastElementChild);
+    syncOverflow();
+  }
+
+  /**
+   * Unmount a pinned tab.
+   * The pinned wrapper goes with its last tab.
+   * @param {HTMLElement} elem
+   */
+  function removePinnedTab(elem) {
+    if (!pinnedWrap || elem.parentElement !== pinnedWrap) return;
+    elem.remove();
+    if (pinnedWrap.children.length <= 1) {
+      pinnedWrap.remove();
+      pinnedWrap = null;
+    }
+    syncOverflow();
+  }
+
+  /** How many tabs are pinned ahead of the lane. */
+  function pinnedCount() {
+    return pinnedWrap ? pinnedWrap.children.length - 1 : 0;
+  }
+
+  /**
+   * Light the pinned tab as the active one.
+   * While on, the lane's active tab renders inactive, since the pinned tab's surface covers the document.
+   * @param {boolean} on
+   */
+  function setPinnedActive(on) {
+    tabStripElem.classList.toggle('pin-active', on);
+  }
+
+  // Mounted on the viewer root lazily, since the strip has no parent yet at build time.
+  const menuElem = document.createElement('div');
+  menuElem.className = 'scribe-tab-menu';
+  menuElem.style.display = 'none';
+
+  function closeTabMenu() {
+    menuElem.style.display = 'none';
+    document.removeEventListener('pointerdown', onTabMenuOutside);
+    document.removeEventListener('keydown', onTabMenuKey);
+  }
+  /** @param {PointerEvent} e */
+  function onTabMenuOutside(e) {
+    if (menuElem.contains(/** @type {Node} */ (e.target))) return;
+    closeTabMenu();
+  }
+  /** @param {KeyboardEvent} e */
+  function onTabMenuKey(e) {
+    if (e.key === 'Escape') closeTabMenu();
+  }
+
+  /**
+   * Open the tab context menu at the cursor.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @param {number} index
+   * @param {string} name - The tab's document name.
+   * @param {number} tabCount
+   */
+  function openTabMenu(clientX, clientY, index, name, tabCount) {
+    const host = tabStripElem.parentElement;
+    if (!host) return;
+    if (menuElem.parentElement !== host) host.appendChild(menuElem);
+    menuElem.replaceChildren();
+    /**
+     * @param {string} label
+     * @param {() => void} onPick
+     */
+    const addItem = (label, onPick) => {
+      const item = document.createElement('div');
+      item.className = 'scribe-tab-menu-item';
+      item.textContent = label;
+      item.addEventListener('click', () => {
+        closeTabMenu();
+        onPick();
+      });
+      menuElem.appendChild(item);
+    };
+    addItem('Copy Name', () => navigator.clipboard?.writeText(name));
+    addItem('Close', () => onClose(index));
+    if (tabCount > 1) addItem('Close Others', () => onCloseOthers(index));
+    const extras = extraMenuItems ? extraMenuItems(index) : [];
+    if (extras.length) {
+      const sep = document.createElement('div');
+      sep.className = 'scribe-tab-menu-sep';
+      menuElem.appendChild(sep);
+      for (const extra of extras) addItem(extra.label, extra.onPick);
+    }
+    // Show first so the menu has measurable dimensions, then clamp it inside the host.
+    menuElem.style.display = '';
+    const hostRect = host.getBoundingClientRect();
+    const left = Math.min(clientX - hostRect.left, hostRect.width - menuElem.offsetWidth - 4);
+    const top = Math.min(clientY - hostRect.top, hostRect.height - menuElem.offsetHeight - 4);
+    menuElem.style.left = `${Math.max(4, left)}px`;
+    menuElem.style.top = `${Math.max(4, top)}px`;
+    // Deferred so the pointer sequence that opened the menu cannot immediately dismiss it.
+    setTimeout(() => {
+      document.addEventListener('pointerdown', onTabMenuOutside);
+      document.addEventListener('keydown', onTabMenuKey);
+    }, 0);
+  }
+
+  const noteElem = document.createElement('div');
+  noteElem.className = 'scribe-tab-note';
+  noteElem.setAttribute('role', 'status');
+  noteElem.style.display = 'none';
+  let noteTimer = 0;
+
+  function closeTabNote() {
+    noteElem.style.display = 'none';
+    window.clearTimeout(noteTimer);
+    document.removeEventListener('pointerdown', onTabNoteOutside, true);
+  }
+  /** @param {PointerEvent} e */
+  function onTabNoteOutside(e) {
+    if (noteElem.contains(/** @type {Node} */ (e.target))) return;
+    closeTabNote();
+  }
+
+  /**
+   * Show a note under the tab at `index`, with an optional action button.
+   * It closes after eight seconds, when its action is taken, or on a press anywhere else.
+   * @param {number} index
+   * @param {string} message
+   * @param {{actionLabel?: string, onAction?: () => void}} [options]
+   */
+  function showTabNote(index, message, { actionLabel, onAction } = {}) {
+    const host = tabStripElem.parentElement;
+    const tabElem = laneElem.querySelector(`[data-tab-index="${index}"]`);
+    if (!host || !tabElem) return;
+    closeTabNote();
+    if (noteElem.parentElement !== host) host.appendChild(noteElem);
+    noteElem.replaceChildren();
+    const text = document.createElement('span');
+    text.textContent = message;
+    noteElem.appendChild(text);
+    if (actionLabel && onAction) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'scribe-tab-note-action';
+      button.textContent = actionLabel;
+      button.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeTabNote();
+        onAction();
+      });
+      noteElem.appendChild(button);
+    }
+    noteElem.style.display = '';
+    const hostRect = host.getBoundingClientRect();
+    const tabRect = tabElem.getBoundingClientRect();
+    const stripRect = tabStripElem.getBoundingClientRect();
+    noteElem.style.left = `${Math.max(4, Math.min(tabRect.left - hostRect.left + 4, hostRect.width - noteElem.offsetWidth - 6))}px`;
+    noteElem.style.top = `${stripRect.bottom - hostRect.top + 6}px`;
+    noteTimer = window.setTimeout(closeTabNote, 8000);
+    setTimeout(() => document.addEventListener('pointerdown', onTabNoteOutside, true), 0);
+  }
+
+  /** @type {?{tabs: Array<Object>, activeIndex: number, group: {grouped: boolean, inGroup: (tab: Object) => boolean}}} */
+  let lastRender = null;
+
+  /**
+   * Rebuild the tab elements from the current tab list.
+   * With `group`, the tabs `inGroup` admits sit first, in a group that continues the pinned folder tab, and the rest follow after a gap.
+   * @param {Array<{ name: string, asleep?: boolean, waking?: boolean }>} tabs
+   * @param {number} activeIndex
+   * @param {{grouped: boolean, inGroup: (tab: Object) => boolean}} [group]
+   */
+  function render(tabs, activeIndex, group = { grouped: false, inGroup: () => false }) {
+    if (drag) cancelDrag(false);
+    closeTabMenu();
+    closeTabNote();
+    lastRender = { tabs, activeIndex, group };
+    laneElem.textContent = '';
+    tabStripElem.classList.toggle('grouped', group.grouped);
+    groupElem = null;
+    gapElem = null;
+    let groupedN = 0;
+    if (group.grouped) {
+      groupElem = document.createElement('span');
+      groupElem.className = 'scribe-tab-group';
+      gapElem = document.createElement('span');
+      gapElem.className = 'scribe-tab-gap';
+      laneElem.append(groupElem, gapElem);
+    }
+    if (pinnedWrap) pinnedWrap.classList.toggle('scribe-tab-group-head', group.grouped);
+    tabs.forEach((tab, i) => {
+      const tabElem = document.createElement('div');
+      tabElem.className = i === activeIndex ? 'scribe-tab active' : 'scribe-tab';
+      if (tab.asleep) tabElem.classList.add('asleep');
+      tabElem.title = tab.asleep && !tab.waking ? `${tab.name} — asleep to save memory` : tab.name;
+      tabElem.addEventListener('contextmenu', (event) => {
+        event.preventDefault();
+        openTabMenu(event.clientX, event.clientY, i, tab.name, tabs.length);
+      });
+
+      const name = document.createElement('span');
+      name.className = 'scribe-tab-name';
+      name.textContent = tab.name;
+      tabElem.appendChild(name);
+
+      if (tab.waking) {
+        const spin = document.createElement('span');
+        spin.className = 'scribe-tab-spin';
+        tabElem.appendChild(spin);
+      } else {
+        const close = document.createElement('span');
+        close.className = 'scribe-tab-close';
+        close.textContent = '×';
+        close.role = 'button';
+        close.ariaLabel = `Close ${tab.name}`;
+        tabElem.appendChild(close);
+        // Stop the click reaching the tab, so closing it never also selects it.
+        close.addEventListener('click', (event) => {
+          event.stopPropagation();
+          onClose(i);
+        });
+      }
+
+      tabElem.addEventListener('click', () => {
+        if (suppressClick) return;
+        onSelect(i);
+      });
+      tabElem.addEventListener('pointerdown', beginTabDrag);
+      tabElem.dataset.tabIndex = String(i);
+      if (group.grouped && group.inGroup(tab)) {
+        /** @type {HTMLSpanElement} */ (groupElem).appendChild(tabElem);
+        groupedN += 1;
+      } else {
+        laneElem.appendChild(tabElem);
+      }
+    });
+    if (group.grouped) {
+      /** @type {HTMLSpanElement} */ (gapElem).classList.toggle('empty', groupedN === 0 || groupedN === tabs.length);
+    }
+    syncOverflow();
+    // The active tab scrolls fully into view, clear of the fades.
+    const activeElem = laneElem.querySelector(`[data-tab-index="${activeIndex}"]`);
+    if (activeElem && laneElem.clientWidth) {
+      const tabElems = laneElem.querySelectorAll('.scribe-tab');
+      const laneRect = laneElem.getBoundingClientRect();
+      const rect = activeElem.getBoundingClientRect();
+      const minLeft = laneRect.left + (activeElem === tabElems[0] ? 0 : TAB_FADE_WIDTH);
+      const maxRight = laneRect.right - (activeElem === tabElems[tabElems.length - 1] ? 0 : TAB_FADE_WIDTH);
+      const delta = rect.left < minLeft ? rect.left - minLeft : Math.max(0, rect.right - maxRight);
+      if (delta) {
+        laneElem.scrollTo({ left: Math.max(0, Math.min(laneElem.scrollWidth - laneElem.clientWidth, laneElem.scrollLeft + delta)) });
+      }
+    }
+  }
+
+  // --- Drag to reorder ---
+  /** @type {?TabDrag} */
+  let drag = null;
+  let suppressClick = false;
+
+  /** @param {PointerEvent} event */
+  function beginTabDrag(event) {
+    // A touch press is left to scroll the lane.
+    if (event.button !== 0 || event.pointerType === 'touch' || drag) return;
+    const tabElem = /** @type {HTMLElement} */ (event.currentTarget);
+    if (/** @type {HTMLElement} */ (event.target).closest('.scribe-tab-close')) return;
+    drag = {
+      tabElem,
+      from: +(tabElem.dataset.tabIndex || 0),
+      startX: event.clientX,
+      startY: event.clientY,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      started: false,
+      inGroup: false,
+      w: 0,
+      grabDX: 0,
+      statics: { group: [], loose: [] },
+      grouped: false,
+      groupX: 0,
+      gapW: 0,
+      contentW: 0,
+      drop: null,
+      crossing: false,
+      positions: null,
+      autoDir: 0,
+      rafId: 0,
+    };
+    window.addEventListener('pointermove', onDragMove);
+    window.addEventListener('pointerup', onDragUp);
+    window.addEventListener('pointercancel', onDragCancel);
+  }
+
+  function removeDragListeners() {
+    window.removeEventListener('pointermove', onDragMove);
+    window.removeEventListener('pointerup', onDragUp);
+    window.removeEventListener('pointercancel', onDragCancel);
+  }
+
+  /** @param {PointerEvent} event */
+  function onDragMove(event) {
+    const d = drag;
+    if (!d) return;
+    d.lastX = event.clientX;
+    d.lastY = event.clientY;
+    if (!d.started) {
+      if (Math.hypot(event.clientX - d.startX, event.clientY - d.startY) < DRAG_THRESHOLD) return;
+      startDrag(d);
+    }
+    moveDrag(event.clientX, event.clientY);
+  }
+
+  function onDragUp() {
+    const d = drag;
+    if (!d) return;
+    removeDragListeners();
+    if (!d.started) {
+      drag = null;
+      return;
+    }
+    // The click that ends a drag is the drop, not a selection.
+    suppressClick = true;
+    setTimeout(() => { suppressClick = false; }, 0);
+    endDrag(d);
+  }
+
+  function onDragCancel() {
+    cancelDrag(true);
+  }
+
+  /** @param {KeyboardEvent} event */
+  function onDragKey(event) {
+    if (event.key !== 'Escape' || !drag) return;
+    event.preventDefault();
+    cancelDrag(true);
+  }
+
+  function onDragBlur() {
+    cancelDrag(true);
+  }
+
+  /**
+   * Turn the press into a drag.
+   * The tab leaves the flow, and from here on script positions it and every other tab in the lane.
+   * @param {TabDrag} d
+   */
+  function startDrag(d) {
+    d.started = true;
+    const laneRect = laneElem.getBoundingClientRect();
+    const scroll = laneElem.scrollLeft;
+    /** @param {DOMRect} r */
+    const toLane = (r) => r.left - laneRect.left + scroll;
+    const tabRect = d.tabElem.getBoundingClientRect();
+    d.inGroup = !!groupElem && d.tabElem.parentElement === groupElem;
+    for (const other of /** @type {NodeListOf<HTMLElement>} */ (laneElem.querySelectorAll('.scribe-tab'))) {
+      if (other === d.tabElem) continue;
+      const r = other.getBoundingClientRect();
+      d.statics[groupElem && other.parentElement === groupElem ? 'group' : 'loose'].push({
+        tabElem: other, x: toLane(r), w: r.width, index: +(other.dataset.tabIndex || 0),
+      });
+    }
+    d.grouped = !!groupElem;
+    d.groupX = groupElem ? toLane(groupElem.getBoundingClientRect()) : 0;
+    const gapRect = gapElem && !gapElem.classList.contains('empty') ? gapElem.getBoundingClientRect() : null;
+    d.gapW = gapRect ? gapRect.width : 14;
+    d.w = tabRect.width;
+    d.grabDX = d.startX - tabRect.left;
+    d.contentW = laneElem.scrollWidth;
+    const x0 = toLane(tabRect);
+    tabStripElem.classList.add('tab-drag');
+    // The lane's content is about to leave the flow, so a sizer keeps its scroll extent and offset.
+    laneElem.style.setProperty('--scribe-tab-drag-w', `${d.contentW}px`);
+    laneElem.style.scrollBehavior = 'auto';
+    const region = d.inGroup ? 'group' : 'loose';
+    applyPositions(positionsFor({ region, atIndex: d.statics[region].filter((s) => s.x < x0).length }));
+    laneElem.appendChild(d.tabElem);
+    d.tabElem.classList.add('dragging');
+    d.tabElem.style.left = `${x0}px`;
+    const plus = document.createElement('span');
+    plus.className = 'scribe-tab-plus';
+    plus.textContent = '+';
+    d.tabElem.appendChild(plus);
+    document.body.style.cursor = 'grabbing';
+    document.addEventListener('keydown', onDragKey, true);
+    window.addEventListener('blur', onDragBlur);
+    d.rafId = requestAnimationFrame(autoScrollTick);
+  }
+
+  /**
+   * Lane positions of every other tab when the dragged tab is taken out and a slot of its width is opened at `drop`, or nowhere.
+   * @param {?TabDrop} drop
+   * @returns {TabPositions}
+   */
+  function positionsFor(drop) {
+    const d = /** @type {TabDrag} */ (drag);
+    /** @type {Map<HTMLElement, number>} */
+    const pos = new Map();
+    /** @type {?number} */
+    let slotX = null;
+    /**
+     * @param {'group'|'loose'} region
+     * @param {number} left
+     */
+    const lay = (region, left) => {
+      let x = left;
+      const list = d.statics[region];
+      for (let i = 0; i <= list.length; i += 1) {
+        if (drop && drop.region === region && drop.atIndex === i) {
+          slotX = x;
+          x += d.w;
+        }
+        if (i < list.length) {
+          pos.set(list[i].tabElem, x);
+          x += list[i].w;
+        }
+      }
+      return x - left;
+    };
+    const groupW = d.grouped ? lay('group', d.groupX) : 0;
+    const gapW = groupW > 0 && d.statics.loose.length + (drop && drop.region === 'loose' ? 1 : 0) > 0 ? d.gapW : 0;
+    const looseX = d.groupX + groupW + gapW;
+    const looseW = lay('loose', looseX);
+    return {
+      pos, slotX, groupW, gapW, looseX, looseW,
+    };
+  }
+
+  /** @param {TabPositions} positions */
+  function applyPositions(positions) {
+    const d = /** @type {TabDrag} */ (drag);
+    if (groupElem && gapElem) {
+      groupElem.style.left = `${d.groupX}px`;
+      groupElem.style.width = `${positions.groupW}px`;
+      gapElem.style.left = `${d.groupX + positions.groupW}px`;
+      gapElem.style.width = `${positions.gapW}px`;
+    }
+    for (const s of d.statics.group) s.tabElem.style.left = `${positions.pos.get(s.tabElem) - d.groupX}px`;
+    for (const s of d.statics.loose) s.tabElem.style.left = `${positions.pos.get(s.tabElem)}px`;
+    d.positions = positions;
+  }
+
+  /**
+   * @param {number} clientX
+   * @param {number} clientY
+   */
+  function moveDrag(clientX, clientY) {
+    const d = drag;
+    if (!d) return;
+    d.lastX = clientX;
+    d.lastY = clientY;
+    const laneRect = laneElem.getBoundingClientRect();
+    const px = clientX - laneRect.left + laneElem.scrollLeft;
+    const base = positionsFor(null);
+    const groupEnd = d.groupX + base.groupW;
+    const canCross = d.grouped && !d.inGroup && typeof onCopyInto === 'function';
+    let minX = d.grouped ? d.groupX : 0;
+    let maxX = Math.max(minX, d.contentW - d.w);
+    // Group membership comes from the library, not from where a tab is dropped, so a folder document's tab is held inside the group.
+    if (d.inGroup) maxX = groupEnd;
+    else if (!canCross) minX = base.looseX;
+    const x = Math.max(minX, Math.min(maxX, px - d.grabDX));
+    const cx = x + d.w / 2;
+    // Over an empty group there is nothing to pass, so the tab counts as inside once it sits against the folder tab.
+    const groupSide = d.grouped && cx < (base.groupW > 0 ? groupEnd + d.gapW / 2 : d.groupX + d.w / 2 + 7);
+    /** @param {'group'|'loose'} region */
+    const countBefore = (region) => d.statics[region].filter((s) => /** @type {number} */ (base.pos.get(s.tabElem)) + s.w / 2 < cx).length;
+    // Against either stop the tab may not be able to pass a wider neighbor's midpoint, so the stop itself decides.
+    /** @param {'group'|'loose'} region */
+    const dropIndex = (region) => (x <= minX + 0.5 ? 0 : x >= maxX - 0.5 ? d.statics[region].length : countBefore(region));
+    /** @type {TabDrop} */
+    let drop;
+    if (d.inGroup) drop = { region: 'group', atIndex: dropIndex('group') };
+    else if (canCross && groupSide) drop = { region: 'group', atIndex: x <= minX + 0.5 ? 0 : countBefore('group') };
+    else drop = { region: 'loose', atIndex: dropIndex('loose') };
+    d.drop = drop;
+    d.crossing = !d.inGroup && drop.region === 'group';
+    applyPositions(positionsFor(drop));
+    d.tabElem.style.left = `${x}px`;
+    if (pinnedWrap) pinnedWrap.classList.toggle('drop', d.crossing);
+    if (groupElem) groupElem.classList.toggle('drop', d.crossing);
+    d.tabElem.classList.toggle('adding', d.crossing);
+    const max = laneElem.scrollWidth - laneElem.clientWidth;
+    if (clientX < laneRect.left + AUTOSCROLL_EDGE && laneElem.scrollLeft > 0) d.autoDir = -1;
+    else if (clientX > laneRect.right - AUTOSCROLL_EDGE && laneElem.scrollLeft < max) d.autoDir = 1;
+    else d.autoDir = 0;
+  }
+
+  function autoScrollTick() {
+    const d = drag;
+    if (!d) return;
+    if (d.autoDir) {
+      const before = laneElem.scrollLeft;
+      laneElem.scrollLeft = Math.max(0, Math.min(laneElem.scrollWidth - laneElem.clientWidth, before + d.autoDir * AUTOSCROLL_SPEED));
+      if (laneElem.scrollLeft !== before) moveDrag(d.lastX, d.lastY);
+    }
+    d.rafId = requestAnimationFrame(autoScrollTick);
+  }
+
+  /**
+   * Remove the drag's styling, key and blur listeners, and auto-scroll, applying nothing.
+   * The render that follows every end of a drag rebuilds the lane's tabs, so only what outlives it is reset here.
+   * @param {TabDrag} d
+   */
+  function endDragVisuals(d) {
+    cancelAnimationFrame(d.rafId);
+    tabStripElem.classList.remove('tab-drag', 'settling');
+    if (pinnedWrap) pinnedWrap.classList.remove('drop');
+    laneElem.style.removeProperty('--scribe-tab-drag-w');
+    laneElem.style.scrollBehavior = '';
+    document.body.style.cursor = '';
+    document.removeEventListener('keydown', onDragKey, true);
+    window.removeEventListener('blur', onDragBlur);
+  }
+
+  /**
+   * End the press or drag without applying it.
+   * @param {boolean} rerender - Redraw the strip, which a render already under way does not need.
+   */
+  function cancelDrag(rerender) {
+    const d = drag;
+    if (!d) return;
+    drag = null;
+    removeDragListeners();
+    if (!d.started) return;
+    endDragVisuals(d);
+    if (rerender && lastRender) render(lastRender.tabs, lastRender.activeIndex, lastRender.group);
+  }
+
+  /**
+   * Settle the released tab into its slot, then apply the move or the copy.
+   * @param {TabDrag} d
+   */
+  function endDrag(d) {
+    cancelAnimationFrame(d.rafId);
+    const drop = d.drop || { region: d.inGroup ? 'group' : 'loose', atIndex: 0 };
+    const finish = () => {
+      if (drag !== d) return;
+      drag = null;
+      // The insertion index counts in the list without the dragged tab.
+      /** @param {number} i */
+      const without = (i) => i - (i > d.from ? 1 : 0);
+      const list = d.statics[drop.region];
+      let to;
+      if (drop.atIndex < list.length) to = without(list[drop.atIndex].index);
+      else if (list.length) to = without(list[list.length - 1].index) + 1;
+      else to = drop.region === 'group' ? 0 : (lastRender ? lastRender.tabs.length - 1 : 0);
+      endDragVisuals(d);
+      if (lastRender) render(lastRender.tabs, lastRender.activeIndex, lastRender.group);
+      if (d.crossing && onCopyInto) onCopyInto(d.from, to);
+      else if (!d.crossing && onMove && to !== d.from) onMove(d.from, to);
+    };
+    const slotX = d.positions ? d.positions.slotX : null;
+    if (slotX !== null && Math.abs(parseFloat(d.tabElem.style.left) - slotX) > 0.5) {
+      tabStripElem.classList.add('settling');
+      d.tabElem.style.left = `${slotX}px`;
+      setTimeout(finish, 130);
+    } else {
+      finish();
+    }
+  }
+
+  return {
+    tabStripElem, render, addPinnedTab, removePinnedTab, pinnedCount, setPinnedActive, showTabNote,
+  };
+}
+
+/**
+ * Build the find/search bar and its behaviors.
+ * @param {import('../../viewer.js').ScribeViewer} scribe
+ * @param {HTMLElement} rootElem - The app's root element (used to scope the Ctrl/Cmd+F shortcut).
+ * @returns {{
+ *   searchElem: HTMLSpanElement, findGroupElem: HTMLSpanElement,
+ *   searchInputElem: HTMLInputElement, searchCounterElem: HTMLSpanElement,
+ *   openSearch: (options?: {focus?: boolean}) => Promise<void>, closeSearch: () => void, runSearch: (q: string, targetPageN?: number, navigate?: boolean) => Promise<void>,
+ *   updateSearchCounter: () => void, resetSearch: () => void, rehome: () => void,
+ *   installFindShortcut: () => (() => void)
+ * }}
+ */
+export function createSearchBar(scribe, rootElem) {
+  const searchElem = makeIconButton('Find', barIcon('find'));
+  searchElem.dataset.tipKey = shortcutLabel('F');
+
+  const findGroupElem = document.createElement('span');
+  findGroupElem.className = 'scribe-search-group';
+  findGroupElem.style.display = 'none';
+
+  const searchFieldElem = document.createElement('span');
+  searchFieldElem.className = 'scribe-search-field';
+
+  const searchInputElem = document.createElement('input');
+  searchInputElem.type = 'text';
+  searchInputElem.className = 'scribe-search-input';
+  searchInputElem.placeholder = 'Find';
+  searchInputElem.autocomplete = 'off';
+  searchInputElem.spellcheck = false;
+
+  const searchCounterElem = document.createElement('span');
+  searchCounterElem.className = 'scribe-search-count';
+  // The ghost draws its text from an attribute, so the counter's textContent is only the current value.
+  const searchCountValueElem = document.createElement('span');
+  searchCountValueElem.className = 'scribe-search-count-value in';
+  const searchCountGhostElem = document.createElement('span');
+  searchCountGhostElem.className = 'scribe-search-count-ghost';
+  searchCounterElem.append(searchCountValueElem, searchCountGhostElem);
+  searchFieldElem.append(searchInputElem, searchCounterElem);
+
+  const searchSepElem = document.createElement('span');
+  searchSepElem.className = 'scribe-search-sep';
+
+  const searchPrevElem = makeIconButton('Previous match', barIcon('stepUp'));
+  const searchNextElem = makeIconButton('Next match', barIcon('stepDown'));
+  searchPrevElem.classList.add('scribe-search-step');
+  searchNextElem.classList.add('scribe-search-step');
+  // The desktop find bar closes from the Find button or Esc, so only the phone find bar, with no Esc key, shows this control.
+  const searchCloseElem = makeIconButton('Close', barIcon('close'));
+  searchCloseElem.classList.add('scribe-search-close');
+  for (const el of [searchPrevElem, searchNextElem, searchCloseElem]) delete el.dataset.tip;
+
+  findGroupElem.append(searchFieldElem, searchSepElem, searchPrevElem, searchNextElem, searchCloseElem);
+
+  function updateSearchCounter() {
+    const s = scribe._searchState;
+    let text = '';
+    if (s.search) text = s.matchList.length ? `${s.activeMatch + 1}/${s.matchList.length}` : 'No results';
+    if (text !== searchCountValueElem.textContent) {
+      // The reflow commits the swapped classes before they flip back, so both fades play.
+      searchCountGhostElem.dataset.text = searchCountValueElem.textContent;
+      searchCountValueElem.textContent = text;
+      searchCountGhostElem.classList.add('show');
+      searchCountValueElem.classList.remove('in');
+      searchCounterElem.getBoundingClientRect();
+      searchCountGhostElem.classList.remove('show');
+      searchCountValueElem.classList.add('in');
+    }
+    const none = !s.matchList.length;
+    for (const el of [searchPrevElem, searchNextElem]) {
+      el.classList.toggle('disabled', none);
+      el.ariaDisabled = String(none);
+      el.tabIndex = none ? -1 : 0;
+    }
+    // The toolbar field keeps typed text clear of the count drawn inside it.
+    const countW = searchCountValueElem.offsetWidth;
+    searchFieldElem.style.setProperty('--scribe-search-count-w', `${countW ? countW + 8 : 0}px`);
+  }
+
+  /**
+   * Search from the bar, keeping the counter in step.
+   * Does nothing while the bar is closed.
+   * @param {string} query
+   * @param {number} [targetPageN] - Land on this page, on its first match or on the page itself when none is there, rather than on the first match from the page in view.
+   * @param {boolean} [navigate] - Pass false to refresh the matches and highlights without moving the view.
+   */
+  async function runSearch(query, targetPageN, navigate = true) {
+    await searchDoc(scribe, query, { pageN: targetPageN, navigate });
+    updateSearchCounter();
+  }
+
+  // Restored on reopen, since re-running the search leaves no match active and the count would read 0/N.
+  let lastActive = -1;
+  // The query whose matches `lastActive` indexes.
+  let lastQuery = '';
+  let searchDebounce = null;
+  /** @type {?ReturnType<typeof setTimeout>} Hides the bar once its exit has played. */
+  let closeTimer = null;
+
+  // The desktop find bar hangs from the Find button's right edge, which a desktop shell's window controls can push in from the toolbar's.
+  const placeBar = () => {
+    const bar = findGroupElem.parentElement;
+    if (!bar) return;
+    const barRect = bar.getBoundingClientRect();
+    const want = barRect.right - searchElem.getBoundingClientRect().right;
+    // The bar stays inside a narrow host, such as the library's preview pane.
+    const most = Math.max(8, barRect.width - findGroupElem.offsetWidth - 8);
+    findGroupElem.style.setProperty('--scribe-search-right', `${Math.min(want, most)}px`);
+  };
+  const barResize = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(placeBar) : null;
+
+  /**
+   * Open the find bar.
+   * @param {object} [options]
+   * @param {boolean} [options.focus=true] - Pass false to open the bar without taking focus, for a search started from elsewhere.
+   */
+  async function openSearch({ focus = true } = {}) {
+    if (!scribe.doc || !scribe.doc.pageMetrics || scribe.doc.pageMetrics.length === 0) return;
+    if (closeTimer) {
+      clearTimeout(closeTimer);
+      closeTimer = null;
+    }
+    findGroupElem.classList.remove('scribe-search-closing');
+    findGroupElem.style.display = 'inline-flex';
+    placeBar();
+    if (barResize && findGroupElem.parentElement) {
+      barResize.disconnect();
+      barResize.observe(findGroupElem.parentElement);
+    }
+    // The display flip has to land before the class does, or the entrance has no start state to play from.
+    findGroupElem.getBoundingClientRect();
+    findGroupElem.classList.add('scribe-search-open');
+    updateSearchCounter();
+    searchElem.classList.add('active');
+    scribe.state.searchMode = true;
+    if (focus) {
+      searchInputElem.focus();
+      searchInputElem.select();
+    }
+    // A retained query gets its highlights and its active match back, but the view must not move until the user types or steps through matches.
+    if (!searchInputElem.value.trim()) return;
+    await runSearch(searchInputElem.value, undefined, false);
+    const { matchList, search, activeMatch } = scribe._searchState;
+    // A search or step that picked a match during the wait above wins over the restore.
+    if (lastActive < 0 || !matchList.length || !scribe.state.searchMode || search !== lastQuery || activeMatch >= 0) return;
+    await goToMatch(scribe, Math.min(lastActive, matchList.length - 1), { navigate: false });
+    updateSearchCounter();
+  }
+
+  function closeSearch() {
+    clearTimeout(searchDebounce);
+    barResize?.disconnect();
+    lastActive = scribe._searchState.activeMatch;
+    lastQuery = scribe._searchState.search;
+    searchElem.classList.remove('active');
+    scribe.state.searchMode = false;
+    findText(scribe, '');
+    updateSearchCounter();
+    // The bar stays displayed through its exit, so it gives up focus now.
+    if (document.activeElement === searchInputElem) searchInputElem.blur();
+    findGroupElem.classList.remove('scribe-search-open');
+    if (findGroupElem.style.display === 'none') return;
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      findGroupElem.style.display = 'none';
+      return;
+    }
+    findGroupElem.classList.add('scribe-search-closing');
+    if (closeTimer) clearTimeout(closeTimer);
+    closeTimer = setTimeout(() => {
+      closeTimer = null;
+      findGroupElem.classList.remove('scribe-search-closing');
+      findGroupElem.style.display = 'none';
+    }, 90);
+  }
+
+  function resetSearch() {
+    // Re-attaching the same document keeps the viewer's search state, so the reset clears it the way a close does.
+    closeSearch();
+    lastActive = -1;
+    searchInputElem.value = '';
+  }
+
+  /** Re-place an open bar after its elements moved to another host, such as the library's pane head. */
+  function rehome() {
+    if (findGroupElem.style.display === 'none') return;
+    placeBar();
+    if (barResize && findGroupElem.parentElement) {
+      barResize.disconnect();
+      barResize.observe(findGroupElem.parentElement);
+    }
+  }
+
+  searchElem.addEventListener('click', () => {
+    if (!scribe.state.searchMode) openSearch();
+    else closeSearch();
+  });
+
+  searchInputElem.addEventListener('input', () => {
+    if (searchDebounce) clearTimeout(searchDebounce);
+    const { value } = searchInputElem;
+    searchDebounce = setTimeout(() => runSearch(value), 150);
+  });
+  searchInputElem.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    if (event.shiftKey) prevMatch(scribe).then(() => updateSearchCounter());
+    else nextMatch(scribe).then(() => updateSearchCounter());
+  });
+  findGroupElem.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    closeSearch();
+  });
+
+  searchPrevElem.addEventListener('click', () => prevMatch(scribe).then(() => updateSearchCounter()));
+  searchNextElem.addEventListener('click', () => nextMatch(scribe).then(() => updateSearchCounter()));
+  searchCloseElem.addEventListener('click', () => closeSearch());
+
+  /**
+   * @param {boolean} backwards
+   * @returns {Promise<void>}
+   */
+  async function stepMatch(backwards) {
+    if (!scribe.state.searchMode || !searchInputElem.value) {
+      openSearch();
+      return;
+    }
+    await (backwards ? prevMatch(scribe) : nextMatch(scribe));
+    updateSearchCounter();
+  }
+
+  /**
+   * @returns {() => void} A cleanup function that removes the listener.
+   */
+  function installFindShortcut() {
+    const handler = (event) => {
+      if (event.altKey || scribe.opt.keyboardScope === 'off') return;
+      const mod = event.ctrlKey || event.metaKey;
+      const isFind = mod && (event.key === 'f' || event.key === 'F');
+      const isStep = (mod && (event.key === 'g' || event.key === 'G')) || (!mod && event.key === 'F3');
+      if (!isFind && !isStep) return;
+      const target = event.target instanceof Node ? event.target : null;
+      const insideThis = !!(target && rootElem.contains(target));
+      const isActive = ScribeViewer.getActiveViewer() === scribe;
+      const inScope = scribe.opt.keyboardScope === 'global' ? isActive : (insideThis || isActive);
+      if (!inScope) return;
+      event.preventDefault();
+      if (isFind) openSearch();
+      else stepMatch(event.shiftKey);
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }
+
+  return {
+    searchElem,
+    findGroupElem,
+    searchInputElem,
+    searchCounterElem,
+    openSearch,
+    closeSearch,
+    runSearch,
+    updateSearchCounter,
+    resetSearch,
+    rehome,
+    stepMatch,
+    installFindShortcut,
+  };
+}
+
+/** @type {Set<string>} Root classes already injected, so each is added at most once. */
+const injected = new Set();
+
+/**
+ * Inject the shared control stylesheet scoped to `rootClass`, once per class.
+ * @param {string} [rootClass='scribe-pdf-viewer']
+ */
+export function addControlStyles(rootClass = 'scribe-pdf-viewer') {
+  if (injected.has(rootClass)) return;
+  injected.add(rootClass);
+
+  const r = rootClass;
+  const style = document.createElement('style');
+  style.type = 'text/css';
+
+  const css = `
+    /* Design tokens. Light is the default, and [data-theme="dark"] swaps to the dark palette.
+       The document page itself is never themed, only the chrome. */
+    .${r} {
+      /* Pinch-zoom consults the whole ancestor chain, so this single declaration keeps Safari's page zoom from engaging on any touch inside the app.
+         Engaged page zoom re-rasters the content-sized layer tree at gesture scale and jetsams the tab on iPhones.
+         The document viewer's own pinch runs on touch events, which touch-action does not suppress. */
+      touch-action: pan-x pan-y;
+      font-synthesis-weight: none;
+      --scribe-surface: #ffffff;
+      --scribe-canvas: #f4f6fa;
+      --scribe-sunken: #eef1f6;
+      --scribe-line: #e4e8ef;
+      --scribe-line-strong: #d7dce4;
+      --scribe-hover: rgba(28, 42, 68, .06);
+      --scribe-active: rgba(28, 98, 212, .10);
+      --scribe-ink: #1f2530;
+      --scribe-ink-2: #586170;
+      --scribe-ink-3: #98a1b0;
+      --scribe-accent: #1c62d4;
+      --scribe-accent-hover: #1550ad;
+      --scribe-accent-ink: #ffffff;
+      --scribe-accent-soft: #e8f0fd;
+      --scribe-accent-ring: rgba(28, 98, 212, .30);
+      --scribe-accent-wash: rgba(28, 98, 212, .14);
+      --scribe-match: #e4e6ea;
+      --scribe-match-active: #a4c0ee;
+      --scribe-note: #f4d06a;
+      --scribe-warn-soft: #fbf1d3;
+      --scribe-danger: #d1493d;
+      --scribe-danger-soft: #fbe9e7;
+      --scribe-scrollbar: rgba(28, 42, 68, .26);
+      --scribe-shadow-pop: 0 8px 28px rgba(20, 30, 60, .17);
+      --scribe-menu-shadow: 0 1px 2px rgba(20, 30, 60, .10), 0 5px 14px rgba(20, 30, 60, .12);
+      --scribe-page-shadow: 0 1px 3px rgba(30, 26, 16, .18);
+      --scribe-lift-shadow: 0 10px 24px rgba(20, 30, 60, .30);
+      --scribe-plate: rgba(28, 42, 68, .09);
+      --scribe-tip-bg: #5e5950;
+      --scribe-tip-ink: #ffffff;
+      --scribe-tip-ink-2: rgba(255, 255, 255, .72);
+      --scribe-tip-shadow: 0 2px 6px rgba(20, 30, 60, .22);
+    }
+    .${r}[data-theme="dark"] {
+      --scribe-surface: #1c2028;
+      --scribe-canvas: #12151b;
+      --scribe-sunken: #262b34;
+      --scribe-line: #2b313c;
+      --scribe-line-strong: #3a4150;
+      --scribe-hover: rgba(255, 255, 255, .06);
+      --scribe-active: rgba(79, 139, 240, .16);
+      --scribe-ink: #e8ebf2;
+      --scribe-ink-2: #9aa4b3;
+      --scribe-ink-3: #6b7482;
+      --scribe-accent: #4f8bf0;
+      --scribe-accent-hover: #6a9df3;
+      --scribe-accent-ink: #ffffff;
+      --scribe-accent-soft: #1e2c44;
+      --scribe-accent-ring: rgba(79, 139, 240, .38);
+      --scribe-accent-wash: rgba(79, 139, 240, .22);
+      --scribe-match: #e4e6ea;
+      --scribe-match-active: #a4c0ee;
+      --scribe-note: #f0cd68;
+      --scribe-warn-soft: #3a3117;
+      --scribe-danger: #ef7a6c;
+      --scribe-danger-soft: #33201d;
+      --scribe-scrollbar: rgba(255, 255, 255, .26);
+      --scribe-shadow-pop: 0 10px 30px rgba(0, 0, 0, .55);
+      --scribe-menu-shadow: 0 1px 2px rgba(0, 0, 0, .40), 0 6px 16px rgba(0, 0, 0, .48);
+      --scribe-page-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+      --scribe-lift-shadow: 0 12px 28px rgba(0, 0, 0, .7);
+      --scribe-plate: rgba(255, 255, 255, .09);
+      --scribe-tip-bg: #5e5950;
+      --scribe-tip-ink: #ffffff;
+      --scribe-tip-ink-2: rgba(255, 255, 255, .72);
+      --scribe-tip-shadow: 0 2px 8px rgba(0, 0, 0, .5);
+    }
+
+    .${r} .scribe-viewport { font-synthesis-weight: auto; }
+
+    .${r} .cr-icon {
+      align-items: center;
+      display: inline-flex;
+      justify-content: center;
+      position: relative;
+      vertical-align: middle;
+      fill: currentcolor;
+      stroke: none;
+      width: var(--scribe-icon-size, 32px);
+      height: var(--scribe-icon-size, 32px);
+    }
+
+    /* Glyphs keep their authored size when it fits, but shrink to the icon box on a short toolbar. */
+    .${r} .cr-icon svg {
+      max-width: 100%;
+      max-height: 100%;
+    }
+    .${r}.scribe-coarse .scribe-bar-glyph { width: calc(var(--scribe-icon-size, 32px) - 2px); height: calc(var(--scribe-icon-size, 32px) - 2px); }
+
+    .${r} .cr-icon-button {
+      -webkit-tap-highlight-color: transparent;
+      border-radius: 7px;
+      color: var(--scribe-ink-2);
+      cursor: pointer;
+      display: inline-flex;
+      flex-shrink: 0;
+      height: var(--scribe-icon-size, 32px);
+      outline: 0px;
+      overflow: hidden;
+      position: relative;
+      user-select: none;
+      vertical-align: middle;
+      width: var(--scribe-icon-size, 32px);
+      transition: background-color .12s ease, color .12s ease;
+    }
+
+    .${r} .cr-icon-button:hover {
+      background: var(--scribe-hover);
+      color: var(--scribe-ink);
+      border-radius: 7px;
+    }
+
+    .${r} .cr-icon-button.active {
+      background: var(--scribe-active);
+      color: var(--scribe-accent);
+    }
+
+    /* An icon button grown to carry a text label, for toggles that name their mode. */
+    .${r} .cr-labeled-button {
+      width: auto;
+      padding-right: 10px;
+      align-items: center;
+    }
+
+    .${r} .cr-labeled-button .cr-btn-label {
+      font-size: 12.5px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .${r} .cr-icon-button.busy {
+      opacity: .5;
+      pointer-events: none;
+    }
+
+    /* A control that needs an open document is dimmed in place rather than hidden, so the bar never re-flows. */
+    .${r} .cr-icon-button.disabled {
+      color: color-mix(in srgb, var(--scribe-ink-2) 50%, var(--scribe-ink-3));
+      cursor: default;
+      pointer-events: none;
+    }
+
+    .${r} .scribe-tip {
+      position: absolute; left: 0; top: 0; z-index: 70; pointer-events: none; opacity: 0;
+      padding: 4px 8px; border-radius: 5px; background: var(--scribe-tip-bg); color: var(--scribe-tip-ink);
+      box-shadow: var(--scribe-tip-shadow); font-size: 12px; line-height: 1.3; white-space: nowrap; user-select: none;
+    }
+    .${r} .scribe-tip.on { opacity: 1; transition: opacity .08s ease-out; }
+    .${r} .scribe-tip-key { margin-left: 9px; color: var(--scribe-tip-ink-2); }
+
+    .${r} .scribe-app-menu-wrap {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      /* Match the sibling .cr-icon-buttons (vertical-align: middle), since the default baseline value would otherwise make this wrap ride ~9px high. */
+      vertical-align: middle;
+    }
+    .${r} .scribe-app-menu {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 30;
+      min-width: 214px;
+      ${MENU_PLATE_CSS}
+    }
+    .${r} .scribe-app-menu-item {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      cursor: pointer;
+      ${MENU_ROW_CSS}
+    }
+    .${r} .scribe-app-menu-item:hover, .${r} .scribe-app-menu-item:focus { background: var(--scribe-hover); outline: none; }
+    .${r} .scribe-app-menu-x { flex: none; margin: -2px -4px -2px auto; width: 18px; height: 18px; border: none; border-radius: 4px; padding: 0; background: none; color: var(--scribe-ink-3); font: inherit; font-size: 15px; line-height: 1; cursor: pointer; visibility: hidden; }
+    .${r} .scribe-app-menu-item:hover .scribe-app-menu-x, .${r} .scribe-app-menu-item:focus-within .scribe-app-menu-x, .${r}.scribe-coarse .scribe-app-menu-x { visibility: visible; }
+    .${r} .scribe-app-menu-x:hover { background: var(--scribe-plate); color: var(--scribe-ink); }
+    .${r} .scribe-app-menu-x:focus-visible { outline: 2px solid var(--scribe-accent); outline-offset: -1px; }
+    .${r} .scribe-app-menu-item.busy { opacity: .6; pointer-events: none; }
+    .${r} .scribe-app-menu-item.disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r} .scribe-app-menu-item.disabled:hover { background: none; }
+    .${r} .scribe-app-menu-accel { margin-left: auto; padding-left: 26px; font-size: 12px; color: var(--scribe-ink-3); }
+    .${r} .scribe-app-menu-subwrap { position: relative; }
+    .${r} .scribe-app-menu-subchev { margin-left: auto; padding-left: 26px; font-size: 14px; line-height: 1; color: var(--scribe-ink-3); }
+    .${r} .scribe-app-menu-sub { display: none; left: calc(100% - 6px); top: -5px; min-width: 190px; }
+    .${r} .scribe-app-menu-subwrap.sub-open .scribe-app-menu-sub { display: block; }
+
+    .${r} .scribe-fs-pal { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 30;
+      background: var(--scribe-surface); border: 1px solid var(--scribe-line); border-radius: 10px;
+      box-shadow: var(--scribe-menu-shadow); padding: 4px; display: flex; gap: 2px; align-items: center; cursor: grab; }
+    .${r} .scribe-fs-grip { width: 18px; height: 24px; color: var(--scribe-ink-3); display: flex; align-items: center; justify-content: center; }
+    .${r} .scribe-fs-grip svg { width: 16px; height: 16px; fill: currentColor; }
+    .${r} .scribe-fs-lbl { display: none; }
+    /* Undo shows only on the phone, where this mode otherwise has no undo control at all. */
+    .${r} .scribe-fs-undo { display: none; }
+    .${r}.scribe-phone .scribe-fs-pal .scribe-fs-undo { display: inline-flex; }
+    .${r}.scribe-phone.scribe-vbar-on .scribe-fs-pal { display: none; }
+    /* On phone the palette restyles into a tool bar, in the same bottom slot the verb bar uses. */
+    .${r}.scribe-phone .scribe-fs-pal { left: 0; right: 0; bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      transform: none; height: 52px; box-sizing: border-box; z-index: 24; justify-content: center;
+      border: none; border-top: 1px solid var(--scribe-line); border-radius: 0; box-shadow: none;
+      padding: 0 6px; cursor: default; }
+    .${r}.scribe-phone .scribe-fs-grip { display: none; }
+    .${r}.scribe-phone .scribe-fs-pal .cr-icon-button { width: auto; height: 44px; min-width: 44px;
+      padding: 0 9px; border-radius: 8px; align-items: center; justify-content: center; gap: 6px;
+      font-size: 12.5px; font-weight: 600; color: var(--scribe-ink); }
+    .${r}.scribe-phone .scribe-fs-pal .cr-icon-button > svg { width: 20px; height: 20px; flex: none; color: var(--scribe-ink-2); }
+    .${r}.scribe-phone .scribe-fs-pal .cr-icon-button.active { color: var(--scribe-accent); }
+    .${r}.scribe-phone .scribe-fs-pal .cr-icon-button.active > svg { color: var(--scribe-accent); }
+    .${r}.scribe-phone .scribe-fs-pal .scribe-fs-lbl { display: inline; }
+    .${r} .scribe-fs-menu { position: absolute; bottom: calc(100% + 6px); right: 0; min-width: 210px;
+      background: var(--scribe-surface); border: 1px solid var(--scribe-line); border-radius: 8px;
+      box-shadow: var(--scribe-menu-shadow); padding: 4px; z-index: 31; }
+    .${r} .scribe-fs-menu-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 5px;
+      cursor: pointer; color: var(--scribe-ink); font-size: 12.5px; }
+    .${r} .scribe-fs-menu-item:hover { background: var(--scribe-hover); }
+    .${r} .scribe-fs-menu-prev { flex: 1; height: 30px; display: flex; align-items: center; }
+    .${r} .scribe-fs-menu-prev svg, .${r} .scribe-fs-menu-prev img { max-width: 150px; max-height: 30px; }
+    /* Safari gives a viewBox-only SVG zero width as a flex item, so the size is set here and not just capped above. */
+    .${r} .scribe-fs-menu-prev svg { width: 100%; height: 100%; }
+    .${r} .scribe-fs-menu-del { width: 20px; height: 20px; border-radius: 4px; display: flex; align-items: center;
+      justify-content: center; color: var(--scribe-ink-3); font-size: 14px; }
+    .${r} .scribe-fs-menu-del:hover { background: var(--scribe-hover); color: #d1493d; }
+    .${r} .scribe-fs-menu-ic { width: 18px; height: 18px; display: flex; }
+    .${r} .scribe-fs-menu-ic svg { width: 16px; height: 16px; }
+    /* The preview chip stays white in both themes. */
+    .${r}.scribe-phone .scribe-fs-menu { min-width: 250px; max-height: 232px; overflow-y: auto; }
+    .${r}.scribe-phone .scribe-fs-menu-item { min-height: 44px; padding: 4px 6px; font-size: 13px; }
+    .${r}.scribe-phone .scribe-fs-menu-item:hover { background: none; }
+    .${r}.scribe-phone .scribe-fs-menu-item:active { background: var(--scribe-hover); }
+    .${r}.scribe-phone .scribe-fs-menu-prev { height: 36px; background: #ffffff; border: 1px solid var(--scribe-line);
+      border-radius: 6px; justify-content: center; }
+    .${r}.scribe-phone .scribe-fs-menu-prev svg, .${r}.scribe-phone .scribe-fs-menu-prev img { max-width: 160px; max-height: 30px; }
+    .${r}.scribe-phone .scribe-fs-menu-del { width: 40px; height: 40px; font-size: 17px; border-radius: 8px; }
+    .${r}.scribe-phone .scribe-fs-menu-del:hover { background: none; color: var(--scribe-ink-3); }
+    .${r}.scribe-phone .scribe-fs-menu-del:active { background: var(--scribe-hover); color: var(--scribe-danger); }
+    .${r}.scribe-phone .scribe-fs-menu-add { padding: 4px 10px; }
+
+    .${r} .scribe-fs-scrim { position: absolute; inset: 0; background: rgba(15, 18, 26, .42); z-index: 60;
+      display: flex; align-items: center; justify-content: center; }
+    .${r} .scribe-fs-dialog { width: min(620px, calc(100% - 32px)); background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line); border-radius: 12px; box-shadow: var(--scribe-menu-shadow);
+      padding: 16px; color: var(--scribe-ink); }
+    .${r} .scribe-fs-dlg-title { font-size: 15px; font-weight: 650; margin-bottom: 10px; }
+    .${r} .scribe-fs-dlg-body { display: grid; }
+    .${r} .scribe-fs-dlg-body > * { grid-area: 1 / 1; }
+    .${r} .scribe-fs-pane-off { visibility: hidden; pointer-events: none; }
+    .${r} .scribe-fs-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--scribe-line); margin-bottom: 12px; }
+    .${r} .scribe-fs-tab { appearance: none; background: none; border: none; padding: 7px 12px; font-size: 13px;
+      color: var(--scribe-ink-2); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+    .${r} .scribe-fs-tab.active { color: var(--scribe-accent); border-bottom-color: var(--scribe-accent); font-weight: 650; }
+    .${r} .scribe-fs-draw { width: 560px; max-width: 100%; height: 180px; border: 1px dashed var(--scribe-line-strong);
+      border-radius: 8px; background: #fff; cursor: crosshair; display: block; touch-action: none; }
+    .${r} .scribe-fs-btn { appearance: none; background: none; border: 1px solid var(--scribe-line-strong);
+      border-radius: 7px; padding: 7px 14px; font-size: 13px; color: var(--scribe-ink); cursor: pointer; margin-top: 8px; }
+    .${r} .scribe-fs-btn:hover { background: var(--scribe-hover); }
+    .${r} .scribe-fs-btn-primary { background: var(--scribe-accent); border-color: var(--scribe-accent); color: #fff; font-weight: 650; }
+    .${r} .scribe-fs-dlg-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+    .${r} .scribe-fs-type-input { width: 100%; box-sizing: border-box; font-size: 14px; padding: 8px 10px;
+      border: 1px solid var(--scribe-line-strong); border-radius: 7px; background: var(--scribe-surface); color: var(--scribe-ink); }
+    .${r} .scribe-fs-fonts { display: flex; gap: 6px; margin: 10px 0; flex-wrap: wrap; }
+    .${r} .scribe-fs-font { appearance: none; background: none; border: 1px solid var(--scribe-line); border-radius: 7px;
+      padding: 0 10px; font-size: 16px; color: var(--scribe-ink); cursor: pointer;
+      height: 34px; line-height: 1; display: inline-flex; align-items: center; }
+    .${r} .scribe-fs-font.active { border-color: var(--scribe-accent); }
+    .${r} .scribe-fs-type-preview { height: 88px; box-sizing: border-box; line-height: 1.2;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 44px; border: 1px dashed var(--scribe-line-strong); border-radius: 8px; background: #fff;
+      color: #101010; padding: 8px; overflow: hidden; }
+    .${r} .scribe-fs-bgtoggle { display: flex; gap: 6px; align-items: center; font-size: 12.5px;
+      color: var(--scribe-ink-2); margin: 8px 0; }
+    /* Capped so a tall upload cannot outgrow the drawing pane and resize the dialog under the user.
+       Only the displayed size shrinks — the saved PNG comes from the canvas backing store. */
+    .${r} .scribe-fs-img-preview { background: repeating-conic-gradient(#eceff4 0 25%, #fff 0 50%) 0 0/16px 16px;
+      border: 1px dashed var(--scribe-line-strong); border-radius: 8px; display: block; max-width: 100%;
+      max-height: 150px; }
+    .${r} .scribe-fs-file { font-size: 12.5px; color: var(--scribe-ink-2); display: block; margin-bottom: 4px; }
+    /* Coarse-pointer (touch-primary) sizing: platform-minimum 44px targets, and 16px input fonts because iOS zooms the page when focusing any input smaller.
+       Keyed on the state class the app constructor sets rather than a media query, so embedders and tests can force either mode. */
+    .${r}.scribe-coarse .scribe-app-menu-item { min-height: 44px; }
+    .${r}.scribe-coarse input,
+    .${r}.scribe-coarse textarea,
+    .${r}.scribe-coarse [contenteditable] { font-size: 16px; }
+    /* A long press starts the platform's own text selection, which sweeps the zoom layer's unscaled text layout and jetsams the tab on iPhones.
+       The custom engine owns document selection, so native selection and the long-press callout stay off everywhere on touch devices. */
+    .${r}.scribe-coarse,
+    .${r}.scribe-coarse * {
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .${r}.scribe-coarse input,
+    .${r}.scribe-coarse textarea,
+    .${r}.scribe-coarse [contenteditable] {
+      -webkit-user-select: auto;
+      user-select: auto;
+    }
+    .${r}.scribe-coarse .scribe-drop-btn { min-height: 44px; }
+    /* The panel resize strips are invisible hit areas (cursor only), so widening them costs nothing visually. */
+    .${r}.scribe-coarse .scribe-thumb-resize,
+    .${r}.scribe-coarse .scribe-bm-resize,
+    .${r}.scribe-coarse .scribe-am-resize,
+    .${r}.scribe-coarse .scribe-cm-resize { width: 18px; }
+
+    /* Touch priority: controls whose job lives in a gesture on touch (zoom = pinch/double-tap) or is rare enough for the app menu (rotate) leave the bar, so a single row fits tablet widths at 44px targets.
+       The app-menu rows that replace them show only then. */
+    .${r}.scribe-coarse .scribe-touch-hide,
+    .${r}.scribe-phone .scribe-touch-hide { display: none !important; }
+    /* Phone-only hide, for a control tablets keep. The phone layout forces single-page view, so only it drops the two-page toggle. */
+    .${r}.scribe-phone .scribe-phone-hide { display: none !important; }
+    .${r} .scribe-app-menu-item.scribe-touch-row { display: none; }
+    .${r}.scribe-coarse .scribe-app-menu-item.scribe-touch-row,
+    .${r}.scribe-phone .scribe-app-menu-item.scribe-touch-row { display: flex; }
+
+    /* ---- Phone layout (scribe-phone): the thumb dock replaces the top toolbar. ----
+       The dock carries the irreducible set (menu, find, page pill, panels) at the bottom in thumb reach, above the home indicator.
+       No bars above the document. */
+    .${r} .scribe-dock {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      /* Above the sheet (z-index 25), which slides up from behind the dock.
+         Without this the rising sheet covers the dock mid-animation and the dock pops back over it at the end. */
+      z-index: 26;
+      display: none;
+      align-items: center;
+      justify-content: space-evenly;
+      /* 56px of controls + the home-indicator safe area; border-box so offsetHeight is exactly the dock's height. */
+      height: calc(56px + env(safe-area-inset-bottom, 0px));
+      box-sizing: border-box;
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+      background: var(--scribe-surface);
+      border-top: 1px solid var(--scribe-line);
+      color: var(--scribe-ink);
+    }
+    .${r}.scribe-phone .scribe-dock { display: flex; }
+    /* Dock targets are 44px regardless of pointer: this bar exists only in the phone layout. */
+    .${r} .scribe-dock .cr-icon-button { width: 44px; height: 44px; }
+    /* The page-number pill: information first, tap to go to a page.
+       44px tall: the input inside is interactive, so the pill is a touch target like its dock siblings.
+       "2 / 14" must read as one piece of text, not an input beside a label. */
+    .${r} .scribe-dock .btn-group {
+      height: 44px;
+      box-sizing: border-box;
+      padding: 0 16px;
+      border-radius: 999px;
+      background: var(--scribe-sunken);
+      border: 1px solid var(--scribe-line);
+      font-size: 16px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    /* font: inherit is load-bearing: an input does not inherit font on its own, and the "-toolbar input" font rules do not match inside the dock, so the page number would render in the browser's default font. */
+    .${r} .scribe-dock .btn-group input {
+      font: inherit;
+      border: none;
+      background: transparent;
+      color: var(--scribe-ink);
+      text-align: right;
+      padding: 0;
+      margin: 0;
+    }
+    /* The count span's min-width/padding are inline styles from the desktop toolbar, so zeroing them here needs !important. */
+    .${r} .scribe-dock .btn-group span { font-size: 16px !important; min-width: 0 !important; padding-left: 0 !important; }
+    .${r} .scribe-dock .btn-group .scribe-page-sep { color: var(--scribe-ink-3); font-weight: 500; margin: 0 5px; }
+
+    /* The app menu opens upward from the dock.
+       The app sets --scribe-phone-menu-max to the height above the dock, so a long menu scrolls in place instead of leaving the top edge. */
+    .${r}.scribe-phone .scribe-app-menu {
+      top: auto;
+      bottom: calc(100% + 10px);
+      max-height: var(--scribe-phone-menu-max, calc(100dvh - 140px));
+      overflow-y: auto;
+    }
+
+    /* Phone find bar: a full-width surface at the bottom, the mobile convention of sitting just above the keyboard.
+       The app tracks the keyboard overlap into --scribe-kb-inset (visualViewport), and the bar rides just above it, or 8px above the dock when no keyboard is up.
+       The input row wraps below the controls so it sits nearest the keyboard. */
+    .${r}.scribe-phone .scribe-search-group {
+      top: auto;
+      bottom: max(calc(64px + env(safe-area-inset-bottom, 0px)), calc(var(--scribe-kb-inset, 0px) + 8px));
+      left: 8px;
+      right: 8px;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 8px;
+    }
+    .${r}.scribe-phone input.scribe-search-input {
+      flex: 1 1 100%;
+      order: 2;
+      height: 40px;
+      box-sizing: border-box;
+      padding: 0 10px;
+      border: 1px solid var(--scribe-line-strong);
+      border-radius: 6px;
+      background: var(--scribe-surface);
+      color: var(--scribe-ink);
+      font-size: 16px;
+      text-align: left;
+    }
+    .${r}.scribe-phone .scribe-search-count { margin-right: auto; }
+
+    /* Toasts clear the dock instead of hiding behind it. */
+    .${r}.scribe-phone .scribe-toast-stack { bottom: calc(72px + env(safe-area-inset-bottom, 0px)); }
+
+    /* ---- Phone editing modes: the Edit slot's mode sheet, the dock's mode bar, and the docked verb bar. ---- */
+    .${r} .scribe-mode-sheet {
+      position: absolute;
+      left: 0; right: 0;
+      bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      z-index: 25;
+      background: var(--scribe-surface);
+      border-top: 1px solid var(--scribe-line);
+      border-radius: 14px 14px 0 0;
+      box-shadow: 0 -6px 22px rgba(20, 30, 60, .14);
+      padding: 0 0 10px;
+      /* The hidden transform adds the dock offset: the sheet rests one dock-height above the bottom edge, so a bare 102% would leave it peeking over the dock. */
+      transform: translateY(calc(102% + 56px + env(safe-area-inset-bottom, 0px)));
+      transition: transform 0.26s cubic-bezier(0.3, 0.9, 0.3, 1);
+    }
+    .${r} .scribe-mode-sheet.open { transform: translateY(0); }
+    .${r} .scribe-mode-sheet.dragging { transition: none; }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-mode-sheet { transition: none; }
+    }
+    .${r} .scribe-mode-sheet-hd {
+      position: relative;
+      height: 16px;
+      cursor: grab;
+      touch-action: none;
+    }
+    .${r} .scribe-mode-sheet-hd .scribe-sheet-pill { top: 6px; }
+    .${r} .scribe-mode-sheet-row {
+      display: flex; align-items: center; gap: 12px;
+      width: 100%; min-height: 52px; padding: 6px 16px; box-sizing: border-box;
+      background: none; border: none; text-align: left; cursor: pointer;
+      color: var(--scribe-ink);
+      font-family: inherit;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-mode-sheet-row:disabled { opacity: .45; cursor: default; }
+    .${r} .scribe-mode-sheet-row.on { background: var(--scribe-active); }
+    .${r} .scribe-mode-sheet-ic { width: 22px; height: 22px; flex: none; color: var(--scribe-ink-2); }
+    .${r} .scribe-mode-sheet-ic svg { width: 22px; height: 22px; display: block; }
+    .${r} .scribe-mode-sheet-row.on .scribe-mode-sheet-ic, .${r} .scribe-mode-sheet-row.on .scribe-mode-sheet-nm { color: var(--scribe-accent); }
+    .${r} .scribe-mode-sheet-txt { display: flex; flex-direction: column; line-height: 1.3; }
+    .${r} .scribe-mode-sheet-nm { font-size: 15px; font-weight: 600; }
+    .${r} .scribe-mode-sheet-sub { font-size: 12px; color: var(--scribe-ink-3); }
+
+    /* !important because the page pill carries an inline display from the desktop toolbar. */
+    .${r} .scribe-dock-mode { display: none; }
+    .${r} .scribe-dock.scribe-mode-on > :not(.scribe-dock-mode) { display: none !important; }
+    .${r} .scribe-dock.scribe-mode-on .scribe-dock-mode {
+      display: flex; align-items: center; gap: 7px;
+      width: 100%; height: 100%;
+      padding: 0 6px 0 14px; box-sizing: border-box;
+    }
+    .${r} .scribe-dock-mode-ic { width: 20px; height: 20px; flex: none; color: var(--scribe-accent); }
+    .${r} .scribe-dock-mode-ic svg { width: 20px; height: 20px; display: block; }
+    /* The name is the only element that shrinks, so a crowded bar truncates it rather than clipping Done. */
+    .${r} .scribe-dock-mode-nm { font-size: 14px; font-weight: 650; white-space: nowrap; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .${r} .scribe-dock-mode-status { margin-left: auto; font-size: 12px; color: var(--scribe-ink-3); white-space: nowrap; }
+    .${r} .scribe-dock-mode-done {
+      flex: none; min-height: 44px; padding: 0 14px;
+      background: none; border: none; border-radius: 8px; cursor: pointer;
+      font-family: inherit; font-size: 15px; font-weight: 650; color: var(--scribe-accent);
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-dock-mode-save, .${r} .scribe-dock-mode-discard {
+      flex: none; min-height: 44px; padding: 0 12px;
+      background: none; border: none; border-radius: 8px; cursor: pointer;
+      font-family: inherit; font-size: 15px; font-weight: 650; color: var(--scribe-accent);
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-dock-mode-discard { font-weight: 600; }
+    .${r} .scribe-dock-mode-save:disabled { color: var(--scribe-ink-3); cursor: default; }
+    /* The banner sizes Start for a mouse row, so the dock re-sizes it as a touch target. */
+    .${r} .scribe-dock-mode .scribe-mode-banner-run { flex: none; min-height: 40px; padding-left: 16px; padding-right: 16px; font-size: 13.5px; }
+
+    .${r} .scribe-recog-dock { display: contents; }
+    /* The row's status span carries nothing in this mode, and its auto margin would otherwise hold Start away from Done. */
+    .${r} .scribe-dock-mode.scribe-mode-recognize .scribe-dock-mode-status { display: none; }
+    .${r} .scribe-recog-chip {
+      flex: 0 1 auto; min-width: 0; min-height: 40px; padding: 0 8px 0 12px; margin-right: auto;
+      display: inline-flex; align-items: center; gap: 3px;
+      border: 1px solid var(--scribe-line-strong); border-radius: 8px; background: none; cursor: pointer;
+      font-family: inherit; font-size: 13.5px; color: var(--scribe-ink-2); white-space: nowrap;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-recog-chip b { color: var(--scribe-ink); font-weight: 600; }
+    .${r} .scribe-recog-chip svg, .${r} .scribe-recog-two-b svg { width: 14px; height: 14px; color: var(--scribe-ink-3); display: block; flex: none; }
+    .${r} .scribe-recog-two {
+      flex: 1 1 auto; min-width: 0; min-height: 44px; padding: 0 4px;
+      display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 1px;
+      background: none; border: none; border-radius: 8px; cursor: pointer; text-align: left;
+      font-family: inherit; color: var(--scribe-ink);
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-recog-two-a { max-width: 100%; font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .${r} .scribe-recog-two-b { font-size: 12px; color: var(--scribe-ink-2); display: inline-flex; align-items: center; gap: 1px; white-space: nowrap; }
+    .${r} .scribe-recog-prog { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+    .${r} .scribe-recog-prog-row { display: flex; align-items: baseline; font-size: 12.5px; font-weight: 600; color: var(--scribe-ink); white-space: nowrap; }
+    .${r} .scribe-recog-track { height: 5px; border-radius: 3px; background: var(--scribe-sunken); overflow: hidden; position: relative; }
+    .${r} .scribe-recog-track > i { display: block; height: 100%; width: 0%; background: var(--scribe-accent); border-radius: 3px; transition: width .2s ease; }
+    /* A sheen for the stretches with no page fraction to draw. */
+    .${r} .scribe-recog-track.alive::after {
+      content: ''; position: absolute; top: 0; bottom: 0; width: 42%; left: 0;
+      background: linear-gradient(100deg, transparent, var(--scribe-accent-ring), transparent);
+      animation: scribe-recog-sheen 1.8s ease-in-out infinite;
+    }
+    .${r} .scribe-recog-cancel {
+      width: 44px; height: 44px; padding: 8px; margin-right: -4px; flex: none;
+      border: none; background: none; border-radius: 8px; color: var(--scribe-accent); cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-recog-cancel svg { display: block; width: 100%; height: 100%; }
+    .${r} .scribe-recog-cancel:disabled { opacity: .45; cursor: default; }
+    .${r} .scribe-recog-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 52px; padding: 6px 16px; box-sizing: border-box; color: var(--scribe-ink); }
+    .${r} .scribe-recog-row-nm { font-size: 15px; font-weight: 600; }
+    /* The select's 44px target overhangs the row's padding by 2px each way, so the row keeps the sheet's 52px rhythm. */
+    .${r} .scribe-recog-selwrap { margin-left: auto; margin-block: -2px; position: relative; display: inline-flex; align-items: center; }
+    /* 16px, since iOS Safari zooms the page for a focused control set smaller. */
+    .${r} .scribe-recog-select {
+      appearance: none; -webkit-appearance: none; border: 0; background: none; cursor: pointer;
+      font-family: inherit; font-size: 16px; font-weight: 400; color: var(--scribe-ink-2);
+      min-height: 44px; padding: 0 20px 0 8px; max-width: 210px; border-radius: 8px;
+      text-align: right; text-align-last: right;
+    }
+    .${r} .scribe-recog-selwrap svg { position: absolute; right: 2px; top: 50%; width: 14px; height: 14px; transform: translateY(-50%); color: var(--scribe-ink-3); pointer-events: none; }
+    .${r} .scribe-recog-row .scribe-sheet-seg { margin-left: auto; }
+    .${r} .scribe-recog-row .scribe-sheet-seg button:disabled { opacity: .45; cursor: default; }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-recog-track.alive::after { content: none; }
+      .${r} .scribe-recog-track > i { transition: none; }
+    }
+
+    /* The picked object's verbs, docked above the dock and never over the document. */
+    .${r} .scribe-vbar {
+      position: absolute;
+      left: 0; right: 0;
+      bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      height: 52px; z-index: 24;
+      display: none; align-items: center; gap: 2px;
+      padding: 0 6px; box-sizing: border-box;
+      background: var(--scribe-surface);
+      border-top: 1px solid var(--scribe-line);
+      overflow-x: auto; scrollbar-width: none;
+    }
+    .${r} .scribe-vbar::-webkit-scrollbar { display: none; }
+    .${r}.scribe-phone .scribe-vbar.on { display: flex; }
+    .${r} .scribe-vbtn {
+      min-height: 44px; min-width: 44px; padding: 0 9px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      background: none; border: none; border-radius: 8px; cursor: pointer;
+      font-family: inherit; font-size: 12.5px; font-weight: 600; color: var(--scribe-ink);
+      flex: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-vbtn:disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r} .scribe-vbtn:disabled .scribe-vbtn-ic { color: var(--scribe-ink-3); }
+    .${r} .scribe-vbtn.active { background: var(--scribe-active); color: var(--scribe-accent); }
+    .${r} .scribe-vbtn.active .scribe-vbtn-ic { color: var(--scribe-accent); }
+    .${r} .scribe-vbtn-ic { width: 20px; height: 20px; color: var(--scribe-ink-2); }
+    .${r} .scribe-vbtn-ic svg { width: 20px; height: 20px; display: block; }
+    .${r} .scribe-vbtn.danger { color: var(--scribe-danger); }
+    .${r} .scribe-vbtn.danger .scribe-vbtn-ic { color: var(--scribe-danger); }
+    .${r} .scribe-vbtn.danger:disabled { color: var(--scribe-ink-3); }
+    .${r} .scribe-vbtn.danger:disabled .scribe-vbtn-ic { color: var(--scribe-ink-3); }
+    .${r} .scribe-vbtn.accent { color: var(--scribe-accent); font-size: 15px; font-weight: 650; margin-left: auto; }
+    .${r} .scribe-vbar-sep { width: 1px; height: 26px; background: var(--scribe-line); margin: 0 3px; flex: none; }
+    .${r} .scribe-vbar-hint { font-size: 12.5px; color: var(--scribe-ink-3); padding-left: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+    .${r}.scribe-phone.scribe-vbar-on .scribe-strip { bottom: calc(108px + env(safe-area-inset-bottom, 0px)); }
+    .${r}.scribe-phone.scribe-fsbar-on .scribe-strip { bottom: calc(108px + env(safe-area-inset-bottom, 0px)); }
+    .${r}.scribe-line-editing .scribe-strip.on { display: none; }
+    .${r}.scribe-phone.scribe-line-editing .scribe-vbar.on {
+      bottom: max(calc(56px + env(safe-area-inset-bottom, 0px)), var(--scribe-kb-inset, 0px));
+      z-index: 31;
+    }
+
+    /* ---- Phone panels: one bottom sheet hosts pages/bookmarks/comments. ----
+       There is no scrim: opening the sheet reflows the document into the space above it (_docBottomInset), so the page stays interactive and the dock stays visible to toggle the sheet closed.
+       The scrim element below is retained but never shown. */
+    .${r} .scribe-sheet-scrim {
+      position: absolute;
+      inset: 0;
+      z-index: 24;
+      background: rgba(12, 16, 26, 0.42);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.22s ease;
+    }
+    .${r} .scribe-sheet-scrim.open { opacity: 1; pointer-events: auto; }
+    .${r} .scribe-sheet {
+      position: absolute;
+      left: 0; right: 0;
+      bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      z-index: 25;
+      height: 50%;
+      display: flex;
+      flex-direction: column;
+      box-sizing: border-box;
+      background: var(--scribe-surface);
+      /* Text the views leave uncolored, like the inspector's table cells, takes the surface's ink rather than the root's black. */
+      color: var(--scribe-ink);
+      border-radius: 18px 18px 0 0;
+      box-shadow: var(--scribe-shadow-pop);
+      /* The hidden transform adds the dock offset: the sheet rests one dock-height above the bottom edge, so a bare 102% would leave it peeking over the dock. */
+      transform: translateY(calc(102% + 56px + env(safe-area-inset-bottom, 0px)));
+      transition: transform 0.26s cubic-bezier(0.3, 0.9, 0.3, 1), height 0.26s cubic-bezier(0.3, 0.9, 0.3, 1);
+    }
+    .${r} .scribe-sheet.open { transform: translateY(0); }
+    /* The inspector's full height leaves 44px of page in view above it (SHEET_FULL_GAP in pdf-viewer.js). */
+    .${r} .scribe-sheet.scribe-sheet-full { height: calc(100% - 56px - 44px - env(safe-area-inset-bottom, 0px)); }
+    .${r} .scribe-sheet.dragging { transition: none; }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-sheet, .${r} .scribe-sheet-scrim { transition: none; }
+    }
+    /* Replaces the panel tabs in the sheet header while the inspector's view is up. */
+    .${r} .scribe-sheet-title { flex: 1; min-width: 0; font-size: 15px; font-weight: 600; color: var(--scribe-ink); padding-left: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* One-row sheet header: pill cap on the top edge, tabs left, the active panel's actions right. */
+    .${r} .scribe-sheet-hd {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+      padding: 10px 10px 5px 12px;
+      cursor: grab;
+      touch-action: none;
+    }
+    .${r} .scribe-sheet-pill {
+      position: absolute;
+      top: 5px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 40px;
+      height: 4.5px;
+      border-radius: 3px;
+      background: var(--scribe-ink-3);
+      opacity: 0.55;
+      pointer-events: none;
+    }
+    .${r} .scribe-sheet-seg { display: flex; gap: 4px; min-width: 0; }
+    .${r} .scribe-sheet-seg button {
+      min-height: 36px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      cursor: pointer;
+      font: 600 13px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink-2);
+      white-space: nowrap;
+    }
+    .${r}.scribe-coarse .scribe-sheet-seg button { min-height: 44px; font-size: 14px; }
+    .${r} .scribe-sheet-seg button.on { background: var(--scribe-active); color: var(--scribe-accent); }
+    .${r} .scribe-sheet-acts { display: flex; align-items: center; gap: 5px; margin-left: auto; }
+    /* Bookmarks Move session, not a sheet drag. */
+    .${r} .scribe-sheet-movehd { display: none; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
+    .${r} .scribe-sheet.scribe-sheet-moving .scribe-sheet-seg,
+    .${r} .scribe-sheet.scribe-sheet-moving .scribe-sheet-acts { display: none; }
+    .${r} .scribe-sheet.scribe-sheet-moving .scribe-sheet-movehd { display: flex; }
+    .${r} .scribe-sheet-moving-title {
+      font: 600 14px/1.25 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .${r} .scribe-sheet-moving-done {
+      margin-left: auto;
+      flex: 0 0 auto;
+      border: 0;
+      background: none;
+      color: var(--scribe-accent);
+      cursor: pointer;
+      font: 600 14px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      min-height: 44px;
+      padding: 0 10px;
+      border-radius: 8px;
+    }
+    .${r} .scribe-sheet-act {
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--scribe-ink-2);
+      cursor: pointer;
+    }
+    .${r} .scribe-sheet-act:hover { background: var(--scribe-hover); }
+    .${r} .scribe-sheet-act svg { width: 16px; height: 16px; }
+    .${r}.scribe-coarse .scribe-sheet-act { width: 44px; height: 44px; }
+    .${r} .scribe-sheet-content { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+
+    /* Panels docked in the sheet: neutralize the rail geometry so each panel fills the sheet body.
+       The !important is load-bearing: the rail code positions the panels with inline styles. */
+    .${r} .scribe-sheet-content .scribe-bookmarks-panel,
+    .${r} .scribe-sheet-content .scribe-comments-panel {
+      top: 0 !important;
+      height: 100% !important;
+      width: 100% !important;
+      left: 0 !important;
+      transform: none !important;
+      border-right: none;
+      background: transparent;
+      transition: none;
+      /* The rail slide-in's will-change must not ride into the sheet: a composited layer filling the sheet re-allocates its backing on every frame of a height drag, which jetsams the tab on iPhones. */
+      will-change: auto;
+    }
+    /* The desktop panel title bars are redundant under a tab that already names the panel; their actions live in the sheet header. */
+    .${r} .scribe-sheet-content .scribe-bm-hd,
+    .${r} .scribe-sheet-content .scribe-cm-hd { display: none; }
+    .${r} .scribe-sheet-content .scribe-bm-has-header .scribe-bm-tree { top: 0; }
+    .${r} .scribe-sheet-content .scribe-cm-list { top: 0; }
+    .${r} .scribe-sheet-content .scribe-bm-resize,
+    .${r} .scribe-sheet-content .scribe-cm-resize { display: none; }
+    .${r} .scribe-sheet-content > .scribe-am-inswrap { position: absolute; inset: 0; }
+
+    /* ---- Full-height Pages room: the companion strip's expanded state. ----
+       Slides up from behind the dock like the sheet: a header over the re-homed thumbnail panel, whose compact grid spreads across the room's full width. */
+    .${r} .scribe-pages-room {
+      position: absolute;
+      left: 0; right: 0; top: 0;
+      bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      z-index: 25;
+      display: flex;
+      flex-direction: column;
+      background: var(--scribe-canvas);
+      transform: translateY(calc(103% + 56px + env(safe-area-inset-bottom, 0px)));
+      transition: transform 0.26s cubic-bezier(0.3, 0.9, 0.3, 1);
+    }
+    .${r} .scribe-pages-room.open { transform: translateY(0); }
+    .${r} .scribe-pages-room.dragging { transition: none; }
+    /* Mid-morph the room is one stretching panel: overflow clips the parked reveal row, and the hairline makes the band it starts as pixel-identical to the strip it covers.
+       The line is an inset shadow because a border would consume 1px of the content box and shift everything down relative to the settled room. */
+    .${r} .scribe-pages-room.morphing {
+      overflow: hidden;
+      box-shadow: inset 0 1px 0 0 var(--scribe-line);
+      will-change: transform;
+    }
+    .${r} .scribe-pages-room.sinking {
+      box-shadow: var(--scribe-shadow-pop), inset 0 1px 0 0 var(--scribe-line);
+      will-change: transform;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-pages-room { transition: none; }
+    }
+    .${r} .scribe-room-hd {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+      padding: 10px 6px 10px 14px;
+      background: var(--scribe-surface);
+      border-bottom: 1px solid var(--scribe-line);
+      /* Above the morph layer (z 3), so a stand-in cell riding under the header's band slides beneath it rather than painting over it, matching the settled room where the grid lives below the header. */
+      position: relative;
+      z-index: 4;
+      /* Nothing native pans from the header, so the drag-down close gesture owns every touch that starts here. */
+      touch-action: none;
+    }
+    .${r} .scribe-room-title { font: 700 15px/1 -apple-system, system-ui, 'Segoe UI', sans-serif; color: var(--scribe-ink); }
+    .${r} .scribe-room-count {
+      font: 600 12px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      font-variant-numeric: tabular-nums;
+      color: var(--scribe-ink-3);
+    }
+    .${r} .scribe-room-done {
+      margin-left: auto;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--scribe-accent);
+      font: 700 13.5px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      cursor: pointer;
+    }
+    .${r} .scribe-room-done:hover { background: var(--scribe-hover); }
+    .${r}.scribe-coarse .scribe-room-done { min-height: 44px; }
+    .${r} .scribe-room-body { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+    .${r} .scribe-room-body .scribe-thumb-panel {
+      top: 0 !important;
+      height: 100% !important;
+      width: 100% !important;
+      left: 0 !important;
+      transform: none !important;
+      border-right: none;
+      background: transparent;
+      transition: none;
+      /* The rail slide-in's will-change is dropped here too: the panel never transforms inside the room, so promotion would only pin a panel-sized backing store. */
+      will-change: auto;
+    }
+    .${r} .scribe-room-body .scribe-thumb-resize { display: none; }
+
+    /* Room modes: browse is read-only, and Edit-to-Save carries all mutation.
+       Entering Edit swaps the button's label to Save and hides the room-close Done, so the mode exits only through Save or Discard. */
+    .${r} .scribe-room-edit {
+      margin-left: auto;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--scribe-accent);
+      font: 600 13.5px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      cursor: pointer;
+    }
+    .${r} .scribe-room-edit:hover:not(:disabled) { background: var(--scribe-hover); }
+    /* Save is disabled until the session has changes to commit. */
+    .${r} .scribe-room-edit:disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r}.scribe-coarse .scribe-room-edit { min-height: 44px; }
+    /* The Edit button owns the flexible gap while present; Done then hugs it. */
+    .${r} .scribe-room-edit ~ .scribe-room-done { margin-left: 0; }
+    .${r} .scribe-pages-room.editing .scribe-room-edit { font-weight: 700; }
+    .${r} .scribe-pages-room.editing .scribe-room-hd { box-shadow: inset 0 -2px 0 0 var(--scribe-accent); }
+
+    /* Discard-the-session: shown in Edit mode only, live for the whole session (it is also the mode's cancel).
+       Save keeps the flexible gap, and Discard hugs it at the right edge. */
+    .${r} .scribe-room-revert {
+      min-height: 36px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--scribe-accent);
+      font: 600 13.5px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      cursor: pointer;
+      display: none;
+    }
+    .${r} .scribe-room-revert:hover:not(:disabled) { background: var(--scribe-hover); }
+    .${r} .scribe-room-revert:disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r}.scribe-coarse .scribe-room-revert { min-height: 44px; }
+    .${r} .scribe-pages-room.editing .scribe-room-revert { display: block; }
+
+    /* Edit-mode selection checkbox overhanging each page's top-left corner.
+       The check glyph is always in the markup: color transparent hides it at rest, and .selected turns it white. */
+    .${r} .scribe-thumb-chk {
+      position: absolute;
+      top: -5px;
+      left: -3px;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      /* A checkbox press starts the range-paint gesture, never a scroll.
+         Declared in CSS because iOS only honors touch-action set before the touchstart.
+         WebKit cancels the pointer stream of any moving touch that could still pan, and no listener-side preventDefault can win it back. */
+      touch-action: none;
+      /* Some mobile browsers flash their rectangular tap highlight over the round badge. */
+      -webkit-tap-highlight-color: transparent;
+      border-radius: 50%;
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line-strong);
+      box-shadow: var(--scribe-page-shadow);
+      color: transparent;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 3;
+    }
+    .${r} .scribe-thumb-chk svg { width: 13px; height: 13px; }
+    /* Invisible hit halo: a press near the corner counts as the checkbox, so a near-miss can never wobble into a drag lift.
+       It reaches much further right and down than up and left, because the badge overhangs the corner and a miss lands on the page below or beside it, never off the tile. */
+    .${r} .scribe-thumb-chk::before {
+      content: '';
+      position: absolute;
+      inset: -8px -26px -26px -8px;
+    }
+    .${r} .scribe-pages-room.editing .scribe-thumb-chk,
+    .${r} .scribe-thumb-editmode .scribe-thumb-chk { display: flex; }
+    .${r} .scribe-thumb.selected .scribe-thumb-chk {
+      background: var(--scribe-accent);
+      border-color: var(--scribe-accent);
+      color: #fff;
+    }
+
+    /* A press on a selected page grabs it outright (the lift starts at the press), so no touch that lands there may become a pan.
+       Same iOS constraint as the checkbox above: touch-action must be set in CSS before the touchstart, or WebKit pointercancels the drag on the first finger movement.
+       Unselected pages keep their default touch-action, which is what lets the Edit grid still scroll. */
+    .${r} .scribe-pages-room .scribe-thumb.selected { touch-action: none; }
+
+    /* Room-Edit selection: the page wears the accent ring, not the desktop lift + tint, which reads as a wash at phone cell sizes.
+       While anything is selected the active page's ring stands down to a neutral hairline, so accent means exactly one thing in the grid: selected. */
+    .${r} .scribe-pages-room .scribe-thumb.selected .scribe-thumb-box {
+      transform: none;
+      box-shadow: var(--scribe-page-shadow);
+      outline: 2.5px solid var(--scribe-accent);
+    }
+    .${r} .scribe-pages-room .scribe-thumb.selected .scribe-thumb-box::after { content: none; }
+    .${r} .scribe-pages-room .scribe-thumb-hassel .scribe-thumb.active:not(.selected) .scribe-thumb-box {
+      outline: 1px solid var(--scribe-line-strong);
+    }
+
+    .${r} .scribe-thumb-selbar {
+      position: absolute;
+      left: 10px;
+      right: 10px;
+      bottom: 10px;
+      height: 46px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 0 6px 0 14px;
+      box-sizing: border-box;
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line);
+      border-radius: 12px;
+      box-shadow: var(--scribe-menu-shadow);
+      /* Above in-rail decorations (insert line 50, marquee 40), below the page context menu (60). */
+      z-index: 55;
+      font: 600 13px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink-2);
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity .16s, transform .16s;
+      pointer-events: none;
+    }
+    .${r} .scribe-thumb-selbar.on { opacity: 1; transform: none; pointer-events: auto; }
+    .${r} .scribe-thumb-selbar-count { margin-right: 2px; }
+    .${r} .scribe-thumb-selbar-clear {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      margin-right: auto;
+      padding: 0;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--scribe-ink-3);
+      cursor: pointer;
+    }
+    .${r} .scribe-thumb-selbar-clear svg { width: 15px; height: 15px; }
+    .${r} .scribe-thumb-selbar-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 38px;
+      padding: 0 11px;
+      border: 0;
+      border-radius: 9px;
+      background: none;
+      color: var(--scribe-accent);
+      font: 600 13px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      cursor: pointer;
+    }
+    .${r} .scribe-thumb-selbar-btn svg { width: 16px; height: 16px; }
+    .${r} .scribe-thumb-selbar-btn:hover, .${r} .scribe-thumb-selbar-clear:hover { background: var(--scribe-hover); }
+    .${r} .scribe-thumb-selbar-delete { color: var(--scribe-danger); }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-thumb-selbar { transition: none; }
+    }
+
+    /* Browse-mode page peek: a buttonless preview that lives only under a held finger.
+       pointer-events: none throughout: nothing in it is pressable, and the scrub hit-test must pass through to the cells beneath.
+       The hidden state also needs visibility: hidden.
+       A merely transparent full-panel overlay still claims the compositor's touch hit-test, and pointer-events: none does not remove it.
+       Chrome then treats every touch on the panel as non-cancelable scrolling, which pointercancels any hold gesture on the first movement. */
+    .${r} .scribe-thumb-scrim {
+      position: absolute;
+      inset: 0;
+      background: rgba(12, 16, 26, .35);
+      /* Above the selection bar: the peek dims everything in the panel, the bar included. */
+      z-index: 56;
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      transition: opacity .16s, visibility 0s .16s;
+    }
+    .${r} .scribe-thumb-scrim.on { opacity: 1; visibility: visible; transition: opacity .16s; }
+    .${r} .scribe-thumb-peek {
+      position: absolute;
+      left: 50%;
+      top: 42%;
+      transform: translate(-50%, -50%) scale(.94);
+      transition: transform .16s;
+    }
+    .${r} .scribe-thumb-scrim.on .scribe-thumb-peek { transform: translate(-50%, -50%) scale(1); }
+    .${r} .scribe-thumb-peek-box {
+      position: relative;
+      background: #fff;
+      border-radius: 4px;
+      box-shadow: var(--scribe-shadow-pop);
+      outline: 1px solid rgba(0, 0, 0, .14);
+      overflow: hidden;
+    }
+    .${r} .scribe-thumb-peek-box img {
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: contain;
+    }
+    .${r} .scribe-thumb-peek-cap {
+      margin-top: 8px;
+      text-align: center;
+      font: 600 12px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: #fff;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, .45);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-thumb-scrim, .${r} .scribe-thumb-peek { transition: none; }
+    }
+
+    /* Empty state on touch: dragging a file is not a phone gesture, so the copy leads with opening. */
+    .${r} .scribe-drop-title-touch { display: none; }
+    .${r}.scribe-coarse .scribe-drop-title-touch { display: inline; }
+    .${r}.scribe-coarse .scribe-drop-title-full { display: none; }
+    .${r}.scribe-coarse .scribe-drop-hint { display: none; }
+    .${r} .scribe-app-menu-ic { display: inline-flex; flex: 0 0 auto; width: 16px; height: 16px; color: var(--scribe-ink-2); }
+    .${r} .scribe-app-menu-ic svg { width: 100%; height: 100%; display: block; }
+    .${r} .scribe-app-menu-sep {
+      ${MENU_SEP_CSS}
+    }
+    /* Dark-mode toggle: a pill switch pushed to the row's right edge. */
+    .${r} .scribe-app-menu-switch {
+      margin-left: auto;
+      flex: 0 0 auto;
+      width: 30px;
+      height: 17px;
+      border-radius: 9px;
+      background: var(--scribe-line-strong);
+      position: relative;
+      transition: background .15s ease;
+    }
+    .${r} .scribe-app-menu-switch::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, .3);
+      transition: transform .15s ease;
+    }
+    .${r} .scribe-app-menu-toggle.on .scribe-app-menu-switch { background: var(--scribe-accent); }
+    .${r} .scribe-app-menu-toggle.on .scribe-app-menu-switch::after { transform: translateX(13px); }
+
+    .${r} .scribe-tab-strip {
+      display: flex;
+      align-items: stretch;
+      width: 100%;
+      background: var(--scribe-canvas);
+      border-bottom: 1px solid var(--scribe-line);
+      position: relative;
+    }
+
+    .${r} .scribe-tab-lane {
+      display: flex;
+      align-items: stretch;
+      flex: 1 1 auto;
+      overflow-x: auto;
+      overflow-y: hidden;
+      scroll-behavior: smooth;
+      scrollbar-width: none;
+      /* Safari permits out-of-range scroll offsets while its edge bounce is enabled, so hard-stop the lane's edges. */
+      overscroll-behavior-x: none;
+    }
+    .${r} .scribe-tab-lane::-webkit-scrollbar { display: none; }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-tab-lane { scroll-behavior: auto; }
+    }
+
+    .${r} .scribe-tab-paddle-wrap {
+      flex: none;
+      display: none;
+      align-items: center;
+      gap: 5px;
+      padding: 0 5px;
+      position: relative;
+    }
+    .${r} .scribe-tab-paddle-wrap.left { padding-right: 0; }
+    .${r} .scribe-tab-paddle-wrap.right { padding-left: 0; }
+    .${r} .scribe-tab-strip.overflowing .scribe-tab-paddle-wrap { display: flex; }
+    .${r} .scribe-tab-paddle-sep { flex: none; width: 1px; height: 16px; background: var(--scribe-line-strong); }
+    .${r} .scribe-tab-paddle {
+      flex: none;
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--scribe-ink-2);
+      cursor: pointer;
+      user-select: none;
+      outline: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .${r} .scribe-tab-paddle:hover { color: var(--scribe-ink); background: var(--scribe-hover); }
+    .${r} .scribe-tab-paddle:active { color: var(--scribe-ink); background: var(--scribe-plate); }
+    .${r} .scribe-tab-paddle:focus-visible { outline: 2px solid var(--scribe-accent-ring); }
+    .${r} .scribe-tab-paddle.disabled { color: var(--scribe-ink-3); opacity: .45; background: none; cursor: default; pointer-events: none; }
+
+    .${r} .scribe-tab-lane-wrap { position: relative; display: flex; flex: 1 1 auto; min-width: 0; }
+    .${r} .scribe-tab-fade {
+      position: absolute;
+      top: 0;
+      bottom: 1px;
+      width: ${TAB_FADE_WIDTH}px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .12s ease;
+      z-index: 1;
+    }
+    .${r} .scribe-tab-fade.left { left: 0; background: linear-gradient(90deg, var(--scribe-canvas), transparent); }
+    .${r} .scribe-tab-fade.right { right: 0; background: linear-gradient(-90deg, var(--scribe-canvas), transparent); }
+    .${r} .scribe-tab-fade.on { opacity: 1; }
+    /* The folder's bar runs solid through the fade. */
+    .${r} .scribe-tab-strip.grouped .scribe-tab-fade { top: 2px; }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-tab-fade { transition: none; }
+    }
+
+    .${r} .scribe-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 140px;
+      max-width: 200px;
+      padding: 0 10px;
+      color: var(--scribe-ink-2);
+      font-size: 13px;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      user-select: none;
+    }
+
+    .${r} .scribe-tab.asleep .scribe-tab-name { color: var(--scribe-ink-3); }
+
+    .${r} .scribe-tab-pin { display: flex; align-items: stretch; flex: none; }
+    .${r} .scribe-tab-pin .scribe-tab { min-width: 0; max-width: 300px; }
+    .${r} .scribe-tab-pin-sep { width: 1px; background: var(--scribe-line-strong); margin: 6px 4px; flex-shrink: 0; }
+    .${r} .scribe-tab-icon { width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; }
+    .${r} .scribe-tab-icon svg { width: 100%; height: 100%; display: block; }
+    .${r} .scribe-tab-strip.pin-active .scribe-tab-pin .scribe-tab.active {
+      background: var(--scribe-surface);
+      color: var(--scribe-accent);
+      border-bottom-color: var(--scribe-accent);
+    }
+    .${r} .scribe-tab-strip.pin-active .scribe-tab-pin .scribe-tab.active .scribe-tab-name { text-shadow: 0 0 .4px currentColor; }
+    .${r} .scribe-tab-strip.pin-active .scribe-tab-lane .scribe-tab.active {
+      background: none;
+      color: var(--scribe-ink-2);
+      border-bottom-color: transparent;
+    }
+    .${r} .scribe-tab-strip.pin-active .scribe-tab-lane .scribe-tab.active .scribe-tab-name { text-shadow: none; }
+
+    .${r} .scribe-tab-strip.grouped .scribe-tab-pin-sep { display: none; }
+    .${r} .scribe-tab-pin.scribe-tab-group-head, .${r} .scribe-tab-group { position: relative; }
+    .${r} .scribe-tab-pin.scribe-tab-group-head::before, .${r} .scribe-tab-group::before, .${r} .scribe-tab-paddle-wrap.group-bridge::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 0;
+      height: 2px;
+      background: var(--scribe-ink-3);
+      pointer-events: none;
+      z-index: 1;
+    }
+    .${r} .scribe-tab-group { display: flex; align-items: stretch; flex: none; }
+    .${r} .scribe-tab-pin.scribe-tab-group-head .scribe-tab.pinned { background: color-mix(in srgb, var(--scribe-accent) 12%, var(--scribe-surface)); color: var(--scribe-ink); padding-right: 8px; }
+    .${r} .scribe-tab-strip.pin-active .scribe-tab-pin.scribe-tab-group-head .scribe-tab.pinned.active { background: var(--scribe-surface); color: var(--scribe-accent); }
+    .${r} .scribe-tab-gap { width: 14px; flex: none; }
+    .${r} .scribe-tab-gap.empty { width: 0; }
+    .${r} .scribe-tab-chev { width: 12px; height: 12px; flex: none; display: inline-flex; color: var(--scribe-ink-3); border-radius: 3px; }
+    .${r} .scribe-tab-chev svg { width: 100%; height: 100%; display: block; }
+    .${r} .scribe-tab-chev:hover { color: var(--scribe-ink); background: var(--scribe-hover); }
+    /* The library sets this class while its Close Folder command is hovered, previewing which tabs the command closes. */
+    .${r} .scribe-tab-strip.scribe-tab-close-preview .scribe-tab-pin.scribe-tab-group-head, .${r} .scribe-tab-strip.scribe-tab-close-preview .scribe-tab-group { opacity: .35; }
+
+    .${r} .scribe-tab-lane { position: relative; }
+    .${r} .scribe-tab-strip.tab-drag .scribe-tab-lane::after { content: ''; flex: none; width: var(--scribe-tab-drag-w, 0px); }
+    .${r} .scribe-tab-strip.tab-drag .scribe-tab-group, .${r} .scribe-tab-strip.tab-drag .scribe-tab-gap { position: absolute; top: 0; bottom: 0; transition: left 120ms ease, width 120ms ease; }
+    .${r} .scribe-tab-strip.tab-drag .scribe-tab-lane .scribe-tab:not(.dragging) { position: absolute; top: 0; bottom: 0; transition: left 120ms ease; }
+    .${r} .scribe-tab.dragging { position: absolute; top: 0; bottom: 0; z-index: 5; background: var(--scribe-surface); color: var(--scribe-ink); box-shadow: 0 2px 10px rgba(20, 30, 60, .22); cursor: grabbing; }
+    .${r} .scribe-tab-strip.tab-drag.settling .scribe-tab.dragging { transition: left 120ms ease; }
+    .${r} .scribe-tab-plus { display: none; width: 14px; height: 14px; border-radius: 50%; background: var(--scribe-accent); color: var(--scribe-accent-ink); align-items: center; justify-content: center; font-size: 12px; font-weight: 600; line-height: 1; flex: none; }
+    .${r} .scribe-tab.dragging.adding .scribe-tab-plus { display: inline-flex; }
+    .${r} .scribe-tab.dragging.adding .scribe-tab-close { display: none; }
+    .${r} .scribe-tab-pin.scribe-tab-group-head.drop, .${r} .scribe-tab-group.drop { background: var(--scribe-accent-soft); }
+    .${r} .scribe-tab-pin.scribe-tab-group-head.drop::after, .${r} .scribe-tab-group.drop::after { content: ''; position: absolute; inset: 0; border: 2px dashed var(--scribe-accent); box-sizing: border-box; pointer-events: none; z-index: 3; }
+    .${r} .scribe-tab-pin.scribe-tab-group-head.drop::after { border-right: none; }
+    .${r} .scribe-tab-group.drop::after { border-left: none; }
+    .${r} .scribe-tab-note { position: absolute; z-index: 70; display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 12px; background: var(--scribe-surface); border: 1px solid var(--scribe-line); border-radius: 8px; box-shadow: var(--scribe-menu-shadow); font-size: 13px; color: var(--scribe-ink); white-space: nowrap; }
+    .${r} .scribe-tab-note::before { content: ''; position: absolute; top: -5px; left: 18px; width: 8px; height: 8px; background: var(--scribe-surface); border-left: 1px solid var(--scribe-line); border-top: 1px solid var(--scribe-line); transform: rotate(45deg); }
+    .${r} .scribe-tab-note-action { background: none; border: none; border-radius: 7px; padding: 5px 9px; color: var(--scribe-accent); font: 600 13px/1 inherit; font-family: inherit; cursor: pointer; }
+    .${r} .scribe-tab-note-action:hover { background: var(--scribe-hover); }
+
+    .${r} .scribe-tab-spin {
+      flex: none;
+      width: 12px;
+      height: 12px;
+      border: 1.6px solid var(--scribe-ink-3);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: scribe-tab-spin .7s linear infinite;
+    }
+    @keyframes scribe-tab-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-tab-spin { animation: none; opacity: .5; }
+    }
+
+    .${r} .scribe-tab:hover {
+      color: var(--scribe-ink);
+    }
+
+    .${r} .scribe-tab.active {
+      background: var(--scribe-surface);
+      color: var(--scribe-ink);
+      border-bottom-color: var(--scribe-accent);
+    }
+
+    .${r} .scribe-tab.active .scribe-tab-name {
+      /* Fake the heavier weight with a shadow, not font-weight, whose per-glyph advance widths would slide the title's characters sideways as a tab activates. */
+      text-shadow: 0 0 0.4px currentColor;
+    }
+
+    .${r} .scribe-tab-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .${r} .scribe-tab-close {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      font-size: 14px;
+      line-height: 1;
+      color: var(--scribe-ink-3);
+    }
+
+    .${r} .scribe-tab-close:hover {
+      background: var(--scribe-hover);
+      color: var(--scribe-ink);
+    }
+
+    /* Right-click menu on a document tab, mounted on the viewer root and placed at the cursor by JS. */
+    .${r} .scribe-tab-menu {
+      position: absolute;
+      min-width: 150px;
+      z-index: 60;
+      ${MENU_PLATE_CSS}
+    }
+    .${r} .scribe-tab-menu-item {
+      cursor: pointer;
+      ${MENU_ROW_NOICON_CSS}
+    }
+    .${r} .scribe-tab-menu-item:hover { background: var(--scribe-hover); }
+    .${r} .scribe-tab-menu-sep { ${MENU_SEP_CSS} }
+
+    .${r} .highlight-color-btn {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      cursor: pointer;
+      border: 2px solid transparent;
+      box-sizing: border-box;
+      display: block;
+      flex: 0 0 auto;
+    }
+
+    .${r} .highlight-color-btn:hover, .${r} .highlight-color-btn:focus {
+      border-color: var(--scribe-ink-3);
+      outline: none;
+    }
+
+    .${r} .highlight-color-btn.active {
+      border-color: var(--scribe-ink);
+    }
+
+    /* Highlighter split button: the marker (the primary control, applying the current color and arming paint mode) sits flush against a slim caret that opens the color palette, so the two read as one control.
+       Corner radii are split so only the outer corners round, leaving the touching edges square so the marker and caret merge into a single pill. */
+    .${r} .scribe-hl-split {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      vertical-align: middle;
+    }
+
+    .${r} .scribe-hl-split .scribe-hl-mark,
+    .${r} .scribe-hl-split .scribe-hl-mark:hover {
+      border-radius: 7px 0 0 7px;
+    }
+
+    .${r} .scribe-hl-split .scribe-hl-caret,
+    .${r} .scribe-hl-split .scribe-hl-caret:hover {
+      border-radius: 0 7px 7px 0;
+    }
+
+    .${r} .scribe-hl-split .scribe-hl-caret {
+      width: 16px;
+      align-items: center;
+      justify-content: center;
+      color: var(--scribe-ink-3);
+    }
+    .${r} .scribe-hl-split .scribe-hl-caret svg { margin: -1px 0 0 -1px; }
+    /* Slim is fine for a mouse; a finger needs the platform-minimum width on the dropdown half too. */
+    .${r}.scribe-coarse .scribe-hl-split .scribe-hl-caret { width: 44px; }
+
+    .${r} .scribe-hl-split .scribe-hl-caret::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 1px;
+      height: 14px;
+      background: var(--scribe-line-strong);
+      pointer-events: none;
+    }
+
+    /* Palette popover under the split button, matching the app menu and find widget surface. */
+    .${r} .scribe-hl-pop {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 30;
+      display: none;
+      gap: 8px;
+      padding: 9px 10px;
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line);
+      border-radius: 10px;
+      box-shadow: var(--scribe-menu-shadow);
+    }
+
+    .${r} .scribe-hl-pop.open {
+      display: inline-flex;
+    }
+
+    /* Edit Text's text-color control, in the highlighter's split idiom: an A that applies the ink shown in its bar, and a caret that opens the plate. */
+    .${r} .scribe-edit-text-cluster { display: inline-flex; align-items: center; gap: 2px; vertical-align: middle; }
+    /* No native selection can start on the controls' labels or gaps; the hex field keeps its own. */
+    .${r} .scribe-edit-text-tools, .${r} .scribe-tc-pop { -webkit-user-select: none; user-select: none; }
+    .${r} .scribe-tc-hex { -webkit-user-select: text; user-select: text; }
+    .${r} .scribe-tc-split { position: relative; display: inline-flex; align-items: center; vertical-align: middle; }
+    .${r} .scribe-tc-split .scribe-tc-apply, .${r} .scribe-tc-split .scribe-tc-apply:hover { border-radius: 7px 0 0 7px; }
+    .${r} .scribe-tc-split .scribe-tc-caret, .${r} .scribe-tc-split .scribe-tc-caret:hover { border-radius: 0 7px 7px 0; }
+    .${r} .scribe-tc-split .scribe-tc-caret { width: 16px; align-items: center; justify-content: center; color: var(--scribe-ink-3); }
+    .${r}.scribe-coarse .scribe-tc-split .scribe-tc-caret { width: 44px; }
+    .${r} .scribe-tc-split .scribe-tc-caret::before { content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%); width: 1px; height: 14px; background: var(--scribe-line-strong); pointer-events: none; }
+    .${r} .scribe-tc-split .scribe-tc-caret.active { color: var(--scribe-accent); }
+    .${r} .scribe-tc-bar-ink { fill: var(--scribe-text-ink, #000000); }
+    .${r} .scribe-tc-bar-edge { fill: none; stroke: rgba(127, 127, 127, .45); stroke-width: 1; }
+    /* The plate: "In this document", "Standard" and "Custom...", on a 202px swatch row that wraps for a colorful document. */
+    .${r} .scribe-tc-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; display: none; flex-direction: column; align-items: stretch; padding: 8px 10px 6px; box-sizing: border-box; background: var(--scribe-surface); border: 1px solid var(--scribe-line); border-radius: 10px; box-shadow: var(--scribe-menu-shadow); }
+    .${r} .scribe-tc-pop.open { display: flex; }
+    .${r} .scribe-tc-pop.scribe-tc-right { left: auto; right: 0; }
+    .${r} .scribe-tc-hd { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--scribe-ink-3); margin: 2px 0 5px; white-space: nowrap; }
+    .${r} .scribe-tc-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; width: 202px; }
+    .${r} .scribe-tc-sw { position: relative; width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; box-sizing: border-box; background: var(--scribe-surface); cursor: pointer; flex: 0 0 auto; display: block; padding: 0; margin: 0; }
+    .${r} .scribe-tc-sw::after { content: ''; position: absolute; inset: 0; border-radius: 50%; background: var(--c); box-shadow: inset 0 0 0 1px rgba(127, 127, 127, .3); }
+    .${r} .scribe-tc-sw:hover { border-color: var(--scribe-ink-3); }
+    .${r} .scribe-tc-sw.active { border-color: var(--scribe-ink); }
+    .${r} .scribe-tc-sw.active::after { inset: 1.5px; }
+    .${r} .scribe-tc-sw:focus-visible { outline: 2px solid var(--scribe-accent-ring); outline-offset: 1px; }
+    .${r} .scribe-tc-sw.scribe-tc-custom::after { background: conic-gradient(#e02020, #f5a623, #f8e71c, #7ed321, #4a90e2, #9013fe, #e02020); }
+    .${r} .scribe-tc-sw.scribe-tc-custom::before { content: ''; position: absolute; inset: 5px; border-radius: 50%; background: var(--scribe-surface); z-index: 1; }
+    .${r} .scribe-tc-sep { height: 1px; background: var(--scribe-line); margin: 0 -10px 4px; }
+    .${r} .scribe-tc-crow { display: flex; align-items: center; gap: 8px; margin: 0 -6px; padding: 4px 6px; border-radius: 5px; font-size: 13px; color: var(--scribe-ink); cursor: pointer; white-space: nowrap; }
+    .${r} .scribe-tc-crow:hover { background: var(--scribe-hover); }
+    .${r} .scribe-tc-crow:focus-visible { outline: 2px solid var(--scribe-accent-ring); outline-offset: -2px; }
+    .${r} .scribe-tc-crow .scribe-tc-sw { width: 16px; height: 16px; pointer-events: none; }
+    .${r} .scribe-tc-crow .scribe-tc-sw.scribe-tc-custom::before { inset: 4px; }
+    .${r} .scribe-tc-crow .scribe-tc-chev { margin-left: auto; width: 12px; height: 12px; color: var(--scribe-ink-2); opacity: .75; }
+    /* Font control */
+    .${r} .scribe-tc-gap { width: 1px; height: 16px; background: var(--scribe-line-strong); margin: 0 3px; flex: none; }
+    .${r} .scribe-tc-font-pop { min-width: 208px; }
+    .${r} .scribe-tc-font-row { display: flex; align-items: center; gap: 8px; margin: 0 -6px; padding: 3px 6px; border-radius: 5px; font-size: 14px; color: var(--scribe-ink); cursor: pointer; white-space: nowrap; min-height: 22px; }
+    .${r} .scribe-tc-font-row:hover { background: var(--scribe-hover); }
+    .${r} .scribe-tc-font-row:focus-visible { outline: 2px solid var(--scribe-accent-ring); outline-offset: -2px; }
+    .${r} .scribe-tc-font-row.active { color: var(--scribe-accent); }
+    .${r} .scribe-tc-font-row.disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r} .scribe-tc-font-chk { width: 14px; height: 14px; flex: none; color: var(--scribe-accent); visibility: hidden; }
+    .${r} .scribe-tc-font-row.active .scribe-tc-font-chk { visibility: visible; }
+    .${r} .scribe-tc-font-nm { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+    .${r} .scribe-tc-font-ct { flex: none; margin-left: auto; padding-left: 10px; font-size: 11px; font-family: inherit; color: var(--scribe-ink-3); }
+    .${r} .scribe-edit-text-refused { position: absolute; z-index: 6; pointer-events: none; white-space: nowrap; font-family: -apple-system, system-ui, "Segoe UI", sans-serif; font-size: calc(12px / var(--scribe-zoom, 1)); line-height: 1.3; padding: calc(3px / var(--scribe-zoom, 1)) calc(8px / var(--scribe-zoom, 1)); border-radius: calc(5px / var(--scribe-zoom, 1)); border: calc(1px / var(--scribe-zoom, 1)) solid var(--scribe-line); background: var(--scribe-surface); color: var(--scribe-danger); box-shadow: var(--scribe-menu-shadow); }
+    .${r} .scribe-font-sheet { height: auto; bottom: calc(108px + env(safe-area-inset-bottom, 0px)); padding: 0 18px 10px; box-sizing: border-box; }
+    .${r} .scribe-font-sheet .scribe-sheet-hd { padding: 10px 0 4px; margin: 0 -18px; }
+    .${r} .scribe-font-sheet .scribe-tc-pkhd { font-size: 15px; margin: 2px 0 8px; }
+    .${r} .scribe-font-sheet .scribe-tc-font-row { font-size: 17px; min-height: 34px; padding: 4px 8px; margin: 0; }
+    .${r} .scribe-font-sheet .scribe-tc-font-chk { width: 18px; height: 18px; }
+    .${r} .scribe-font-sheet .scribe-tc-font-ct { font-size: 13px; }
+    .${r} .scribe-font-sheet .scribe-tc-hd { margin: 6px 8px 4px; }
+    /* The picker page the plate turns into: a saturation / value square, a hue strip, the hex field with the loupe and the wells. */
+    .${r} .scribe-tc-pk { display: flex; flex-direction: column; gap: 8px; width: 202px; }
+    .${r} .scribe-tc-pkhd { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 600; color: var(--scribe-ink); margin: -2px 0 0; }
+    .${r} .scribe-tc-back { width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; color: var(--scribe-ink-2); cursor: pointer; margin-left: -4px; }
+    .${r} .scribe-tc-back:hover { background: var(--scribe-hover); }
+    .${r} .scribe-tc-back:focus-visible { outline: 2px solid var(--scribe-accent-ring); outline-offset: -2px; }
+    .${r} .scribe-tc-sv { position: relative; width: 100%; height: 122px; border-radius: 6px; cursor: crosshair; background: linear-gradient(to top, #000, rgba(0, 0, 0, 0)), linear-gradient(to right, #fff, var(--h, #f00)); box-shadow: inset 0 0 0 1px rgba(127, 127, 127, .35); touch-action: none; outline: none; box-sizing: border-box; }
+    .${r} .scribe-tc-sv:focus-visible { box-shadow: inset 0 0 0 1px rgba(127, 127, 127, .35), 0 0 0 2px var(--scribe-accent-ring); }
+    .${r} .scribe-tc-svh { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), inset 0 0 0 1px rgba(0, 0, 0, .35); pointer-events: none; box-sizing: border-box; }
+    .${r} .scribe-tc-hue { position: relative; width: 100%; height: 12px; border-radius: 6px; background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); cursor: pointer; touch-action: none; outline: none; }
+    .${r} .scribe-tc-hue:focus-visible { box-shadow: 0 0 0 2px var(--scribe-accent-ring); }
+    .${r} .scribe-tc-hueh { position: absolute; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; background: var(--h, #f00); border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, .45); pointer-events: none; box-sizing: border-box; }
+    .${r} .scribe-tc-pkrow { display: flex; align-items: center; gap: 6px; }
+    .${r} .scribe-tc-pkrow .cr-icon-button { width: 24px; height: 24px; }
+    .${r} .scribe-tc-hexlbl { font-size: 12.5px; color: var(--scribe-ink-3); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .${r} .scribe-tc-hex { width: 76px; height: 24px; box-sizing: border-box; padding: 0 6px; border: 1px solid var(--scribe-line-strong); border-radius: 5px; background: var(--scribe-surface); color: var(--scribe-ink); font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .04em; text-transform: uppercase; }
+    .${r} .scribe-tc-hex:focus { outline: none; border-color: var(--scribe-accent); box-shadow: 0 0 0 2px var(--scribe-accent-ring); }
+    .${r} .scribe-tc-hex.bad { border-color: var(--scribe-danger); }
+    .${r} .scribe-tc-wells { display: inline-flex; margin-left: auto; border-radius: 5px; overflow: hidden; box-shadow: inset 0 0 0 1px rgba(127, 127, 127, .45); }
+    .${r} .scribe-tc-wells span { width: 22px; height: 22px; display: block; }
+    .${r} .scribe-tc-pkbtns { display: flex; justify-content: flex-end; gap: 4px; margin-top: -2px; }
+    .${r} .scribe-tc-btn { appearance: none; border: none; background: none; height: 24px; padding: 0 10px; border-radius: 6px; font: inherit; font-size: 12.5px; font-weight: 600; color: var(--scribe-ink-2); cursor: pointer; white-space: nowrap; }
+    .${r} .scribe-tc-btn:hover { background: var(--scribe-hover); color: var(--scribe-ink); }
+    .${r} .scribe-tc-btn.accent { color: var(--scribe-accent); }
+    .${r} .scribe-tc-btn:focus-visible { outline: 2px solid var(--scribe-accent-ring); outline-offset: -2px; }
+    /* The floating style bar (Word's mini toolbar): the Fill & Sign plate, at the pointer above the selection, fading in and out. */
+    .${r} .scribe-edit-text-bar { position: fixed; z-index: 45; display: none; align-items: center; gap: 2px; padding: 4px; background: var(--scribe-surface); border: 1px solid var(--scribe-line); border-radius: 10px; box-shadow: var(--scribe-menu-shadow); opacity: 0; transition: opacity .12s ease; }
+    .${r} .scribe-edit-text-bar.on { display: flex; }
+    .${r} .scribe-edit-text-bar.shown { opacity: 1; }
+    /* Docked above the body-level context menu (z-index 60): the plate hangs down over the menu, so the docked bar rides one layer above it. */
+    .${r} .scribe-edit-text-bar.docked { z-index: 61; }
+    /* The page sampler's loupe: the pixels under the pointer, the one at the center named beneath. */
+    .${r} .scribe-edit-text-loupe { position: fixed; z-index: 70; width: 76px; height: 76px; margin: -38px 0 0 -38px; border-radius: 50%; overflow: hidden; border: 2px solid #fff; box-shadow: 0 0 0 3px var(--c, #000), 0 3px 10px rgba(0, 0, 0, .3); pointer-events: none; background: #fff; box-sizing: border-box; display: none; }
+    .${r} .scribe-edit-text-loupe canvas { display: block; width: 72px; height: 72px; image-rendering: pixelated; }
+    .${r} .scribe-edit-text-loupe::after { content: ''; position: absolute; left: 50%; top: 50%; width: 6px; height: 6px; margin: -4px 0 0 -4px; border: 1px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, .6); }
+    .${r} .scribe-edit-text-loupe-lbl { position: fixed; z-index: 70; transform: translate(-50%, 0); margin-top: 44px; padding: 2px 7px; border-radius: 5px; background: var(--scribe-surface); color: var(--scribe-ink); border: 1px solid var(--scribe-line); box-shadow: var(--scribe-menu-shadow); font: 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; display: none; align-items: center; gap: 5px; pointer-events: none; white-space: nowrap; }
+    .${r} .scribe-edit-text-loupe-lbl i { width: 10px; height: 10px; border-radius: 50%; background: var(--c); box-shadow: inset 0 0 0 1px rgba(127, 127, 127, .45); }
+    .${r} .scribe-edit-text-sampling, .${r} .scribe-edit-text-sampling * { cursor: crosshair !important; }
+    /* The phone: the verb bar's swatch row (the strip scrolls under a pinned "Custom..." and "Done") and the picker sheet above the bar. */
+    .${r} .scribe-vstrip { display: flex; align-items: center; gap: 8px; overflow-x: auto; scrollbar-width: none; flex: 1 1 auto; min-width: 0; padding: 0 4px; }
+    .${r} .scribe-vstrip::-webkit-scrollbar { display: none; }
+    .${r} .scribe-vstrip .scribe-tc-sw { width: 24px; height: 24px; }
+    .${r} .scribe-vstrip .scribe-tc-sw.active::after { inset: 2px; }
+    .${r} .scribe-vstrip-sep { width: 1px; height: 18px; background: var(--scribe-line-strong); flex: none; }
+    .${r} .scribe-vbar > .scribe-tc-custom { width: 24px; height: 24px; flex: none; margin: 0 2px; }
+    .${r} .scribe-tc-sheet { height: auto; bottom: calc(108px + env(safe-area-inset-bottom, 0px)); padding: 0 18px 10px; box-sizing: border-box; }
+    .${r} .scribe-tc-sheet .scribe-sheet-hd { padding: 10px 0 4px; margin: 0 -18px; }
+    .${r} .scribe-tc-sheet .scribe-tc-pk { width: auto; gap: 12px; }
+    .${r} .scribe-tc-sheet .scribe-tc-pkhd { font-size: 15px; }
+    .${r} .scribe-tc-sheet .scribe-tc-sv { height: 170px; }
+    .${r} .scribe-tc-sheet .scribe-tc-hue { height: 16px; }
+    .${r} .scribe-tc-sheet .scribe-tc-hex { height: 32px; width: 104px; font-size: 15px; }
+    .${r} .scribe-tc-sheet .scribe-tc-wells span { width: 30px; height: 30px; }
+    .${r} .scribe-tc-sheet .scribe-tc-btn { height: 32px; font-size: 14px; padding: 0 14px; }
+    .${r} .scribe-tc-sheet .scribe-tc-pkrow .cr-icon-button { width: 32px; height: 32px; }
+
+    .${r} .scribe-cmt-card {
+      position: absolute;
+      width: 210px;
+      box-sizing: border-box;
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line);
+      border-radius: 8px;
+      box-shadow: var(--scribe-menu-shadow);
+      padding: 9px 11px;
+      font-size: 12.5px;
+      line-height: 1.45;
+      color: var(--scribe-ink);
+      z-index: 21;
+    }
+    .${r} .scribe-cmt-card.pinned {
+      border-color: var(--scribe-accent);
+      box-shadow: 0 0 0 2px var(--scribe-accent-ring), var(--scribe-menu-shadow);
+    }
+    .${r} .scribe-cmt-meta { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+    /* position: relative anchors the swatch shelf under the header.
+       The min-height is the verb button's, reserved even unpinned so the verbs appearing cannot push the thread down. */
+    .${r} .scribe-cmt-quote-row { display: flex; align-items: stretch; gap: 7px; min-height: 20px; margin-bottom: 5px; cursor: grab; position: relative; }
+    .${r} .scribe-cmt-quote {
+      min-width: 0;
+      font-size: 11px;
+      font-style: italic;
+      color: var(--scribe-ink-3);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    /* The comment is edited in place: a seamless textarea that reads as the card's text. */
+    .${r} .scribe-cmt-text {
+      display: block;
+      box-sizing: border-box;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      outline: none;
+      resize: none;
+      overflow: hidden;
+      background: transparent;
+      font: inherit;
+      line-height: inherit;
+      color: inherit;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .${r} .scribe-cmt-text::placeholder { color: var(--scribe-ink-3); }
+    .${r} .scribe-cmt-thread { display: flex; flex-direction: column; gap: 7px; max-height: 320px; overflow-y: auto; }
+    .${r} .scribe-cmt-msg .scribe-cmt-meta { margin-bottom: 2px; }
+    .${r} .scribe-cmt-mtext { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .${r} .scribe-cmt-card.pinned .scribe-cmt-mtext { cursor: text; }
+    .${r} .scribe-cmt-mtext.editing { outline: none; border-radius: 3px; box-shadow: 0 0 0 2px var(--scribe-accent-ring); }
+    .${r} .scribe-cmt-more { font-size: 11px; color: var(--scribe-ink-3); }
+    .${r} .scribe-cmt-card.pinned .scribe-cmt-more { display: none; }
+    .${r} .scribe-cmt-card:not(.pinned) .scribe-cmt-msg.scribe-cmt-old { display: none; }
+    .${r} .scribe-cmt-reply { display: flex; align-items: flex-start; gap: 7px; }
+    .${r} .scribe-cmt-reply .scribe-cm-ava { margin-top: 1px; }
+    .${r} .scribe-cmt-reply .scribe-cmt-text { flex: 1 1 auto; width: auto; min-width: 0; }
+    .${r} .scribe-cmt-card:not(.pinned) .scribe-cmt-reply { display: none; }
+    .${r} .scribe-cmt-foot { display: flex; align-items: baseline; gap: 10px; margin-top: 1px; }
+    .${r} .scribe-cmt-reply-btn {
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: none;
+      font: inherit;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--scribe-accent);
+      cursor: pointer;
+    }
+    .${r} .scribe-cmt-reply-btn:hover { text-decoration: underline; }
+    .${r} .scribe-cmt-card:not(.pinned) .scribe-cmt-reply-btn { display: none; }
+    /* Header verbs: shown pinned only, since the preview shows content, never controls. */
+    .${r} .scribe-cmt-hd-verbs { display: none; align-items: center; align-self: center; gap: 2px; flex: 0 0 auto; }
+    .${r} .scribe-cmt-card.pinned .scribe-cmt-hd-verbs { display: flex; }
+    .${r} .scribe-cmt-vb {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      padding: 0;
+      border: 0;
+      border-radius: 5px;
+      background: none;
+      color: var(--scribe-ink-3);
+      cursor: pointer;
+      flex: 0 0 auto;
+    }
+    .${r} .scribe-cmt-vb:hover { background: var(--scribe-hover); color: var(--scribe-ink); }
+    .${r} .scribe-cmt-vb.scribe-cmt-vb-del:hover { color: var(--scribe-danger); }
+    .${r} .scribe-cmt-vb svg { width: 16px; height: 16px; display: block; }
+    /* The panel verb is only a reveal shortcut, and on phones it would sit one small glyph from Delete, so it hides there (the sheet stays a dock tap away). */
+    .${r}.scribe-phone .scribe-cmt-vb-panel { display: none; }
+
+    /* The quote bar doubles as the recolor control on highlight/markup cards (cmtFill arms it). */
+    .${r} .scribe-cmt-bar-ctl { cursor: pointer; }
+    .${r} .scribe-cmt-bar-ctl:hover, .${r} .scribe-cmt-bar-ctl:focus-visible { box-shadow: 0 0 0 2px var(--scribe-accent-ring); outline: none; }
+    .${r} .scribe-cmt-shelf {
+      position: absolute;
+      left: 8px;
+      top: calc(100% + 4px);
+      display: none;
+      align-items: center;
+      gap: 6px;
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line);
+      border-radius: 99px;
+      padding: 5px 9px;
+      box-shadow: var(--scribe-menu-shadow);
+      z-index: 3;
+    }
+    .${r} .scribe-cmt-shelf.open { display: inline-flex; }
+
+
+    /* The notes layer is scaled by the zoom, so dividing it back out holds a constant on-screen size. */
+    .${r} .scribe-note-icon {
+      position: absolute;
+      width: calc(14px / var(--scribe-zoom, 1));
+      height: calc(14px / var(--scribe-zoom, 1));
+      color: var(--scribe-note);
+      pointer-events: auto;
+      cursor: grab;
+      user-select: none;
+      z-index: 3;
+      filter: drop-shadow(0 1px 2px rgba(30, 26, 16, .3));
+    }
+    .${r} .scribe-note-icon svg { width: 100%; height: 100%; display: block; }
+    .${r} .scribe-note-icon:active { cursor: grabbing; }
+    .${r} .scribe-note-icon:focus-visible { outline: 2px solid var(--scribe-accent); outline-offset: 1px; border-radius: 3px; }
+
+    .${r} .vertical-separator {
+      background: var(--scribe-line-strong);
+      height: 15px;
+      width: 1px;
+      margin-left: 10px;
+      margin-right: 10px;
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    /* Empty-state drop zone shown when no document is loaded. */
+    .${r} .scribe-drop-region {
+      position: absolute;
+      inset: 30px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1.5px dashed var(--scribe-line-strong);
+      border-radius: 14px;
+      transition: border-color .05s ease-out, background-color .05s ease-out;
+    }
+
+    .${r} .scribe-drop-zone.highlight .scribe-drop-region {
+      border-color: var(--scribe-accent);
+      background-color: var(--scribe-accent-soft);
+    }
+
+    .${r} .scribe-drop-content {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    .${r} .scribe-drop-icon { color: var(--scribe-ink-3); margin-bottom: 20px; }
+
+    .${r} .scribe-drop-icon svg { width: 42px; height: 42px; }
+
+    .${r} .scribe-drop-title {
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--scribe-ink);
+      letter-spacing: .2px;
+    }
+
+    .${r} .scribe-drop-btn {
+      margin-top: 22px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 18px;
+      border-radius: 8px;
+      background: var(--scribe-accent);
+      border: 1px solid var(--scribe-accent);
+      color: var(--scribe-accent-ink);
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color .15s ease-out;
+    }
+
+    .${r} .scribe-drop-btn:hover { background: var(--scribe-accent-hover); border-color: var(--scribe-accent-hover); }
+
+    .${r} .scribe-drop-btn svg { width: 16px; height: 16px; }
+
+    .${r} .scribe-drop-hint {
+      font-size: 12.5px;
+      color: var(--scribe-ink-3);
+      margin-top: 14px;
+    }
+
+    .${r} .scribe-drop-loading { display: none; flex-direction: column; align-items: center; }
+
+    .${r} .scribe-drop-zone.loading .scribe-drop-content { display: none; }
+
+    .${r} .scribe-drop-zone.loading .scribe-drop-loading { display: flex; }
+
+    .${r} .scribe-drop-spinner {
+      width: 34px;
+      height: 34px;
+      border: 3px solid var(--scribe-line);
+      border-top-color: var(--scribe-accent);
+      border-radius: 50%;
+      animation: scribe-drop-spin .7s linear infinite;
+    }
+
+    @keyframes scribe-drop-spin { to { transform: rotate(360deg); } }
+
+    .${r} .scribe-drop-loading-text {
+      margin-top: 18px;
+      font-size: 14px;
+      color: var(--scribe-ink-3);
+      letter-spacing: .2px;
+    }
+
+    /* Shown/hidden by toggling opacity (not display) so it can fade in and out.
+       pointer-events:none keeps it click-through. */
+    .${r} .scribe-drag-overlay {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      opacity: 0;
+      pointer-events: none;
+      /* Above a pinned surface (30), so a drop onto the library home is labeled too. */
+      z-index: 31;
+      background: var(--scribe-accent-soft);
+      transition: opacity .06s ease-out;
+    }
+
+    .${r} .scribe-drag-frame {
+      position: absolute;
+      inset: 14px;
+      border: 2px dashed var(--scribe-accent);
+      border-radius: 14px;
+    }
+
+    .${r} .scribe-drag-pill {
+      position: absolute;
+      top: 26px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 9px 16px 9px 13px;
+      border-radius: 8px;
+      background: var(--scribe-accent);
+      color: var(--scribe-accent-ink);
+      font-size: 13.5px;
+      font-weight: 500;
+      letter-spacing: .2px;
+      white-space: nowrap;
+      box-shadow: var(--scribe-shadow-pop);
+    }
+
+    .${r} .scribe-drag-pill svg {
+      width: 17px;
+      height: 17px;
+    }
+
+    /* A fixed width, not text spaces: a leading space in the flex row collapses asymmetrically. */
+    .${r} .scribe-page-sep { width: 12px; text-align: center; }
+    .${r} .scribe-rotate-pair { display: inline-flex; align-items: center; }
+
+    .${r}-toolbar input {
+      background: var(--scribe-sunken);
+      border: 1px solid var(--scribe-line-strong);
+      border-radius: 5px;
+      caret-color: var(--scribe-accent);
+      color: var(--scribe-ink);
+      font-family: inherit;
+      font-size: 13px;
+      /* Without an explicit height the inherited line-height inflates the field to 34px, off the bar's 28px control line. */
+      height: 28px;
+      box-sizing: border-box;
+      line-height: 22px;
+      margin: 0 4px;
+      outline: 0;
+      padding: 2px 4px;
+      text-align: center;
+      vertical-align: middle;
+      width: 5ch;
+    }
+    .${r}-toolbar .scribe-page-sep { font-size: 13px; }
+    /* The mode-button overflow fold measures these children, so they must never flex-shrink below their natural widths. */
+    .${r}-toolbar .col-md > * { flex: 0 0 auto; }
+
+    .${r}-toolbar {
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    .${r}-toolbar input,
+    .${r}-toolbar textarea,
+    .${r}-toolbar [contenteditable] {
+      -webkit-user-select: auto;
+      user-select: auto;
+    }
+
+    /* Floating find widget: opening it overlays content instead of reflowing the right-zone controls. */
+    .${r} .scribe-search-group {
+      position: absolute;
+      top: calc(100% + 6px);
+      right: var(--scribe-search-right, 8px);
+      z-index: 20;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line);
+      border-radius: 8px;
+      box-shadow: var(--scribe-menu-shadow);
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    .${r} .scribe-search-group.scribe-search-open {
+      opacity: 1;
+      transform: none;
+      transition: opacity .12s cubic-bezier(.2, .7, .3, 1), transform .12s cubic-bezier(.2, .7, .3, 1);
+    }
+    .${r} .scribe-search-group.scribe-search-closing {
+      opacity: 0;
+      transform: translateY(-2px);
+      transition: opacity .09s ease-in, transform .09s ease-in;
+      pointer-events: none;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-search-group,
+      .${r} .scribe-search-group.scribe-search-open,
+      .${r} .scribe-search-group.scribe-search-closing { transition: none; transform: none; }
+      .${r} .cr-icon-button,
+      .${r} .scribe-tip.on,
+      .${r}-toolbar input.scribe-search-input,
+      .${r} .scribe-search-count > span { transition: none; }
+    }
+
+    /* These rules style the phone find bar, which sits outside the toolbar.
+       The toolbar rules below restyle the same parts for the desktop find bar. */
+    .${r} .scribe-search-count {
+      display: grid;
+      justify-items: center;
+      align-items: center;
+      font-size: 13px;
+      min-width: 6ch;
+      padding: 0 6px;
+      text-align: center;
+      white-space: nowrap;
+      isolation: isolate;
+    }
+    /* The values blend additively within the isolated count, so text both share, such as the match total, keeps its full ink through the cross-fade. */
+    .${r} .scribe-search-count > span { grid-area: 1 / 1; white-space: nowrap; mix-blend-mode: plus-lighter; }
+    .${r} .scribe-search-count-value { opacity: 0; }
+    .${r} .scribe-search-count-value.in { opacity: 1; transition: opacity .09s ease; }
+    .${r} .scribe-search-count-ghost { opacity: 0; transition: opacity .09s ease; }
+    .${r} .scribe-search-count-ghost.show { opacity: 1; transition: none; }
+    .${r} .scribe-search-count-ghost::before { content: attr(data-text); }
+    /* The wrapper dissolves, so the field and the count are the phone find bar's own flex items. */
+    .${r} .scribe-search-field { display: contents; }
+    .${r} .scribe-search-sep { display: none; }
+
+    .${r}-toolbar .scribe-search-field {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      width: 220px;
+      height: 28px;
+      flex: none;
+    }
+    .${r}-toolbar input.scribe-search-input {
+      width: 100%;
+      margin: 0;
+      padding: 2px calc(var(--scribe-search-count-w, 0px) + 8px) 2px 8px;
+      text-align: left;
+      transition: border-color .12s ease;
+    }
+    .${r}-toolbar input.scribe-search-input:focus { border-color: var(--scribe-accent); }
+    .${r}-toolbar .scribe-search-count {
+      position: absolute;
+      right: 8px;
+      top: 0;
+      bottom: 0;
+      display: grid;
+      justify-items: end;
+      align-items: center;
+      min-width: 0;
+      padding: 0;
+      font-size: 12.5px;
+      color: var(--scribe-ink-3);
+      font-variant-numeric: tabular-nums;
+      pointer-events: none;
+    }
+    .${r}-toolbar .scribe-search-sep {
+      display: block;
+      width: 1px;
+      height: 18px;
+      margin: 0 2px;
+      background: var(--scribe-line-strong);
+      flex: none;
+    }
+    .${r}-toolbar .scribe-search-step,
+    .${r}-toolbar .scribe-search-step:hover {
+      width: calc(var(--scribe-icon-size, 32px) - 4px);
+      height: calc(var(--scribe-icon-size, 32px) - 4px);
+      border-radius: 6px;
+    }
+    .${r}-toolbar .scribe-search-step .cr-icon { width: 100%; height: 100%; }
+    .${r}-toolbar .scribe-search-close { display: none; }
+
+    .${r} .scribe-scrollbar {
+      position: absolute;
+      z-index: 9;
+      touch-action: none;
+      user-select: none;
+    }
+
+    .${r} .scribe-scrollbar-v {
+      top: 0;
+      right: 0;
+      width: 12px;
+    }
+
+    .${r} .scribe-scrollbar-h {
+      left: 0;
+      bottom: 0;
+      height: 12px;
+    }
+
+    .${r} .scribe-scrollbar-thumb {
+      position: absolute;
+      background: var(--scribe-scrollbar);
+      border-radius: 6px;
+      transition: background 0.15s ease-in-out;
+    }
+
+    .${r} .scribe-scrollbar-thumb:hover,
+    .${r} .scribe-scrollbar-thumb.dragging {
+      background: var(--scribe-scrollbar);
+    }
+
+    .${r} .scribe-scrollbar-v .scribe-scrollbar-thumb {
+      left: 2px;
+      width: 8px;
+    }
+
+    .${r} .scribe-scrollbar-h .scribe-scrollbar-thumb {
+      top: 2px;
+      height: 8px;
+    }
+
+    .${r} .scribe-thumb-panel {
+      position: absolute;
+      left: 0;
+      overflow: hidden;
+      box-sizing: border-box;
+      background: var(--scribe-canvas);
+      border-right: 1px solid var(--scribe-line);
+      z-index: 7;
+      transition: transform 180ms ease;
+      will-change: transform;
+      /* The panel is focusable so it can be the active pane.
+         Its focus is shown by the active page's accent, not a default outline on the whole panel. */
+      outline: none;
+      /* On the panel root so it cascades to every thumbnail image and caption, preventing a click-drag across the rail from selecting them. */
+      -webkit-user-select: none;
+      user-select: none;
+      /* Also inherited by every page image: without it, iOS Safari's long-press save-image callout hijacks the hold-to-preview and hold-to-reorder gestures. */
+      -webkit-touch-callout: none;
+    }
+
+    /* The resize handle is a sibling of this inner scroll container so it stays at the edge while the container scrolls. */
+    .${r} .scribe-thumb-scroll {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      right: 6px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 8px 0;
+      box-sizing: border-box;
+    }
+
+    .${r} .scribe-thumb-scroll::-webkit-scrollbar {
+      width: 7px;
+    }
+
+    .${r} .scribe-thumb-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .${r} .scribe-thumb-scroll::-webkit-scrollbar-thumb {
+      background: var(--scribe-scrollbar);
+      border-radius: 6px;
+    }
+
+    .${r} .scribe-thumb-scroll::-webkit-scrollbar-thumb:hover {
+      background: var(--scribe-scrollbar);
+    }
+
+    .${r} .scribe-thumb-resize {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: ew-resize;
+      z-index: 8;
+      touch-action: none;
+    }
+
+    .${r} .scribe-thumb-resize:hover {
+      background: var(--scribe-hover);
+    }
+
+    .${r} .scribe-thumb {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      padding: 6px 4px;
+    }
+
+    /* Tighter rows for the compact phone grid.
+       Keep the overhead in sync with COMPACT_ROW_OVERHEAD (3 pad + 2 gap + 13 label + 3 pad = 21). */
+    .${r} .scribe-thumb-compact .scribe-thumb {
+      gap: 2px;
+      padding: 3px 4px;
+    }
+
+    .${r} .scribe-thumb-box {
+      position: relative;
+      background: #fff;
+      box-shadow: var(--scribe-page-shadow);
+      overflow: hidden;
+      box-sizing: border-box;
+      cursor: pointer;
+      transition: transform .13s ease, box-shadow .13s ease;
+    }
+
+    .${r} .scribe-thumb-box img {
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: contain;
+    }
+
+    /* The page's highlight bands drawn over the thumbnail raster (which never includes the highlight layer).
+       Multiply blend keeps the tiny glyphs legible through the band, exactly like the main view's fill layer. */
+    .${r} .scribe-thumb-hl {
+      position: absolute;
+      pointer-events: none;
+      mix-blend-mode: multiply;
+    }
+
+    .${r} .scribe-thumb-hl span {
+      position: absolute;
+    }
+
+    /* Redaction marks over the thumbnail raster: solid black bars previewing what export bakes in, not the on-page red mark. */
+    .${r} .scribe-thumb-redact {
+      position: absolute;
+      pointer-events: none;
+    }
+
+    .${r} .scribe-thumb-redact span {
+      position: absolute;
+      background: #000;
+    }
+
+    .${r} .scribe-thumb-label {
+      color: var(--scribe-ink-3);
+      font-size: 13px;
+      line-height: 1;
+      text-align: center;
+    }
+
+    .${r} .scribe-thumb-box:hover {
+      outline: 2px solid var(--scribe-line-strong);
+    }
+
+    /* Current page while the rail is not the active pane: a subtle accent ring. */
+    .${r} .scribe-thumb.active .scribe-thumb-box {
+      outline: 3px solid var(--scribe-accent);
+    }
+
+    /* While the rail has keyboard focus it is the active pane, so the current page's ring gains an outer accent glow cueing that keystrokes land here.
+       The box-shadow re-lists the drop shadow so the glow adds to it rather than replacing it. */
+    .${r} .scribe-thumb-panel:focus-within .scribe-thumb.active .scribe-thumb-box {
+      outline-color: var(--scribe-accent);
+      box-shadow: 0 0 0 5px var(--scribe-accent-ring), var(--scribe-page-shadow);
+    }
+
+    .${r} .scribe-thumb.active .scribe-thumb-label {
+      color: var(--scribe-ink);
+      font-weight: 600;
+    }
+
+    .${r} .scribe-thumb-armed .scribe-thumb-box {
+      cursor: grab;
+    }
+
+    .${r} .scribe-thumb.dragging .scribe-thumb-box {
+      opacity: .3;
+    }
+
+    /* Touch reorder: a press swells the page a touch before it lifts, then the source hides under the carried ghost. */
+    .${r} .scribe-thumb.prelift .scribe-thumb-box {
+      transform: scale(1.06);
+    }
+
+    .${r} .scribe-thumb.lifting {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    /* Pages caught in a sweep-gathered run, before they collapse into the clump in hand. */
+    .${r} .scribe-thumb.inrun .scribe-thumb-box {
+      outline: 2.5px solid var(--scribe-accent);
+      outline-offset: -1px;
+    }
+
+    .${r} .scribe-thumb.inrun .scribe-thumb-label {
+      color: var(--scribe-accent);
+      font-weight: 700;
+    }
+
+    /* A page held for a pending cut: dimmed until the cut is pasted or canceled (Escape). */
+    .${r} .scribe-thumb.cut .scribe-thumb-box {
+      opacity: .45;
+    }
+
+    .${r} .scribe-thumb-insert {
+      position: absolute;
+      left: 6px;
+      right: 6px;
+      height: 3px;
+      margin-top: -2px;
+      background: var(--scribe-accent);
+      border-radius: 2px;
+      box-shadow: 0 0 6px var(--scribe-accent-ring);
+      pointer-events: none;
+      z-index: 50;
+    }
+
+    /* Grid reorder: the same accent runs vertically in the gap between cells (left/top/height are set inline). */
+    .${r} .scribe-thumb-insert.vertical {
+      right: auto;
+      width: 3px;
+      margin-top: 0;
+      margin-left: -1.5px;
+    }
+
+    /* Drop-slot placeholder: a dashed outline marking a reorder drag's opened gap as the drop destination.
+       Kept before the rows in the DOM so the sliding crowd passes over it, never under. */
+    .${r} .scribe-thumb-slot {
+      position: absolute;
+      border: 1.5px dashed var(--scribe-line-strong);
+      border-radius: 3px;
+      box-sizing: border-box;
+      pointer-events: none;
+    }
+
+    /* Drag-select rubber band: a translucent accent-blue box over the rail, sized inline as the pointer drags. */
+    .${r} .scribe-thumb-marquee {
+      position: absolute;
+      z-index: 40;
+      /* Translucent accent fill (not the opaque accent-soft) so the thumbnails under the drag rectangle stay visible. */
+      background: color-mix(in srgb, var(--scribe-accent) 20%, transparent);
+      border: 1px solid var(--scribe-accent);
+      pointer-events: none;
+    }
+
+    /* Selection is shown by a lift and a translucent tint, never an outline: the outline marks the current page alone.
+       The lift is a purely visual transform (translateY, no scaling), so the rail layout never reflows. */
+    .${r} .scribe-thumb.selected .scribe-thumb-box {
+      transform: translateY(-6px);
+      box-shadow: var(--scribe-lift-shadow);
+    }
+
+    .${r} .scribe-thumb.selected .scribe-thumb-box::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: var(--scribe-accent);
+      opacity: .18;
+      pointer-events: none;
+    }
+
+    /* Floating vertical action strip that pops up beside the rail, next to the selection (JS sets its left/top). */
+    .${r} .scribe-thumb-batch {
+      position: absolute;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 5px;
+      box-sizing: border-box;
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line);
+      border-radius: 10px;
+      box-shadow: var(--scribe-menu-shadow);
+      z-index: 20;
+    }
+
+    .${r} .scribe-thumb-batch-count {
+      color: var(--scribe-ink-2);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 2px 0;
+      min-width: 14px;
+      text-align: center;
+    }
+
+    .${r} .scribe-thumb-batch-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border: none;
+      border-radius: 50%;
+      background: transparent;
+      color: var(--scribe-ink-2);
+      cursor: pointer;
+      transition: background-color .12s ease-out;
+    }
+
+    .${r} .scribe-thumb-batch-btn svg {
+      width: 20px;
+      height: 20px;
+    }
+
+    .${r} .scribe-thumb-batch-btn:hover {
+      background: var(--scribe-hover);
+      color: var(--scribe-ink);
+    }
+
+    .${r} .scribe-thumb-batch-delete:hover {
+      background: var(--scribe-danger);
+      color: #fff;
+    }
+
+    /* Right-click page context menu, mounted on the viewer root and placed at the cursor by JS. */
+    .${r} .scribe-thumb-menu {
+      position: absolute;
+      min-width: 150px;
+      z-index: 60;
+      ${MENU_PLATE_CSS}
+    }
+
+    .${r} .scribe-thumb-menu-item {
+      cursor: pointer;
+      ${MENU_ROW_NOICON_CSS}
+    }
+
+    .${r} .scribe-thumb-menu-item:hover {
+      background: var(--scribe-hover);
+    }
+
+    .${r} .scribe-thumb-menu-item.danger { color: var(--scribe-danger); }
+
+    .${r} .scribe-thumb-menu-item.danger:hover {
+      background: var(--scribe-danger-soft);
+    }
+
+    .${r} .scribe-thumb-menu-item.disabled {
+      color: var(--scribe-ink-3);
+      pointer-events: none;
+    }
+
+    .${r} .scribe-thumb-menu-header {
+      padding: 5px 12px 6px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      color: var(--scribe-ink-3);
+    }
+
+    .${r} .scribe-thumb-menu-divider {
+      ${MENU_SEP_CSS}
+    }
+
+    /* Mirrors the thumbnail panel's dock geometry, chrome, and slide: the two form one sidebar. */
+    /* One toolbar button opens the sidebar, and this strip picks which view it shows. */
+
+    /* A desktop shell whose native menus carry the app commands hides the in-window menu button.
+       Hidden by class rather than inline style, because the library's bar swap snapshots and restores inline display and would resurface it. */
+    .${r}.scribe-menu-button-hidden .scribe-app-menu-wrap,
+    .${r}.scribe-menu-button-hidden .scribe-menu-sep { display: none; }
+
+    /* The library home swaps the bar over to its own controls, so the sidebar toggle sits that state out like the other document controls. */
+    .${r} .scribe-library-bar .scribe-sidebar-toggle { display: none; }
+
+    /* View-switch strip pinned above the open sidebar view. */
+    .${r} .scribe-sbtabs {
+      position: absolute;
+      left: 0;
+      height: 36px;
+      box-sizing: border-box;
+      padding: 3px 6px 4px;
+      background: var(--scribe-canvas);
+      border-right: 1px solid var(--scribe-line);
+      border-bottom: 1px solid var(--scribe-line);
+      z-index: 8;
+      will-change: transform;
+    }
+
+    .${r} .scribe-sbtabs-track {
+      display: flex;
+      gap: 2px;
+      height: 100%;
+      box-sizing: border-box;
+      background: var(--scribe-sunken);
+      border-radius: 7px;
+      padding: 2px;
+    }
+
+    .${r} .scribe-sbtab {
+      flex: 1 1 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 5px;
+      color: var(--scribe-ink-3);
+      cursor: pointer;
+    }
+
+    .${r} .scribe-sbtab:hover { color: var(--scribe-ink); }
+
+    .${r} .scribe-sbtab.on {
+      background: var(--scribe-surface);
+      color: var(--scribe-accent);
+      box-shadow: 0 1px 2px rgba(20, 30, 60, .14);
+    }
+
+    .${r} .scribe-sbtab svg {
+      width: 16px;
+      height: 16px;
+      display: block;
+      pointer-events: none;
+    }
+
+    .${r} .scribe-bookmarks-panel {
+      position: absolute;
+      left: 0;
+      overflow: hidden;
+      box-sizing: border-box;
+      background: var(--scribe-canvas);
+      border-right: 1px solid var(--scribe-line);
+      z-index: 7;
+      color: var(--scribe-ink);
+      font-size: 13px;
+      transition: transform 180ms ease;
+      will-change: transform;
+      outline: none;
+    }
+
+    /* Persistent header (editor mode): an uppercase title and an always-present add button.
+       Full width so its bottom border spans the panel.
+       The add button is inset well clear of the resize handle at the right edge. */
+    .${r} .scribe-bm-hd {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 36px;
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 8px 0 12px;
+      border-bottom: 1px solid var(--scribe-line);
+      background: var(--scribe-canvas);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--scribe-ink-2);
+      z-index: 2;
+    }
+    .${r} .scribe-bm-hd-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .${r} .scribe-bm-add {
+      flex: 0 0 auto;
+      width: 26px;
+      height: 26px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      margin: 0;
+      color: var(--scribe-ink-2);
+      background: none;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .${r} .scribe-bm-add:hover { background: var(--scribe-hover); color: var(--scribe-ink); }
+    .${r} .scribe-bm-add svg { width: 16px; height: 16px; display: block; }
+
+    /* Fills the panel but for a 6px right gutter, so the tree's scrollbar clears the resize handle (as the rail's does). */
+    .${r} .scribe-bm-tree {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      right: 6px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 8px 0;
+      box-sizing: border-box;
+    }
+    /* When the header is present, drop the tree below it (36px header + 1px border). */
+    .${r} .scribe-bm-has-header .scribe-bm-tree { top: 37px; }
+
+    /* Right-edge resize handle, matching the thumbnail rail's. */
+    .${r} .scribe-bm-resize {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: ew-resize;
+      z-index: 8;
+      touch-action: none;
+    }
+
+    .${r} .scribe-bm-resize:hover {
+      background: var(--scribe-hover);
+    }
+
+    .${r} .scribe-bm-tree::-webkit-scrollbar { width: 5px; }
+    .${r} .scribe-bm-tree::-webkit-scrollbar-track { background: transparent; }
+    .${r} .scribe-bm-tree::-webkit-scrollbar-thumb { background: var(--scribe-scrollbar); border-radius: 6px; }
+
+    .${r} .scribe-bm-row {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4.5px 8px 4.5px 0;
+      cursor: pointer;
+      white-space: nowrap;
+      border-radius: 4px;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .${r} .scribe-bm-row:hover { background: var(--scribe-hover); }
+    .${r} .scribe-bm-row.active { background: var(--scribe-accent-soft); color: var(--scribe-accent); }
+    /* Top-level entries carry more weight, so the hierarchy reads from type alone. */
+    .${r} .scribe-bm-row.top > .scribe-bm-label { font-weight: 600; }
+    /* A little air above each section label groups it with its children. */
+    .${r} .scribe-bm-row.structural { margin-top: 4px; }
+
+    .${r} .scribe-bm-twisty {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      flex: 0 0 16px;
+      color: var(--scribe-ink-2);
+    }
+    .${r} .scribe-bm-twisty svg { width: 12px; height: 12px; display: block; }
+    .${r} .scribe-bm-twisty.open svg { transform: rotate(90deg); }
+    .${r} .scribe-bm-row:hover .scribe-bm-twisty { color: var(--scribe-ink); }
+    .${r} .scribe-bm-row.active .scribe-bm-twisty { color: var(--scribe-accent); }
+
+    .${r} .scribe-bm-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    /* Title-only (structural) parents read as confident section labels, not de-emphasized afterthoughts. */
+    .${r} .scribe-bm-label.structural {
+      font-size: 10.5px;
+      font-weight: 650;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+      color: var(--scribe-ink-2);
+    }
+
+    /* Quiet right-aligned page number, TOC-style. */
+    .${r} .scribe-bm-page {
+      flex: 0 0 auto;
+      margin: 0 8px 0 6px;
+      font-size: 11px;
+      color: var(--scribe-ink-3);
+      font-variant-numeric: tabular-nums;
+    }
+    .${r} .scribe-bm-row.active .scribe-bm-page { color: var(--scribe-accent); }
+
+    /* Inline rename occupies the label's exact box with no border or padding, so editing never changes the row height or nudges the text.
+       Focus shows via a paint-only outline that takes no layout space. */
+    .${r} .scribe-bm-rename {
+      flex: 1 1 auto;
+      min-width: 0;
+      font: inherit;
+      line-height: inherit;
+      color: var(--scribe-ink);
+      background: transparent;
+      border: 0;
+      padding: 0;
+      margin: 0;
+    }
+    .${r} .scribe-bm-rename:focus {
+      outline: 1px solid var(--scribe-accent);
+      outline-offset: 1px;
+    }
+    /* iOS decides its input zoom at focus, so the rename input starts at the coarse-mode 16px floor and takes this class right after focus(). */
+    .${r} .scribe-bm-rename.scribe-bm-rename-live { font-size: inherit; }
+    /* The input wears the label styling of the row it replaces, so entering rename never restyles the text. */
+    .${r} .scribe-bm-row.top > .scribe-bm-rename { font-weight: 600; }
+    .${r} .scribe-bm-rename.structural {
+      font-weight: 650;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+      color: var(--scribe-ink-2);
+    }
+    .${r} .scribe-bm-rename.structural.scribe-bm-rename-live { font-size: 10.5px; }
+
+    .${r} .scribe-bm-empty { padding: 12px; color: var(--scribe-ink-3); font-size: 12px; }
+
+    .${r} .scribe-bm-menu {
+      position: absolute;
+      min-width: 170px;
+      z-index: 60;
+      ${MENU_PLATE_CSS}
+    }
+
+    .${r} .scribe-bm-menu-item {
+      cursor: pointer;
+      ${MENU_ROW_NOICON_CSS}
+    }
+    .${r} .scribe-bm-menu-item:hover { background: var(--scribe-hover); }
+    .${r} .scribe-bm-menu-item.disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r} .scribe-bm-menu-item.disabled:hover { background: none; }
+    .${r} .scribe-bm-menu-item.danger { color: var(--scribe-danger); }
+    .${r} .scribe-bm-menu-sep {
+      ${MENU_SEP_CSS}
+    }
+    .${r} .scribe-bm-menu-item.scribe-bm-menu-hand { display: flex; align-items: center; gap: 10px; }
+    .${r} .scribe-bm-menu-item.scribe-bm-menu-hand .scribe-bm-autoglyph { margin-left: auto; }
+    /* Sized explicitly because the glyph markup carries inline width and height of 100%, which would otherwise inflate it. */
+    .${r} .scribe-bm-autoglyph { width: 14px; height: 14px; flex: none; display: inline-flex; color: var(--scribe-ink-3); }
+    .${r} .scribe-bm-autoglyph svg { width: 14px; height: 14px; display: block; }
+
+    .${r} .scribe-bm-rails { position: absolute; top: 0; left: 0; right: 0; pointer-events: none; z-index: 8; }
+    .${r} .scribe-bm-rails i { position: absolute; top: 0; bottom: 0; border-left: 1px dashed var(--scribe-accent-ring); }
+    .${r} .scribe-bm-rails i.on { border-left: 1.5px solid var(--scribe-accent); }
+    .${r} .scribe-bm-row.scribe-bm-adopt { background: var(--scribe-accent-soft); }
+    .${r} .scribe-bm-row.scribe-bm-adopt .scribe-bm-twisty { color: var(--scribe-accent); }
+    /* The menu can open away from its row, so the subject row carries its own wash. */
+    .${r} .scribe-bm-row.scribe-bm-menu-subject:not(.active) { background: var(--scribe-hover); }
+    .${r} .scribe-bm-slot {
+      position: absolute;
+      z-index: 9;
+      border-radius: 8px;
+      background: var(--scribe-plate);
+      pointer-events: none;
+      transition: left 90ms ease, top 90ms ease;
+    }
+
+    .${r} .scribe-bm-lift {
+      position: absolute;
+      z-index: 12;
+      pointer-events: none;
+    }
+    .${r} .scribe-bm-lift.scribe-bm-lift-armed { pointer-events: auto; cursor: grab; }
+    .${r} .scribe-bm-lift .scribe-bm-row {
+      background: var(--scribe-surface);
+      border-radius: 8px;
+      box-shadow: 0 0 0 1px var(--scribe-line-strong), var(--scribe-lift-shadow);
+    }
+    .${r} .scribe-bm-lift-count {
+      position: absolute;
+      top: -6px;
+      right: 4px;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 9px;
+      background: var(--scribe-accent);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    /* visibility, not display: the slide offsets are measured against a layout that still contains the lifted subtree's slot. */
+    .${r} .scribe-bm-lift-src { visibility: hidden; }
+    .${r} .scribe-bm-sliding .scribe-bm-row { transition: transform 160ms ease; }
+    .${r} .scribe-bm-row-drag .scribe-bm-row { cursor: grabbing; }
+    @keyframes scribe-bm-fade-in { from { opacity: 0; } to { opacity: 1; } }
+    .${r} .scribe-bm-row.scribe-bm-drop-in .scribe-bm-dots,
+    .${r} .scribe-bm-row.scribe-bm-drop-in .scribe-bm-twisty { animation: scribe-bm-fade-in 140ms ease; }
+    .${r} .scribe-bm-row.scribe-bm-drop-in-child { animation: scribe-bm-fade-in 140ms ease; }
+
+    .${r} .scribe-bm-dots {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 24px;
+      flex: 0 0 auto;
+      margin: 0 -6px 0 -8px;
+      padding: 0;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--scribe-ink-3);
+      cursor: pointer;
+    }
+    .${r} .scribe-bm-dots:hover { background: var(--scribe-hover); color: var(--scribe-ink); }
+    .${r} .scribe-bm-dots svg { width: 15px; height: 15px; display: block; }
+    .${r}.scribe-coarse .scribe-bm-dots { width: 34px; height: 30px; }
+
+    /* A phone can still deliver hover from a stray fine pointer, so the sheet's rows explicitly take no hover wash. */
+    .${r}.scribe-phone .scribe-bm-row { padding-top: 8px; padding-bottom: 8px; font-size: 13.5px; min-height: 30px; }
+    .${r}.scribe-phone .scribe-bm-page { font-size: 11.5px; }
+    .${r}.scribe-phone .scribe-bm-row:hover { background: transparent; }
+    .${r}.scribe-phone .scribe-bm-row.active, .${r}.scribe-phone .scribe-bm-row.active:hover { background: var(--scribe-accent-soft); }
+
+    .${r} .scribe-bm-empty-editor { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; padding: 14px 12px; }
+    .${r} .scribe-bm-empty-msg { color: var(--scribe-ink-2); font-size: 12px; }
+    .${r} .scribe-bm-empty-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--scribe-line-strong);
+      background: var(--scribe-surface);
+      color: var(--scribe-ink);
+      font: 600 12px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      padding: 7px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .${r} .scribe-bm-empty-btn:hover { background: var(--scribe-hover); }
+    .${r} .scribe-bm-empty-btn svg { width: 14px; height: 14px; display: block; }
+    .${r}.scribe-coarse .scribe-bm-empty-btn { min-height: 42px; font-size: 13px; padding: 7px 14px; }
+    .${r} .scribe-bm-empty-hint { font-size: 11px; color: var(--scribe-ink-3); max-width: 210px; }
+
+    /* Comments panel: a flat list of every comment (highlight-anchored + freestanding notes), a sibling of the rails. */
+    .${r} .scribe-comments-panel {
+      position: absolute;
+      left: 0;
+      overflow: hidden;
+      box-sizing: border-box;
+      background: var(--scribe-canvas);
+      border-right: 1px solid var(--scribe-line);
+      z-index: 7;
+      color: var(--scribe-ink);
+      font-size: 13px;
+      transition: transform 180ms ease;
+      will-change: transform;
+      outline: none;
+    }
+    .${r} .scribe-cm-hd {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 36px;
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--scribe-line);
+      background: var(--scribe-canvas);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--scribe-ink-2);
+      z-index: 2;
+    }
+    .${r} .scribe-cm-hd-title { flex: 1 1 auto; }
+    /* "New note on this page" button in the header. */
+    .${r} .scribe-cm-new {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--scribe-ink-2);
+      cursor: pointer;
+    }
+    .${r} .scribe-cm-new:hover { background: var(--scribe-hover); color: var(--scribe-ink); }
+    .${r} .scribe-cm-new svg { width: 15px; height: 15px; display: block; }
+    /* List fills below the header, with a 6px right gutter so its scrollbar clears the resize handle. */
+    .${r} .scribe-cm-list {
+      position: absolute;
+      top: 37px; left: 0; bottom: 0; right: 6px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 6px;
+      box-sizing: border-box;
+    }
+    .${r} .scribe-cm-list::-webkit-scrollbar { width: 5px; }
+    .${r} .scribe-cm-list::-webkit-scrollbar-track { background: transparent; }
+    .${r} .scribe-cm-list::-webkit-scrollbar-thumb { background: var(--scribe-scrollbar); border-radius: 6px; }
+    .${r} .scribe-cm-resize {
+      position: absolute;
+      top: 0; right: 0; bottom: 0;
+      width: 6px;
+      cursor: ew-resize;
+      z-index: 8;
+      touch-action: none;
+    }
+    .${r} .scribe-cm-resize:hover { background: var(--scribe-hover); }
+
+    /* Sticky page-group headers: rows group per page; the current page's header carries the accent. */
+    .${r} .scribe-cm-grp {
+      position: sticky;
+      top: -6px;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 4px 5px;
+      background: var(--scribe-canvas);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--scribe-ink-3);
+    }
+    .${r} .scribe-cm-grp::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--scribe-line); }
+    .${r} .scribe-cm-grp.active { color: var(--scribe-accent); }
+
+    /* Rail comment cards share the surface-on-canvas figure-ground of the pages and floating card. */
+    .${r} .scribe-cm-row {
+      background: var(--scribe-surface);
+      border: 1px solid var(--scribe-line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      /* The fold animation drives height from measured border-box rects. */
+      box-sizing: border-box;
+    }
+    .${r} .scribe-cm-row:hover { border-color: var(--scribe-line-strong); }
+    /* Hover-sync: the row whose highlight the pointer is over in the viewer. */
+    .${r} .scribe-cm-row.lit { border-color: var(--scribe-accent); box-shadow: 0 0 0 1px var(--scribe-accent-ring); }
+    /* The row morphed into the editor signals focus on the card itself, like the on-page card. */
+    .${r} .scribe-cm-row.editing {
+      cursor: default;
+      border-color: var(--scribe-accent);
+      box-shadow: 0 0 0 2px var(--scribe-accent-ring);
+    }
+
+    /* Bulk selection (Ctrl/Cmd+A) in the bookmarks and comments panels: an accent wash plus a left accent bar. */
+    .${r} .scribe-bm-row.selected, .${r} .scribe-cm-row.selected {
+      background: var(--scribe-accent-soft);
+      box-shadow: inset 3px 0 0 var(--scribe-accent);
+    }
+
+    /* The card's own header row. */
+    .${r} .scribe-cm-top { display: flex; align-items: center; gap: 7px; min-height: 20px; }
+    .${r} .scribe-cm-meta {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 12px;
+      color: var(--scribe-ink-3);
+    }
+    .${r} .scribe-cm-ava {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--scribe-accent-soft);
+      color: var(--scribe-accent);
+      font-size: 9px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+    }
+    .${r} .scribe-cm-who {
+      font-weight: 600;
+      color: var(--scribe-ink);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .${r} .scribe-cm-when {
+      font-size: 11px;
+      color: var(--scribe-ink-3);
+      white-space: nowrap;
+    }
+
+    /* Right slot of the lead line, holding the date. */
+    .${r} .scribe-cm-right { flex: 0 0 auto; margin-left: auto; align-self: center; }
+
+    /* Anchor line: the quoted highlight behind a mini-swatch bar of its raw color (set inline), or the note mark. */
+    .${r} .scribe-cm-anchor { display: flex; align-items: stretch; gap: 7px; margin-top: 6px; min-width: 0; }
+    .${r} .scribe-cm-anchor:first-child { margin-top: 0; }
+    .${r} .scribe-cm-bar { flex: 0 0 3px; width: 3px; border-radius: 2px; }
+    .${r} .scribe-cm-quote {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 11.5px;
+      font-style: italic;
+      color: var(--scribe-ink-3);
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+    }
+    /* Double-click on the quote swaps the two-line clamp for the full quoted text (and back).
+       A very tall quote gets .scroll (max-height set inline from QUOTE_SCROLL_MAX_PX) and scrolls inside. */
+    .${r} .scribe-cm-quote.expanded { display: block; }
+    .${r} .scribe-cm-quote.expanded.scroll { overflow-y: auto; overscroll-behavior: contain; }
+    .${r} .scribe-cm-quote.expanded.scroll::-webkit-scrollbar { width: 5px; }
+    .${r} .scribe-cm-quote.expanded.scroll::-webkit-scrollbar-track { background: transparent; }
+    .${r} .scribe-cm-quote.expanded.scroll::-webkit-scrollbar-thumb { background: var(--scribe-scrollbar); border-radius: 6px; }
+    /* Firefox lacks ::-webkit-scrollbar and shows a fat native bar in this narrow box.
+       Scope the standard thin-scrollbar fallback to non-webkit engines: setting scrollbar-width
+       unconditionally would make Chrome drop the 7px custom bar above for a wider native one. */
+    @supports not selector(::-webkit-scrollbar) {
+      .${r} .scribe-cm-quote.expanded.scroll { scrollbar-width: thin; scrollbar-color: var(--scribe-scrollbar) transparent; }
+    }
+    /* Only note rows get a kind label (the note mark); a markup row's quote wears its markup instead. */
+    .${r} .scribe-cm-kind {
+      flex: 1 1 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--scribe-ink-3);
+    }
+    .${r} .scribe-cm-kind svg { width: 12px; height: 12px; color: var(--scribe-note); flex: 0 0 auto; }
+    /* The wash (--scribe-cm-wash) is theme-scaled down (dark 22%) because a full-strength yellow reads mustard on dark.
+       The text lifts one ink step so the wash never costs contrast.
+       box-decoration-break: clone wraps the wash/hatch onto each clamped line like a real mark. */
+    .${r} .scribe-cm-qmark {
+      --scribe-cm-wash: 35%;
+      color: var(--scribe-ink-2);
+      padding: 0 3px;
+      border-radius: 2px;
+      -webkit-box-decoration-break: clone;
+      box-decoration-break: clone;
+    }
+    .${r}[data-theme="dark"] .scribe-cm-qmark { --scribe-cm-wash: 22%; }
+    /* line-height 1.55 leaves room for the offset underline; the clamp box's overflow:hidden would otherwise clip it below the last line's baseline. */
+    .${r} .scribe-cm-q-ul { text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 2.5px; line-height: 1.55; }
+    .${r} .scribe-cm-q-st { text-decoration: line-through; text-decoration-thickness: 1.5px; line-height: 1.55; }
+    /* Redaction quotes sit on the on-page mark's own hatch (panel-scale stroke). */
+    .${r} .scribe-cm-q-rd {
+      background: repeating-linear-gradient(45deg, rgba(209, 73, 61, .16) 0 1px, transparent 1px 6px);
+      box-shadow: inset 0 0 0 1px rgba(209, 73, 61, .38);
+    }
+
+    .${r} .scribe-cm-text {
+      margin-top: 6px;
+      color: var(--scribe-ink);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    /* Reply-thread messages: the row-header identity anatomy again, once per message. */
+    .${r} .scribe-cm-msg { margin-top: 8px; }
+    .${r} .scribe-cm-msg .scribe-cm-text { margin-top: 2px; }
+    /* The reply composer line the Reply ghost morphs into: the author's avatar beside the field, as on the card. */
+    .${r} .scribe-cm-reply { display: flex; align-items: flex-start; gap: 7px; margin-top: 6px; }
+    .${r} .scribe-cm-reply .scribe-cm-ava { margin-top: 3px; }
+    .${r} .scribe-cm-reply .scribe-cm-field { flex: 1 1 auto; min-width: 0; margin-top: 0; }
+
+    /* The visible way into a comment-less row. */
+    .${r} .scribe-cm-ghost {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 4px;
+      padding: 3px 4px;
+      border: 0;
+      border-radius: 5px;
+      background: none;
+      color: var(--scribe-ink-3);
+      font: inherit;
+      font-size: 12.5px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .${r} .scribe-cm-ghost:hover { background: var(--scribe-hover); color: var(--scribe-ink-2); }
+    .${r} .scribe-cm-ghost svg { width: 13px; height: 13px; flex: 0 0 auto; }
+
+    /* In-place editor: the card is the writing surface (no inner box); the footer slides in below.
+       This is the on-page card's comment sheet, hosted by the row. */
+    .${r} .scribe-cm-field {
+      width: 100%;
+      box-sizing: border-box;
+      resize: none;
+      min-height: 40px;
+      max-height: 190px;
+      overflow-y: auto;
+      margin-top: 4px;
+      font: inherit;
+      font-size: 13px;
+      line-height: 1.45;
+      color: var(--scribe-ink);
+      background: none;
+      border: 0;
+      padding: 1px 2px;
+      outline: none;
+    }
+    .${r} .scribe-cm-fold { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .18s ease; }
+    .${r} .scribe-cm-row.editing .scribe-cm-fold { grid-template-rows: 1fr; }
+    .${r} .scribe-cm-fold > div { overflow: hidden; min-height: 0; }
+    /* No Save button: clicking anywhere outside the row saves and folds, so the footer is just the quiet remove link. */
+    .${r} .scribe-cm-foot { display: flex; align-items: center; padding-top: 6px; }
+    .${r} button.scribe-cm-remove {
+      font: inherit;
+      font-size: 11.5px;
+      color: var(--scribe-ink-3);
+      border: 0;
+      background: none;
+      padding: 2px 0;
+      cursor: pointer;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    .${r} button.scribe-cm-remove:hover { color: var(--scribe-danger); }
+
+    .${r} .scribe-cm-empty {
+      height: 100%;
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      text-align: center;
+      padding: 18px;
+      color: var(--scribe-ink-3);
+    }
+    .${r} .scribe-cm-empty svg { width: 26px; height: 26px; opacity: .75; margin-bottom: 4px; }
+    .${r} .scribe-cm-empty-t { font-size: 13px; font-weight: 600; color: var(--scribe-ink-2); }
+    .${r} .scribe-cm-empty-h { font-size: 12px; max-width: 180px; line-height: 1.5; }
+    .${r} .scribe-cm-compact .scribe-cm-empty-h { max-width: 34ch; }
+
+    .${r} .scribe-cm-menu {
+      position: absolute;
+      min-width: 150px;
+      z-index: 60;
+      ${MENU_PLATE_CSS}
+    }
+    .${r} .scribe-cm-menu-item {
+      cursor: pointer;
+      ${MENU_ROW_NOICON_CSS}
+    }
+    .${r} .scribe-cm-menu-item:hover { background: var(--scribe-hover); }
+
+    /* Compact (phone) comments.
+       The panel builds these elements only in compact mode (.scribe-cm-compact). */
+    /* The gutter is reserved so a row does not narrow the moment expanding or editing pushes the list past its own height. */
+    .${r} .scribe-cm-compact .scribe-cm-list { padding: 8px 10px 14px; scrollbar-gutter: stable; }
+    .${r} .scribe-cmc-row {
+      -webkit-tap-highlight-color: transparent;
+      position: relative;
+      display: flex;
+      border: 1px solid var(--scribe-line);
+      border-radius: 10px;
+      background: var(--scribe-surface);
+      margin: 0 0 8px;
+      min-height: 44px;
+      box-sizing: border-box;
+      cursor: pointer;
+      overflow: hidden;
+      user-select: none;
+    }
+    .${r} .scribe-cmc-row.lit { border-color: var(--scribe-accent); box-shadow: 0 0 0 1px var(--scribe-accent-ring); }
+    .${r} .scribe-cmc-rail {
+      position: absolute;
+      left: 0;
+      top: 10px;
+      bottom: 10px;
+      width: 3px;
+      border-radius: 0 2px 2px 0;
+    }
+    .${r} .scribe-cmc-in { flex: 1; min-width: 0; padding: 12px; padding-left: 15px; }
+    .${r} .scribe-cmc-ava {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      /* border-box so a ring stays inside the disc and a stack's width stays predictable. */
+      box-sizing: border-box;
+      background: var(--scribe-accent-soft);
+      color: var(--scribe-accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font: 700 8px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      flex: 0 0 auto;
+    }
+    .${r} .scribe-cmc-ava-b { background: #dff0e6; color: #2c6b45; }
+    .${r} .scribe-cmc-ava-c { background: #f3e2dc; color: #9a4f38; }
+    .${r}[data-theme="dark"] .scribe-cmc-ava-b { background: #1e3527; color: #8fd6ac; }
+    .${r}[data-theme="dark"] .scribe-cmc-ava-c { background: #3a2620; color: #e2a68e; }
+    .${r} .scribe-cmc-quote {
+      font: italic 500 11.5px/1.45 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink-2);
+      display: -webkit-box;
+      -webkit-line-clamp: 1;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      width: fit-content;
+      max-width: 100%;
+      padding: 1px 5px;
+      border-radius: 4px;
+      margin: 8px 0 0;
+    }
+    .${r} .scribe-cmc-quote.ul { text-decoration: underline 1.5px; text-underline-offset: 2px; }
+    .${r} .scribe-cmc-quote.st { text-decoration: line-through 1.5px; }
+    .${r} .scribe-cmc-quote.rd { background: repeating-linear-gradient(45deg, rgba(209, 73, 61, .16) 0 1px, transparent 1px 6px); }
+    .${r} .scribe-cmc-text {
+      font: 400 16px/1.45 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink);
+      overflow: hidden;
+      overflow-wrap: anywhere;
+    }
+    /* The clamp lives on the resting collapsed state only, so the reveal can ease it away. */
+    .${r} .scribe-cmc-row:not(.open) .scribe-cmc-text {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+    }
+    .${r} .scribe-cmc-text.gone { font: 600 11.5px/1 -apple-system, system-ui, 'Segoe UI', sans-serif; color: var(--scribe-danger); margin-top: 8px; }
+    .${r} .scribe-cmc-hd { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .${r} .scribe-cmc-who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .${r} .scribe-cmc-pg {
+      margin-left: auto;
+      flex: 0 0 auto;
+      font: 500 11.5px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink-3);
+      font-variant-numeric: tabular-nums;
+    }
+    .${r} .scribe-cmc-dots {
+      flex: 0 0 auto;
+      width: 28px;
+      height: 24px;
+      margin: -2px -6px -2px 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--scribe-ink-3);
+      cursor: pointer;
+    }
+    .${r} .scribe-cmc-dots:hover { background: var(--scribe-hover); color: var(--scribe-ink); }
+    .${r} .scribe-cmc-dots svg { width: 15px; height: 15px; }
+    .${r}.scribe-coarse .scribe-cmc-dots { width: 34px; height: 30px; }
+    .${r} .scribe-cmc-root { display: flex; gap: 8px; margin-top: 8px; }
+    .${r} .scribe-cmc-rc { flex: 1; min-width: 0; }
+    .${r} .scribe-cmc-ft { display: flex; align-items: baseline; gap: 10px; margin-top: 3px; }
+    .${r} .scribe-cmc-fd {
+      font: 500 11.5px/1.3 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink-3);
+      font-variant-numeric: tabular-nums;
+    }
+    .${r} .scribe-cmc-fr {
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: none;
+      font: 500 11.5px/1.3 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-accent);
+      cursor: pointer;
+      position: relative;
+    }
+    /* The verb's visual box stays a text label; the tap target extends invisibly around it. */
+    .${r} .scribe-cmc-fr::after { content: ''; position: absolute; inset: -10px -8px; }
+    .${r} .scribe-cmc-fr:hover { text-decoration: underline; }
+
+    .${r} .scribe-cmc-strip { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    .${r} .scribe-cmc-row.open .scribe-cmc-strip { height: 0; margin-top: 0; opacity: 0; visibility: hidden; overflow: hidden; }
+    .${r} .scribe-cmc-faces { display: flex; flex-direction: row-reverse; flex: 0 0 auto; }
+    .${r} .scribe-cmc-faces .scribe-cmc-ava {
+      border: 1.5px solid var(--scribe-surface);
+      margin-left: -3px;
+    }
+    .${r} .scribe-cmc-faces .scribe-cmc-ava:last-child { margin-left: 0; }
+    .${r} .scribe-cmc-n {
+      flex: 0 0 auto;
+      font: 600 11.5px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink-3);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .${r} .scribe-cmc-row.open {
+      background: var(--scribe-sunken);
+      border-color: var(--scribe-line-strong);
+      cursor: default;
+    }
+    .${r} .scribe-cmc-row.scribe-cmc-reflow { transition: height .24s cubic-bezier(.3, .8, .3, 1); }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-cmc-row.scribe-cmc-reflow { transition: none; }
+    }
+    .${r} .scribe-cmc-hd .scribe-cmc-mh { min-width: 0; }
+    .${r} .scribe-cmc-mh .scribe-cmc-dots { margin-left: auto; }
+    .${r} .scribe-cmc-row:focus-visible {
+      outline: 2px solid var(--scribe-accent);
+      outline-offset: -2px;
+    }
+    .${r} .scribe-cmc-drawer { padding: 0; }
+    .${r} .scribe-cmc-msg { display: flex; gap: 8px; margin: 12px 0 0; }
+    .${r} .scribe-cmc-msg .scribe-cmc-ava { margin-top: 1px; }
+    .${r} .scribe-cmc-mb { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+    .${r} .scribe-cmc-mh {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font: 600 13px/1.2 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink);
+    }
+    .${r} .scribe-cmc-when {
+      font: 500 11.5px/1 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      color: var(--scribe-ink-3);
+      flex: 0 0 auto;
+      font-variant-numeric: tabular-nums;
+    }
+    /* 16px because the edit field that replaces this text is pinned there, and a message that resized the moment you edited it would be a visible jump. */
+    .${r} .scribe-cmc-mt { font: 400 16px/1.45 -apple-system, system-ui, 'Segoe UI', sans-serif; color: var(--scribe-ink); overflow-wrap: anywhere; }
+    .${r} .scribe-cmc-comp { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; }
+    .${r} .scribe-cmc-field {
+      flex: 1;
+      min-height: 40px;
+      max-height: 120px;
+      resize: none;
+      box-sizing: border-box;
+      border: 1px solid var(--scribe-line-strong);
+      border-radius: 8px;
+      background: var(--scribe-surface);
+      color: var(--scribe-ink);
+      font: 400 16px/1.4 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      padding: 8px 12px;
+      outline: none;
+    }
+    .${r} .scribe-cmc-field:focus { border-color: var(--scribe-accent); }
+    .${r} .scribe-cmc-send {
+      width: 40px;
+      height: 40px;
+      box-sizing: border-box;
+      flex: 0 0 auto;
+      border: 0;
+      border-radius: 8px;
+      background: var(--scribe-accent);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .${r} .scribe-cmc-send:disabled {
+      background: none;
+      color: var(--scribe-ink-3);
+      border: 1px solid var(--scribe-line-strong);
+      cursor: default;
+    }
+    .${r} .scribe-cmc-send svg { width: 17px; height: 17px; }
+    .${r}.scribe-coarse .scribe-cmc-send { width: 44px; height: 44px; }
+    .${r}.scribe-coarse .scribe-cmc-field { min-height: 44px; }
+
+    .${r} .scribe-cm-menu-danger { color: var(--scribe-danger); }
+
+    /* The edit field must occupy exactly the space the message text did, so its padding is painted with an outward box-shadow, which takes no layout space. */
+    .${r} .scribe-cmc-edit { display: flex; flex-direction: column; }
+    .${r} .scribe-cmc-ed {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 0;
+      border: 0;
+      border-radius: 2px;
+      resize: none;
+      /* JS sizes the field to its content on every keystroke, so it never scrolls its own text. */
+      overflow: hidden;
+      background: var(--scribe-surface);
+      box-shadow: 0 0 0 6px var(--scribe-surface);
+      color: var(--scribe-ink);
+      /* Must stay identical to .scribe-cmc-mt, or the words move the moment editing begins. */
+      font: 400 16px/1.45 -apple-system, system-ui, 'Segoe UI', sans-serif;
+      overflow-wrap: anywhere;
+      outline: none;
+    }
+
+    @keyframes scribe-undo-swell {
+      0% { background: transparent; }
+      25% { background: var(--scribe-active); }
+      100% { background: transparent; }
+    }
+    .${r} .scribe-undo-swell { animation: scribe-undo-swell .7s ease; }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-undo-swell { animation: none; background: var(--scribe-active); }
+    }
+
+    /* Message surface: transient toasts (self-evident failures) + a persistent banner (away/non-obvious) */
+    .${r} .scribe-toast-stack {
+      position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+      z-index: 80; pointer-events: none; max-width: calc(100% - 40px);
+    }
+    .${r} .scribe-toast {
+      pointer-events: auto; cursor: pointer; max-width: 460px;
+      display: flex; align-items: center; gap: 9px;
+      padding: 11px 15px; border-radius: 9px;
+      background: var(--scribe-surface); color: var(--scribe-ink);
+      border: 1px solid var(--scribe-line); border-left: 3px solid var(--scribe-danger);
+      box-shadow: var(--scribe-shadow-pop); font-size: 13px; line-height: 1.35;
+      opacity: 0; transform: translateY(8px); transition: opacity .18s ease, transform .18s ease;
+    }
+    .${r} .scribe-toast.shown { opacity: 1; transform: translateY(0); }
+    .${r} .scribe-toast.leaving { opacity: 0; transform: translateY(8px); }
+    /* Inline toast action, e.g. Undo after a delete. */
+    .${r} .scribe-toast-action {
+      flex: 0 0 auto;
+      margin: -6px -6px -6px 2px;
+      padding: 6px 10px;
+      background: none;
+      border: none;
+      border-radius: 7px;
+      color: var(--scribe-accent);
+      font: 600 13px/1 inherit;
+      font-family: inherit;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .${r} .scribe-toast-action:hover { background: var(--scribe-hover); }
+    .${r}.scribe-coarse .scribe-toast-action { min-height: 40px; padding: 6px 12px; }
+
+    .${r} .scribe-banner {
+      position: absolute; left: 0; right: 0; height: 40px; z-index: 35;
+      display: flex; align-items: center; gap: 10px; padding: 0 14px;
+      background: var(--scribe-danger-soft); border-bottom: 1px solid var(--scribe-line);
+      color: var(--scribe-ink); font-size: 13px;
+    }
+    .${r} .scribe-banner.warn { background: var(--scribe-warn-soft); }
+    .${r} .scribe-banner-text { flex: 1 1 auto; line-height: 1.35; }
+    .${r} .scribe-banner-text b { font-weight: 650; }
+    .${r} .scribe-banner-close {
+      flex: none; display: inline-grid; place-items: center; width: 26px; height: 26px;
+      padding: 0; border: none; border-radius: 6px; background: transparent;
+      color: var(--scribe-ink-2); cursor: pointer;
+    }
+    .${r} .scribe-banner-close:hover { background: var(--scribe-hover); color: var(--scribe-ink); }
+    .${r} .scribe-banner-close svg { width: 16px; height: 16px; display: block; }
+
+    .${r} .scribe-mode-banner {
+      position: absolute; left: 0; right: 0; height: 40px; z-index: 35; box-sizing: border-box;
+      display: flex; align-items: center; gap: 8px; padding: 0 10px 0 14px;
+      background: var(--scribe-accent-soft); border-bottom: 1px solid var(--scribe-line);
+      color: var(--scribe-ink); user-select: none;
+    }
+    .${r} .scribe-mode-banner-ic { display: inline-flex; width: 17px; height: 17px; color: var(--scribe-accent); flex: none; }
+    .${r} .scribe-mode-banner-name { font-size: 12.5px; font-weight: 650; white-space: nowrap; }
+    .${r} .scribe-mode-banner-dot { color: var(--scribe-ink-3); }
+    .${r} .scribe-mode-banner-hint { font-size: 12px; color: var(--scribe-ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .${r} .scribe-mode-banner-done {
+      margin-left: auto; flex: none; display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 12px; border: none; border-radius: 6px; background: transparent;
+      font: inherit; font-size: 12.5px; font-weight: 650; color: var(--scribe-accent); cursor: pointer;
+    }
+    .${r} .scribe-mode-banner-done:hover { background: var(--scribe-active); }
+    .${r} .scribe-mode-banner-done kbd {
+      font-family: inherit; font-size: 10.5px; font-weight: 600; color: var(--scribe-ink-3);
+      border: 1px solid var(--scribe-line-strong); border-radius: 4px; padding: 0 4px; line-height: 1.5;
+    }
+    .${r} .scribe-mode-banner-exit { margin-left: auto; display: inline-flex; align-items: center; flex: none; }
+    .${r} .scribe-mode-banner-hint-armed { color: var(--scribe-accent); font-weight: 600; }
+    .${r} .scribe-mode-banner-exit .scribe-mode-banner-done { margin-left: 0; }
+    .${r} .scribe-mode-banner-discard { font-weight: 600; }
+    .${r} .scribe-mode-banner-save:disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r} .scribe-mode-banner-save:disabled kbd { opacity: .6; }
+    .${r} .scribe-mode-banner-save:disabled:hover { background: none; }
+    .${r} .scribe-mode-banner-tools { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; flex: none; }
+    .${r} .scribe-mode-banner-tools + .scribe-mode-banner-exit { margin-left: 0; }
+
+    /* The Fill & Sign palette hosted in the mode bar: the pill chrome comes off and the signature menu opens downward. */
+    .${r} .scribe-mode-banner .scribe-fs-pal {
+      position: relative; left: auto; bottom: auto; transform: none; z-index: auto;
+      background: none; border: none; border-radius: 0; box-shadow: none; padding: 0;
+      cursor: default; margin-left: auto; flex: none;
+    }
+    .${r} .scribe-mode-banner .scribe-fs-grip { display: none; }
+    .${r} .scribe-mode-banner .scribe-fs-pal + .scribe-mode-banner-exit { margin-left: 0; }
+    .${r} .scribe-mode-banner .scribe-fs-menu { bottom: auto; top: calc(100% + 6px); right: 0; }
+    .${r} .scribe-recog-tools { gap: 20px; }
+    /* The cancel glyph at the size of the banner's other icon buttons. */
+    .${r} .scribe-recog-desk { display: inline-flex; align-items: center; gap: 4px; }
+    .${r} .scribe-recog-desk .cr-icon-button { width: 28px; height: 28px; }
+    .${r} .scribe-recog-desk .cr-icon-button > svg { width: 28px; height: 28px; display: block; }
+    .${r} .scribe-recog-status { font-size: 12px; color: var(--scribe-ink-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .${r} .scribe-dock-mode .scribe-recog-tools { gap: 6px; }
+    .${r} .scribe-mode-banner-settings { display: inline-flex; align-items: center; gap: 2px; }
+    .${r} .scribe-mode-banner-pickwrap { position: relative; display: inline-flex; }
+    .${r} .scribe-mode-banner-pick {
+      display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: none; border-radius: 6px;
+      background: transparent; font: inherit; font-size: 12px; color: var(--scribe-ink-2); cursor: pointer;
+    }
+    .${r} .scribe-mode-banner-pick:not(:disabled):hover, .${r} .scribe-mode-banner-pick.active { background: var(--scribe-active); }
+    .${r} .scribe-mode-banner-pick:disabled { color: var(--scribe-ink-3); cursor: default; }
+    .${r} .scribe-mode-banner-pick svg { display: block; }
+    /* Every option's label shares one grid cell, so the button is as wide as its longest option whichever is picked. */
+    .${r} .scribe-mode-banner-pick-label { display: inline-grid; justify-items: start; }
+    .${r} .scribe-mode-banner-pick-label > span { grid-area: 1 / 1; white-space: nowrap; }
+    .${r} .scribe-mode-banner-pick-label > span:not(.on) { visibility: hidden; }
+    .${r} .scribe-mode-banner-run {
+      flex: none; display: inline-flex; align-items: center; padding: 2px 12px; border: 1px solid var(--scribe-accent);
+      border-radius: 6px; background: transparent; font: inherit; font-size: 12.5px; font-weight: 650; color: var(--scribe-accent); cursor: pointer;
+    }
+    .${r} .scribe-mode-banner-run:not(:disabled):hover { background: var(--scribe-active); }
+    .${r} .scribe-mode-banner-run:disabled { color: var(--scribe-ink-3); border-color: var(--scribe-line-strong); cursor: default; }
+    .${r} .scribe-mode-banner-run.busy { opacity: .6; pointer-events: none; }
+
+    /* The mode drop-down: the sidebar strip's material at bar scale. */
+    .${r} .scribe-mode-track-wrap { position: relative; display: inline-flex; }
+    .${r} .scribe-mode-track-el {
+      display: inline-flex; align-items: stretch; height: 28px; box-sizing: border-box;
+      background: var(--scribe-sunken); border-radius: 7px; padding: 2px;
+    }
+    .${r} .scribe-mode-track-row1 { display: inline-flex; gap: 2px; justify-content: space-between; flex: 1 1 auto; }
+    .${r} .scribe-mode-track-more { display: none; }
+    .${r} .scribe-mode-track-el.open {
+      position: absolute; top: 0; right: 0; z-index: 30; height: auto;
+      flex-direction: column; align-items: stretch; box-shadow: var(--scribe-menu-shadow);
+    }
+    .${r} .scribe-mode-track-el.open .scribe-mode-track-more { display: flex; flex-direction: column; gap: 2px; margin-top: 2px; }
+    .${r} .scribe-mode-track-row { display: flex; gap: 2px; }
+    /* The value cell and the list rows share one left-aligned column, so the icons line up down the open control. */
+    .${r} .scribe-mode-track-row1 .cr-icon-button:first-child,
+    .${r} .scribe-mode-track-row .cr-icon-button { flex: 1 1 auto; justify-content: flex-start; }
+    .${r} .scribe-mode-track-el .cr-icon-button { height: 24px; width: auto; border-radius: 5px; color: var(--scribe-ink-2); align-items: center; }
+    .${r} .scribe-mode-track-el .cr-labeled-button { padding: 0 9px 0 5px; gap: 5px; }
+    .${r} .scribe-mode-track-row1 .cr-icon-button:first-child:not(.active):not(.disabled) { color: var(--scribe-ink); }
+    .${r} .scribe-mode-track-el .cr-icon-button:hover { background: none; color: var(--scribe-ink); }
+    /* The track's ink override above outranks the shared .disabled rule, so the dim is restated here. */
+    .${r} .scribe-mode-track-el .cr-icon-button.disabled { color: color-mix(in srgb, var(--scribe-ink-2) 50%, var(--scribe-ink-3)); }
+    .${r} .scribe-mode-track-el .cr-icon-button.active,
+    .${r} .scribe-mode-track-el .cr-icon-button.active:hover {
+      background: var(--scribe-surface); color: var(--scribe-accent);
+      box-shadow: 0 1px 2px rgba(20, 30, 60, .14);
+    }
+    /* The mode control's glyphs (modeIcon's, TRACK_VIEW_SVG and TRACK_MENU_SVG) are drawn on a 17-unit pixel grid, so any other size blurs their strokes at 1x. */
+    .${r} .scribe-mode-track-el .cr-icon { width: 17px; height: 17px; margin-top: -1px; }
+    .${r} .scribe-mode-track-el .cr-btn-label { font-size: 13px; }
+    .${r} .scribe-mode-track-chev { padding: 0 6px; }
+    /* Played when a mode is entered from the app menu rather than from the control itself. */
+    .${r} .scribe-mode-track-el .cr-icon-button.scribe-mode-track-flash { animation: scribe-mode-flash 1.1s ease-out 1; }
+    @keyframes scribe-mode-flash {
+      0%, 100% { box-shadow: 0 1px 2px rgba(20, 30, 60, .14); }
+      15%, 55% { box-shadow: 0 0 0 3px var(--scribe-accent-ring), 0 1px 2px rgba(20, 30, 60, .14); }
+      35%, 75% { box-shadow: 0 0 0 0 var(--scribe-accent-ring), 0 1px 2px rgba(20, 30, 60, .14); }
+    }
+    .${r} .scribe-dock-mode-nm.scribe-dock-mode-flash { animation: scribe-dock-mode-flash 1.1s ease-out 1; }
+    @keyframes scribe-dock-mode-flash { 0%, 100% { color: var(--scribe-ink); } 25%, 65% { color: var(--scribe-accent); } }
+    @media (prefers-reduced-motion: reduce) {
+      .${r} .scribe-mode-track-flash, .${r} .scribe-dock-mode-flash { animation: none; }
+    }
+  `;
+
+  style.appendChild(document.createTextNode(css));
+  document.head.appendChild(style);
+}

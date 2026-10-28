@@ -1,36 +1,32 @@
-import { clearData } from '../clear.js';
-import { inputData, opt } from '../containers/app.js';
+import { opt } from '../containers/app.js';
+import { scribeDocDefaults } from '../containers/scribeDocDefaults.js';
+import { markFillTextRefs } from '../fillSign.js';
+import { GlobalFonts } from '../containers/fontContainer.js';
 import {
-  annotations,
-  convertPageWarn,
-  layoutDataTables,
-  layoutRegions,
-  ocrAll,
-  ocrAllRaw,
-  pageMetricsAll,
-} from '../containers/dataContainer.js';
-import { FontCont } from '../containers/fontContainer.js';
-import { ImageCache } from '../containers/imageContainer.js';
-import { extractInternalPDFText } from '../extractPDFText.js';
-import {
-  enableFontOpt,
+  enableOpt,
   loadBuiltInFontsRaw,
-  optimizeFontContainerAll, setDefaultFontAuto,
+  optimizeFontContainerAll,
+  setDefaultAuto,
 } from '../fontContainerMain.js';
-import { runFontOptimization } from '../fontEval.js';
 import { calcCharMetricsFromPages } from '../fontStatistics.js';
-import { calcSuppFontInfo } from '../fontSupp.js';
 import { gs } from '../generalWorkerMain.js';
 import { imageUtils, ImageWrapper } from '../objects/imageObjects.js';
-import { addCircularRefsDataTables, LayoutDataTablePage, LayoutPage } from '../objects/layoutObjects.js';
-import { addCircularRefsOcr, updateOcrFormat } from '../objects/ocrObjects.js';
+import {
+  addCircularRefsDataTables, addCircularRefsRegions, LayoutDataTablePage, LayoutPage,
+} from '../objects/layoutObjects.js';
+import ocr, { OcrPage, addCircularRefsOcr, updateOcrFormat } from '../objects/ocrObjects.js';
 import { PageMetrics } from '../objects/pageMetricsObjects.js';
+import { reassignOutlineIds } from '../objects/outlineObjects.js';
 import { checkCharWarn, convertOCR } from '../recognizeConvert.js';
+import { assignPageLineNums } from './assignPageLineNums.js';
 import { importImageFileToBase64 } from '../utils/imageUtils.js';
 import {
   readOcrFile, clearObjectProperties, objectAssignDefined, readTextFile,
 } from '../utils/miscUtils.js';
-import { importOCRFiles } from './importOCR.js';
+import { countOcrPages, importOCRFiles } from './importOCR.js';
+import { extractInternalPDFText } from '../extractPDFText.js';
+
+/** @typedef {import('../containers/scribeDoc.js').ScribeDoc} ScribeDoc */
 
 /**
  * Standardize file-like inputs between platforms.
@@ -108,7 +104,7 @@ export async function sortInputFiles(files) {
     } else if (['png', 'jpeg', 'jpg'].includes(fileExt)) {
       imageFilesAll.push(file);
       // All .gz files are assumed to be OCR data (xml) since all other file types can be compressed already
-    } else if (['hocr', 'xml', 'html', 'gz', 'stext', 'json', 'txt', 'docx'].includes(fileExt)) {
+    } else if (['hocr', 'xml', 'html', 'gz', 'stext', 'json', 'txt', 'docx', 'md'].includes(fileExt)) {
       ocrFilesAll.push(file);
     } else if (['scribe'].includes(fileExt)) {
       scribeFilesAll.push(file);
@@ -137,7 +133,7 @@ export async function sortInputFiles(files) {
 
   if (unsupportedFilesAll.length > 0) {
     const errorText = `Import includes unsupported file types: ${Object.keys(unsupportedExt).join(', ')}`;
-    opt.warningHandler(errorText);
+    opt.warningHandler?.(errorText);
   }
 
   imageFilesAll.sort((a, b) => ((a.name > b.name) ? 1 : ((b.name > a.name) ? -1 : 0)));
@@ -167,59 +163,286 @@ export const importImageFilesP = async (files) => {
 };
 
 /**
- * Read a .scribe file and restore session data.
+ * Read a .scribe file and restore session data into this document.
+ * @param {ScribeDoc} doc
  * @param {string | File | FileNode | ArrayBuffer} scribeFile
+ * @returns {Promise<{rotations: ?Array<number>, sourceIndices: ?Array<?number>, outline: ?Array<import('../objects/outlineObjects.js').OutlineNode>}>}
  */
-const restoreSessionFromFile = async (scribeFile) => {
-  const scribeRestoreStr = await readOcrFile(scribeFile);
+async function restoreSessionFromFile(doc, scribeFile) {
+  /** @type {?Uint8Array} */
+  let scribeBytes = null;
+  if (scribeFile instanceof ArrayBuffer) scribeBytes = new Uint8Array(scribeFile);
+  else if (typeof scribeFile !== 'string' && typeof scribeFile.arrayBuffer === 'function') scribeBytes = new Uint8Array(await scribeFile.arrayBuffer());
+
   /** @type {ScribeSaveData} */
-  const scribeRestoreObj = JSON.parse(scribeRestoreStr);
+  let scribeRestoreObj;
+  // Segmented restores normalize pages inside applyRecord, so the whole-document sweeps below are skipped.
+  let segmentedNormalized = false;
+  if (!scribeBytes) {
+    scribeRestoreObj = JSON.parse(await readOcrFile(scribeFile));
+  } else {
+    const isGzipped = scribeBytes[0] === 0x1F && scribeBytes[1] === 0x8B;
+
+    let head = '';
+    if (isGzipped) {
+      const sniffReader = new Blob([scribeBytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();
+      const sniffDecoder = new TextDecoder('utf-8');
+      let part = await sniffReader.read();
+      while (!part.done && head.length < 32) {
+        head += sniffDecoder.decode(part.value, { stream: true });
+        part = await sniffReader.read();
+      }
+      await sniffReader.cancel().catch(() => {});
+    } else {
+      head = new TextDecoder('utf-8').decode(scribeBytes.subarray(0, 32));
+    }
+
+    if (!head.startsWith('{"scribeSegments"')) {
+      // A single-JSON payload has to fit in one JavaScript string, which V8 caps at 2^29 - 24 characters.
+      // Default exports past that cap are written on purpose, for consumers that parse them outside JavaScript.
+      const STRING_CAP = 536_870_888;
+      const tooLargeError = () => new Error('This .scribe file stores the document as a single JSON string longer than JavaScript supports, so it cannot be imported here. '
+        + 'Re-export it with the scribeSegments option, or process it with non-JavaScript JSON tooling.');
+      // The gzip ISIZE trailer gives the decompressed size mod 2^32, so it can understate a huge file but never overstate a small one.
+      // No character takes more than four UTF-8 bytes, so a payload above four times the cap is certainly too long to parse.
+      const utf8Len = isGzipped
+        ? new DataView(scribeBytes.buffer, scribeBytes.byteOffset + scribeBytes.length - 4, 4).getUint32(0, true)
+        : scribeBytes.length;
+      if (utf8Len > STRING_CAP * 4) throw tooLargeError();
+      try {
+        scribeRestoreObj = JSON.parse(await readOcrFile(scribeFile));
+      } catch (err) {
+        // Node surfaces an over-cap TextDecoder.decode as a bogus invalid-encoding TypeError, so that error code only maps to the size error when the payload is actually past the cap.
+        const overCapDecodeFailure = /** @type {?} */ (err)?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA' && utf8Len > STRING_CAP;
+        if (err instanceof RangeError || overCapDecodeFailure || /string longer|Invalid string length/.test(String(/** @type {?} */ (err)?.message))) throw tooLargeError();
+        throw err;
+      }
+    } else {
+      let stream = new Blob([scribeBytes]).stream();
+      if (isGzipped) stream = stream.pipeThrough(new DecompressionStream('gzip'));
+      const reader = stream.getReader();
+      const decoder = new TextDecoder('utf-8');
+
+      /** @type {?Record<string, any>} */
+      let assembled = null;
+      const applyHeader = (line) => {
+        const header = line ? JSON.parse(line) : {};
+        const n = header.pageCount || 0;
+        assembled = {
+          ocr: new Array(n).fill(null),
+          fontState: header.fontState,
+          layoutRegions: header.layoutRegions,
+          layoutDataTables: header.layoutDataTables,
+          annotations: header.annotations,
+          pageRotations: header.pageRotations,
+          outline: header.outline,
+          inputData: header.inputData,
+          session: header.session ? {
+            ...header.session, contentEdits: new Array(n).fill(null), nativeText: new Array(n).fill(null), fillShapes: new Array(n).fill(null),
+          } : undefined,
+        };
+      };
+      const applyRecord = (line) => {
+        if (!line) return;
+        const rec = JSON.parse(line);
+        // Normalizing each page while it is still hot from JSON.parse avoids a second pass over gigabytes of cold heap.
+        if (rec.ocr) {
+          updateOcrFormat([rec.ocr]);
+          addCircularRefsOcr([rec.ocr]);
+        }
+        assembled.ocr[rec.i] = rec.ocr ?? null;
+        if (assembled.session) {
+          // `textEdits` is the pre-rename key, still present in older saved sessions.
+          const recEdits = rec.contentEdits !== undefined ? rec.contentEdits : rec.textEdits;
+          if (recEdits !== undefined) assembled.session.contentEdits[rec.i] = recEdits;
+          if (rec.nativeText !== undefined) assembled.session.nativeText[rec.i] = rec.nativeText;
+          if (rec.fillShapes !== undefined) assembled.session.fillShapes[rec.i] = rec.fillShapes;
+        }
+      };
+
+      // Decoding chunks to strings and joining them re-copies every record, which made large restores GC-bound.
+      // Splitting on '\n' at the byte level is safe because that byte cannot appear inside a multi-byte UTF-8 character.
+      /** @type {Uint8Array[]} Byte segments since the last completed line. */
+      let pendingBytes = [];
+      let pendingLen = 0;
+      const applyLineBytes = (segTail) => {
+        let recBytes = segTail;
+        if (pendingLen) {
+          recBytes = new Uint8Array(pendingLen + segTail.length);
+          let off = 0;
+          for (const p of pendingBytes) { recBytes.set(p, off); off += p.length; }
+          recBytes.set(segTail, off);
+          pendingBytes = [];
+          pendingLen = 0;
+        }
+        const line = decoder.decode(recBytes);
+        if (!assembled) applyHeader(line);
+        else applyRecord(line);
+      };
+      const feedBytes = (chunk) => {
+        let start = 0;
+        let nl = chunk.indexOf(0x0A, start);
+        while (nl !== -1) {
+          applyLineBytes(chunk.subarray(start, nl));
+          start = nl + 1;
+          nl = chunk.indexOf(0x0A, start);
+        }
+        if (start < chunk.length) {
+          const rest = chunk.subarray(start);
+          pendingBytes.push(rest);
+          pendingLen += rest.length;
+        }
+      };
+      let part = await reader.read();
+      while (!part.done) {
+        feedBytes(part.value);
+        part = await reader.read();
+      }
+      if (pendingLen) applyLineBytes(new Uint8Array(0));
+      scribeRestoreObj = /** @type {ScribeSaveData} */ (assembled);
+      segmentedNormalized = true;
+    }
+  }
   if (scribeRestoreObj.fontState) {
-    objectAssignDefined(FontCont.state, scribeRestoreObj.fontState);
-    await runFontOptimization(ocrAll.active);
+    objectAssignDefined(doc.fonts.state, scribeRestoreObj.fontState);
+    await doc.runOptimization(doc.ocr.active);
   }
   if (scribeRestoreObj.layoutRegions) {
-    // existingLayout = true;
-    layoutRegions.pages = scribeRestoreObj.layoutRegions;
+    doc.layoutRegions.pages = addCircularRefsRegions(scribeRestoreObj.layoutRegions);
   }
   if (scribeRestoreObj.layoutDataTables) {
-    // existingLayoutDataTable = true;
     addCircularRefsDataTables(scribeRestoreObj.layoutDataTables);
-    layoutDataTables.pages = scribeRestoreObj.layoutDataTables;
+    doc.layoutDataTables.pages = scribeRestoreObj.layoutDataTables;
   }
   if (scribeRestoreObj.annotations) {
-    annotations.pages = scribeRestoreObj.annotations;
+    doc.annotations.pages = scribeRestoreObj.annotations;
+    doc.annotations.restored = true;
+  }
+  if (scribeRestoreObj.session) {
+    // `textEdits` is the pre-rename key, still present in older saved sessions.
+    const sessionEdits = scribeRestoreObj.session.contentEdits || scribeRestoreObj.session.textEdits;
+    if (sessionEdits) {
+      let legacy = 0;
+      for (let i = 0; i < sessionEdits.length; i++) {
+        const records = sessionEdits[i];
+        if (!Array.isArray(records)) continue;
+        const kept = records.filter((rec) => !rec || (rec.type !== 'deleteText' && rec.type !== 'replaceText'));
+        legacy += records.length - kept.length;
+        if (kept.length !== records.length) sessionEdits[i] = kept;
+      }
+      if (legacy > 0) console.warn(`${legacy} text edit${legacy === 1 ? '' : 's'} saved by an earlier version could not be restored; the edited text shows as the page drew it.`);
+      doc.contentEdits.pages = sessionEdits;
+    }
+    if (scribeRestoreObj.session.fillText) markFillTextRefs(doc, scribeRestoreObj.session.fillText);
+    if (scribeRestoreObj.session.tableExport) {
+      doc.tableExport.excluded = { ...(scribeRestoreObj.session.tableExport.excluded || {}) };
+      doc.tableExport.names = { ...(scribeRestoreObj.session.tableExport.names || {}) };
+    }
+    if (Array.isArray(scribeRestoreObj.session.assistantChats)) doc.assistantChats.chats = scribeRestoreObj.session.assistantChats;
+    if (Array.isArray(scribeRestoreObj.session.type3GlyphMappings)) {
+      for (const [hash, text] of scribeRestoreObj.session.type3GlyphMappings) doc.type3GlyphMappings.set(hash, text);
+    }
+    if (Array.isArray(scribeRestoreObj.session.redactions?.terms)) {
+      doc.redactions = {
+        terms: scribeRestoreObj.session.redactions.terms,
+        matchCase: !!scribeRestoreObj.session.redactions.matchCase,
+        scannedAt: scribeRestoreObj.session.redactions.scannedAt ?? null,
+      };
+    }
+    if (scribeRestoreObj.session.nativeText) {
+      for (let i = 0; i < scribeRestoreObj.session.nativeText.length; i++) {
+        const nt = scribeRestoreObj.session.nativeText[i];
+        if (!nt) continue;
+        // A fresh restore has no existing entry to merge into.
+        // Rebuilding these per-word dictionaries via spread anyway costs seconds on multi-thousand-page documents.
+        const existing = doc.nativeText.pages[i];
+        doc.nativeText.pages[i] = existing && Object.keys(existing).length ? { ...existing, ...nt } : nt;
+      }
+    }
+    if (scribeRestoreObj.session.fillShapes) {
+      const site = (/** @type {Array<number>} */ t) => ({
+        left: t[0], top: t[1], right: t[2], bottom: t[3],
+      });
+      for (let i = 0; i < scribeRestoreObj.session.fillShapes.length; i++) {
+        const enc = scribeRestoreObj.session.fillShapes[i];
+        if (!enc) continue;
+        /** @type {PageFillShapes} */
+        const shapes = {};
+        if (enc.i) shapes.images = enc.i.map((t) => ({ ...site(t), sites: t[4].map((st) => ({ ...site(st), ...(st[4] !== -1 ? { objNum: st[4] } : {}) })) }));
+        if (enc.p) shapes.paths = enc.p.map((t) => ({ ...site(t), sites: t[4].map((st) => ({ ...site(st), paint: st[4], commands: st[5] })) }));
+        if (enc.q) shapes.squares = enc.q.map((t) => ({ ...site(t), stroke: !!t[4] }));
+        if (enc.m) shapes.marks = enc.m.map(site);
+        if (enc.g) shapes.glyphBoxes = enc.g.map((t) => ({ id: t[0], bbox: site(t.slice(1)) }));
+        if (enc.pi) shapes.pathsIneligible = true;
+        if (enc.mo) shapes.marksOverflow = true;
+        doc.fillShapes.pages[i] = shapes;
+      }
+    }
+  }
+
+  // `.inputData` added to .scribe in June 2026, do not assume this field exists for re-imports.
+  // This line also skips when `inputData` has already been calculated for the active session, which is presumed more accurate.
+  if (scribeRestoreObj.inputData) {
+    if (doc.inputData.pdfType == null && scribeRestoreObj.inputData.pdfType) {
+      doc.inputData.pdfType = scribeRestoreObj.inputData.pdfType;
+    }
+    if (doc.inputData.pageStats == null && scribeRestoreObj.inputData.pageStats) {
+      doc.inputData.pageStats = scribeRestoreObj.inputData.pageStats;
+      doc.inputData.requiresOCR = !!scribeRestoreObj.inputData.requiresOCR;
+    }
+    // A document that was never recognized saves null here, so leave it null rather than filling in a default.
+    if (doc.inputData.ocrApplied == null && scribeRestoreObj.inputData.ocrApplied) {
+      doc.inputData.ocrApplied = scribeRestoreObj.inputData.ocrApplied;
+    }
   }
 
   const oemName = 'User Upload';
-  if (!ocrAll[oemName]) ocrAll[oemName] = Array(inputData.pageCount);
-  updateOcrFormat(scribeRestoreObj.ocr);
-  addCircularRefsOcr(scribeRestoreObj.ocr);
-  ocrAll[oemName] = scribeRestoreObj.ocr;
-  ocrAll.active = ocrAll[oemName];
-
-  for (let i = 0; i < ocrAll[oemName].length; i++) {
-    inputData.xmlMode[i] = true;
-    if (ocrAll[oemName][i].dims.height && ocrAll[oemName][i].dims.width) {
-      pageMetricsAll[i] = new PageMetrics(ocrAll[oemName][i].dims);
-    }
-    pageMetricsAll[i].angle = ocrAll[oemName][i].angle;
+  if (!doc.ocr[oemName]) doc.ocr[oemName] = Array(doc.inputData.pageCount);
+  if (!segmentedNormalized) {
+    updateOcrFormat(scribeRestoreObj.ocr);
+    addCircularRefsOcr(scribeRestoreObj.ocr);
   }
-};
+  doc.ocr[oemName] = scribeRestoreObj.ocr;
+  doc.ocr.active = doc.ocr[oemName];
+
+  const savedRotations = scribeRestoreObj.pageRotations ?? null;
+  const savedSourceIndices = scribeRestoreObj.session?.pageSourceIndices ?? null;
+  for (let i = 0; i < doc.ocr[oemName].length; i++) {
+    if (!doc.ocr[oemName][i]) {
+      doc.ocr[oemName][i] = new OcrPage(i, { height: 1920, width: 1080 });
+    }
+    doc.inputData.xmlMode[i] = true;
+    doc.pageMetrics[i] = new PageMetrics(doc.ocr[oemName][i].dims);
+    doc.pageMetrics[i].angle = doc.ocr[oemName][i].angle;
+    doc.pageMetrics[i].rotation = savedRotations?.[i] || 0;
+    doc.pageMetrics[i].sourcePageN = savedSourceIndices?.[i] ?? null;
+  }
+  // The page:line fields load as saved; a file from before they existed gets the pass run once on the restored layer.
+  if (doc.ocr[oemName].some((page) => page && page.lines.some((line) => line.lineNum === undefined))) assignPageLineNums(doc.ocr[oemName]);
+
+  // The caller applies `outline` after the PDF loads, since openMainPDF's parse of the source /Outlines would otherwise clobber it.
+  // A returned `null` (key absent) means a pre-outline .scribe, so the PDF's own bookmarks win; `[]` means the session deliberately had none.
+  return {
+    rotations: savedRotations,
+    sourceIndices: savedSourceIndices,
+    outline: 'outline' in scribeRestoreObj ? (scribeRestoreObj.outline || []) : null,
+  };
+}
 
 /**
- * Restore session data from legacy HOCR exports.
+ * Restore session data from legacy HOCR exports into this document.
  * Originally HOCR was used as the primary format for saving and restoring sessions,
  * which lead to a significant amount of session data being stored in HOCR files.
  * This function extracts that data and restores it to the current session format.
  * Eventually this function can be deprecated and removed.
  * Users should use the .scribe format for saving and restoring sessions instead.
+ * @param {ScribeDoc} doc
  * @param {Awaited<ReturnType<importOCRFiles>>} ocrData
  */
-const restoreSessionFromLegacyHocr = async (ocrData) => {
+async function _restoreSessionFromLegacyHocr(doc, ocrData) {
   let existingOpt = false;
 
-  objectAssignDefined(FontCont.state, ocrData.fontState);
+  objectAssignDefined(doc.fonts.state, ocrData.fontState);
 
   // Restore font metrics and optimize font from previous session (if applicable)
   if (ocrData.fontState.charMetrics && Object.keys(ocrData.fontState.charMetrics).length > 0) {
@@ -228,40 +451,41 @@ const restoreSessionFromLegacyHocr = async (ocrData) => {
     existingOpt = true;
 
     await gs.schedulerReady;
-    setDefaultFontAuto(FontCont.state.charMetrics);
+    setDefaultAuto(doc.fonts, doc.fonts.state.charMetrics);
 
     // If `ocrData.enableOpt` is `false`, then the metrics are present but ignored.
     // This occurs if optimization was found to decrease accuracy for both sans and serif,
     // not simply because the user disabled optimization in the view settings.
     // If no `enableOpt` property exists but metrics are present, then optimization is enabled.
     if (ocrData.enableOpt === 'false') {
-      FontCont.state.enableOpt = false;
+      doc.fonts.state.enableOpt = false;
     } else {
       await fontPromise;
-      if (!FontCont.raw) throw new Error('Raw font data not found.');
-      FontCont.opt = await optimizeFontContainerAll(FontCont.raw, FontCont.state.charMetrics);
-      FontCont.state.enableOpt = true;
-      await enableFontOpt(true);
+      if (!GlobalFonts.raw) throw new Error('Raw font data not found.');
+      doc.fonts.opt = await optimizeFontContainerAll(GlobalFonts.raw, doc.fonts.state.charMetrics, doc.fonts.id);
+      doc.fonts.state.enableOpt = true;
+      await enableOpt(doc.fonts, true);
     }
   }
 
   // Restore layout data from previous session (if applicable)
   if (ocrData.layoutObj) {
+    addCircularRefsRegions(ocrData.layoutObj);
     for (let i = 0; i < ocrData.layoutObj.length; i++) {
-      layoutRegions.pages[i] = ocrData.layoutObj[i];
+      doc.layoutRegions.pages[i] = ocrData.layoutObj[i];
     }
   }
 
   if (ocrData.layoutDataTableObj) {
     for (let i = 0; i < ocrData.layoutDataTableObj.length; i++) {
-      layoutDataTables.pages[i] = ocrData.layoutDataTableObj[i];
+      doc.layoutDataTables.pages[i] = ocrData.layoutDataTableObj[i];
     }
   }
 
   return {
     existingOpt,
   };
-};
+}
 
 /**
  * An object with this shape can be used to provide input to the `importFiles` function,
@@ -276,17 +500,36 @@ const restoreSessionFromLegacyHocr = async (ocrData) => {
  */
 
 /**
- * Import files for processing.
+ * Import files for processing into this document.
  * An object with `pdfFiles`, `imageFiles`, and `ocrFiles` arrays can be provided to import multiple types of files.
  * Alternatively, for `File` objects (browser) and file paths (Node.js), a single array can be provided, which is sorted based on extension.
- * @public
+ * @param {ScribeDoc} doc
  * @param {Array<File>|FileList|Array<string>|SortedInputFiles} files
+ * @param {Object} [options]
+ * @param {typeof import('../containers/scribeDoc.js').ScribeDoc.defaults.usePDFText} [options.usePDFText]
+ * @param {boolean} [options.keepPDFTextAlways]
+ * @param {boolean} [options.skipFontOpt]
+ * @param {boolean} [options.usePdfSharedBuffer]
+ * @param {number} [options.pdfWorkerN] - Fixed PDF worker-pool size for this document.
+ * @param {'width' | 'sentence'} [options.docxLineSplitMode]
+ * @param {boolean} [options.deferText] - Resolve once the PDF is renderable, running text extraction in the background behind `doc.textReady` instead of blocking on it.
+ *   PDF inputs only.
  */
-export async function importFiles(files) {
+export async function importFiles(doc, files, options = {}) {
+  const usePDFText = options.usePDFText ?? scribeDocDefaults.usePDFText;
+  const keepPDFTextAlways = options.keepPDFTextAlways ?? scribeDocDefaults.keepPDFTextAlways;
+  const skipFontOpt = options.skipFontOpt ?? scribeDocDefaults.skipFontOpt;
+  const usePdfSharedBuffer = options.usePdfSharedBuffer ?? opt.usePdfSharedBuffer;
+  const docxLineSplitMode = options.docxLineSplitMode ?? scribeDocDefaults.docxLineSplitMode;
+  const deferText = options.deferText ?? false;
   if (!files) throw new Error('No files provided.');
 
-  clearData();
-  gs.getGeneralScheduler();
+  // Wait for any in-flight extraction before clearing, so its workers don't write stale pages into the new document.
+  await doc.textReady;
+
+  await doc.clear();
+  // Pre-warm the general worker pool, except with `opt.inProcess`.
+  if (!opt.inProcess) gs.getGeneralScheduler();
 
   /** @type {Array<File|FileNode|ArrayBuffer>} */
   let pdfFiles = [];
@@ -338,44 +581,53 @@ export async function importFiles(files) {
 
   if (pdfFiles.length === 0 && imageFiles.length === 0 && ocrFiles.length === 0 && scribeFiles.length === 0) {
     const errorText = 'No supported files found.';
-    opt.errorHandler(errorText);
+    doc.errorHandler({ message: errorText });
     return;
   } if (pdfFiles.length > 0 && imageFiles.length > 0) {
     const errorText = 'PDF and image files cannot be imported together. Only first PDF file will be imported.';
-    opt.warningHandler(errorText);
+    doc.warningHandler({ message: errorText });
     pdfFiles.length = 1;
     imageFiles.length = 0;
   } else if (pdfFiles.length > 1) {
     const errorText = 'Multiple PDF files are not supported. Only first PDF file will be imported.';
-    opt.warningHandler(errorText);
+    doc.warningHandler({ message: errorText });
     pdfFiles.length = 1;
     imageFiles.length = 0;
   }
 
   if (pdfFiles[0] && !(pdfFiles[0] instanceof ArrayBuffer)) {
-    inputData.inputFileNames = [pdfFiles[0].name];
+    doc.inputData.inputFileNames = [pdfFiles[0].name];
   } else if (imageFiles[0] && !(imageFiles[0] instanceof ArrayBuffer)) {
     // @ts-ignore
-    inputData.inputFileNames = imageFiles.map((x) => x.name);
+    doc.inputData.inputFileNames = imageFiles.map((x) => x.name);
   }
 
   // Set default download name
   if (pdfFiles.length > 0 && 'name' in pdfFiles[0]) {
-    inputData.defaultDownloadFileName = `${pdfFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
+    doc.inputData.defaultDownloadFileName = `${pdfFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
   } else if (imageFiles.length > 0 && 'name' in imageFiles[0]) {
-    inputData.defaultDownloadFileName = `${imageFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
+    doc.inputData.defaultDownloadFileName = `${imageFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
   } else if (ocrFiles.length > 0 && 'name' in ocrFiles[0]) {
-    inputData.defaultDownloadFileName = `${ocrFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
+    doc.inputData.defaultDownloadFileName = `${ocrFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
   } else if (scribeFiles.length > 0 && 'name' in scribeFiles[0]) {
-    inputData.defaultDownloadFileName = `${scribeFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
+    doc.inputData.defaultDownloadFileName = `${scribeFiles[0].name.replace(/\.\w{1,6}$/, '')}.pdf`;
   }
 
-  inputData.pdfMode = pdfFiles.length === 1;
-  inputData.imageMode = !!(imageFiles.length > 0 && !inputData.pdfMode);
-  ImageCache.inputModes.image = !!(imageFiles.length > 0 && !inputData.pdfMode);
+  doc.inputData.pdfMode = pdfFiles.length === 1;
+  doc.inputData.imageMode = !!(imageFiles.length > 0 && !doc.inputData.pdfMode);
+  doc.images.inputModes.image = !!(imageFiles.length > 0 && !doc.inputData.pdfMode);
 
+  /** @type {number[]|null} */
+  let restoredRotations = null;
+  /** @type {Array<?number>|null} */
+  let restoredSourceIndices = null;
+  /** @type {Array<import('../objects/outlineObjects.js').OutlineNode>|null} */
+  let restoredOutline = null;
   if (scribeFiles[0]) {
-    await restoreSessionFromFile(scribeFiles[0]);
+    const restoreRes = await restoreSessionFromFile(doc, scribeFiles[0]);
+    restoredRotations = restoreRes.rotations;
+    restoredSourceIndices = restoreRes.sourceIndices;
+    restoredOutline = restoreRes.outline;
   }
 
   const xmlModeImport = ocrFiles.length > 0;
@@ -386,174 +638,382 @@ export async function importFiles(files) {
   let format;
   let reimportHocrMode = false;
 
-  if (inputData.pdfMode) {
+  if (doc.inputData.pdfMode) {
     // If no XML data is provided, page sizes are calculated using muPDF alone
-    await ImageCache.openMainPDF(pdfFiles[0], opt.omitNativeText);
+    await doc.images.openMainPDF(pdfFiles[0], { usePdfSharedBuffer, pdfWorkerN: options.pdfWorkerN });
 
-    pageCountImage = ImageCache.pageCount;
-    ImageCache.loadCount = ImageCache.pageCount;
-  } else if (inputData.imageMode) {
+    pageCountImage = doc.images.pageCount;
+    doc.images.loadCount = doc.images.pageCount;
+  } else if (doc.inputData.imageMode) {
     pageCountImage = imageFiles.length;
   }
 
   let existingOpt = false;
   const oemName = 'User Upload';
+  let pdfTextExtracted = false;
   if (xmlModeImport) {
-    // Initialize a new array on `ocrAll` if one does not already exist
-    if (!ocrAll[oemName]) ocrAll[oemName] = Array(inputData.pageCount);
-    ocrAll.active = ocrAll[oemName];
+    // Initialize a new array on `ocr` if one does not already exist
+    if (!doc.ocr[oemName]) doc.ocr[oemName] = Array(doc.inputData.pageCount);
+    doc.ocr.active = doc.ocr[oemName];
 
     const ocrData = await importOCRFiles(Array.from(ocrFiles));
 
     format = /** @type {("hocr" | "abbyy" | "alto" | "stext" | "textract" | "text")} */ (ocrData.format);
 
-    // The text import function requires built-in fonts to be loaded.
-    if (['text', 'docx'].includes(format)) {
+    // The text import functions require built-in fonts to be loaded, and run in a general worker.
+    // The pool is started first because fonts reach workers only as they load, so a pool created afterwards, as `opt.inProcess` does by skipping the pre-warm above, would have none.
+    if (['text', 'docx', 'md'].includes(format)) {
+      await gs.getGeneralScheduler();
       await loadBuiltInFontsRaw();
     }
 
-    ocrAllRaw.active = ocrData.hocrRaw;
-    // Subset OCR data to avoid uncaught error that occurs when there are more pages of OCR data than image data.
-    // While this should be rare, it appears to be fairly common with Archive.org documents.
-    // TODO: Add warning message displayed to user for this.
-    // Textract JSON data is returned in arbitrary chunks (multiple pages may be in one file, or one page may be in multiple files).
-    // Therefore, it is impossible to know how many pages of OCR data there are based only on the length of `ocrAllRaw.active`.
-    if (pageCountImage && ocrAllRaw.active.length > pageCountImage && ocrData.format !== 'textract' && ocrData.format !== 'google_doc_ai') {
-      console.log(`Identified ${ocrAllRaw.active.length} pages of OCR data but ${pageCountImage} pages of image/pdf data. Only first ${pageCountImage} pages will be used.`);
-      ocrAllRaw.active = ocrAllRaw.active.slice(0, pageCountImage);
+    doc.ocrRaw.active = ocrData.hocrRaw;
+    // Textract, Google Document AI and Azure Document Intelligence data come in document-level or arbitrary chunks, so the array length says nothing about their page count.
+    // Text, Markdown and DOCX inputs have no pages of their own.
+    const pagedOcr = !['textract', 'google_doc_ai', 'azure_doc_intel', 'text', 'docx', 'md'].includes(format);
+    if (pageCountImage && pagedOcr && doc.ocrRaw.active.length !== pageCountImage) {
+      const ocrRawAll = doc.ocrRaw.active;
+      const ocrPageCount = ocrRawAll.length;
+      const mismatch = `The OCR file has ${ocrPageCount} page${ocrPageCount === 1 ? '' : 's'} but the ${doc.inputData.pdfMode ? 'PDF' : 'image input'} has ${pageCountImage}`;
+      // Archive.org's ABBYY and hOCR files include scan leaves (insert cards, blank leaves, plates) that the item's PDF omits, at varying positions.
+      // Neither truncation nor a constant offset lines such a file up, and a wrong guess silently puts every page's text on the wrong page.
+      let reason = doc.inputData.pdfMode ? '' : 'only a PDF text layer can match OCR pages to pages';
+      /** @type {?Int32Array} The OCR page of each page, -1 where none belongs. */
+      let pageMap = null;
+      /** @type {string[]} */
+      let ocrTexts = [];
+      if (!reason) {
+        await extractInternalPDFText(doc, { usePDFText, keepPDFTextAlways, supplemental: true });
+        pdfTextExtracted = true;
+        const normText = (/** @type {string} */ s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+        const pdfTexts = Array.from({ length: pageCountImage }, (_, i) => (doc.ocr.pdf?.[i] ? normText(ocr.getPageText(doc.ocr.pdf[i])) : ''));
+        ocrTexts = ocrRawAll.map((str) => {
+          let text;
+          if (format === 'alto') {
+            text = (str.match(/CONTENT=(?:"[^"]*"|'[^']*')/g) || []).map((m) => m.slice(9, -1)).join(' ');
+          } else if (format === 'stext') {
+            text = (str.match(/\bc=(?:"[^"]*"|'[^']*')/g) || []).map((m) => m.slice(3, -1)).join('');
+          } else if (format === 'google_vision') {
+            try { text = JSON.parse(str).fullTextAnnotation?.text || ''; } catch { text = ''; }
+          } else {
+            text = str.replace(/<[^>]*>/g, ' ');
+          }
+          return normText(text.replace(/&[^;\s]{1,8};/g, ''));
+        });
+        const shinglesOf = (/** @type {string} */ t) => {
+          const set = new Set();
+          if (t.length < 16) return set;
+          for (let i = 0; i + 8 <= t.length; i++) {
+            let h = 2166136261;
+            for (let c = i; c < i + 8; c++) h = Math.imul(h ^ t.charCodeAt(c), 16777619);
+            set.add(h >>> 0);
+          }
+          return set;
+        };
+        const pdfSh = pdfTexts.map(shinglesOf);
+        const ocrSh = ocrTexts.map(shinglesOf);
+        const M = pageCountImage;
+        const N = ocrPageCount;
+        /** @type {Map<number, number[]>} */
+        const postings = new Map();
+        for (let j = 0; j < N; j++) {
+          for (const h of ocrSh[j]) {
+            const list = postings.get(h);
+            if (list) list.push(j); else postings.set(h, [j]);
+          }
+        }
+        const sim = new Float32Array(M * N);
+        const counts = new Int32Array(N);
+        for (let i = 0; i < M; i++) {
+          if (!pdfSh[i].size) continue;
+          counts.fill(0);
+          for (const h of pdfSh[i]) {
+            const list = postings.get(h);
+            if (list) for (const j of list) counts[j]++;
+          }
+          for (let j = 0; j < N; j++) {
+            // Dividing by the larger fingerprint stops a page whose text is only a fragment of another page's, such as a running head, from matching that page.
+            const s = counts[j] / Math.max(pdfSh[i].size, ocrSh[j].size);
+            if (s >= 0.5) sim[i * N + j] = s;
+          }
+        }
+        // Order-preserving matching that maximizes total similarity (a weighted longest common subsequence).
+        // Backpointers: 1 pairs the two pages, 2 skips the page, 3 skips the OCR page.
+        const W = N + 1;
+        const score = new Float64Array((M + 1) * W);
+        const step = new Uint8Array((M + 1) * W);
+        for (let i = 1; i <= M; i++) {
+          for (let j = 1; j <= N; j++) {
+            const s = sim[(i - 1) * N + (j - 1)];
+            let best = score[(i - 1) * W + j];
+            let from = 2;
+            if (score[i * W + (j - 1)] > best) {
+              best = score[i * W + (j - 1)];
+              from = 3;
+            }
+            if (s > 0 && score[(i - 1) * W + (j - 1)] + s > best) {
+              best = score[(i - 1) * W + (j - 1)] + s;
+              from = 1;
+            }
+            score[i * W + j] = best;
+            step[i * W + j] = from;
+          }
+        }
+        pageMap = new Int32Array(M).fill(-1);
+        let anchors = 0;
+        for (let i = M, j = N; i > 0 && j > 0;) {
+          const from = step[i * W + j];
+          if (from === 1) {
+            pageMap[i - 1] = j - 1;
+            anchors++;
+            i--;
+            j--;
+          } else if (from === 2) {
+            i--;
+          } else {
+            j--;
+          }
+        }
+        // The bar rejects another document's OCR file, which matches a page or two at most, and a partial file, which matches only its share of the pages.
+        const textPages = pdfTexts.filter((t) => t.length >= 16).length;
+        if (anchors < 2 || anchors < 0.9 * textPages) {
+          reason = `only ${anchors} of the ${textPages} PDF pages with text matched an OCR page`;
+          pageMap = null;
+        } else {
+          // Between two matched pairs, an equal number of unmatched pages on each side (blank leaves, plates) pair up in order.
+          let prevPage = -1;
+          let prevOcr = -1;
+          for (let i = 0; i <= M; i++) {
+            if (i < M && pageMap[i] < 0) continue;
+            const curOcr = i < M ? pageMap[i] : N;
+            if (i - prevPage === curOcr - prevOcr) for (let d = 1; d < i - prevPage; d++) pageMap[prevPage + d] = prevOcr + d;
+            prevPage = i;
+            prevOcr = curOcr;
+          }
+        }
+      }
+      if (!pageMap) {
+        const err = /** @type {Error & {ocrPages: number, pageCount: number}} */ (new Error(`${mismatch}, and the pages could not be matched (${reason}), so the OCR was not imported.`));
+        err.name = 'OcrPageMismatchError';
+        err.ocrPages = ocrPageCount;
+        err.pageCount = pageCountImage;
+        throw err;
+      }
+      const used = new Uint8Array(ocrPageCount);
+      for (let i = 0; i < pageCountImage; i++) if (pageMap[i] >= 0) used[pageMap[i]] = 1;
+      const droppedWithText = [];
+      for (let j = 0; j < ocrPageCount; j++) if (!used[j] && ocrTexts[j].length >= 16) droppedWithText.push(j);
+      const pagesWithoutOcr = [];
+      for (let i = 0; i < pageCountImage; i++) if (pageMap[i] < 0) pagesWithoutOcr.push(i);
+      const matched = pageCountImage - pagesWithoutOcr.length;
+      doc.inputData.ocrPageMatch = {
+        ocrPages: ocrPageCount, matched, droppedWithText, pagesWithoutOcr,
+      };
+      const listPages = (/** @type {number[]} */ arr) => arr.slice(0, 12).map((i) => i + 1).join(', ') + (arr.length > 12 ? ', …' : '');
+      const droppedNote = droppedWithText.length ? `, ${droppedWithText.length} of them carrying text (OCR pages ${listPages(droppedWithText)})` : '';
+      const withoutNote = pagesWithoutOcr.length ? `; ${pagesWithoutOcr.length} pages have no OCR page (pages ${listPages(pagesWithoutOcr)})` : '';
+      doc.warningHandler({ message: `${mismatch}. ${matched} OCR pages were matched to pages by their text; ${ocrPageCount - matched} were not used${droppedNote}${withoutNote}.` });
+      doc.ocrRaw.active = Array.from(pageMap, (j) => (j >= 0 ? ocrRawAll[j] : null));
     }
 
     format = /** @type {("hocr" | "abbyy" | "alto" | "stext" | "textract" | "text")} */ (ocrData.format);
     reimportHocrMode = ocrData.reimportHocrMode;
 
     if (ocrData.reimportHocrMode) {
-      const restoreRes = await restoreSessionFromLegacyHocr(ocrData);
+      const restoreRes = await _restoreSessionFromLegacyHocr(doc, ocrData);
       existingOpt = restoreRes.existingOpt;
     }
   }
 
-  let pageCountOcr = ocrAllRaw.active?.length || ocrAll.active?.length || 0;
-
-  // For Textract, `ocrAllRaw.active[0]` is a string containing the Textract JSON data for all pages.
-  // This ad-hoc solution counts the number of "PAGE" blocks in the Textract JSON data.
-  if (format === 'textract' && ocrAllRaw.active?.length) {
-    pageCountOcr = ocrAllRaw.active[0].match(/"BLOCKTYPE":\s*"PAGE"/ig)?.length || pageCountOcr;
-  }
-
-  if (format === 'google_doc_ai' && ocrAllRaw.active?.length) {
-    pageCountOcr = ocrAllRaw.active[0].match(/"pageNumber":\s*\d+/g)?.length || pageCountOcr;
-  }
+  const pageCountOcr = doc.ocrRaw.active?.length ? countOcrPages(format, doc.ocrRaw.active) : (doc.ocr.active?.length || 0);
 
   // If both OCR data and image data are present, confirm they have the same number of pages
-  if (xmlModeImport && (inputData.imageMode || inputData.pdfMode)) {
+  if (xmlModeImport && (doc.inputData.imageMode || doc.inputData.pdfMode)) {
     if (pageCountImage !== pageCountOcr) {
       const warningHTML = `Page mismatch detected. Image data has ${pageCountImage} pages while OCR data has ${pageCountOcr} pages.`;
-      opt.warningHandler(warningHTML);
+      doc.warningHandler({ message: warningHTML });
     }
   }
 
-  inputData.pageCount = pageCountImage ?? pageCountOcr;
+  doc.inputData.pageCount = pageCountImage ?? pageCountOcr;
+  // A session whose pages were deleted or moved has its own page count, not the source file's.
+  if (restoredSourceIndices?.some((s) => s != null)) doc.inputData.pageCount = restoredSourceIndices.length;
 
-  ocrAllRaw.active = ocrAllRaw.active || Array(pageCount);
+  // OCR imported from external files (.hocr/.xml/Textract/etc.) becomes the active layer for every page,
+  // so mark each page OCR-applied for the export flatten gate (a category-flagged page flattens iff OCR was applied to it).
+  // Skip if a .scribe restore already set an explicit array.
+  if (xmlModeImport && doc.inputData.ocrApplied == null) {
+    doc.inputData.ocrApplied = Array(doc.inputData.pageCount).fill(true);
+  }
 
-  for (let i = 0; i < inputData.pageCount; i++) {
-    if (!layoutRegions.pages[i]) {
-      layoutRegions.pages[i] = new LayoutPage(i);
+  doc.ocrRaw.active = doc.ocrRaw.active || Array(pageCount);
+
+  for (let i = 0; i < doc.inputData.pageCount; i++) {
+    if (!doc.layoutRegions.pages[i]) {
+      doc.layoutRegions.pages[i] = new LayoutPage(i);
     }
   }
 
-  for (let i = 0; i < inputData.pageCount; i++) {
-    if (!layoutDataTables.pages[i]) {
-      layoutDataTables.pages[i] = new LayoutDataTablePage(i);
+  for (let i = 0; i < doc.inputData.pageCount; i++) {
+    if (!doc.layoutDataTables.pages[i]) {
+      doc.layoutDataTables.pages[i] = new LayoutDataTablePage(i);
     }
   }
 
-  for (let i = 0; i < inputData.pageCount; i++) {
-    if (!annotations.pages[i]) {
-      annotations.pages[i] = [];
+  for (let i = 0; i < doc.inputData.pageCount; i++) {
+    if (!doc.annotations.pages[i]) {
+      doc.annotations.pages[i] = [];
     }
   }
 
-  // Read highlight annotations from PDF
-  if (inputData.pdfMode) {
-    const muPDFScheduler = await ImageCache.getMuPDFScheduler();
-    const pageDPI = ImageCache.pdfDims300.map((x) => 300 * Math.min(x.width, 3500) / x.width);
-    const annotPromises = pageDPI.map(async (dpi, i) => {
-      /** @type {Array<{rect: bbox, color: Array<number>, opacity: number, comment?: string, quads?: Array<bbox>}>} */
-      const rawAnnots = await muPDFScheduler.pageAnnotations({ page: i + 1, dpi });
-      for (const raw of rawAnnots) {
-        const r = Math.round(raw.color[0] * 255);
-        const g = Math.round(raw.color[1] * 255);
-        const b = Math.round(raw.color[2] * 255);
-        /** @type {AnnotationHighlight} */
-        const annot = {
-          bbox: raw.rect,
-          color: `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`,
-          opacity: raw.opacity,
-          groupId: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        };
-        if (raw.comment) annot.comment = raw.comment;
-        if (raw.quads) annot.quads = raw.quads;
-        annotations.pages[i].push(annot);
-      }
-    });
-    await Promise.all(annotPromises);
+  // Full-length so page insert/delete splice these arrays in lockstep (spliceFull skips short arrays).
+  for (let i = 0; i < doc.inputData.pageCount; i++) {
+    if (!doc.contentEdits.pages[i]) {
+      doc.contentEdits.pages[i] = [];
+    }
+    if (!doc.nativeText.pages[i]) {
+      doc.nativeText.pages[i] = {};
+    }
+    if (doc.fillShapes.pages[i] === undefined) {
+      doc.fillShapes.pages[i] = null;
+    }
   }
 
   // Render first page for PDF only
-  if (inputData.pdfMode && !xmlModeImport) {
-    opt.progressHandler({ n: 0, type: 'importPDF', info: { } });
+  if (doc.inputData.pdfMode && !xmlModeImport) {
+    doc.progressHandler({ n: 0, type: 'importPDF', info: { } });
   }
 
-  if (inputData.imageMode) {
-    ImageCache.pageCount = inputData.pageCount;
-    for (let i = 0; i < inputData.pageCount; i++) {
-      ImageCache.nativeSrc[i] = await importImageFileToBase64(imageFiles[i]).then(async (imgStr) => {
+  if (doc.inputData.imageMode) {
+    doc.images.pageCount = imageFiles.length;
+    for (let i = 0; i < imageFiles.length; i++) {
+      doc.images.nativeSrc[i] = await importImageFileToBase64(imageFiles[i]).then(async (imgStr) => {
         const imgWrapper = new ImageWrapper(i, imgStr, 'native', false, false);
         const imageDims = await imageUtils.getDims(imgWrapper);
-        pageMetricsAll[i] = new PageMetrics(imageDims);
+        doc.pageMetrics[i] = new PageMetrics(imageDims);
         return imgWrapper;
       });
-      ImageCache.loadCount++;
-      opt.progressHandler({ n: i, type: 'importImage', info: { } });
+      doc.images.loadCount++;
+      doc.progressHandler({ n: i, type: 'importImage', info: { } });
+    }
+  }
+
+  // Re-apply page angles from .scribe data after PDF/image loading overwrites pageMetrics.
+  // The PDF/image loading creates new PageMetrics with correct dimensions but angle=null.
+  if (scribeFiles[0] && doc.ocr.active) {
+    // The source load builds its per-page arrays in source order, so a session whose pages were deleted or moved is put back in its own order.
+    if (restoredSourceIndices?.some((s) => s != null)) {
+      const order = restoredSourceIndices.map((s, i) => s ?? i);
+      const sourceMetrics = doc.pageMetrics.slice();
+      const sourceDims = doc.images.pdfDims300.slice();
+      const sourceImages = doc.images.nativeSrc.slice();
+      if (order.every((s) => s >= 0 && s < sourceMetrics.length)) {
+        doc.pageMetrics.length = 0;
+        if (sourceDims.length) doc.images.pdfDims300.length = 0;
+        if (sourceImages.length) doc.images.nativeSrc.length = 0;
+        order.forEach((s, i) => {
+          doc.pageMetrics[i] = new PageMetrics(sourceMetrics[s].dims);
+          doc.pageMetrics[i].sourcePageN = s;
+          if (sourceDims.length) doc.images.pdfDims300[i] = sourceDims[s];
+          if (sourceImages.length) doc.images.nativeSrc[i] = sourceImages[s];
+        });
+        doc.inputData.pageCount = order.length;
+        doc.images.pageCount = order.length;
+        doc.images.loadCount = order.length;
+      } else {
+        doc.warningHandler({ message: 'The session refers to pages the source file does not have, so the source page order is kept.' });
+      }
+    }
+    // An image document with no text has an empty text layer, so the page count bounds this loop.
+    for (let i = 0; i < doc.pageMetrics.length; i++) {
+      if (doc.ocr.active[i]?.angle != null) {
+        doc.pageMetrics[i].angle = doc.ocr.active[i].angle;
+      }
+      if (restoredRotations?.[i]) {
+        doc.pageMetrics[i].rotation = restoredRotations[i];
+      }
+    }
+    // Re-apply the session's saved bookmarks, overriding those the PDF load parsed from the source's own /Outlines.
+    if (restoredOutline != null) {
+      doc.outline.length = 0;
+      for (const n of reassignOutlineIds(restoredOutline)) doc.outline.push(n);
     }
   }
 
   if (xmlModeImport) {
     // Process OCR using web worker, reading from file first if that has not been done already
-    await convertOCR(ocrAllRaw.active, true, format, oemName, reimportHocrMode, pageMetricsAll).then(async () => {
-      // Skip this step if optimization info was already restored from a previous session,
-      // or if using stext/textract (which are character-level but not visually accurate).
-      if (!existingOpt && !['stext', 'textract', 'google_vision', 'google_doc_ai', 'azure_doc_intel'].includes(format)) {
-        await checkCharWarn(convertPageWarn);
-        const charMetrics = calcCharMetricsFromPages(ocrAll.active);
+    await convertOCR(doc, doc.ocrRaw.active, true, format, oemName, reimportHocrMode, doc.pageMetrics, { docxLineSplitMode });
 
-        if (Object.keys(charMetrics).length > 0) {
-          clearObjectProperties(FontCont.state.charMetrics);
-          Object.assign(FontCont.state.charMetrics, charMetrics);
-        }
-        await runFontOptimization(ocrAll.active);
+    // An OCR page carries its own pixel size into `pageMetrics`, so a page that got none is sized like its neighbors: its PDF size at the OCR file's scale.
+    const pagesWithoutOcr = doc.inputData.ocrPageMatch?.pagesWithoutOcr;
+    if (pagesWithoutOcr?.length && doc.images.pdfDims300) {
+      const ratios = [];
+      for (let n = 0; n < doc.inputData.pageCount; n++) {
+        if (doc.ocr.active[n]?.dims?.width && doc.images.pdfDims300[n]?.width) ratios.push(doc.ocr.active[n].dims.width / doc.images.pdfDims300[n].width);
       }
-    });
-  } else if (inputData.pdfMode && (opt.usePDFText.native.main || opt.usePDFText.native.supp || opt.usePDFText.ocr.main || opt.usePDFText.ocr.supp || opt.keepPDFTextAlways)) {
-    await extractInternalPDFText();
-    if (inputData.pdfType === 'text' && opt.usePDFText.native.main || inputData.pdfType === 'ocr' && opt.usePDFText.ocr.main) {
-      if (inputData.pdfType === 'text') FontCont.state.enableCleanToNimbusMono = true;
-      if (opt.calcSuppFontInfo) await calcSuppFontInfo(ocrAll.pdf);
+      ratios.sort((a, b) => a - b);
+      const ratio = ratios[Math.floor(ratios.length / 2)] || 1;
+      for (const n of pagesWithoutOcr) {
+        if (doc.images.pdfDims300[n] && doc.pageMetrics[n]) {
+          doc.pageMetrics[n].dims = { width: doc.images.pdfDims300[n].width * ratio, height: doc.images.pdfDims300[n].height * ratio };
+        }
+        // Per-page consumers expect a page object at every index, so a page without an OCR page gets an empty one.
+        if (doc.pageMetrics[n]) doc.ocr[oemName][n] = new OcrPage(n, doc.pageMetrics[n].dims);
+      }
+    }
+
+    // Skip this step if optimization info was already restored from a previous session,
+    // or if using stext/textract (which are character-level but not visually accurate).
+    if (!existingOpt && !skipFontOpt && !['stext', 'textract', 'google_vision', 'google_doc_ai', 'azure_doc_intel'].includes(format)) {
+      await checkCharWarn(doc, doc.convertPageWarn);
+      const charMetrics = calcCharMetricsFromPages(doc.ocr.active);
+
+      if (Object.keys(charMetrics).length > 0) {
+        clearObjectProperties(doc.fonts.state.charMetrics);
+        Object.assign(doc.fonts.state.charMetrics, charMetrics);
+      }
+      await doc.runOptimization(doc.ocr.active);
+    }
+    assignPageLineNums(doc.ocr[oemName]);
+  }
+
+  // A PDF still needs parsing when an OCR file accompanies it.
+  if (!scribeFiles[0] && !pdfTextExtracted && doc.inputData.pdfMode && (usePDFText.native.main || usePDFText.native.supp || usePDFText.ocr.main || usePDFText.ocr.supp || keepPDFTextAlways)) {
+    const extractOptions = { usePDFText, keepPDFTextAlways, supplemental: xmlModeImport };
+    if (deferText) {
+      // `terminate()` and `clear()` resolve this still-pending promise to null via `_textReadySettle`, so waiters never hang when the worker pool is torn down mid-extraction.
+      // Extraction errors also resolve to null rather than reject, so awaiting `textReady` never throws.
+      doc.textReady = new Promise((resolve) => {
+        doc._textReadySettle = () => resolve(null);
+        extractInternalPDFText(doc, extractOptions).then(
+          (res) => {
+            doc._textReadySettle = null;
+            resolve(res);
+          },
+          (err) => {
+            doc._textReadySettle = null;
+            console.error('Deferred PDF text extraction failed:', err);
+            resolve(null);
+          },
+        );
+      });
+    } else {
+      await extractInternalPDFText(doc, extractOptions);
     }
   }
 }
 
 /**
- * Import supplemental OCR files, such as an alternate OCR version or ground truth data.
+ * Import supplemental OCR files into this document, such as an alternate OCR version or ground truth data.
  * This function should not be used to import the main OCR files.
+ * @param {ScribeDoc} doc
  * @param {Array<File>|FileList|Array<string>} files
  * @param {string} ocrName - Name of the OCR version (e.g. "Ground Truth")
  */
-export async function importFilesSupp(files, ocrName) {
+export async function importFilesSupp(doc, files, ocrName) {
   if (!files || files.length === 0) return;
 
-  if (!ocrAll[ocrName]) ocrAll[ocrName] = Array(inputData.pageCount);
+  if (!doc.ocr[ocrName]) doc.ocr[ocrName] = Array(doc.inputData.pageCount);
 
   const curFiles = await standardizeFiles(files);
 
@@ -565,15 +1025,16 @@ export async function importFilesSupp(files, ocrName) {
 
   const ocrData = await importOCRFiles(ocrFilesAll);
 
-  const pageCountHOCR = ocrData.hocrRaw.length;
+  const pageCountHOCR = countOcrPages(ocrData.format, ocrData.hocrRaw);
 
   // If both OCR data and image data are present, confirm they have the same number of pages
-  if (ImageCache.pageCount > 0 && ImageCache.pageCount !== pageCountHOCR) {
-    const warningHTML = `Page mismatch detected. Image data has ${ImageCache.pageCount} pages while OCR data has ${pageCountHOCR} pages.`;
-    opt.warningHandler(warningHTML);
+  if (doc.images.pageCount > 0 && doc.images.pageCount !== pageCountHOCR) {
+    const warningHTML = `Page mismatch detected. Image data has ${doc.images.pageCount} pages while OCR data has ${pageCountHOCR} pages.`;
+    doc.warningHandler({ message: warningHTML });
   }
 
   const format = /** @type {("hocr" | "abbyy" | "stext" | "textract" | "text")} */ (ocrData.format);
 
-  await convertOCR(ocrData.hocrRaw, false, format, ocrName, ocrData.reimportHocrMode);
+  await convertOCR(doc, ocrData.hocrRaw, false, format, ocrName, ocrData.reimportHocrMode, doc.pageMetrics);
+  assignPageLineNums(doc.ocr[ocrName]);
 }
