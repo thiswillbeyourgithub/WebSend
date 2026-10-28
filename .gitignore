@@ -14,6 +14,7 @@ remotes/
 
 # test artifacts
 src/test-results/
+src/test/fixtures/test-large.bin
 
 
 .serena
