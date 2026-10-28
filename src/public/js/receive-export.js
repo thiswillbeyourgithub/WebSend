@@ -725,10 +725,10 @@
     const MAX_PDF_RENDER_PAGES = 1000;
 
     /**
-     * Render all pages of a PDF to PNG data URLs (scribe's PDF renderer).
+     * Render all pages of a PDF to PNG Blobs (scribe's PDF renderer).
      * @param {Uint8Array} pdfData - Raw PDF bytes
      * @param {number} dpi - Render DPI (default 150)
-     * @returns {Promise<string[]>} Array of data:image/png;base64,... URLs
+     * @returns {Promise<Blob[]>} One image/png Blob per page
      * @throws Error if pageCount > MAX_PDF_RENDER_PAGES
      */
     function renderPdfPages(pdfData, dpi = 150) {
@@ -751,13 +751,7 @@
             const zipFiles = [];
             const baseName = file.name.replace(/\.pdf$/i, '');
             for (let i = 0; i < pages.length; i++) {
-                const resp = await fetch(pages[i]);
-                const blob = await resp.blob();
-                const buf = await blob.arrayBuffer();
-                zipFiles.push({
-                    name: `${baseName}_page_${i + 1}.png`,
-                    input: new Uint8Array(buf)
-                });
+                zipFiles.push({ name: `${baseName}_page_${i + 1}.png`, input: pages[i] });
             }
 
             const clientZipModule = await import('/vendor/client-zip.js');
@@ -796,9 +790,7 @@
 
             const ocrFiles = [];
             for (let i = 0; i < pages.length; i++) {
-                const resp = await fetch(pages[i]);
-                const blob = await resp.blob();
-                ocrFiles.push(new File([blob], `page_${i + 1}.png`, { type: 'image/png' }));
+                ocrFiles.push(new File([pages[i]], `page_${i + 1}.png`, { type: 'image/png' }));
             }
 
             // Always go through ScribeHandle: it tracks isAlive so dispose()

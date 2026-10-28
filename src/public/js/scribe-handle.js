@@ -39,6 +39,15 @@
         return scribePromise;
     }
 
+    // Decode a "data:image/png;base64,..." URL locally (no fetch, see
+    // renderPdfPages for why).
+    function pngDataUrlToBlob(dataUrl) {
+        const bin = atob(dataUrl.slice(dataUrl.indexOf(',') + 1));
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new Blob([bytes], { type: 'image/png' });
+    }
+
     class ScribeHandle {
         constructor(scribe, doc) {
             this._scribe = scribe;
@@ -108,7 +117,10 @@
          * @param {number} opts.dpi - Render resolution.
          * @param {number} opts.maxPages - Refuse PDFs with more pages (see
          *   MAX_PDF_RENDER_PAGES in receive-export.js for the rationale).
-         * @returns {Promise<string[]>} data:image/png;base64,... URLs, in page order.
+         * @returns {Promise<Blob[]>} One image/png Blob per page, in page order.
+         *   Blobs rather than scribe's data URLs because turning a data URL
+         *   into bytes with fetch() is blocked by the CSP (connect-src has
+         *   no data:), so callers must never have to do it.
          * @throws {Error} if the page count exceeds maxPages or a page fails to render.
          */
         static async renderPdfPages(pdfData, { dpi, maxPages }) {
@@ -128,7 +140,7 @@
                     // On failure scribe returns a blank PNG with ok=false;
                     // surface it rather than silently exporting a blank page.
                     if (!res.ok) throw new Error(`Failed to render PDF page ${i + 1}: ${res.failReason || 'unknown error'}`);
-                    pages.push(res.dataUrl);
+                    pages.push(pngDataUrlToBlob(res.dataUrl));
                 }
                 return pages;
             } finally {
