@@ -53,7 +53,7 @@ WebSend/
 ├── deploy.sh               # Deployment script
 │
 ├── docker/
-│   ├── Dockerfile          # Node 20 Alpine image, non-root user, production build
+│   ├── Dockerfile          # Node 26 Alpine image, non-root user, production build
 │   ├── docker-compose.yml  # Service definition with security hardening (read-only FS,
 │   │                       #   dropped capabilities, resource limits, health check).
 │   │                       #   Defines four opt-in profiles selected via

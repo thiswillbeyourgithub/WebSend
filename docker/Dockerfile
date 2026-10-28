@@ -1,6 +1,6 @@
 # Express server for serving static files and WebRTC signaling
 # Using Node.js because it's lightweight and doesn't require compilation
-FROM node:20-alpine
+FROM node:26-alpine
 
 WORKDIR /app
 
