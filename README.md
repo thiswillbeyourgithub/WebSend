@@ -478,7 +478,7 @@ All client-side libraries are vendored directly in the repository (no CDN at run
 
 | Library | Version | License | Source |
 |---------|---------|---------|--------|
-| [qrcode.js](https://github.com/soldair/node-qrcode) | 1.5.1 | MIT | QR code generation |
+| [qrcode.js](https://github.com/soldair/node-qrcode) | 1.5.4 | MIT | QR code generation |
 | [jsQR](https://github.com/cozmo/jsQR) | 1.4.0 | Apache-2.0 | QR code scanning |
 | [client-zip](https://github.com/Touffy/client-zip) | 2.5.1 | MIT | ZIP export |
 | [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.10.1 | AGPL-3.0 | OCR engine (preloaded in background; bundles Tesseract WASM and MuPDF) |
