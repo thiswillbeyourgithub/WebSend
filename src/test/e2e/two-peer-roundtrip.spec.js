@@ -7,6 +7,7 @@
  */
 
 const { test, expect } = require('@playwright/test');
+const { pairAndVerify } = require('./helpers');
 const path = require('path');
 const fs = require('fs');
 
@@ -77,60 +78,6 @@ function ensureBigFixture() {
 
 test.beforeAll(ensureFixture);
 
-/**
- * Pair a receiver and sender context and walk both through the
- * verification modal. Returns the pages ready for file transfers.
- */
-async function pairAndVerify(browser) {
-    // Context A = receiver
-    const ctxA = await browser.newContext();
-    const pageA = await ctxA.newPage();
-    await pageA.goto('/receive.html');
-
-    await pageA.waitForSelector('#qr-url-input', { timeout: 12000 });
-    const senderUrl = await pageA.inputValue('#qr-url-input');
-
-    // Context B = sender
-    const ctxB = await browser.newContext();
-    const pageB = await ctxB.newPage();
-    await pageB.goto(senderUrl);
-    await pageB.waitForLoadState('domcontentloaded');
-
-    // Wait for WebRTC connection + key exchange (both sides show verification modal)
-    // The modal becomes visible when the fingerprint is ready — wait for it
-    await pageA.waitForFunction(
-        () => {
-            const modal = document.getElementById('verification-modal');
-            if (!modal) return false;
-            // Modal is shown when it does NOT have the 'hidden' class
-            return !modal.classList.contains('hidden');
-        },
-        { timeout: 20000 }
-    );
-
-    // Click Accept on receiver side
-    await pageA.click('#confirm-match-btn');
-
-    // Wait for sender verification modal too
-    await pageB.waitForFunction(
-        () => {
-            const modal = document.getElementById('verification-modal');
-            return modal && !modal.classList.contains('hidden');
-        },
-        { timeout: 10000 }
-    ).catch(() => null);
-    await pageB.$eval('#confirm-match-btn', btn => btn.click()).catch(() => null);
-
-    // Wait for both sides to be in "connected" state (past verification)
-    await pageA.waitForFunction(
-        () => !document.getElementById('verification-modal') ||
-              document.getElementById('verification-modal').classList.contains('hidden'),
-        { timeout: 10000 }
-    ).catch(() => null);
-
-    return { ctxA, pageA, ctxB, pageB };
-}
-
 test('receiver page creates a room and shows a QR/URL', async ({ page }) => {
     await page.goto('/receive.html');
     await page.waitForSelector('#qr-url-input', { timeout: 12000 });
@@ -179,12 +126,8 @@ test('multi-segment file (>1 MiB) arrives byte-identical', async ({ browser }) =
 
     const { ctxA, pageA, ctxB, pageB } = await pairAndVerify(browser);
     try {
-        // A single non-image file is queued and sent automatically once a
-        // shared key exists; wait for it so handleFileSelect doesn't bail.
-        await pageB.waitForFunction(
-            () => window.SenderConnect && window.SenderConnect.getSharedKey() != null,
-            { timeout: 15000 }
-        );
+        // A single non-image file is sent automatically once selected
+        // (pairAndVerify already waited for the shared key).
         await pageB.setInputFiles('#file-input', FIXTURE_BIG);
 
         // Non-image files render as a generic file card with a download link.

@@ -14,6 +14,7 @@
  */
 
 const { test, expect } = require('@playwright/test');
+const { pairAndVerify } = require('./helpers');
 const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
@@ -71,44 +72,6 @@ function ensureFixtures(n) {
         paths.push(p);
     }
     return paths;
-}
-
-/**
- * Pair a receiver and sender context, walk both through the verification
- * modal, and return the pages ready for file transfers. Mirrors the flow
- * in two-peer-roundtrip.spec.js but kept local to avoid coupling.
- */
-async function pairAndVerify(browser) {
-    const ctxA = await browser.newContext();
-    const pageA = await ctxA.newPage();
-    await pageA.goto('/receive.html');
-    await pageA.waitForSelector('#qr-url-input', { timeout: 12000 });
-    const senderUrl = await pageA.inputValue('#qr-url-input');
-
-    const ctxB = await browser.newContext();
-    const pageB = await ctxB.newPage();
-    await pageB.goto(senderUrl);
-    await pageB.waitForLoadState('domcontentloaded');
-
-    await pageA.waitForFunction(() => {
-        const m = document.getElementById('verification-modal');
-        return m && !m.classList.contains('hidden');
-    }, { timeout: 20000 });
-    await pageA.click('#confirm-match-btn');
-
-    await pageB.waitForFunction(() => {
-        const m = document.getElementById('verification-modal');
-        return m && !m.classList.contains('hidden');
-    }, { timeout: 10000 }).catch(() => null);
-    await pageB.$eval('#confirm-match-btn', btn => btn.click()).catch(() => null);
-
-    // Wait until sender has a sharedKey (post-verification) so handleFileSelect won't bail
-    await pageB.waitForFunction(
-        () => window.SenderConnect && window.SenderConnect.getSharedKey() != null,
-        { timeout: 15000 }
-    );
-
-    return { ctxA, pageA, ctxB, pageB };
 }
 
 /**
