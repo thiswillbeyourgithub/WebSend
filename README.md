@@ -474,7 +474,7 @@ A minimal Node script `src/cli/receive.js` pairs as a receiver from a terminal â
 
 ## Third-Party Libraries
 
-All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0. The npm-published ones are also pinned in [`src/vendor-pins/package.json`](src/vendor-pins/package.json) so Dependabot raises CVE alerts for them; when bumping one, re-vendor its files and update this table (`test/unit/vendor-pins.test.mjs` checks all three agree).
+All client-side libraries are vendored directly in the repository (no CDN at runtime). All licenses are compatible with AGPL-3.0. The npm-published ones are also pinned in [`src/vendor-pins/package.json`](src/vendor-pins/package.json) so Dependabot raises CVE alerts for them; when bumping one, re-vendor its files and update this table (`test/unit/vendor-pins.test.mjs` checks all three agree). For scribe.js-ocr, drop the tarball's `cli/`, `docs/`, `examples/`, `mcp/`, `scribe-ui/` and `index.html` (never loaded by WebSend) but keep `scrollview-web/` (imported lazily by scribe).
 
 | Library | Version | License | Source |
 |---------|---------|---------|--------|

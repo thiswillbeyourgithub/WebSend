@@ -463,7 +463,11 @@ WebSend/
         ├── vendor/             # Vendored third-party libraries (committed to repo)
         │   ├── client-zip.js   # ZIP generator (ESM, ~6KB, preloaded in background)
         │   ├── scribe.js-ocr/  # OCR engine (AGPL-3.0): scribe.js + Tesseract WASM,
-        │   │                   #   fonts, own PDF parser/renderer; preloaded in background
+        │   │                   #   fonts, own PDF parser/renderer; preloaded in background.
+        │   │                   #   The npm tarball minus what WebSend never loads (cli/,
+        │   │                   #   docs/, examples/, mcp/, scribe-ui/, the demo index.html),
+        │   │                   #   so those are not served under /scribe/. scrollview-web/
+        │   │                   #   must stay: recognizeConvert.js imports it lazily
         │   ├── tessdata/       # Tesseract language models (eng + fra .traineddata),
         │   │                   #   served locally to avoid CDN dependency
         │   └── eruda/          # Mobile devtools console (loaded in DEV mode, via
