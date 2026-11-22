@@ -23,6 +23,11 @@ RUN npm install --production && \
 # Enable with: RUN_NPM_AUDIT=true in your .env (passed as a build arg).
 ARG RUN_NPM_AUDIT=false
 RUN if [ "$RUN_NPM_AUDIT" = "true" ]; then npm audit --audit-level=high; fi
+# npm/yarn/corepack are build-time only: drop them (their vendored undici/brace-expansion are the
+# image's trivy HIGHs) and pull Alpine security fixes the node tag may lag behind on.
+RUN apk upgrade --no-cache \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-* \
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg
 
 # Copy application files
 COPY server.js ./
