@@ -36,8 +36,8 @@ async function newRoom() {
 
 // Room with two LP slots: { roomId, secret, a, b } where a/b are slot tokens.
 async function lpPair() {
-    const { roomId, secret } = await newRoom();
-    const a = (await (await lpHandshake(srv.baseUrl, roomId, secret)).json()).token;
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = (await (await lpHandshake(srv.baseUrl, roomId, hostSecret)).json()).token;
     const b = (await (await lpHandshake(srv.baseUrl, roomId, secret)).json()).token;
     return { roomId, secret, a, b };
 }
@@ -107,8 +107,8 @@ test('WS send buffers count in the budget; a closed socket gives its bytes back'
     const probeRoom = await lpPair();
     assert.equal((await probe(probeRoom)).status, 204);
 
-    const { roomId, secret } = await newRoom();
-    const sender = await openWs(roomId, secret);
+    const { roomId, secret, hostSecret } = await newRoom();
+    const sender = await openWs(roomId, hostSecret);
     const receiver = await openWs(roomId, secret);
     // The receiver stops reading: once the loopback socket buffers fill,
     // further frames pile up in the relay's ws send buffer.
@@ -135,8 +135,8 @@ test('WS send buffers count in the budget; a closed socket gives its bytes back'
 test('a WS feeder is paused, not dropped, while the budget is spent', async () => {
     const hog = await fillWithLp();
 
-    const { roomId, secret } = await newRoom();
-    const lp = (await (await lpHandshake(srv.baseUrl, roomId, secret)).json()).token;
+    const { roomId, secret, hostSecret } = await newRoom();
+    const lp = (await (await lpHandshake(srv.baseUrl, roomId, hostSecret)).json()).token;
     const ws = await openWs(roomId, secret);
     const TOTAL = 16;
     for (let i = 0; i < TOTAL; i++) {

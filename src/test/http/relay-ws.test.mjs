@@ -6,7 +6,7 @@
  *   - WS sender -> slow LP receiver: socket-pause backpressure, no frame loss
  *   - wrong secret  -> 401 close
  *   - missing room  -> 401 close (no enumeration oracle)
- *   - third peer    -> 409 close
+ *   - second connector for a seated role -> 409 (slots are role-bound)
  *   - oversized control message (>16 KiB) -> 4413 close
  *   - frame over maxPayload (LP_FRAME_BODY_LIMIT, 320 KiB) -> 1009 close,
  *     not forwarded to the peer
@@ -104,8 +104,8 @@ function expectUpgradeRejection(url) {
 }
 
 test('happy path: two peers pair and exchange binary + text frames', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
     const b = await openWs(wsUrl(roomId, secret));
 
     // Binary frame A -> B
@@ -127,9 +127,9 @@ test('happy path: two peers pair and exchange binary + text frames', async () =>
 });
 
 test('WS sender feeding a slow LP receiver loses no frames (socket pause backpressure)', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     // LP receiver claims slot a first, then the WS sender joins as slot b.
-    const lp = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
+    const lp = await (await lpHandshake(srv.baseUrl, roomId, hostSecret)).json();
     const ws = await openWs(wsUrl(roomId, secret));
 
     // Push well past LP_QUEUE_MAX_FRAMES (32) before the receiver drains
@@ -160,10 +160,10 @@ test('WS sender feeding a slow LP receiver loses no frames (socket pause backpre
 });
 
 test('WS feeder gets throttled relay-backlog reports while its peer lags, decaying to 0', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     // LP receiver that does not poll: every frame the WS feeder pushes
     // sits in the LP queue, i.e. a real peer backlog.
-    const lp = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
+    const lp = await (await lpHandshake(srv.baseUrl, roomId, hostSecret)).json();
     const ws = await openWs(wsUrl(roomId, secret));
 
     const reports = [];
@@ -233,8 +233,8 @@ test('missing room rejected with 401 (same status as wrong secret)', async () =>
 });
 
 test('third peer rejected (slots full)', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
     const b = await openWs(wsUrl(roomId, secret));
     const r = await expectUpgradeRejection(wsUrl(roomId, secret));
     assert.equal(r.status, 409);
@@ -242,8 +242,8 @@ test('third peer rejected (slots full)', async () => {
 });
 
 test('oversized control message (>16 KiB) closes connection with 4413', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
     const b = await openWs(wsUrl(roomId, secret));
 
     const huge = 'x'.repeat(17 * 1024); // > MAX_CONTROL_MSG_BYTES (16 KiB)
@@ -256,8 +256,8 @@ test('oversized control message (>16 KiB) closes connection with 4413', async ()
 });
 
 test('frame over maxPayload (320 KiB) closes the socket with 1009 and is not forwarded', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
     const b = await openWs(wsUrl(roomId, secret));
 
     let bGotBinary = false;
@@ -272,8 +272,8 @@ test('frame over maxPayload (320 KiB) closes the socket with 1009 and is not for
 });
 
 test('frame exactly at maxPayload (320 KiB) is forwarded', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
     const b = await openWs(wsUrl(roomId, secret));
     const recvB = nextMessage(b);
     a.send(Buffer.alloc(320 * 1024, 0x43), { binary: true });
@@ -284,8 +284,8 @@ test('frame exactly at maxPayload (320 KiB) is forwarded', async () => {
 
 test('binary frames of legitimate size are NOT capped by control-msg cap', async () => {
     // 32 KiB binary frame must be forwarded fine (caps only apply to text).
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
     const b = await openWs(wsUrl(roomId, secret));
 
     const payload = Buffer.alloc(32 * 1024, 0xAA);
@@ -299,8 +299,8 @@ test('binary frames of legitimate size are NOT capped by control-msg cap', async
 });
 
 test('peer disconnect closes the partner socket', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
     const b = await openWs(wsUrl(roomId, secret));
 
     const bClosed = nextClose(b);
@@ -314,9 +314,9 @@ test('cross-kind WS+LP teardown frees the LP slot for a fresh handshake', async 
     // its LP partner. closeLpSlot used to leave the LP slot reference in
     // room.relay until LP_SLOT_IDLE_TIMEOUT_MS (60s), so a fresh handshake
     // saw "slots full" and returned 409. teardownPeer now nulls the LP
-    // slot reference too, letting a fresh handshake reclaim 'a' immediately.
-    const { roomId, secret } = await newRoom();
-    const a = await openWs(wsUrl(roomId, secret));
+    // slot reference too, letting a fresh handshake reclaim it immediately.
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, hostSecret));
 
     // Claim slot b via long-poll handshake.
     const h1 = await fetch(`${srv.baseUrl}/api/rooms/${roomId}/relay/handshake`, {
@@ -341,7 +341,29 @@ test('cross-kind WS+LP teardown frees the LP slot for a fresh handshake', async 
     });
     assert.equal(h2.status, 200);
     const h2Body = await h2.json();
-    assert.equal(h2Body.slot, 'a');
+    assert.equal(h2Body.slot, 'b');
+});
+
+test('WS slots are role-bound: a lone sender cannot take slot a', async () => {
+    const { roomId, secret, hostSecret } = await newRoom();
+    const s1 = await openWs(wsUrl(roomId, secret));
+    // Slot a is still empty, but it belongs to the host: a second sender
+    // is refused instead of being seated there.
+    assert.equal((await expectUpgradeRejection(wsUrl(roomId, secret))).status, 409);
+    const h = await openWs(wsUrl(roomId, hostSecret));
+    assert.equal((await expectUpgradeRejection(wsUrl(roomId, hostSecret))).status, 409);
+    s1.close(); h.close();
+});
+
+test('mixed LP/WS slots are role-bound: LP sender blocks a WS sender, not the WS host', async () => {
+    const { roomId, secret, hostSecret } = await newRoom();
+    const lp = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
+    assert.equal(lp.slot, 'b');
+    assert.equal((await expectUpgradeRejection(wsUrl(roomId, secret))).status, 409);
+    const h = await openWs(wsUrl(roomId, hostSecret));
+    // And the reverse direction: the WS host now blocks an LP host.
+    assert.equal((await lpHandshake(srv.baseUrl, roomId, hostSecret)).status, 409);
+    h.close();
 });
 
 test('RELAY_ENABLE=false rejects upgrade with 404', async () => {

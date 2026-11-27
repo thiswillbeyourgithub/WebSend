@@ -2,7 +2,8 @@
  * HTTP-relay long-poll fallback: /api/rooms/:id/relay/{handshake,up,down,close}.
  *
  * Covers:
- *   - handshake assigns slots a and b; third refused with 409
+ *   - handshake binds slots to roles (host a, sender b); a second
+ *     connector for a seated role is refused with 409
  *   - wrong secret -> 401 on every endpoint
  *   - wrong slot token -> 401 on up/down
  *   - binary frame round-trip A -> B and B -> A
@@ -35,21 +36,23 @@ const handshake = (roomId, secret) => lpHandshake(srv.baseUrl, roomId, secret);
 const up = (roomId, secret, token, body, isBinary) => lpUp(srv.baseUrl, roomId, secret, token, body, isBinary);
 const down = (roomId, secret, token, wait = false) => lpDown(srv.baseUrl, roomId, secret, token, wait);
 
-test('handshake assigns slot a then b, third gets 409', async () => {
-    const { roomId, secret } = await newRoom();
+test('handshake binds slots to roles: host -> a, sender -> b, second of a role gets 409', async () => {
+    const { roomId, secret, hostSecret } = await newRoom();
+    // Sender arrives first: it must still land on b, never on the free a.
     const h1 = await handshake(roomId, secret);
     assert.equal(h1.status, 200);
     const b1 = await h1.json();
-    assert.equal(b1.slot, 'a');
+    assert.equal(b1.slot, 'b');
     assert.ok(typeof b1.token === 'string' && b1.token.length >= 32);
 
-    const h2 = await handshake(roomId, secret);
-    assert.equal(h2.status, 200);
-    const b2 = await h2.json();
-    assert.equal(b2.slot, 'b');
+    // A second sender may not squat the receiver's slot.
+    assert.equal((await handshake(roomId, secret)).status, 409);
 
-    const h3 = await handshake(roomId, secret);
-    assert.equal(h3.status, 409);
+    const h2 = await handshake(roomId, hostSecret);
+    assert.equal(h2.status, 200);
+    assert.equal((await h2.json()).slot, 'a');
+
+    assert.equal((await handshake(roomId, hostSecret)).status, 409);
 });
 
 test('handshake with wrong secret returns 401', async () => {
@@ -59,15 +62,15 @@ test('handshake with wrong secret returns 401', async () => {
 });
 
 test('up with wrong slot token returns 401', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     await handshake(roomId, secret);
     const res = await up(roomId, secret, 'badtoken', 'hello', false);
     assert.equal(res.status, 401);
 });
 
 test('binary frame round-trip A -> B', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await handshake(roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await handshake(roomId, hostSecret)).json();
     const b = await (await handshake(roomId, secret)).json();
 
     const payload = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -82,8 +85,8 @@ test('binary frame round-trip A -> B', async () => {
 });
 
 test('text frame round-trip B -> A', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await handshake(roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await handshake(roomId, hostSecret)).json();
     const b = await (await handshake(roomId, secret)).json();
 
     const msg = JSON.stringify({ type: 'relay-hello' });
@@ -97,8 +100,8 @@ test('text frame round-trip B -> A', async () => {
 });
 
 test('down with wait=true blocks until peer sends', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await handshake(roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await handshake(roomId, hostSecret)).json();
     const b = await (await handshake(roomId, secret)).json();
 
     const downPromise = down(roomId, secret, b.token, true);
@@ -113,8 +116,8 @@ test('down with wait=true blocks until peer sends', async () => {
 });
 
 test('control msg over MAX_CONTROL_MSG_BYTES returns 413 and closes slot', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await handshake(roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await handshake(roomId, hostSecret)).json();
     await handshake(roomId, secret); // peer b
 
     const big = 'x'.repeat(20_000); // > 16 KiB control cap
@@ -123,8 +126,8 @@ test('control msg over MAX_CONTROL_MSG_BYTES returns 413 and closes slot', async
 });
 
 test('full peer queue returns 429 and loses no frames', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await handshake(roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await handshake(roomId, hostSecret)).json();
     const b = await (await handshake(roomId, secret)).json();
 
     // Push frames from a without b polling. The server must accept exactly
@@ -160,8 +163,8 @@ test('full peer queue returns 429 and loses no frames', async () => {
 });
 
 test('up reports the peer backlog in X-Peer-Backlog-Bytes', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await handshake(roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await handshake(roomId, hostSecret)).json();
     const b = await (await handshake(roomId, secret)).json();
 
     // No waiter on b, so each accepted frame stays queued: the header must
@@ -183,8 +186,8 @@ test('up reports the peer backlog in X-Peer-Backlog-Bytes', async () => {
 });
 
 test('close endpoint tears down both sides', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await handshake(roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await handshake(roomId, hostSecret)).json();
     const b = await (await handshake(roomId, secret)).json();
 
     // b starts a long poll; a closes; b should get 410.

@@ -722,6 +722,17 @@ const validateRoomSecret = requireRoomRole('host', 'sender');
 const requireHost = requireRoomRole('host');
 const requireSender = requireRoomRole('sender');
 
+// Relay slots are bound to the role, not to arrival order: the host
+// (receiver) always holds slot 'a' and the sender always holds slot 'b',
+// on both the WS and the long-poll relay (and any LP/WS mix, since they
+// share room.relay). A holder of the QR secret can therefore never take
+// the receiver's slot, and a second connector for a role that is already
+// seated gets 409 instead of squatting the other side's slot. A slot is
+// freed by a clean close, the WS heartbeat (dead socket terminated within
+// two RELAY_PING_INTERVAL_MS) or the LP idle timer, after which the
+// clients' existing retry loops re-claim it.
+const RELAY_SLOT_FOR_ROLE = Object.freeze({ host: 'a', sender: 'b' });
+
 /**
  * Clean up expired rooms periodically.
  *
@@ -1376,10 +1387,8 @@ app.post('/api/rooms/:id/relay/handshake', rateLimitMiddleware('general'), valid
     if (!RELAY_ENABLE) return res.status(404).json({ error: 'Relay disabled' });
     const room = req.room;
     const r = room.relay || (room.relay = { a: null, b: null, sessionBytes: 0 });
-    let slotName;
-    if (!r.a) slotName = 'a';
-    else if (!r.b) slotName = 'b';
-    else return res.status(409).json({ error: 'Room relay slots full' });
+    const slotName = RELAY_SLOT_FOR_ROLE[req.roomRole];
+    if (r[slotName]) return res.status(409).json({ error: 'Relay slot busy' });
 
     const token = require('crypto').randomBytes(LP_SLOT_TOKEN_BYTES).toString('hex');
     const slot = {
@@ -1661,8 +1670,9 @@ app.use((err, req, res, next) => {
 // client races a WebSocket to /api/rooms/:id/relay against WebRTC. The
 // relay forwards opaque encrypted bytes between two paired peers; the
 // payload remains ECDH+AES-GCM end-to-end encrypted, so the server never
-// sees plaintext. Three slots per room: 'a' (first connector), 'b' (second
-// connector), and a 4409 close code for a third connector. Bounded by the
+// sees plaintext. Two slots per room, bound to the role
+// (RELAY_SLOT_FOR_ROLE): 'a' for the host, 'b' for the sender; a second
+// connector for an already seated role is refused with 409. Bounded by the
 // mirrored MAX_TOTAL_SESSION_BYTES / MAX_CONTROL_MSG_BYTES caps.
 
 const RELAY_PATH_RE = /^\/api\/rooms\/([A-Z0-9]{6})\/relay$/;
@@ -2047,19 +2057,16 @@ httpServer.on('upgrade', (req, socket, head) => {
         return;
     }
 
-    // Slot assignment: first connector becomes 'a', second 'b', third
-    // gets a 4409 close. We have to commit to the slot BEFORE handleUpgrade
+    // Slot assignment is role-bound (RELAY_SLOT_FOR_ROLE): host -> 'a',
+    // sender -> 'b'; a second connector for a seated role gets 409. We have to commit to the slot BEFORE handleUpgrade
     // resolves so a concurrent third upgrade can't slip in.
     const r = room.relay || { a: null, b: null, sessionBytes: 0 };
-    let slot;
-    if (!r.a) slot = 'a';
-    else if (!r.b) slot = 'b';
-    else {
-        socket.write('HTTP/1.1 409 Conflict\r\n\r\nRoom relay slots full');
+    const slot = RELAY_SLOT_FOR_ROLE[role];
+    if (r[slot]) {
+        socket.write('HTTP/1.1 409 Conflict\r\n\r\nRelay slot busy');
         socket.destroy();
         return;
     }
-
     wss.handleUpgrade(req, socket, head, (ws) => {
         attachRelay(room, ws, slot);
     });
