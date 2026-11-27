@@ -5,6 +5,8 @@
  *  - Empty-state behaviors: 204 on no answer, 404 on offer-not-ready
  *  - 404 on nonexistent room (even with any secret)
  *  - JSON body size limit (50kb) → 413
+ *  - wrong secret + oversized/malformed JSON → 401 (parser runs after auth)
+ *  - routes without a body ignore an oversized JSON body
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -119,4 +121,32 @@ test('JSON body over 50kb limit is rejected (413)', async () => {
     const huge = { type: 'offer', sdp: 'v=0\r\n' + 'a'.repeat(60 * 1024) };
     const res = await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, huge, secret);
     assert.equal(res.status, 413);
+});
+
+// The JSON parser is mounted per route after validateRoomSecret, so a
+// request with a wrong secret is refused before its body is read: an
+// oversized or malformed body gets 401, not the parser's 413 / 400.
+test('wrong secret with an oversized or malformed JSON body gets 401, body never parsed', async () => {
+    const { roomId } = await newRoom();
+    const rawPost = (path, body) => fetch(`${srv.baseUrl}/api/rooms/${roomId}/${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Room-Secret': 'wrong' },
+        body,
+    });
+    const huge = JSON.stringify({ type: 'offer', sdp: 'a'.repeat(60 * 1024) });
+    for (const path of ['offer', 'answer', 'ice/offer', 'ice/answer']) {
+        assert.equal((await rawPost(path, huge)).status, 401, `${path} oversized`);
+        assert.equal((await rawPost(path, '{ not json')).status, 401, `${path} malformed`);
+    }
+});
+
+test('routes that do not read a body ignore an oversized JSON body', async () => {
+    const huge = JSON.stringify({ pad: 'x'.repeat(60 * 1024) });
+    const res = await fetch(`${srv.baseUrl}/api/rooms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: huge,
+    });
+    assert.equal(res.status, 200);
+    assert.ok((await res.json()).roomId);
 });

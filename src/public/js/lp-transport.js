@@ -401,10 +401,10 @@
 
         async _sendControl(obj) {
             const body = JSON.stringify(obj);
-            // Sent as text/plain (not application/json) so the global
-            // express.json() body parser leaves it for our route-level
-            // express.raw() to read as bytes. The peer parses it as JSON
-            // on the receive side identically to a WS text frame.
+            // Sent as text/plain: /relay/up reads every body as raw bytes
+            // and treats any non-octet-stream type as a text (control)
+            // frame. The peer parses it as JSON on the receive side
+            // identically to a WS text frame.
             const res = await this._enqueueUp(() => this._postUp('text/plain', body));
             if (!res.ok) throw new Error(`up status ${res.status}`);
         }

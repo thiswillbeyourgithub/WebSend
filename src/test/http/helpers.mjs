@@ -93,9 +93,8 @@ export function lpUp(baseUrl, roomId, secret, token, body, isBinary) {
         headers: {
             'X-Room-Secret': secret,
             'X-Slot-Token': token,
-            // text/plain (not application/json) so the global express.json()
-            // body parser doesn't intercept the body before our route's raw
-            // parser; matches what lp-transport.js sends from the browser.
+            // text/plain for control frames, matching what lp-transport.js
+            // sends from the browser.
             'Content-Type': isBinary ? 'application/octet-stream' : 'text/plain',
         },
         body,

@@ -18,6 +18,17 @@ let server;
 before(async () => { server = await startServer(); });
 after(async () => { await stopServer(server.proc); });
 
+// The JSON parser only runs on routes that read a body, after the secret
+// check, so parser errors need an authenticated POST to such a route.
+async function postJsonToOffer(body) {
+    const { roomId, secret } = await (await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' })).json();
+    return fetch(`${server.baseUrl}/api/rooms/${roomId}/offer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Room-Secret': secret },
+        body,
+    });
+}
+
 test('GET /this/does/not/exist returns generic 404 JSON', async () => {
     const res = await fetch(`${server.baseUrl}/this/does/not/exist`);
     assert.equal(res.status, 404);
@@ -49,22 +60,14 @@ test('body-parser 413 passes through with a scrubbed message', async () => {
     // must still replace err.message with a generic phrase so parser
     // fingerprints do not leak to the network.
     const huge = JSON.stringify({ pad: 'x'.repeat(60 * 1024) });
-    const res = await fetch(`${server.baseUrl}/api/rooms`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Origin: `http://127.0.0.1:${server.port}` },
-        body: huge,
-    });
+    const res = await postJsonToOffer(huge);
     assert.equal(res.status, 413);
     const body = await res.json();
     assert.deepEqual(body, { error: 'Payload too large' });
 });
 
 test('malformed JSON returns 400 with a scrubbed message', async () => {
-    const res = await fetch(`${server.baseUrl}/api/rooms`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Origin: `http://127.0.0.1:${server.port}` },
-        body: '{ not valid json',
-    });
+    const res = await postJsonToOffer('{ not valid json');
     assert.equal(res.status, 400);
     const body = await res.json();
     // err.message would have been something like "Unexpected token n in

@@ -344,8 +344,11 @@ app.use((req, res, next) => {
     next();
 });
 
-// Parse JSON bodies
-app.use(express.json({ limit: '50kb' }));
+// JSON body parser, mounted per route AFTER the auth/secret middleware and
+// only on the routes that read req.body (SDP offer/answer, ICE candidates).
+// Mounted app-wide it made every request, authenticated or not, buffer and
+// parse up to 50 KB before validateRoomSecret could refuse it.
+const jsonBody = express.json({ limit: '50kb' });
 
 // In-memory room storage (in production, use Redis or similar)
 const rooms = new Map();
@@ -976,7 +979,7 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
     res.json({ roomId, secret });
 });
 
-// Max SDP body size (per side). The 50kb express.json limit is the outer cap;
+// Max SDP body size (per side). The 50kb jsonBody limit is the outer cap;
 // this stricter per-field check rejects bloat that would otherwise be echoed
 // to the peer verbatim.
 const MAX_SDP_LEN = 20_000;
@@ -1064,7 +1067,7 @@ function validateSdpBody(body, expectedType) {
  * Headers: X-Room-Secret required
  * Rate limited: general (100/min)
  */
-app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     const err = validateSdpBody(req.body, 'offer');
     if (err) return res.status(400).json({ error: err });
     req.room.offer = { type: req.body.type, sdp: req.body.sdp };
@@ -1101,7 +1104,7 @@ app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), validateRoomS
  * Headers: X-Room-Secret required
  * Rate limited: general (100/min)
  */
-app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     const err = validateSdpBody(req.body, 'answer');
     if (err) return res.status(400).json({ error: err });
     req.room.answer = { type: req.body.type, sdp: req.body.sdp };
@@ -1185,7 +1188,7 @@ app.get('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSec
  * Headers: X-Room-Secret required
  * Rate limited: general (100/min)
  */
-app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     if (req.room.iceCandidatesOffer.length >= MAX_ICE_CANDIDATES) {
         return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
     }
@@ -1217,7 +1220,7 @@ app.get('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoom
  * Headers: X-Room-Secret required
  * Rate limited: general (100/min)
  */
-app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     if (req.room.iceCandidatesAnswer.length >= MAX_ICE_CANDIDATES) {
         return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
     }
