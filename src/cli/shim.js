@@ -81,10 +81,12 @@
             headers: { 'Content-Type': 'application/json' },
             body: '{}',
         });
-        const { roomId, secret } = room;
+        // secret = the sender's (goes in the URL below); hostSecret = ours,
+        // required by the server for every receiver-side signaling route.
+        const { roomId, secret, hostSecret } = room;
         log('ok', `Room ${roomId} created`);
 
-        const auth = { 'Content-Type': 'application/json', 'X-Room-Secret': secret };
+        const auth = { 'Content-Type': 'application/json', 'X-Room-Secret': hostSecret };
 
         const pc = new RTCPeerConnection(rtcConfig);
         const dc = pc.createDataChannel('websend', { ordered: true });

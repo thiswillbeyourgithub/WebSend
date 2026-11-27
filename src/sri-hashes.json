@@ -29,10 +29,10 @@
   "/js/transfer-stats.js": "sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg",
   "/js/transform-replay.js": "sha384-llBFmPHoa+WfUQFqdwis+ar1UdQ2mKlEBmKx1qu2LaaW0i70LZc9GG8byEYOF00N",
   "/js/transport-assembler.js": "sha384-UCZoJWT8EYqihn3Wsw1PE/M5u+eXT5QMZY2Rvs2ezp2c6HeHXvQLhes/dsoslCIU",
-  "/js/transport.js": "sha384-Ge3tX5fg7oGcICW5SUTvCo1gKPcnp2oYj83fAz0EsBYexK+vUxypRb4yA7MZhNKo",
+  "/js/transport.js": "sha384-oaQoZCZphIZc1aM+yiLXEQKPwgV99/7cViNCCqFIoeKoGrblZhPFonyw9yFb5lKR",
   "/js/verification-modal.js": "sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh",
   "/js/wake-lock.js": "sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7",
-  "/js/webrtc.js": "sha384-mnurymuKxpguCirW45yHYQwyyoPmq3JIHQ7BOP8XVOfbN3hCtUVw6ZT1L6PCA/g4",
+  "/js/webrtc.js": "sha384-HJ/v/3mG/hyisilr1BxkrF0PsJDzaCr+6P/ScK179IqegdUGh063zv0TGyhBDZhh",
   "/js/ws-transport.js": "sha384-miuNrG+BxQYrrcCWC6mZJW9LxGtGo20YuczZ2lv1RDcNE5JvH7nbGSDGd6wi4EeJ",
   "/css/style.css": "sha384-M6EfJEFSSiFcK43cAFF+il/uKGmAYB7DXuDC6YM2sTwxXhJ3bhuvsGbS99xEA7xh"
 }

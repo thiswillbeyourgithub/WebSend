@@ -23,13 +23,13 @@ async function newRoom() {
 }
 
 test('long-poll fast path: returns immediately when answer is already present', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     const answer = { type: 'answer', sdp: 'v=0\r\nfast\r\n' };
     await post(`${srv.baseUrl}/api/rooms/${roomId}/answer`, answer, secret);
 
     const t0 = Date.now();
     const res = await fetch(`${srv.baseUrl}/api/rooms/${roomId}/answer?wait=true`, {
-        headers: { 'X-Room-Secret': secret },
+        headers: { 'X-Room-Secret': hostSecret },
     });
     const elapsed = Date.now() - t0;
     assert.equal(res.status, 200);
@@ -39,11 +39,11 @@ test('long-poll fast path: returns immediately when answer is already present', 
 });
 
 test('long-poll wakes when answer is posted mid-wait', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     const answer = { type: 'answer', sdp: 'v=0\r\nlate\r\n' };
 
     const waitPromise = fetch(`${srv.baseUrl}/api/rooms/${roomId}/answer?wait=true`, {
-        headers: { 'X-Room-Secret': secret },
+        headers: { 'X-Room-Secret': hostSecret },
     });
 
     // Post answer after ~200ms (less than one full poll interval; arrives on next tick).
@@ -56,11 +56,11 @@ test('long-poll wakes when answer is posted mid-wait', async () => {
 });
 
 test('aborting a pending long-poll does not crash the server', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, hostSecret } = await newRoom();
 
     const ac = new AbortController();
     const pending = fetch(`${srv.baseUrl}/api/rooms/${roomId}/answer?wait=true`, {
-        headers: { 'X-Room-Secret': secret },
+        headers: { 'X-Room-Secret': hostSecret },
         signal: ac.signal,
     });
 
@@ -78,9 +78,9 @@ test('aborting a pending long-poll does not crash the server', async () => {
 });
 
 test('long-poll: per-room waiter cap rejects 5th concurrent waiter with 429', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, hostSecret } = await newRoom();
     const url = `${srv.baseUrl}/api/rooms/${roomId}/answer?wait=true`;
-    const headers = { 'X-Room-Secret': secret };
+    const headers = { 'X-Room-Secret': hostSecret };
     const acs = [];
     const pendings = [];
 

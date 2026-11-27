@@ -13,8 +13,10 @@
 // Bumping CACHE_NAME forces the activate handler below to drop every
 // pre-existing cache, which is the only way to clear out cross-origin
 // responses that earlier SW versions may have stored before this
-// version restricted caching to same-origin basic responses.
-const CACHE_NAME = 'websend-v3';
+// version restricted caching to same-origin basic responses. Also bump it
+// on a client/server protocol break (v4: per-role room secrets) so an
+// offline-cached old client is never paired with the new server.
+const CACHE_NAME = 'websend-v4';
 
 // Static assets to cache on install
 const STATIC_ASSETS = [

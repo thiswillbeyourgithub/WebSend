@@ -19,7 +19,10 @@ class WebSendRTC {
         this.dataChannel = null;
         this.iceServers = [];
         this.roomId = null;
-        this.roomSecret = null; // Cryptographic secret for room access authorization
+        // OUR room credential, sent as X-Room-Secret: the host secret on
+        // the receiver, the QR (sender) secret on the sender. The server
+        // checks the role per route (see roomRoleForSecret in server.js).
+        this.roomSecret = null;
         this.isOfferer = false; // True for receiver, false for sender
 
         // Callbacks
@@ -597,8 +600,10 @@ class WebSendRTC {
 
     /**
      * Create a room on the server (for receiver).
-     * Returns both room ID and secret; secret is included in QR code URL.
-     * @returns {Promise<{roomId: string, secret: string}>} Room ID and secret
+     * Returns the room ID plus both per-role secrets: `secret` is the
+     * sender's (goes in the QR code URL), `hostSecret` is ours and becomes
+     * this.roomSecret so every receiver-side call authenticates as host.
+     * @returns {Promise<{roomId: string, secret: string, hostSecret: string}>}
      */
     async createRoom() {
         logger.debug('SIGNALING', 'Creating room...');
@@ -613,15 +618,15 @@ class WebSendRTC {
         }
         const data = await response.json();
         this.roomId = data.roomId;
-        this.roomSecret = data.secret;
+        this.roomSecret = data.hostSecret;
         logger.info(`Created room: ${this.roomId}`);
         logger.debug('SIGNALING', 'Room created', { roomId: this.roomId });
-        return { roomId: this.roomId, secret: this.roomSecret };
+        return { roomId: this.roomId, secret: data.secret, hostSecret: data.hostSecret };
     }
 
     /**
      * Create an offer and store it on the server (for receiver)
-     * @returns {Promise<string>} Room ID for QR code
+     * @returns {Promise<{roomId: string}>}
      */
     async createOfferAndStore() {
         this.isOfferer = true;
@@ -665,7 +670,7 @@ class WebSendRTC {
         }
 
         logger.success('Offer stored on server — ready for sender to connect');
-        return { roomId: this.roomId, secret: this.roomSecret };
+        return { roomId: this.roomId };
     }
 
     /**

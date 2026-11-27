@@ -32,14 +32,14 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 // secret, so room existence is not enumerable).
 async function newRoom() {
     const res = await fetch(`${srv.baseUrl}/api/rooms`, { method: 'POST' });
-    const { roomId, secret } = await res.json();
+    const { roomId, secret, hostSecret } = await res.json();
     const stored = await fetch(`${srv.baseUrl}/api/rooms/${roomId}/offer`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Room-Secret': secret },
+        headers: { 'Content-Type': 'application/json', 'X-Room-Secret': hostSecret },
         body: JSON.stringify({ type: 'offer', sdp: 'v=0\r\n' }),
     });
     assert.equal(stored.status, 200);
-    return { roomId, secret };
+    return { roomId, secret, hostSecret };
 }
 
 function getOffer(roomId, secret) {
@@ -56,15 +56,15 @@ test('signaling-only room expires a fixed TTL after creation', async () => {
 });
 
 test('relayed frames keep a room alive well past the TTL; silence then expires it', async () => {
-    const { roomId, secret } = await newRoom();
-    const a = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
+    const { roomId, secret, hostSecret } = await newRoom();
+    const a = await (await lpHandshake(srv.baseUrl, roomId, hostSecret)).json();
     const b = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
 
     // Simulate an in-flight transfer for ~3x the TTL: a frame every
     // TTL/3, each drained by the peer so the queue never fills.
     const deadline = Date.now() + 3 * TTL_MS;
     while (Date.now() < deadline) {
-        const r = await lpUp(srv.baseUrl, roomId, secret, a.token, Buffer.from([1, 2, 3]), true);
+        const r = await lpUp(srv.baseUrl, roomId, hostSecret, a.token, Buffer.from([1, 2, 3]), true);
         assert.equal(r.status, 204, 'the room must not expire while frames flow');
         await lpDown(srv.baseUrl, roomId, secret, b.token, false);
         await sleep(TTL_MS / 3);
@@ -79,8 +79,8 @@ test('relayed frames keep a room alive well past the TTL; silence then expires i
 });
 
 test('empty down-polls alone do not keep a relay room alive', async () => {
-    const { roomId, secret } = await newRoom();
-    await lpHandshake(srv.baseUrl, roomId, secret);
+    const { roomId, secret, hostSecret } = await newRoom();
+    await lpHandshake(srv.baseUrl, roomId, hostSecret);
     const b = await (await lpHandshake(srv.baseUrl, roomId, secret)).json();
 
     // Poll (without any frames flowing) for ~2x the TTL.

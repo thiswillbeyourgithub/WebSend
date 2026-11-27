@@ -468,8 +468,11 @@
         async createRoom() {
             const r = await this.webrtc.createRoom();
             this._roomId = r.roomId;
-            this._roomSecret = r.secret;
-            if (this._relayEnabled && this.ws) this.ws.setRoom(r.roomId, r.secret);
+            // The receiver authenticates with the host secret everywhere,
+            // relay included (the server binds it to relay slot 'a');
+            // r.secret is the sender's and only goes in the QR code.
+            this._roomSecret = r.hostSecret;
+            if (this._relayEnabled && this.ws) this.ws.setRoom(r.roomId, r.hostSecret);
             // LP-only: spawn the long-poll racer right away. The normal
             // flow waits for WS to disconnect first; here there is no WS,
             // so LP must start itself to ever reach the relay-hello state.

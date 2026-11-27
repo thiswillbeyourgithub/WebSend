@@ -491,7 +491,7 @@ WebSend/
   ─────────────────                    ────────                   ───────────────
   1. Generate ECDH key pair
   2. POST /api/rooms ───────────────▶ Create room ◀─────────────── (scans QR later)
-     ◀── roomId + secret ───────────
+     ◀── roomId + secret + hostSecret
   3. Create WebRTC offer
   4. POST /api/rooms/:id/offer ─────▶ Store SDP offer
      (posted immediately, trickle
@@ -641,24 +641,32 @@ the matching photo, it surfaces an error toast and gives up.
 |--------|------------------------------|--------------------------------------|-------------|-----------------|
 | GET    | `/send/:roomId`              | Pretty-URL redirect into the sender flow | None    | None            |
 | GET    | `/api/config`                | ICE server list + DEV flag + OCR / file-type config | None | None     |
-| POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None (or proxy identity header when `AUTH_SCOPE=receiver`) | 30/min per client |
-| GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 120/min per client |
-| POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Room secret | 400/min per client |
-| GET    | `/api/rooms/:id/offer`       | Retrieve SDP offer                   | Room secret | 120/min per client |
-| POST   | `/api/rooms/:id/answer`      | Store SDP answer                     | Room secret | 400/min per client |
-| GET    | `/api/rooms/:id/answer`      | Retrieve SDP answer (long-poll)      | Room secret | 400/min per client |
-| POST   | `/api/rooms/:id/ice/offer`   | Add receiver ICE candidate           | Room secret | 400/min per client |
-| GET    | `/api/rooms/:id/ice/offer`   | Get receiver ICE candidates          | Room secret | 400/min per client |
-| POST   | `/api/rooms/:id/ice/answer`  | Add sender ICE candidate             | Room secret | 400/min per client |
-| GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | 400/min per client |
-| WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query | 400/min per client |
-| POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 400/min per client |
-| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay (429 when the peer's queue is full, or with `Retry-After: 1` when the relay-wide `RELAY_QUEUE_BUDGET_BYTES` is spent; 204 carries `X-Peer-Backlog-Bytes`) | Room secret + `X-Slot-Token` | None (byte caps only) |
-| GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | None (waiter caps only) |
-| POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Room secret + `X-Slot-Token` | 400/min per client |
+| POST   | `/api/rooms`                 | Create a room (returns ID + sender `secret` + `hostSecret`) | None (or proxy identity header when `AUTH_SCOPE=receiver`) | 30/min per client |
+| GET    | `/api/rooms/:id`             | Check room existence                 | Either secret | 120/min per client |
+| POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Host secret | 400/min per client |
+| GET    | `/api/rooms/:id/offer`       | Retrieve SDP offer                   | Sender secret | 120/min per client |
+| POST   | `/api/rooms/:id/answer`      | Store SDP answer                     | Sender secret | 400/min per client |
+| GET    | `/api/rooms/:id/answer`      | Retrieve SDP answer (long-poll)      | Host secret | 400/min per client |
+| POST   | `/api/rooms/:id/ice/offer`   | Add receiver ICE candidate           | Host secret | 400/min per client |
+| GET    | `/api/rooms/:id/ice/offer`   | Get receiver ICE candidates          | Sender secret | 400/min per client |
+| POST   | `/api/rooms/:id/ice/answer`  | Add sender ICE candidate             | Sender secret | 400/min per client |
+| GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Host secret | 400/min per client |
+| WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query (either secret) | 400/min per client |
+| POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Either secret | 400/min per client |
+| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay (429 when the peer's queue is full, or with `Retry-After: 1` when the relay-wide `RELAY_QUEUE_BUDGET_BYTES` is spent; 204 carries `X-Peer-Backlog-Bytes`) | Either secret + `X-Slot-Token` | None (byte caps only) |
+| GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Either secret + `X-Slot-Token` | None (waiter caps only) |
+| POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Either secret + `X-Slot-Token` | 400/min per client |
 
 All `/api/*` endpoints validate the `Origin` header against `ALLOWED_ORIGINS`.
 Room endpoints require an `X-Room-Secret` header (constant-time comparison).
+Each room has two credentials: `hostSecret`, returned only to the creating
+receiver by `POST /api/rooms` and never put in the QR, and `secret`, the sender
+secret carried in the QR hash fragment. Each signaling route accepts only the
+role that legitimately calls it (see the Auth column); routes both sides use
+accept either. A wrong-role secret gets the same 401 body as a bad secret, so
+the response never reveals which credential was presented. A leaked QR
+therefore cannot be used to overwrite the receiver's offer or read the
+sender's answer.
 The HTTP-relay endpoints additionally require a per-slot token issued by
 `/relay/handshake` so the room secret alone cannot be used to hijack a live
 relay slot.
@@ -726,7 +734,9 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
    with a relay session expires after 10 minutes of inactivity (refreshed only when a
    frame actually moves, so an in-flight transfer lives as long as data flows but a
    poller cannot keep a dead room alive).
-3. **Room secrets**: 16-byte random token required for any room access. Passed in URL hash
+3. **Room secrets**: two 16-byte random tokens per room, one per role (`hostSecret` for the
+   receiver, `secret` for the sender, see the API table). Each signaling route requires the
+   matching role. Passed in URL hash
    fragment (never sent to server in HTTP requests). Constant-time comparison prevents
    timing attacks. Prevents room enumeration even if the short room ID is guessed.
 4. **Verification code**: Both parties see a single 24-hex-char (96-bit) SHA-256

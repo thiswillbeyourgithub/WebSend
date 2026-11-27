@@ -669,30 +669,58 @@ app.use('/api', (req, res, next) => {
 });
 
 /**
- * Middleware to validate room secret from X-Room-Secret header.
+ * Per-role room credentials. Each room holds TWO secrets so the one
+ * printed in the QR code cannot impersonate the receiver:
+ *   - room.hostSecret: returned only to the receiver that created the
+ *     room (POST /api/rooms). Required to store the offer, post
+ *     offer-side ICE, and read the answer + answer-side ICE.
+ *   - room.secret: the sender's credential, carried in the QR URL
+ *     fragment. It can only read the offer + offer-side ICE and post
+ *     the answer + answer-side ICE.
+ * Anyone who saw the QR therefore cannot replace the receiver's offer
+ * or read the sender's answer.
  *
- * Defense-in-depth: returns the same 401 status and generic message for
- * three distinct failure modes (room missing, secret missing, secret
- * mismatch) so an attacker without the secret cannot enumerate which
- * roomIds are live by probing. We still run secureCompare against a
- * dummy when the room is missing so the timing of the response does not
- * leak room existence either. The 22-char base64url secret is the real
- * defense; this just removes the cheap oracle in front of it.
+ * Returns 'host', 'sender' or null. Both comparisons always run
+ * (against a dummy when the room is missing) so the response timing
+ * reveals neither which role matched nor whether the room exists.
  */
 const _DUMMY_SECRET = 'dummy-secret-for-constant-time-compare';
-function validateRoomSecret(req, res, next) {
-    const room = rooms.get(req.params.id);
-    const providedSecret = req.headers['x-room-secret'] || '';
-    const compareTarget = room ? room.secret : _DUMMY_SECRET;
-    const ok = providedSecret && helpers.secureCompare(providedSecret, compareTarget);
-    if (!room || !ok) {
-        return res.status(401).json({ error: 'Invalid or missing room secret' });
-    }
-
-    // Attach room to request for use in handler
-    req.room = room;
-    next();
+function roomRoleForSecret(room, providedSecret) {
+    const provided = typeof providedSecret === 'string' ? providedSecret : '';
+    const isHost = helpers.secureCompare(provided, room ? room.hostSecret : _DUMMY_SECRET);
+    const isSender = helpers.secureCompare(provided, room ? room.secret : _DUMMY_SECRET);
+    if (!room || !provided) return null;
+    if (isHost) return 'host';
+    if (isSender) return 'sender';
+    return null;
 }
+
+/**
+ * Middleware factory: admit the request only if the X-Room-Secret header
+ * matches one of `roles` ('host' and/or 'sender').
+ *
+ * Defense-in-depth: returns the same 401 status and generic message for
+ * every failure mode (room missing, secret missing, secret mismatch,
+ * wrong role) so an attacker without the secret cannot enumerate which
+ * roomIds are live by probing. The 22-char base64url secret is the real
+ * defense; this just removes the cheap oracle in front of it.
+ */
+function requireRoomRole(...roles) {
+    return (req, res, next) => {
+        const room = rooms.get(req.params.id);
+        const role = roomRoleForSecret(room, req.headers['x-room-secret']);
+        if (!role || !roles.includes(role)) {
+            return res.status(401).json({ error: 'Invalid or missing room secret' });
+        }
+        // Attach room + role to request for use in handler
+        req.room = room;
+        req.roomRole = role;
+        next();
+    };
+}
+const validateRoomSecret = requireRoomRole('host', 'sender');
+const requireHost = requireRoomRole('host');
+const requireSender = requireRoomRole('sender');
 
 /**
  * Clean up expired rooms periodically.
@@ -1016,6 +1044,8 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
 
     // Generate cryptographic secret for room access authorization
     const secret = helpers.generateRoomSecret();
+    // Receiver-only credential (see roomRoleForSecret): never in the QR.
+    const hostSecret = helpers.generateRoomSecret();
 
     addRoom(roomId, {
         created: Date.now(),
@@ -1026,6 +1056,7 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
         // signaling-only rooms strictly on `created`.
         lastActivity: Date.now(),
         secret: secret,
+        hostSecret,
         offer: null,
         answer: null,
         iceCandidatesOffer: [],
@@ -1041,8 +1072,9 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
 
     console.log(`Room ${roomId} created`);
     debugLog('ROOM', `Room created`, { roomId, clientIp: getClientAddress(req) });
-    // Return both roomId and secret; secret is included in QR code URL
-    res.json({ roomId, secret });
+    // secret goes in the QR code URL (sender); hostSecret stays with the
+    // creating receiver and authorises its side of the signaling.
+    res.json({ roomId, secret, hostSecret });
 });
 
 // Max SDP body size (per side). The 50kb jsonBody limit is the outer cap;
@@ -1130,10 +1162,10 @@ function validateSdpBody(body, expectedType) {
  * Store SDP offer for a room
  * POST /api/rooms/:id/offer
  * Body: { sdp: "...", type: "offer" }
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (host secret)
  * Rate limited: general (400/min)
  */
-app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
+app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), requireHost, jsonBody, (req, res) => {
     const err = validateSdpBody(req.body, 'offer');
     if (err) return res.status(400).json({ error: err });
     req.room.offer = { type: req.body.type, sdp: req.body.sdp };
@@ -1148,10 +1180,10 @@ app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSec
 /**
  * Get SDP offer for a room
  * GET /api/rooms/:id/offer
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (sender secret)
  * Rate limited: 120 lookups per minute per client
  */
-app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), validateRoomSecret, (req, res) => {
+app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), requireSender, (req, res) => {
     if (!req.room.offer) {
         debugLog('SIGNALING', `Offer not ready for room ${req.params.id}`);
         return res.status(404).json({ error: 'Offer not ready yet' });
@@ -1167,10 +1199,10 @@ app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), validateRoomS
  * Store SDP answer for a room
  * POST /api/rooms/:id/answer
  * Body: { sdp: "...", type: "answer" }
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (sender secret)
  * Rate limited: general (400/min)
  */
-app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
+app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), requireSender, jsonBody, (req, res) => {
     const err = validateSdpBody(req.body, 'answer');
     if (err) return res.status(400).json({ error: err });
     req.room.answer = { type: req.body.type, sdp: req.body.sdp };
@@ -1195,10 +1227,10 @@ app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSe
 /**
  * Get SDP answer for a room (long-polling)
  * GET /api/rooms/:id/answer
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (host secret)
  * Query: ?wait=true for long-polling (up to 30 seconds)
  */
-app.get('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+app.get('/api/rooms/:id/answer', rateLimitMiddleware('general'), requireHost, (req, res) => {
     // Fast path: answer already available, or caller didn't ask to wait.
     if (req.room.answer) {
         return res.json(req.room.answer);
@@ -1251,10 +1283,10 @@ app.get('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSec
 /**
  * Add ICE candidate for offer side (receiver's candidates)
  * POST /api/rooms/:id/ice/offer
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (host secret)
  * Rate limited: general (400/min)
  */
-app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
+app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), requireHost, jsonBody, (req, res) => {
     if (req.room.iceCandidatesOffer.length >= MAX_ICE_CANDIDATES) {
         return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
     }
@@ -1271,9 +1303,9 @@ app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoo
 /**
  * Get ICE candidates for offer side
  * GET /api/rooms/:id/ice/offer
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (sender secret)
  */
-app.get('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+app.get('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), requireSender, (req, res) => {
     debugLog('ICE', `Offer ICE candidates retrieved for room ${req.params.id}`, {
         count: req.room.iceCandidatesOffer.length
     });
@@ -1283,10 +1315,10 @@ app.get('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoom
 /**
  * Add ICE candidate for answer side (sender's candidates)
  * POST /api/rooms/:id/ice/answer
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (sender secret)
  * Rate limited: general (400/min)
  */
-app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
+app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), requireSender, jsonBody, (req, res) => {
     if (req.room.iceCandidatesAnswer.length >= MAX_ICE_CANDIDATES) {
         return res.status(429).json({ error: `ICE candidate cap reached (${MAX_ICE_CANDIDATES})` });
     }
@@ -1303,9 +1335,9 @@ app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRo
 /**
  * Get ICE candidates for answer side
  * GET /api/rooms/:id/ice/answer
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (host secret)
  */
-app.get('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, (req, res) => {
+app.get('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), requireHost, (req, res) => {
     debugLog('ICE', `Answer ICE candidates retrieved for room ${req.params.id}`, {
         count: req.room.iceCandidatesAnswer.length
     });
@@ -1315,7 +1347,7 @@ app.get('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoo
 /**
  * Check if room exists
  * GET /api/rooms/:id
- * Headers: X-Room-Secret required
+ * Headers: X-Room-Secret required (host or sender secret)
  * Rate limited: 120 lookups per minute per client (prevents enumeration)
  */
 app.get('/api/rooms/:id', rateLimitMiddleware('roomLookup'), validateRoomSecret, (req, res) => {
@@ -2005,13 +2037,11 @@ httpServer.on('upgrade', (req, socket, head) => {
 
     const roomId = match[1];
     const room = rooms.get(roomId);
-    const providedSecret = url.searchParams.get('secret') || '';
-    // Same constant-time secret check as validateRoomSecret(), including
-    // the dummy compare when the room is missing so an attacker cannot
-    // tell from response timing whether a roomId exists.
-    const compareTarget = room ? room.secret : _DUMMY_SECRET;
-    const ok = providedSecret && helpers.secureCompare(providedSecret, compareTarget);
-    if (!room || !ok) {
+    // Same constant-time per-role check as validateRoomSecret (either role
+    // may open a relay socket), including the dummy compare when the room
+    // is missing so response timing does not reveal whether it exists.
+    const role = roomRoleForSecret(room, url.searchParams.get('secret'));
+    if (!role) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
         return;

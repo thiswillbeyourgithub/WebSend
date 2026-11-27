@@ -22,7 +22,7 @@ test('GET /api/rooms/:id/answer fast path participates in the general rate limit
     // times. Without the rate-limit middleware on this handler (the historical
     // gap that allowed long-poll DoS), all 200/204 responses came back. With
     // the middleware applied, the per-client general cap (400/min) kicks in.
-    const { roomId, secret } = await (await fetch(`${srv.baseUrl}/api/rooms`, {
+    const { roomId, secret, hostSecret } = await (await fetch(`${srv.baseUrl}/api/rooms`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
     })).json();
 
@@ -39,7 +39,7 @@ test('GET /api/rooms/:id/answer fast path participates in the general rate limit
     let saw429 = false;
     for (let i = 0; i < 410; i++) {
         const r = await fetch(`${srv.baseUrl}/api/rooms/${roomId}/answer`, {
-            headers: { 'X-Room-Secret': secret },
+            headers: { 'X-Room-Secret': hostSecret },
         });
         if (r.status === 429) { saw429 = true; break; }
     }

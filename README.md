@@ -127,7 +127,7 @@ The protections listed in [Security Features](#security-features) below address 
 ### Room Security
 - Room IDs are short (6 characters) for usability, but each room also has a **128-bit cryptographic secret** (generated with `crypto.randomBytes`)
 - The secret is embedded in the QR code URL's **hash fragment** (never sent to the server in HTTP requests)
-- All room API calls require the secret via the `X-Room-Secret` header
+- All room API calls require a secret via the `X-Room-Secret` header. Each room has **two per-role secrets**: a `hostSecret` returned only to the creating receiver (never in the QR) and the sender `secret` in the QR. Each signaling route accepts only the role that legitimately calls it (e.g. only the host may post the offer or read the answer, only the sender may post the answer), so someone who sees the QR cannot impersonate the receiver. A wrong-role secret gets the same 401 as a bad one
 - Secret comparison uses **constant-time comparison** (`crypto.timingSafeEqual`) to prevent timing attacks
 - This prevents room enumeration and unauthorized room access even if an attacker guesses or brute-forces the short room ID
 

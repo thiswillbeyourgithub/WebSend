@@ -35,8 +35,8 @@ function makeInner() {
         sent: [],
         closed: false,
         async init() {},
-        async createRoom() { return { roomId: 'ROOM01', secret: 'sekret' }; },
-        async createOfferAndStore() { return { roomId: 'ROOM01', secret: 'sekret' }; },
+        async createRoom() { return { roomId: 'ROOM01', secret: 'sekret', hostSecret: 'hostsekret' }; },
+        async createOfferAndStore() { return { roomId: 'ROOM01' }; },
         async waitForAnswer() {},
         async joinRoom() {},
         sendMessage(m) { this.sent.push({ kind: 'msg', m }); return true; },
@@ -168,14 +168,16 @@ test('relay disabled in /api/config -> RacingTransport falls back to WebRTC-only
     assert.equal(connected, 1);
 });
 
-test('createRoom propagates roomId/secret to the WS inner', async () => {
+test('createRoom propagates roomId and the HOST secret to the WS inner', async () => {
     const { win, ws } = await loadTransport();
     const t = new win.Transport.RacingTransport('receiver');
     await t.init();
     const r = await t.createRoom();
     assert.equal(r.roomId, 'ROOM01');
     assert.equal(ws.roomId, 'ROOM01');
-    assert.equal(ws.roomSecret, 'sekret');
+    // The receiver's relay slot is authorised by the host secret, never
+    // by the QR (sender) secret.
+    assert.equal(ws.roomSecret, 'hostsekret');
 });
 
 test('close() closes both inners and clears the grace timer', async () => {

@@ -21,10 +21,10 @@ after(async () => { await stopServer(server.proc); });
 // The JSON parser only runs on routes that read a body, after the secret
 // check, so parser errors need an authenticated POST to such a route.
 async function postJsonToOffer(body) {
-    const { roomId, secret } = await (await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' })).json();
+    const { roomId, hostSecret } = await (await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' })).json();
     return fetch(`${server.baseUrl}/api/rooms/${roomId}/offer`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Room-Secret': secret },
+        headers: { 'Content-Type': 'application/json', 'X-Room-Secret': hostSecret },
         body,
     });
 }

@@ -147,12 +147,12 @@
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-S+vBH4Trc75ooxKyRtdLlprxDsa541cJyioDfb0pW4oTRlZjFvbceu5Y2rfpZw1Q"></script>
     <script src="/js/protocol.js" integrity="sha384-89vOW/06rvZE/z0eUFyeMuo9zO39iZuClDSL03fXaQECagydV0oEExolJbxp+/nJ"></script>
-    <script src="/js/webrtc.js" integrity="sha384-mnurymuKxpguCirW45yHYQwyyoPmq3JIHQ7BOP8XVOfbN3hCtUVw6ZT1L6PCA/g4"></script>
+    <script src="/js/webrtc.js" integrity="sha384-HJ/v/3mG/hyisilr1BxkrF0PsJDzaCr+6P/ScK179IqegdUGh063zv0TGyhBDZhh"></script>
     <script src="/js/transport-assembler.js" integrity="sha384-UCZoJWT8EYqihn3Wsw1PE/M5u+eXT5QMZY2Rvs2ezp2c6HeHXvQLhes/dsoslCIU"></script>
     <script src="/js/segment-stream.js" integrity="sha384-vYPirWIlAZuqrya8JHRylowxpn1RbvWAk0pe/MYpISoweEkzL21qRY+VXO29UVMk"></script>
     <script src="/js/ws-transport.js" integrity="sha384-miuNrG+BxQYrrcCWC6mZJW9LxGtGo20YuczZ2lv1RDcNE5JvH7nbGSDGd6wi4EeJ"></script>
     <script src="/js/lp-transport.js" integrity="sha384-OMvnHUPFdfzo1gMTyz63wLc5YbPsTY3XmZwUeuloaodOWMSTBGpE0ZjkK4hmywyG"></script>
-    <script src="/js/transport.js" integrity="sha384-Ge3tX5fg7oGcICW5SUTvCo1gKPcnp2oYj83fAz0EsBYexK+vUxypRb4yA7MZhNKo"></script>
+    <script src="/js/transport.js" integrity="sha384-oaQoZCZphIZc1aM+yiLXEQKPwgV99/7cViNCCqFIoeKoGrblZhPFonyw9yFb5lKR"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-OB4QY3CCpEJiptMsiTcPnBGnoDm2iqtD5/EoKp6OeKJD0VOsSHt4bV+9OGFGEDfI"></script>
     <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-y1MKLIIjfJYVE55Bz7HRv/AnOVpiNy8pMIJ4XjZkt9s4A6CK1Py6WqK8RNimoZ9g"></script>
@@ -203,7 +203,9 @@
         const receiveRateTracker = createRateTracker();
 
         let photoCount = 0;
-        let roomSecret = ''; // Cryptographic secret for room access
+        // The sender's room secret, printed in the QR URL fragment. Our own
+        // credential (the host secret) lives in rtc.roomSecret.
+        let senderSecret = '';
         let weConfirmed = false;  // Track if we confirmed fingerprints
         let theyConfirmed = false; // Track if sender confirmed fingerprints
         // Cached after the original verification ceremony so a transport
@@ -350,7 +352,7 @@
 
                 // Create the room: this yields the room id + secret.
                 const roomInfo = await rtc.createRoom();
-                roomSecret = roomInfo.secret;
+                senderSecret = roomInfo.secret;
 
                 // Store the offer BEFORE rendering the QR so the room is
                 // already joinable the instant the QR is scannable. This is
@@ -406,7 +408,7 @@
             // the default 'both' mode senderOrigin is null and we keep using our
             // own origin exactly as before.
             const inviteOrigin = (window.__wsConfig && window.__wsConfig.senderOrigin) || window.location.origin;
-            const url = `${inviteOrigin}/send/${rtc.roomId}#${roomSecret}`;
+            const url = `${inviteOrigin}/send/${rtc.roomId}#${senderSecret}`;
 
             logger.info(`QR code URL: ${url}`);
 
@@ -784,7 +786,7 @@
         }
 
         /**
-         * Same-room reconnect: keep the existing roomId/roomSecret (and therefore
+         * Same-room reconnect: keep the existing roomId and both room secrets (and therefore
          * the displayed QR), but tear down the per-pairing crypto + RTC state and
          * publish a fresh SDP offer so the same sender can re-scan the same QR.
          * Does NOT shred user data — that's the explicit "new pairing" path.
@@ -800,8 +802,9 @@
 
             // Capture room identity before tearing down rtc.
             const keepRoomId = rtc?.roomId;
-            const keepRoomSecret = roomSecret;
-            if (!keepRoomId || !keepRoomSecret) {
+            const keepSenderSecret = senderSecret;
+            const keepHostSecret = rtc?.roomSecret;
+            if (!keepRoomId || !keepSenderSecret || !keepHostSecret) {
                 // No room identity to preserve — fall back to a fresh pairing.
                 // (This should only happen if reconnect is called before init().)
                 return startNewPairing();
@@ -845,10 +848,10 @@
                 rtc.onReconnecting = onReconnecting;
                 rtc.onReconnected = onReconnected;
 
-                // Reuse the same roomId/secret so the displayed QR stays valid.
+                // Reuse the same roomId/secrets so the displayed QR stays valid.
                 rtc.roomId = keepRoomId;
-                rtc.roomSecret = keepRoomSecret;
-                roomSecret = keepRoomSecret;
+                rtc.roomSecret = keepHostSecret;
+                senderSecret = keepSenderSecret;
                 await rtc.createOfferAndStore();
 
                 // Acquire wake lock while waiting for sender to reconnect
@@ -926,7 +929,7 @@
                 rtc.onReconnected = onReconnected;
 
                 const roomInfo = await rtc.createRoom();
-                roomSecret = roomInfo.secret;
+                senderSecret = roomInfo.secret;
                 await rtc.createOfferAndStore();
                 await generateQRCode();
 

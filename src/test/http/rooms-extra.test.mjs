@@ -30,7 +30,7 @@ async function newRoom() {
 }
 
 test('GET /api/rooms/:id reports existence and offer/answer state', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
 
     // Fresh room: exists, no offer, no answer
     let res = await get(`${srv.baseUrl}/api/rooms/${roomId}`, secret);
@@ -38,7 +38,7 @@ test('GET /api/rooms/:id reports existence and offer/answer state', async () => 
     assert.deepEqual(await res.json(), { exists: true, hasOffer: false, hasAnswer: false });
 
     // After posting an offer: hasOffer flips to true
-    await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, { type: 'offer', sdp: 'v=0\r\n' }, secret);
+    await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, { type: 'offer', sdp: 'v=0\r\n' }, hostSecret);
     res = await get(`${srv.baseUrl}/api/rooms/${roomId}`, secret);
     assert.deepEqual(await res.json(), { exists: true, hasOffer: true, hasAnswer: false });
 });
@@ -69,19 +69,19 @@ test('GET /api/rooms/:id/offer returns 404 when no offer posted yet', async () =
 });
 
 test('GET /api/rooms/:id/answer without wait returns 204 when no answer', async () => {
-    const { roomId, secret } = await newRoom();
-    const res = await get(`${srv.baseUrl}/api/rooms/${roomId}/answer`, secret);
+    const { roomId, hostSecret } = await newRoom();
+    const res = await get(`${srv.baseUrl}/api/rooms/${roomId}/answer`, hostSecret);
     assert.equal(res.status, 204);
 });
 
 test('ICE answer: POST then GET round-trip', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     const cand = { candidate: 'candidate:2 1 UDP 1 10.0.0.1 40000 typ host', sdpMid: '0' };
 
     const postRes = await post(`${srv.baseUrl}/api/rooms/${roomId}/ice/answer`, cand, secret);
     assert.equal(postRes.status, 200);
 
-    const getRes = await get(`${srv.baseUrl}/api/rooms/${roomId}/ice/answer`, secret);
+    const getRes = await get(`${srv.baseUrl}/api/rooms/${roomId}/ice/answer`, hostSecret);
     assert.equal(getRes.status, 200);
     const body = await getRes.json();
     assert.ok(Array.isArray(body.candidates));
@@ -89,19 +89,19 @@ test('ICE answer: POST then GET round-trip', async () => {
 });
 
 test('ICE endpoints start with empty candidate list', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     const offerRes = await get(`${srv.baseUrl}/api/rooms/${roomId}/ice/offer`, secret);
     assert.deepEqual(await offerRes.json(), { candidates: [] });
-    const answerRes = await get(`${srv.baseUrl}/api/rooms/${roomId}/ice/answer`, secret);
+    const answerRes = await get(`${srv.baseUrl}/api/rooms/${roomId}/ice/answer`, hostSecret);
     assert.deepEqual(await answerRes.json(), { candidates: [] });
 });
 
 test('ICE candidates accumulate in insertion order', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, secret, hostSecret } = await newRoom();
     const c1 = { candidate: 'candidate:1 1 UDP 1 1.1.1.1 1 typ host' };
     const c2 = { candidate: 'candidate:2 1 UDP 1 2.2.2.2 2 typ host' };
-    await post(`${srv.baseUrl}/api/rooms/${roomId}/ice/offer`, c1, secret);
-    await post(`${srv.baseUrl}/api/rooms/${roomId}/ice/offer`, c2, secret);
+    await post(`${srv.baseUrl}/api/rooms/${roomId}/ice/offer`, c1, hostSecret);
+    await post(`${srv.baseUrl}/api/rooms/${roomId}/ice/offer`, c2, hostSecret);
     const res = await get(`${srv.baseUrl}/api/rooms/${roomId}/ice/offer`, secret);
     const { candidates } = await res.json();
     assert.equal(candidates.length, 2);
@@ -116,10 +116,10 @@ test('Request without X-Room-Secret returns 401', async () => {
 });
 
 test('JSON body over 50kb limit is rejected (413)', async () => {
-    const { roomId, secret } = await newRoom();
+    const { roomId, hostSecret } = await newRoom();
     // ~60kb of SDP — well past the 50kb cap
     const huge = { type: 'offer', sdp: 'v=0\r\n' + 'a'.repeat(60 * 1024) };
-    const res = await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, huge, secret);
+    const res = await post(`${srv.baseUrl}/api/rooms/${roomId}/offer`, huge, hostSecret);
     assert.equal(res.status, 413);
 });
 

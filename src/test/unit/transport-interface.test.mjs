@@ -34,7 +34,7 @@ const STUB_RTC = `
             this._isStub = true;
         }
         async init() {}
-        async createOfferAndStore() { return { roomId: 'ROOM01', secret: 'secret' }; }
+        async createOfferAndStore() { return { roomId: 'ROOM01' }; }
         async waitForAnswer() {}
         async joinRoom() {}
         sendMessage() { return true; }
