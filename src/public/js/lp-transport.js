@@ -45,7 +45,8 @@
     // backpressure, replacing the old silent frame drop that corrupted
     // transfers). The queue drains one frame per receiver round trip
     // (~100-300 ms), so retry the same frame on a short fixed gap; a 429
-    // from an upstream proxy carries Retry-After and is honoured instead.
+    // carrying Retry-After (an upstream proxy, or our server when its
+    // relay-wide RELAY_QUEUE_BUDGET_BYTES is spent) is honoured instead.
     // Give up after UP_STALL_MAX_MS of solid 429s: the peer is alive
     // (otherwise the slot would close with 410) but not draining, e.g. a
     // suspended background tab.

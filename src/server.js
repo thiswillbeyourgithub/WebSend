@@ -392,6 +392,19 @@ const LP_SLOT_IDLE_TIMEOUT_MS = 60_000;     // close LP slot after this idle
 // byte cap. Same order of magnitude as the LP queue bound
 // (LP_QUEUE_MAX_FRAMES x ~300 KiB ≈ 9 MiB).
 const WS_PEER_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
+// Process-wide cap on bytes the relay holds for receivers: LP queued frames
+// plus bytes handed to ws.send that ws has not flushed to the kernel yet.
+// The per-peer caps above bound one pairing (~8-9 MiB) but not the sum over
+// rooms, so a few dozen slow receivers could OOM the container and kill every
+// transfer in it. Past the budget the relay backpressures every feeder, the
+// same way it does for a full peer: /relay/up answers 429 with Retry-After: 1
+// and WS feeders have their socket paused. Nothing is dropped. Receivers that
+// hold budget without draining are reaped anyway (WS: no pong within the
+// heartbeat, since the ping queues behind the backlog; LP: slot idle timeout).
+const RELAY_QUEUE_BUDGET_BYTES = parseInt(process.env.RELAY_QUEUE_BUDGET_BYTES, 10) > 0
+    ? parseInt(process.env.RELAY_QUEUE_BUDGET_BYTES, 10)
+    : 64 * 1024 * 1024;
+let relayHeldBytes = 0; // only touched via lpEnqueue/lpDequeue/wsSendCounted/wsReleaseHeld
 
 // ============ Rate Limiting ============
 // Simple sliding window rate limiter to prevent DoS and room enumeration attacks.
@@ -1345,7 +1358,13 @@ app.post(
         // retries on its own short gap, but it honours a Retry-After when
         // present (proxies send whole seconds, which would needlessly
         // halve LP throughput if we sent one too).
+        // The relay-wide budget, by contrast, is shared by every room and
+        // does not clear within one round trip, so that 429 asks for 1 s.
         if (peerBacklogFull(peer)) {
+            if (relayBudgetFull()) {
+                res.set('Retry-After', '1');
+                return res.status(429).json({ error: 'Relay queue budget full' });
+            }
             return res.status(429).json({ error: 'Peer backlog full' });
         }
         r.sessionBytes += len;
@@ -1567,24 +1586,39 @@ function peerBacklogBytes(peer) {
     return peer.bufferedAmount || 0;
 }
 
-// True when the peer cannot absorb another frame and the feeder must hold
-// off (429 on /relay/up, socket pause on the WS path). A missing peer is
-// not "full": pre-handshake frames are dropped on the floor by design and
-// renegotiated by the client.
-function peerBacklogFull(peer) {
+// True when the peer can still receive frames (LP slot not closed, WS open).
+function peerAccepting(peer) {
     if (!peer) return false;
-    if (peer.kind === 'lp') return !peer.closed && peer.queue.length >= LP_QUEUE_MAX_FRAMES;
-    return peer.readyState === peer.OPEN && peer.bufferedAmount > WS_PEER_BUFFER_MAX_BYTES;
+    return peer.kind === 'lp' ? !peer.closed : peer.readyState === peer.OPEN;
+}
+
+function relayBudgetFull() {
+    return relayHeldBytes >= RELAY_QUEUE_BUDGET_BYTES;
+}
+
+// True when the peer cannot absorb another frame and the feeder must hold
+// off (429 on /relay/up, socket pause on the WS path): either its own
+// backlog is full or the relay-wide RELAY_QUEUE_BUDGET_BYTES is spent. A
+// missing or closed peer is not "full": its frames cost no memory
+// (pre-handshake frames are dropped on the floor by design and
+// renegotiated by the client).
+function peerBacklogFull(peer) {
+    if (!peerAccepting(peer)) return false;
+    if (relayBudgetFull()) return true;
+    if (peer.kind === 'lp') return peer.queue.length >= LP_QUEUE_MAX_FRAMES;
+    return peer.bufferedAmount > WS_PEER_BUFFER_MAX_BYTES;
 }
 
 // Low-water counterpart of peerBacklogFull: a paused WS feeder resumes
 // only once the peer has drained to half the cap, so the pause/resume
-// cycle doesn't flap on every single frame. A gone/closed peer reads as
-// "low" so the feeder is resumed and the normal teardown path runs.
+// cycle doesn't flap on every single frame, and the relay budget is no
+// longer spent. A gone/closed peer reads as "low" so the feeder is
+// resumed and the normal teardown path runs.
 function peerBacklogLow(peer) {
-    if (!peer) return true;
-    if (peer.kind === 'lp') return peer.closed || peer.queue.length < LP_QUEUE_MAX_FRAMES / 2;
-    return peer.readyState !== peer.OPEN || peer.bufferedAmount < WS_PEER_BUFFER_MAX_BYTES / 2;
+    if (!peerAccepting(peer)) return true;
+    if (relayBudgetFull()) return false;
+    if (peer.kind === 'lp') return peer.queue.length < LP_QUEUE_MAX_FRAMES / 2;
+    return peer.bufferedAmount < WS_PEER_BUFFER_MAX_BYTES / 2;
 }
 
 // How often a paused WS feeder re-checks its peer's backlog. Neither the
@@ -1631,12 +1665,48 @@ function maybePauseWsFeeder(ws, room, slot) {
     ws._backpressureTimer.unref && ws._backpressureTimer.unref();
 }
 
-// Pop the next frame off an LP slot's queue, keeping queueBytes in sync.
-// Every dequeue must go through here or the backlog accounting drifts.
+function frameBytes(data) {
+    return Buffer.isBuffer(data) ? data.length : (data && data.byteLength) || 0;
+}
+
+// Push/pop an LP slot's queue, keeping queueBytes and the relay-wide
+// relayHeldBytes in sync. Every enqueue/dequeue must go through these or
+// the backlog accounting drifts.
+function lpEnqueue(slot, frame) {
+    slot.queue.push(frame);
+    slot.queueBytes += frame.bytes;
+    relayHeldBytes += frame.bytes;
+}
+
 function lpDequeue(slot) {
     const frame = slot.queue.shift();
-    if (frame) slot.queueBytes = Math.max(0, (slot.queueBytes || 0) - frame.bytes);
+    if (frame) {
+        slot.queueBytes -= frame.bytes;
+        relayHeldBytes -= frame.bytes;
+    }
     return frame;
+}
+
+// ws.send with the frame counted in relayHeldBytes until ws flushes it to
+// the kernel (send callback) or the socket closes (wsReleaseHeld), i.e. the
+// relay's share of bufferedAmount.
+function wsSendCounted(ws, data, isBinary) {
+    const n = frameBytes(data);
+    ws._heldBytes = (ws._heldBytes || 0) + n;
+    relayHeldBytes += n;
+    const release = () => {
+        if (ws._heldReleased) return; // already given back wholesale on close
+        ws._heldBytes -= n;
+        relayHeldBytes -= n;
+    };
+    try { ws.send(data, { binary: isBinary }, release); } catch (_) { release(); }
+}
+
+function wsReleaseHeld(ws) {
+    if (ws._heldReleased) return;
+    ws._heldReleased = true;
+    relayHeldBytes -= ws._heldBytes || 0;
+    ws._heldBytes = 0;
 }
 
 function deliverToPeer(peerSlot, data, isBinary) {
@@ -1650,9 +1720,7 @@ function deliverToPeer(peerSlot, data, isBinary) {
         // /relay/up answers 429 and the WS message handler pauses the
         // sender's socket, so the queue can only exceed the bound by the
         // few frames already in flight when backpressure engaged.
-        const bytes = Buffer.isBuffer(data) ? data.length : (data && data.byteLength) || 0;
-        peerSlot.queue.push({ data, isBinary, bytes });
-        peerSlot.queueBytes = (peerSlot.queueBytes || 0) + bytes;
+        lpEnqueue(peerSlot, { data, isBinary, bytes: frameBytes(data) });
         const w = peerSlot.waiters.shift();
         if (w) {
             w.send(lpDequeue(peerSlot));
@@ -1661,7 +1729,7 @@ function deliverToPeer(peerSlot, data, isBinary) {
     }
     // ws slot
     if (peerSlot.readyState === peerSlot.OPEN) {
-        peerSlot.send(data, { binary: isBinary });
+        wsSendCounted(peerSlot, data, isBinary);
     }
 }
 
@@ -1689,6 +1757,9 @@ function closeLpSlot(slot, reason) {
     if (slot.closed) return;
     slot.closed = true;
     if (slot.idleTimer) { clearTimeout(slot.idleTimer); slot.idleTimer = null; }
+    // Nobody can poll a closed slot (/relay/down answers 410), so give its
+    // queued bytes back to the relay budget.
+    while (slot.queue.length > 0) lpDequeue(slot);
     // Drain pending waiters with a 410 Gone signal so the client knows
     // the slot is dead and can stop polling.
     const waiters = slot.waiters.splice(0);
@@ -1724,7 +1795,7 @@ function attachRelay(room, ws, slot) {
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data, isBinary) => {
-        const len = Buffer.isBuffer(data) ? data.length : (data && data.byteLength) || 0;
+        const len = frameBytes(data);
         if (!isBinary && len > MAX_CONTROL_MSG_BYTES) {
             // Mirrors the client-side handleMessage cap in webrtc.js so
             // a hostile peer cannot force the relay container to forward
@@ -1771,6 +1842,7 @@ function attachRelay(room, ws, slot) {
 
     ws.on('close', () => {
         relayPings.delete(ws);
+        wsReleaseHeld(ws);
         if (ws._backpressureTimer) {
             clearInterval(ws._backpressureTimer);
             ws._backpressureTimer = null;
@@ -1913,6 +1985,7 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'TURNS_PORT',            value: process.env.TURNS_PORT,           used: TURNS_PORT || '(none)' },
         { name: 'RELAY_ENABLE',          value: process.env.RELAY_ENABLE,         used: String(RELAY_ENABLE) },
         { name: 'RELAY_LP_ONLY',         value: process.env.RELAY_LP_ONLY,        used: String(RELAY_LP_ONLY) },
+        { name: 'RELAY_QUEUE_BUDGET_BYTES', value: process.env.RELAY_QUEUE_BUDGET_BYTES, used: String(RELAY_QUEUE_BUDGET_BYTES) },
         { name: 'DEV_FORCE_CONNECTION',  value: process.env.DEV_FORCE_CONNECTION, used: DEV_FORCE_CONNECTION },
         { name: 'UMAMI_URL',             value: process.env.UMAMI_URL,            used: UMAMI_URL || '(none)' },
         { name: 'UMAMI_WEBSITE_ID',      value: process.env.UMAMI_WEBSITE_ID,     used: UMAMI_WEBSITE_ID || '(none)' },

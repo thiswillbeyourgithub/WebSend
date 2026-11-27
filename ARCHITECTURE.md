@@ -30,7 +30,9 @@ connection-establishment timeout, seconds, default `15`), `DEV_FORCE_CONNECTION`
 `RELAY_HTTPS` / `RELAY_LP` for testing, default `DEFAULT`), `RELAY_ENABLE` (expose the
 HTTP-relay fallback transport, default `true`), `RELAY_LP_ONLY` (long-poll-only
 transport: suppresses WebRTC ICE servers and disables the WS relay endpoint so only
-the long-poll path is exposed, default `false`), `WEBSEND_ROOM_TTL_MS` /
+the long-poll path is exposed, default `false`), `RELAY_QUEUE_BUDGET_BYTES` (relay-wide
+budget for bytes held for receivers, LP queues plus unflushed WS send buffers across all
+rooms, default 64 MiB; past it senders are backpressured), `WEBSEND_ROOM_TTL_MS` /
 `WEBSEND_ROOM_CLEANUP_INTERVAL_MS` (room TTL and cleanup-sweep interval in ms,
 defaults 10 min / 1 min; mainly a test escape hatch), `TEST_DISABLE_RATE_LIMIT`
 (test escape hatch), `BRANDING` (the instance display name shown on the landing
@@ -649,7 +651,7 @@ the matching photo, it surfaces an error toast and gives up.
 | GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | None            |
 | WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query | 100/min per IP |
 | POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 100/min per IP |
-| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay (429 when the peer's queue is full; 204 carries `X-Peer-Backlog-Bytes`) | Room secret + `X-Slot-Token` | None (byte caps only) |
+| POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay (429 when the peer's queue is full, or with `Retry-After: 1` when the relay-wide `RELAY_QUEUE_BUDGET_BYTES` is spent; 204 carries `X-Peer-Backlog-Bytes`) | Room secret + `X-Slot-Token` | None (byte caps only) |
 | GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | None (waiter caps only) |
 | POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Room secret + `X-Slot-Token` | 100/min per IP |
 
@@ -1101,7 +1103,15 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     when the peer's queue is full (or a WS peer's socket buffer exceeds
     8 MiB), `/relay/up` answers 429 and the client retries the same
     frame on a short gap (bounded at 30 s of solid 429s), so a slow
-    receiver can never cause chunk loss mid-file. A WS sender is
+    receiver can never cause chunk loss mid-file. One process-wide
+    budget (`RELAY_QUEUE_BUDGET_BYTES`, default 64 MiB) also bounds the
+    sum of what the relay holds for receivers across all rooms: LP
+    queued bytes plus bytes handed to `ws.send` and not yet flushed
+    (counted until the send callback, given back wholesale when a
+    socket closes or an LP slot is closed). While it is spent every
+    feeder is backpressured as if its peer were full, the `/relay/up`
+    429 then carrying `Retry-After: 1`; receivers that hog it without
+    draining are reaped by the WS heartbeat or the LP idle timeout. A WS sender is
     backpressured the TCP way instead: the server pauses the sender's
     socket while the peer's backlog is full and resumes it below half
     the cap, which also keeps a fast WS sender from ballooning server
@@ -1264,7 +1274,7 @@ This feature was added with assistance from
 Three tiers, layered from fast/cheap to slow/realistic:
 
 - **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed. `doc-detect-samples.test.mjs` runs the document-edge detector against real camera shots in `test/fixtures/doc-samples/`, warps the detected quad to the ground-truth dimensions in `test/fixtures/doc-target-result/` via `ImageTransforms.perspectiveTransform`, and asserts both mean luminance and mean Sobel edge density of the crop match the target within 1% of 0..255 (BW + math, no colour classifier). It also applies a per-corner **geometry guard** (`EXPECTED_CORNERS`, tolerance 0.06 normalized) because the content metrics stay green even when a corner collapses inward over a uniform page; the guard catches that class of failure. Skips automatically when the optional `canvas` devDep is not installed. `maintenance-banner.test.mjs` loads `sidebar.js` in JSDOM and asserts the DEV maintenance banner's 5-day age gate (shown under 5 days, suppressed over it, DEV badge unaffected, missing `serverStartedAt` fails open).
-- **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, the `/vendor` `/scribe` `/tessdata` static mounts, and the receiver-only-auth gate (`auth-scope.test.mjs`: `AUTH_SCOPE=receiver` refuses `POST /api/rooms` without the proxy identity header, honors a custom `AUTH_IDENTITY_HEADER`, surfaces `senderOrigin`, and aborts startup on the misconfiguration cases). A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
+- **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits, the HTTP relay (`relay-ws.test.mjs`, `relay-lp.test.mjs`: pairing, backpressure, frame caps including the WS `maxPayload`) and its relay-wide byte budget (`relay-queue-budget.test.mjs`: cross-room 429 with `Retry-After: 1`, WS send buffers counted, bytes returned when a slot or socket closes, WS feeder paused rather than dropped), the `/vendor` `/scribe` `/tessdata` static mounts, and the receiver-only-auth gate (`auth-scope.test.mjs`: `AUTH_SCOPE=receiver` refuses `POST /api/rooms` without the proxy identity header, honors a custom `AUTH_IDENTITY_HEADER`, surfaces `senderOrigin`, and aborts startup on the misconfiguration cases). A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
 - **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer. The receiver/sender pairing and fingerprint verification dance lives once in `src/test/e2e/helpers.js` (`pairAndVerify`), shared by every spec that needs a paired session. Two specs run the vendored scribe.js for real. `pdf-card-export.spec.js` sends a generated 2-page text PDF and drives both per-PDF card actions (ZIP of page images, OCR PDF), which exercises `ScribeHandle.renderPdfPages` (scribe's PDF renderer); it is also the regression test for a bug where those actions `fetch()`ed page data URLs, which the CSP (`connect-src 'self'`) blocks, so `renderPdfPages` now returns PNG Blobs. `ocr-export.spec.js` sends a 2400 px wide text image rendered in the browser (above the 2000 px OCR input cap) and exports a searchable PDF through both `generateOcrPdf` paths (cached background-OCR splice, and on-demand fallback forced by corrupting `receivedImages[0].ocrPageData`), then checks the text layer and word geometry with `pdftotext -bbox` (spec skipped when poppler-utils is missing). It is the regression net for scribe.js upgrades, since our code reaches into scribe's per-page OCR objects, page metrics and native image slots (confined to `js/scribe-handle.js` plus the splice code in `receive-export.js`).
 
 A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and aborts the push on failure. The hook is auto-wired by the `prepare` script in `src/package.json` (sets `core.hooksPath=.githooks` on `npm install`).
