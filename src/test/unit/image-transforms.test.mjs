@@ -125,25 +125,17 @@ test('MAX_TRANSFORM_PIXELS bounds the rotate/flip/binarize canvas allocation', (
 // We swap the global before each invocation so the module's reference
 // to `createImageBitmap` resolves to our stub.
 async function withFakeBitmap({ width, height }, fn) {
-    const { createContext, runInContext } = await import('node:vm');
-    // Re-evaluate the module in a context whose createImageBitmap returns
-    // a bitmap of the requested dimensions. This is the cleanest way to
-    // exercise _loadBitmap's gate without poking at module-private state.
-    const { readFileSync } = await import('node:fs');
-    const code = readFileSync(modulePath, 'utf8');
     const fakeBitmap = { width, height, close: () => {} };
-    const ctx = {
-        window: { logger: { info(){}, error(){}, warn(){}, success(){}, debug(){} } },
-        logger: { info(){}, error(){}, warn(){}, success(){}, debug(){} },
+    const win = await loadBrowserModule(modulePath, {
         document: stubDocument,
         createImageBitmap: async () => fakeBitmap,
         Blob: globalThis.Blob,
+        // Outer-realm intrinsics, so the test's own Uint8Array inputs pass
+        // instanceof checks inside the module.
         Uint8Array: globalThis.Uint8Array,
         Promise: globalThis.Promise,
-        console,
-    };
-    runInContext(code, createContext(ctx));
-    return fn(ctx.window.ImageTransforms);
+    });
+    return fn(win.ImageTransforms);
 }
 
 test('rotateImage throws when bitmap dimensions exceed MAX_TRANSFORM_PIXELS', async () => {

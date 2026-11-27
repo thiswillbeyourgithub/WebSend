@@ -14,42 +14,27 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createContext, runInContext } from 'node:vm';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
 import { makeSessionPair } from '../support/session-keys.mjs';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const js = p => path.resolve(__dirname, '../../public/js', p);
+import { loadBrowserModule, publicJs, stubLogger } from '../support/load-browser-module.mjs';
 
 globalThis.btoa = globalThis.btoa ?? (b => Buffer.from(b, 'binary').toString('base64'));
 globalThis.atob = globalThis.atob ?? (b => Buffer.from(b, 'base64').toString('binary'));
 
-const stubLogger = { info: () => {}, success: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
-
 /** One vm realm with every module the two endpoints need. */
 function loadRealm() {
-    const win = { logger: stubLogger };
-    const ctx = createContext({
-        window: win,
-        logger: stubLogger,
-        crypto: globalThis.crypto,
-        console,
-        setTimeout, clearTimeout,
-        TextEncoder, TextDecoder,
-        btoa: globalThis.btoa, atob: globalThis.atob,
-        Blob, Response, CompressionStream, DecompressionStream,
-    });
-    for (const f of ['crypto.js', 'protocol.js', 'segment-stream.js',
-                     'transport-assembler.js', 'receive-flow.js']) {
-        runInContext(readFileSync(js(f), 'utf8'), ctx);
-    }
-    // The modules reference each other as bare globals (browser style).
-    // Property form: crypto.js declares a top-level `const WebSendCrypto`
-    // in this realm, which a bare assignment would collide with.
-    runInContext('globalThis.WebSendCrypto = window.WebSendCrypto; globalThis.Protocol = window.Protocol;', ctx);
-    return win;
+    return loadBrowserModule(
+        ['crypto.js', 'protocol.js', 'segment-stream.js',
+         'transport-assembler.js', 'receive-flow.js'].map(publicJs),
+        {
+            setTimeout, clearTimeout,
+            TextEncoder, TextDecoder,
+            btoa: globalThis.btoa, atob: globalThis.atob,
+            Blob, Response, CompressionStream, DecompressionStream,
+        },
+        // The modules reference each other as bare globals (browser style).
+        // Property form: crypto.js declares a top-level `const WebSendCrypto`
+        // in this realm, which a bare assignment would collide with.
+        { epilogue: 'globalThis.WebSendCrypto = window.WebSendCrypto; globalThis.Protocol = window.Protocol;' });
 }
 
 function patternedBytes(size) {
@@ -165,7 +150,7 @@ async function makeHarness(win, content, { corrupt = () => {} } = {}) {
 }
 
 test('a flipped bit on the wire heals transparently via segment-nack/rewind', async () => {
-    const win = loadRealm();
+    const win = await loadRealm();
     const content = patternedBytes(600 * 1024); // 3 data segments
     let corrupted = false;
     const h = await makeHarness(win, content, {
@@ -206,7 +191,7 @@ test('a flipped bit on the wire heals transparently via segment-nack/rewind', as
 });
 
 test('a clean wire still completes with no retry round', async () => {
-    const win = loadRealm();
+    const win = await loadRealm();
     const content = patternedBytes(100 * 1024);
     const h = await makeHarness(win, content);
 
@@ -219,7 +204,7 @@ test('a clean wire still completes with no retry round', async () => {
 });
 
 test('persistent corruption exhausts the budget and surfaces as file-nack', async () => {
-    const win = loadRealm();
+    const win = await loadRealm();
     const content = patternedBytes(100 * 1024); // 1 data segment
     const h = await makeHarness(win, content, {
         // Smash the tail of EVERY chunk past the metadata record, every

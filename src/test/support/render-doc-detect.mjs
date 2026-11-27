@@ -11,10 +11,10 @@
  * Built with Claude Code.
  */
 
-import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { createContext, runInContext } from 'node:vm';
+import { loadDocDetectRealm } from './doc-detect-realm.mjs';
 import * as canvasMod from 'canvas';
 
 const { createCanvas, loadImage, ImageData } = canvasMod;
@@ -24,19 +24,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SAMPLES_DIR = path.resolve(__dirname, '../fixtures/doc-samples');
 const TARGETS_DIR = path.resolve(__dirname, '../fixtures/doc-target-result');
 const OUT_DIR = path.join(process.env.TMPDIR || '/tmp', 'doc-detect-debug');
-const DOC_DETECT_PATH = path.resolve(__dirname, '../../public/js/doc-detect.js');
-const IMG_TRANSFORMS_PATH = path.resolve(__dirname, '../../public/js/image-transforms.js');
 
-const win = {};
-const vmCtx = createContext({
-    window: win,
-    document: { createElement: (t) => t === 'canvas' ? createCanvas(1, 1) : (() => { throw new Error(t); })() },
-    ImageData,
-    console,
-});
-runInContext(readFileSync(DOC_DETECT_PATH, 'utf8') + '; window.DocDetect = DocDetect;', vmCtx);
-runInContext(readFileSync(IMG_TRANSFORMS_PATH, 'utf8'), vmCtx);
-const { DocDetect, ImageTransforms } = win;
+const { DocDetect, ImageTransforms } = await loadDocDetectRealm(canvasMod);
 
 mkdirSync(OUT_DIR, { recursive: true });
 const samples = readdirSync(SAMPLES_DIR).filter(f => /\.(jpe?g|png)$/i.test(f)).sort();

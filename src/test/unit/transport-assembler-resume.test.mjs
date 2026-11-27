@@ -9,24 +9,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createContext, runInContext } from 'node:vm';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const protocolPath = path.resolve(__dirname, '../../public/js/protocol.js');
-const assemblerPath = path.resolve(__dirname, '../../public/js/transport-assembler.js');
+import { loadBrowserModule, publicJs } from '../support/load-browser-module.mjs';
 
 // Load both scripts into a single vm context so PayloadAssembler can see
-// the same window object as Protocol.
-const win = {};
-const logger = { info: () => {}, success: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
-// Blob is passed in for the file-end assembly path (node's global Blob);
-// timers back the file-ack timeout in setupFileAck.
-const ctx = createContext({ window: win, logger, console, Blob, setTimeout, clearTimeout });
-runInContext(readFileSync(protocolPath, 'utf8'), ctx);
-runInContext(readFileSync(assemblerPath, 'utf8'), ctx);
+// the same window object as Protocol. Blob is passed in for the file-end
+// assembly path (node's global Blob); timers back the file-ack timeout in
+// setupFileAck.
+const win = await loadBrowserModule(
+    [publicJs('protocol.js'), publicJs('transport-assembler.js')],
+    { Blob, setTimeout, clearTimeout });
 
 const PA = win.PayloadAssembler;
 

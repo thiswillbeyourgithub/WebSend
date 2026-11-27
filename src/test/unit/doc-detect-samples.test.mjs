@@ -28,16 +28,14 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { createContext, runInContext } from 'node:vm';
+import { loadDocDetectRealm } from '../support/doc-detect-realm.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SAMPLES_DIR = path.resolve(__dirname, '../fixtures/doc-samples');
 const TARGETS_DIR = path.resolve(__dirname, '../fixtures/doc-target-result');
-const DOC_DETECT_PATH = path.resolve(__dirname, '../../public/js/doc-detect.js');
-const IMG_TRANSFORMS_PATH = path.resolve(__dirname, '../../public/js/image-transforms.js');
 
 // 1% of the 0..255 luminance range.
 const TOLERANCE = 255 * 0.01;
@@ -81,20 +79,8 @@ if (!canvasMod) {
     const { createCanvas, loadImage, ImageData } = canvasMod;
     globalThis.ImageData = ImageData;
 
-    // Load DocDetect AND ImageTransforms into one vm context with a minimal
-    // browser shim. ImageTransforms.perspectiveTransform uses real canvases,
-    // so the document shim returns node-canvas canvases.
-    const win = {};
-    const vmCtx = createContext({
-        window: win,
-        document: { createElement: (t) => t === 'canvas' ? createCanvas(1, 1) : (() => { throw new Error(t); })() },
-        ImageData,
-        console,
-    });
-    runInContext(readFileSync(DOC_DETECT_PATH, 'utf8') + '; window.DocDetect = DocDetect;', vmCtx);
-    runInContext(readFileSync(IMG_TRANSFORMS_PATH, 'utf8'), vmCtx);
-    const DocDetect = win.DocDetect;
-    const { perspectiveTransform } = win.ImageTransforms;
+    const { DocDetect, ImageTransforms } = await loadDocDetectRealm(canvasMod);
+    const { perspectiveTransform } = ImageTransforms;
 
     for (const file of samples) {
         const targetPath = path.join(TARGETS_DIR, file);
