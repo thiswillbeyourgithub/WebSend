@@ -480,12 +480,17 @@ class LruMap {
 const rateLimiters = new LruMap(RATE_LIMITERS_MAX); // key=`${ip}:${limitType}` -> { timestamps: [], blockedUntil: null }
 
 const RATE_LIMIT_CONFIG = {
-    // Room creation: 5 rooms per minute per IP (prevents room flooding)
-    roomCreation: { windowMs: 60 * 1000, maxRequests: 5 },
-    // Room lookup: 30 requests per minute per IP (prevents enumeration)
-    roomLookup: { windowMs: 60 * 1000, maxRequests: 30 },
-    // General API: 100 requests per minute per IP
-    general: { windowMs: 60 * 1000, maxRequests: 100 }
+    // Budgets are per client key (getClientIp), and a hospital's desktops
+    // often share one NAT address, so they are sized for a whole site, not
+    // one user. Enumeration is still hopeless: room ids are ~30 bits and
+    // every room-scoped call also needs the 128-bit room secret.
+    // Room creation: 30 rooms per minute per client (prevents room flooding;
+    // ROOMS_MAX_PER_CLIENT bounds how many stay live)
+    roomCreation: { windowMs: 60 * 1000, maxRequests: 30 },
+    // Room lookup: 120 requests per minute per client (prevents enumeration)
+    roomLookup: { windowMs: 60 * 1000, maxRequests: 120 },
+    // General API: 400 requests per minute per client
+    general: { windowMs: 60 * 1000, maxRequests: 400 }
 };
 
 /**
@@ -959,7 +964,7 @@ app.get('/api/config', (req, res) => {
  * Create a new room
  * POST /api/rooms
  * Returns: { roomId: "ABC123" }
- * Rate limited: 5 rooms per minute per IP
+ * Rate limited: 30 rooms per minute per client
  */
 app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
     // Receiver-only auth gate (AUTH_SCOPE=receiver). Creating a room is what
@@ -1124,7 +1129,7 @@ function validateSdpBody(body, expectedType) {
  * POST /api/rooms/:id/offer
  * Body: { sdp: "...", type: "offer" }
  * Headers: X-Room-Secret required
- * Rate limited: general (100/min)
+ * Rate limited: general (400/min)
  */
 app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     const err = validateSdpBody(req.body, 'offer');
@@ -1142,7 +1147,7 @@ app.post('/api/rooms/:id/offer', rateLimitMiddleware('general'), validateRoomSec
  * Get SDP offer for a room
  * GET /api/rooms/:id/offer
  * Headers: X-Room-Secret required
- * Rate limited: 30 lookups per minute per IP
+ * Rate limited: 120 lookups per minute per client
  */
 app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), validateRoomSecret, (req, res) => {
     if (!req.room.offer) {
@@ -1161,7 +1166,7 @@ app.get('/api/rooms/:id/offer', rateLimitMiddleware('roomLookup'), validateRoomS
  * POST /api/rooms/:id/answer
  * Body: { sdp: "...", type: "answer" }
  * Headers: X-Room-Secret required
- * Rate limited: general (100/min)
+ * Rate limited: general (400/min)
  */
 app.post('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     const err = validateSdpBody(req.body, 'answer');
@@ -1245,7 +1250,7 @@ app.get('/api/rooms/:id/answer', rateLimitMiddleware('general'), validateRoomSec
  * Add ICE candidate for offer side (receiver's candidates)
  * POST /api/rooms/:id/ice/offer
  * Headers: X-Room-Secret required
- * Rate limited: general (100/min)
+ * Rate limited: general (400/min)
  */
 app.post('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     if (req.room.iceCandidatesOffer.length >= MAX_ICE_CANDIDATES) {
@@ -1277,7 +1282,7 @@ app.get('/api/rooms/:id/ice/offer', rateLimitMiddleware('general'), validateRoom
  * Add ICE candidate for answer side (sender's candidates)
  * POST /api/rooms/:id/ice/answer
  * Headers: X-Room-Secret required
- * Rate limited: general (100/min)
+ * Rate limited: general (400/min)
  */
 app.post('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoomSecret, jsonBody, (req, res) => {
     if (req.room.iceCandidatesAnswer.length >= MAX_ICE_CANDIDATES) {
@@ -1309,7 +1314,7 @@ app.get('/api/rooms/:id/ice/answer', rateLimitMiddleware('general'), validateRoo
  * Check if room exists
  * GET /api/rooms/:id
  * Headers: X-Room-Secret required
- * Rate limited: 30 lookups per minute per IP (prevents enumeration)
+ * Rate limited: 120 lookups per minute per client (prevents enumeration)
  */
 app.get('/api/rooms/:id', rateLimitMiddleware('roomLookup'), validateRoomSecret, (req, res) => {
     res.json({
@@ -1980,7 +1985,7 @@ httpServer.on('upgrade', (req, socket, head) => {
         return;
     }
 
-    // Per-IP rate limit. Reuses the existing 'general' category (100/min)
+    // Per-client rate limit. Reuses the existing 'general' category (400/min)
     // so a hostile client cannot pin slots by reconnecting in a tight
     // loop. We can't go through the Express middleware on upgrade so we
     // call checkRateLimit directly. Keyed like the HTTP routes (trust

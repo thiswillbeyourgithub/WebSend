@@ -7,9 +7,9 @@ before(async () => { srv = await startServer(); });
 after(() => stopServer(srv.proc));
 
 test('POST /api/rooms returns 429 after rate limit exceeded', async () => {
-    // Default room creation limit is 10/minute per IP. Send 15 rapid requests.
+    // Default room creation limit is 30/minute per client. Send 40 rapid requests.
     const results = await Promise.all(
-        Array.from({ length: 15 }, () =>
+        Array.from({ length: 40 }, () =>
             fetch(`${srv.baseUrl}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
         )
     );
@@ -21,7 +21,7 @@ test('GET /api/rooms/:id/answer fast path participates in the general rate limit
     // Create one room and use its secret to fast-path-fetch the answer many
     // times. Without the rate-limit middleware on this handler (the historical
     // gap that allowed long-poll DoS), all 200/204 responses came back. With
-    // the middleware applied, the per-IP general cap (100/min) kicks in.
+    // the middleware applied, the per-client general cap (400/min) kicks in.
     const { roomId, secret } = await (await fetch(`${srv.baseUrl}/api/rooms`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
     })).json();
@@ -34,10 +34,10 @@ test('GET /api/rooms/:id/answer fast path participates in the general rate limit
         body: JSON.stringify({ type: 'answer', sdp: 'v=0\r\nx\r\n' }),
     });
 
-    // Fire 110 fast-path GETs serially to keep ordering deterministic. The
-    // 100th-ish should start returning 429.
+    // Fire 410 fast-path GETs serially to keep ordering deterministic. The
+    // 400th-ish should start returning 429.
     let saw429 = false;
-    for (let i = 0; i < 110; i++) {
+    for (let i = 0; i < 410; i++) {
         const r = await fetch(`${srv.baseUrl}/api/rooms/${roomId}/answer`, {
             headers: { 'X-Room-Secret': secret },
         });

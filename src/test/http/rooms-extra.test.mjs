@@ -13,8 +13,8 @@ import assert from 'node:assert/strict';
 import { startServer, stopServer } from './helpers.mjs';
 
 let srv;
-// Disable rate limiting: this file creates >5 rooms per run, which would trip
-// the 5-rooms-per-minute roomCreation limiter.
+// Disable rate limiting: this file creates many rooms per run from one
+// client, so it must not depend on the roomCreation limiter's budget.
 before(async () => { srv = await startServer({ TEST_DISABLE_RATE_LIMIT: '1' }); });
 after(() => stopServer(srv.proc));
 

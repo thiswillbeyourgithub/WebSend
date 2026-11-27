@@ -641,21 +641,21 @@ the matching photo, it surfaces an error toast and gives up.
 |--------|------------------------------|--------------------------------------|-------------|-----------------|
 | GET    | `/send/:roomId`              | Pretty-URL redirect into the sender flow | None    | None            |
 | GET    | `/api/config`                | ICE server list + DEV flag + OCR / file-type config | None | None     |
-| POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None (or proxy identity header when `AUTH_SCOPE=receiver`) | 5/min per IP    |
-| GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 30/min per IP   |
-| POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Room secret | 100/min per IP  |
-| GET    | `/api/rooms/:id/offer`       | Retrieve SDP offer                   | Room secret | 30/min per IP   |
-| POST   | `/api/rooms/:id/answer`      | Store SDP answer                     | Room secret | 100/min per IP  |
-| GET    | `/api/rooms/:id/answer`      | Retrieve SDP answer (long-poll)      | Room secret | None            |
-| POST   | `/api/rooms/:id/ice/offer`   | Add receiver ICE candidate           | Room secret | 100/min per IP  |
-| GET    | `/api/rooms/:id/ice/offer`   | Get receiver ICE candidates          | Room secret | None            |
-| POST   | `/api/rooms/:id/ice/answer`  | Add sender ICE candidate             | Room secret | 100/min per IP  |
-| GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | None            |
-| WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query | 100/min per IP |
-| POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 100/min per IP |
+| POST   | `/api/rooms`                 | Create a room (returns ID + secret)  | None (or proxy identity header when `AUTH_SCOPE=receiver`) | 30/min per client |
+| GET    | `/api/rooms/:id`             | Check room existence                 | Room secret | 120/min per client |
+| POST   | `/api/rooms/:id/offer`       | Store SDP offer                      | Room secret | 400/min per client |
+| GET    | `/api/rooms/:id/offer`       | Retrieve SDP offer                   | Room secret | 120/min per client |
+| POST   | `/api/rooms/:id/answer`      | Store SDP answer                     | Room secret | 400/min per client |
+| GET    | `/api/rooms/:id/answer`      | Retrieve SDP answer (long-poll)      | Room secret | 400/min per client |
+| POST   | `/api/rooms/:id/ice/offer`   | Add receiver ICE candidate           | Room secret | 400/min per client |
+| GET    | `/api/rooms/:id/ice/offer`   | Get receiver ICE candidates          | Room secret | 400/min per client |
+| POST   | `/api/rooms/:id/ice/answer`  | Add sender ICE candidate             | Room secret | 400/min per client |
+| GET    | `/api/rooms/:id/ice/answer`  | Get sender ICE candidates            | Room secret | 400/min per client |
+| WS     | `/api/rooms/:id/relay`       | HTTP-relay fallback (WebSocket; returns 404 when `RELAY_ENABLE=false` or `RELAY_LP_ONLY=true`) | `?secret=...` query | 400/min per client |
+| POST   | `/api/rooms/:id/relay/handshake` | Claim a long-poll relay slot     | Room secret | 400/min per client |
 | POST   | `/api/rooms/:id/relay/up`    | Push a frame on the long-poll relay (429 when the peer's queue is full, or with `Retry-After: 1` when the relay-wide `RELAY_QUEUE_BUDGET_BYTES` is spent; 204 carries `X-Peer-Backlog-Bytes`) | Room secret + `X-Slot-Token` | None (byte caps only) |
 | GET    | `/api/rooms/:id/relay/down`  | Long-poll the next frame on this slot | Room secret + `X-Slot-Token` | None (waiter caps only) |
-| POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Room secret + `X-Slot-Token` | 100/min per IP |
+| POST   | `/api/rooms/:id/relay/close` | Clean teardown of a long-poll slot   | Room secret + `X-Slot-Token` | 400/min per client |
 
 All `/api/*` endpoints validate the `Origin` header against `ALLOWED_ORIGINS`.
 Room endpoints require an `X-Room-Secret` header (constant-time comparison).
@@ -781,8 +781,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
    it layers enforced code signing plus a public transparency log on top of SRI, so a
    compatible browser refuses any WebSend frontend whose signed manifest is absent from the
    log, closing the "backdoor present at vendoring/build time" gap SRI alone cannot catch.
-12. **Rate limiting**: Per-IP sliding window limits on room creation (5/min), room lookup
-    (30/min), and general API (100/min). A client is keyed by
+12. **Rate limiting**: Per-client sliding window limits on room creation (30/min), room
+    lookup (120/min), and general API (400/min). They are sized for a
+    whole site behind one NAT address (hospitals), not one user;
+    enumeration stays hopeless because every room-scoped call also needs
+    the 128-bit room secret. A client is keyed by
     `getClientIp(req)` = `clientIpKey` of the trusted client address (the
     `proxy-addr` resolution Express uses for `req.ip`, so the WebSocket
     upgrade path honours `trust proxy` too): an IPv4 address as is,
@@ -839,7 +842,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     is layered behind three independent caps so a peer holding a valid room
     secret cannot exhaust server memory or file descriptors by pipelining
     `?wait=true` requests over HTTP/2: (a) `rateLimitMiddleware('general')`
-    caps per-IP request rate at 100/min, the same policy already applied to
+    caps per-client request rate at 400/min, the same policy already applied to
     every other room-scoped endpoint; (b) `MAX_WAITERS_PER_ROOM = 4` rejects
     excess concurrent long-polls per room with 429 before allocating any
     socket / closure / timer; (c) a process-wide `MAX_TOTAL_WAITERS = 10000`
