@@ -30,13 +30,18 @@ Options:
 | flag             | default                                      | meaning                                   |
 |------------------|----------------------------------------------|-------------------------------------------|
 | `--out <dir>`    | `./websend-received/<timestamp>`             | Where decrypted files are written         |
-| `--auto-accept`  | off                                          | Skip the fingerprint y/n prompt           |
 | `-v`, `--verbose`| off                                          | Print protocol/crypto debug logs          |
 | `-h`, `--help`   |                                              | Show usage                                |
 
-The script prints the sender URL; open or scan it on the phone, confirm the
-fingerprint matches in both places, and incoming photos / PDFs / files are
-written verbatim to the output directory.
+The script prints the sender URL (`<instance>/send/<roomId>#<roomSecret>:<K>`,
+where K is a fresh 16-byte QR secret in the URL fragment); open or scan it on
+the phone. There is no prompt: both sides mix K into their key derivation and
+exchange an encrypted key-confirm, and the CLI logs "Pairing confirmed" once
+the sender's confirm opens. If it does not (wrong or missing K, a MITM, or a
+sender on another protocol version), the CLI logs the failure, disconnects
+and saves nothing. Incoming photos / PDFs / files are then written verbatim to
+the output directory. Treat the printed URL like a password: anyone who opens
+it before your phone can pair in its place.
 
 ## How it works
 
@@ -46,11 +51,14 @@ Playwright-launched headless Chromium. The Node script:
 
 1. Launches Chromium and navigates to the instance URL (so `fetch()` carries
    the right `Origin` header).
-2. Loads `/js/crypto.js`, `/js/protocol.js`, and `/js/segment-stream.js`
-   from the live server via `page.addScriptTag` — exactly the production
-   receiver code.
-3. Injects `shim.js` (in this directory) as the in-browser driver.
-4. Bridges the y/n fingerprint prompt and file saves back to Node via
+2. Loads `/js/crypto.js`, `/js/protocol.js`, `/js/pairing.js` and
+   `/js/segment-stream.js` from the live server via `page.addScriptTag`,
+   exactly the production receiver code.
+3. Injects `shim.js` (in this directory) as the in-browser driver. Its
+   `createSession()` holds the receiver `Pairing` and drops `file-start` /
+   `file-end` / `batch-end` (and aborts on binary data) until the pairing is
+   bound.
+4. Bridges logs, the sender URL and file saves back to Node via
    `page.exposeFunction`.
 
 Because the wire protocol modules are loaded directly from the server, any

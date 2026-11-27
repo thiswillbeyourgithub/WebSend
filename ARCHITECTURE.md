@@ -74,12 +74,16 @@ WebSend/
     ├── cli/                # Optional Node CLI receiver (advanced; not for end users).
     │   ├── receive.js      # Pairs as a receiver from a terminal; drives a headless
     │   │                   #   Playwright Chromium (already a devDep) that loads the
-    │   │                   #   production crypto.js + protocol.js from the live server,
-    │   │                   #   so the wire protocol cannot drift. File saves and the
-    │   │                   #   y/n fingerprint prompt are bridged to Node via
-    │   │                   #   page.exposeFunction. No new dependencies.
+    │   │                   #   production crypto.js + protocol.js + pairing.js from the
+    │   │                   #   live server, so the wire protocol cannot drift. File
+    │   │                   #   saves are bridged to Node via page.exposeFunction. No
+    │   │                   #   interactive prompt: pairing binds automatically when
+    │   │                   #   the sender's key-confirm opens. No new dependencies.
     │   ├── shim.js         # In-browser driver injected into the Playwright page;
     │   │                   #   runs the full receive flow and calls back into Node.
+    │   │                   #   createSession() holds a receiver Pairing and gates
+    │   │                   #   file-start/file-end/batch-end (and binary data) on
+    │   │                   #   pairing.isBound(); unit-tested in cli-shim.test.mjs.
     │   └── README.md       # Usage doc
     │
     ├── server.js           # Express server: signaling API, ICE config, static serving,
@@ -138,12 +142,19 @@ WebSend/
         │   │               #   random 16 B salt). sealSegment/openSegment implement the
         │   │               #   STREAM-style chunked AEAD (counter nonce + final flag);
         │   │               #   composite-hash helpers digest per-segment plaintexts into
-        │   │               #   the file identity hash. Also the combined two-key
-        │   │               #   verification code for MITM detection
+        │   │               #   the file identity hash. generateQrSecret/isQrSecret
+        │   │               #   handle the 16 B QR secret K; deriveSessionKeys mixes K
+        │   │               #   into the HKDF salt and binds both raw public keys in the
+        │   │               #   info, and returns sealKeyConfirm/openKeyConfirm for the
+        │   │               #   encrypted key-confirm (MITM detection, see Security §4).
+        │   │               #   decodePublicKeyBytes validates a peer key's raw form
         │   ├── protocol.js # Data-channel message schemas, validation, and builders.
         │   │               #   Exposes window.Protocol.validate(msg) → {ok,error} and
         │   │               #   Protocol.build.* typed builder functions (one per wire
-        │   │               #   message type). Every builder stamps protocolVersion:1.
+        │   │               #   message type). Every builder stamps protocolVersion:2
+        │   │               #   (PROTOCOL_VERSION; isCompatibleVersion rejects any other
+        │   │               #   value, surfaced as a "reload the page" error). Includes
+        │   │               #   the key-confirm {ct} message.
         │   │               #   v2 chunked-transfer messages: file-start {v:2, segSize,
         │   │               #   segCount, salt}, segment-nack {seq}, segment-rewind
         │   │               #   {seq, salt}, file-resume-offer {nextSeq},
@@ -152,6 +163,16 @@ WebSend/
         │   │               #   MAX_FILE_SIZE, 16 B salts, seq ranges) so a hostile
         │   │               #   peer cannot trigger huge allocations.
         │   │               #   Must be loaded before webrtc.js
+        │   ├── pairing.js  # Pairing state machine shared by receive.html, the sender
+        │   │               #   (sender-connect.js) and the CLI shim. acceptPeerKey
+        │   │               #   derives the session keys (ECDH + K + both public keys)
+        │   │               #   and returns our key-confirm; handleKeyConfirm binds the
+        │   │               #   session only when the peer's confirm opens (30 s
+        │   │               #   timeout). getSessionKeys() returns null until bound, so
+        │   │               #   "bound" is the single gate for decrypting / sending.
+        │   │               #   A different peer key drops the binding synchronously
+        │   │               #   and forces a fresh key-confirm. Exposes window.Pairing
+        │   │               #   (frozen)
         │   ├── webrtc.js   # WebRTC peer connection management: room creation/joining,
         │   │               #   SDP offer/answer exchange via server API, trickle ICE
         │   │               #   candidate relay, data channel setup, chunked file transfer,
@@ -194,7 +215,7 @@ WebSend/
         │   │               #   this the peer's once-sent public-key could land in
         │   │               #   the ~1-RTT gap before the winner locked and be
         │   │               #   silently dropped, hanging the ECDH handshake so the
-        │   │               #   verification modal never appeared. The receiver also
+        │   │               #   key-confirm never happened and pairing never bound. The receiver also
         │   │               #   re-sends its public-key (startPublicKeyResend, ~2 s x5)
         │   │               #   until sender-public-key arrives, as belt-and-braces
         │   │               #   for the winner-divergence variant
@@ -207,8 +228,8 @@ WebSend/
         │   │               #   (MAX_TOTAL_SESSION_BYTES, MAX_CONTROL_MSG_BYTES,
         │   │               #   record ctLen bounds, seq monotonicity). Emits
         │   │               #   {type:'file-segment', seq, ct} upward; decryption
-        │   │               #   happens in receive-flow.js behind the verification
-        │   │               #   gate. resetParser() clears the partial buffer on
+        │   │               #   happens in receive-flow.js behind the pairing
+        │   │               #   (key-confirm) gate. resetParser() clears the partial buffer on
         │   │               #   reconnect/rewind; armV2Parser() on a resume seeds the
         │   │               #   wire-byte progress counter with the per-record estimate
         │   │               #   for the already-delivered prefix so byte-based ETA stays
@@ -317,7 +338,7 @@ WebSend/
         │   ├── receive-flow.js # Decrypt-and-display pipeline for incoming v2
         │   │               #   chunked transfers: handleFileStart/handleFileSegment/
         │   │               #   handleFileEnd own the SegmentReceiver lifecycle (all
-        │   │               #   decryption behind receive.html's verification gate),
+        │   │               #   decryption behind receive.html's pairing gate),
         │   │               #   the segment-nack/rewind retry state (budget 3, then
         │   │               #   file-nack), reconnect resume state, and the display
         │   │               #   flow (addNewReceivedImage / applyImageReplacement).
@@ -361,13 +382,15 @@ WebSend/
         │   │               #   Caller (receive.html#addReceivedFile) owns parent
         │   │               #   lookup, appendChild, drag-event setup
         │   ├── sender-connect.js # Sender connection lifecycle: WebRTC state callbacks,
-        │   │               #   ECDH key exchange, fingerprint verification handshake,
+        │   │               #   ECDH key exchange + key-confirm via a sender Pairing,
         │   │               #   reconnect-after-disconnect, transform-nack retry, and
         │   │               #   the inbound message dispatcher. Owns rtc/keyPair/
-        │   │               #   sharedKey. Exposes window.SenderConnect with getRtc/
-        │   │               #   getSharedKey getters consumed by the other modules.
+        │   │               #   pairing. Exposes window.SenderConnect (frozen) with
+        │   │               #   getRtc / getSessionKeys (null until bound) / isVerified
+        │   │               #   (= pairing bound) consumed by the other modules. The
+        │   │               #   receiver's `ready` is deferred until the pairing binds.
         │   │               #   On recovery (state back to 'connected', relay
-        │   │               #   onReconnected, or verified reconnect re-key) it removes
+        │   │               #   onReconnected, or a re-key that re-binds) it removes
         │   │               #   the stale back-to-scan retry button, restores the
         │   │               #   capture step if the UI was stuck on step-connecting,
         │   │               #   and kicks SenderSend.drain(); reconnect() preserves
@@ -390,7 +413,9 @@ WebSend/
         │   │               #   sender's scan step (kept out of send.html so it can
         │   │               #   be unit-tested without WebRTC / camera deps).
         │   │               #   QrParse.parseSendInvite(data, currentOrigin) returns
-        │   │               #   {ok,roomId,secret} or {ok:false,reason:...}.
+        │   │               #   {ok,roomId,secret,qrSecret} or {ok:false,reason:...}.
+        │   │               #   A link without the QR secret K (pre-v2 QR) is refused
+        │   │               #   with reason 'outdated-link' and a clear message.
         │   │               #   Foreign-origin URLs (a phishing QR pointing at
         │   │               #   attacker.example) are rejected; bare relative paths
         │   │               #   for manual entry still work; secret length is
@@ -400,7 +425,7 @@ WebSend/
         │   │               #   encryption + transmit (sendOnePhoto), per-photo
         │   │               #   gallery status updates, sticky progress banner, and
         │   │               #   deferred batch-start/batch-end signals. The drain loop
-        │   │               #   pauses (queue intact) while the peer is not verified,
+        │   │               #   pauses (queue intact) while the pairing is not bound,
         │   │               #   so files picked while the connection is down are sent
         │   │               #   after the reconnect instead of refused;
         │   │               #   resetForReconnect() keeps queued blobs across a full
@@ -440,11 +465,6 @@ WebSend/
         │   │               #   longer match the new pixels). Sends `transform-nack` on
         │   │               #   failure. State injected via attach(). Exposes
         │   │               #   window.TransformReplay
-        │   ├── verification-modal.js # Shared blocking modal for ECDH fingerprint
-        │   │               #   verification. Used by both send.html and receive.html;
-        │   │               #   centralises the modal show/hide + keydown listener
-        │   │               #   cleanup that was previously duplicated. Exposes
-        │   │               #   window.VerificationModal
         │   ├── wake-lock.js # Shared Screen Wake Lock manager (acquire/release +
         │   │               #   re-acquisition after visibilitychange). Used by both
         │   │               #   send.html and receive.html to keep the screen on during
@@ -496,10 +516,12 @@ WebSend/
   4. POST /api/rooms/:id/offer ─────▶ Store SDP offer
      (posted immediately, trickle
       ICE, no gathering wait)
-  5. Display QR code
-     (URL with roomId + secret in
-      hash fragment; the room is
-      already joinable at this point)
+  5. Generate QR secret K (16 B)
+     Display QR code
+     (URL with roomId + secret + K in
+      hash fragment, never sent to the
+      server; the room is already
+      joinable at this point)
                                                                   6. Scan QR code
                                                                   7. GET /api/rooms/:id/offer
                                                                      (polls briefly if the
@@ -519,11 +541,15 @@ WebSend/
 
   ════════════ WebRTC P2P data channel established ════════════
 
-  11. Send ECDH public key ─────────────────────────────────────▶ 12. Derive shared AES key
+  11. Send ECDH public key ─────────────────────────────────────▶ 12. Derive session keys
+                                                                     (ECDH + K + both pubkeys)
   ◀────────────────────────────────────────────── Send ECDH public key back
-  13. Derive same shared AES key
-  14. Show same combined verification code ◀────────────────────▶ Show same combined code
-  15. Both check the two screens match, confirm
+                                                  + key-confirm (sender-to-receiver)
+  13. Derive the same session keys
+  14. Send key-confirm (receiver-to-sender) ────────────────────▶
+  15. Each side opens the peer's key-confirm:
+      opens → pairing bound ("Pairing confirmed"), receiver sends ready
+      fails / 30 s timeout → pairing aborted, no file accepted
 
   ◀──────────────────────────────────── Seal file as chunked AEAD records
                                         (per-file subkey, 256 KiB segments)
@@ -546,11 +572,7 @@ trusted for integrity, a corrupted or dropped record is detected and retried
 at segment granularity, and both sides run in near-constant memory (raising
 the file cap to 4 GiB).
 
-- **Key schedule**: `deriveSessionKeys` retains the ECDH bits as an HKDF base
-  key. Per file the sender draws a random 16 B `fileSalt` and derives a
-  non-extractable AES-GCM-256 `fileKey` (`info="WebSend-segment-v2"`). The
-  salt travels in plaintext in `file-start`; without the ECDH secret it is
-  useless to an observer.
+- **Key schedule**: `deriveSessionKeys` derives a 256-bit HKDF master key from the ECDH bits, the QR secret K and both public keys (exact inputs in Security §4). Per file the sender draws a random 16 B `fileSalt` and derives a non-extractable AES-GCM-256 `fileKey` = HKDF(master, salt = fileSalt, `info="WebSend-v2|segment|sender-to-receiver"`). The salt travels in plaintext in `file-start`; without the master key it is useless to an observer.
 - **Wire records**: `[4B BE seq][4B BE ctLen][ct]`. Record 0 seals the
   metadata (JSON `{name, mimeType, originalSize}`, padded to a fixed 2 KiB so
   the name length is not observable); records 1..segCount seal `SEG_SIZE`
@@ -686,8 +708,8 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 1. **Passive network eavesdropper** on any link the traffic crosses: local Wi-Fi, ISP, signaling, TURN/TURNS relay.
 2. **Active signaling-channel MITM**, including a fully malicious WebSend server operator, a compromised reverse proxy in front of the server, or any on-path attacker between the two peers and the signaling endpoint. The same model covers a malicious WebSocket / long-poll relay on the HTTP-fallback transport.
 3. **Compromised or curious TURN / TURNS relay operator**, including a relay that logs all bytes.
-4. **Hostile peer before fingerprint verification**: a stranger who learns the room ID and secret (e.g. shoulder-surfing the QR), joins the room, and pushes malformed wire messages, oversized chunks, or invalid transforms before the user has confirmed the fingerprint.
-5. **Hostile peer after fingerprint verification**: a phone whose user was socially engineered into pairing, or a peer whose verification was accepted by mistake. Once verified, this peer can send real files, but it can still try to deliver oversized payloads, malicious filenames / MIME types, malformed transforms, or pathological PDFs.
+4. **Hostile peer before the pairing binds**: a stranger who learns the room ID and secret but not the QR secret K (e.g. a leaked room secret, or a signaling MITM), joins the room, and pushes malformed wire messages, oversized chunks, or invalid transforms before (and instead of) producing a valid key-confirm.
+5. **Hostile peer after the pairing binds**: a phone whose user was socially engineered into scanning the QR, or anyone who obtained the full QR URL. Once bound, this peer can send real files, but it can still try to deliver oversized payloads, malicious filenames / MIME types, malformed transforms, or pathological PDFs.
 6. **Compromised content delivery**: a tampered WebSend server, a hostile CDN, or any other path that could swap in modified JavaScript or CSS at load time.
 7. **Phishing QR codes**: an attacker prints or shares a QR that encodes a URL on an attacker-controlled origin, hoping the user scans it from the legitimate WebSend page.
 8. **Hostile script reaching the page** (e.g. an XSS escape, a malicious browser extension, or a future tampered third-party load) that tries to monkey-patch security-critical globals.
@@ -695,37 +717,37 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
 ### In scope (defended)
 
 - **Confidentiality and integrity of every file payload, end-to-end, even with hostile server and hostile relay.** ECDH P-256 + HKDF + AES-256-GCM, fresh ephemeral keys per session (forward secrecy). The server only ever sees ciphertext. (Layers §1, §2)
-- **Detection of signaling-channel MITM.** A single 96-bit SHA-256 code derived from both public keys is shown identically on both screens; the users confirm the two screens match. A signaling MITM would need to grind ECDH keys until the combined code matches on both sides, a second-preimage search whose cost is independent of how many rooms are live. (Layers §4, §23, §24)
+- **Detection of signaling-channel MITM, with no human comparison step.** The QR carries a 128-bit secret K in the URL fragment (never sent to the server). Both sides derive the session keys from ECDH + K + both public keys and must exchange an encrypted key-confirm that opens under the peer's derived key. A signaling MITM who substitutes public keys does not know K, so its confirms never open and the pairing aborts with a clear error before any file is accepted. (Layers §4, §23, §24)
 - **Room enumeration and unauthorized room access.** A 128-bit room secret in the URL hash fragment is required for every room API call and compared in constant time. (Layers §3)
-- **Resource-exhaustion DoS from a peer before verification** (the verification modal is up, but message handlers are already running). Caps on receive buffer, per-file size, per-session bytes, control-message size, and log-panel growth all fire before mutual confirmation. (Layers §16, §19, §27)
-- **Resource-exhaustion DoS from a peer after verification.** Transform-replay caps, octet-stream blob URLs, PDF page-render cap, image-transform pixel cap, sender transform-nack retry cap, and background-OCR pixel cap all bound a verified-but-hostile peer. (Layers §17, §20, §28, §29, §30, §31)
+- **Resource-exhaustion DoS from a peer before the pairing binds** (key-confirm still pending or failing, but message handlers are already running). Caps on receive buffer, per-file size, per-session bytes, control-message size, and log-panel growth all apply before verification. (Layers §16, §19, §27)
+- **Resource-exhaustion DoS from a peer after the pairing binds.** Transform-replay caps, octet-stream blob URLs, PDF page-render cap, image-transform pixel cap, sender transform-nack retry cap, and background-OCR pixel cap all bound a bound-but-hostile peer. (Layers §17, §20, §28, §29, §30, §31)
 - **Resource exhaustion against the server.** Per-IP rate limits, long-poll waiter caps (per-room and process-wide), and bounded relay-slot queues. (Layers §11, §18, §36)
 - **Cross-origin and CSRF-style abuse.** Origin header validation on all `/api/*` endpoints; `X-Forwarded-For` only trusted from loopback. (Layers §12, §13)
 - **XSS via peer-controlled filenames or MIME types.** All receiver-facing `blob:` URLs are forced to `application/octet-stream`, the per-file card uses `createElement` + `textContent` only, and a defensive Content-Security-Policy plus other hardening headers constrain even an inline-script escape. (Layers §20, §21)
 - **Silent tampering of static assets.** Vanilla HTML/CSS/JS with no bundler or CDN, all third-party libraries vendored, Subresource Integrity on every script and link tag, plus a service worker that only caches same-origin `basic`-type responses. (Layers §9, §10, §25)
 - **Cross-session data leakage on re-pair.** Both devices shred all in-memory user data (decrypted images, OCR text, preBW buffers, blob URLs, scribe WASM state, crypto keys) before establishing a new session. (Layers §32)
-- **Re-key attack on an already-verified session.** The sender refuses any further `public-key` messages once a shared key exists; the receiver allows re-key but forces re-verification synchronously before any await. (Layers §24, §23)
+- **Re-key attack on an already-bound session.** The sender refuses a different receiver key mid-session outright (and a changed key during the reconnect window drops the session and sends the user back to scan). The receiver accepts a different sender key but drops the binding synchronously (before any await) and forces a fresh key-confirm, which an attacker without K cannot produce. A duplicate of the current key keeps the binding and just re-sends our confirm. (Layers §24, §23)
 - **Phishing QR pointing at an attacker origin.** The sender's scan / paste path rejects any URL whose origin is not the current origin, with a user-facing toast. (Layers §26)
 - **Long-poll abuse of the signaling API.** Three layered caps (per-IP rate limit, per-room waiters, process-wide waiters) and per-slot tokens on the HTTP-relay fallback. (Layers §18, §36)
 - **Information leakage via error responses.** A custom 4-arg error middleware scrubs Express's default stack-trace body; a custom 404 handler refuses to echo the requested path. (Layers §34)
-- **Monkey-patching of security-critical globals from a hostile script.** `Object.freeze` is applied at export time to `WebSendCrypto`, `Protocol` (and `Protocol.build`), `QrParse`, `SenderConnect`, `SenderSend`, `ReceiveCard`, and `VerificationModal`. (Layers §33)
+- **Monkey-patching of security-critical globals from a hostile script.** `Object.freeze` is applied at export time to `WebSendCrypto`, `Protocol` (and `Protocol.build`), `QrParse`, `Pairing`, `SenderConnect`, `SenderSend`, and `ReceiveCard`. (Layers §33)
 
 ### Out of scope (explicitly NOT defended)
 
 - **A fully compromised endpoint device** (rooted phone, malware on the receiver computer, hostile browser, hostile browser extension). Rationale: any application-layer protection is bypassable by code running inside the same browser context as the page. WebSend assumes both endpoints are honest.
-- **A user who skips the verification-code comparison**, or who confirms a non-matching code by mistake. Rationale: the verification ceremony *is* the MITM defense. There is no other check that can detect a chosen-key MITM if the user does not actually compare the codes on the two screens.
+- **An attacker who sees the full QR URL** (shoulder-surfing or photographing the QR, a screen share, the link pasted into a chat). Rationale: K is the out-of-band authenticator. Anyone holding roomId + secret + K before the legitimate sender pairs can pair in its place (first valid key-confirm wins) or, combined with a signaling MITM, relay the session. Treat the QR like a one-time password: show it only to the intended phone.
 - **Targeted denial-of-service at the network / IP layer.** Rationale: WebSend mitigates application-layer DoS (giant chunks, pipelined long-polls, malformed messages) at the Node and browser layers; mitigating packet floods is the job of the upstream reverse proxy / CDN / firewall.
 - **Forensic recovery of decrypted bytes from device RAM after a transfer.** Rationale: we drop references on shred so the garbage collector can reclaim the pages, but JavaScript cannot zero memory deterministically and we do not run in a TEE.
-- **Compromise of the user's HTTPS certificate authority.** Rationale: a forged certificate breaks the TLS layer underneath everything; the fingerprint ceremony still catches an active ECDH MITM on top of that, but confidentiality of the room ID and timing metadata is gone.
+- **Compromise of the user's HTTPS certificate authority.** Rationale: a forged certificate breaks the TLS layer underneath everything; K never reaches the server, so the key-confirm still catches an active ECDH MITM on top of that, but confidentiality of the room ID and timing metadata is gone.
 - **Side-channel attacks against the browser's Web Crypto implementation.** Rationale: Web Crypto is the trusted cryptographic primitive; reimplementing it in user-space would expose worse side channels, not better ones.
 - **Vulnerabilities inside coturn or oauth2-proxy themselves.** Rationale: these are external components; WebSend's threat model assumes they are correct. `misc/check_turn.py` is provided as a manual probe.
 - **Traffic analysis beyond final-segment padding.** Rationale: padding the final segment (and the fixed-size metadata record) hides the *exact* file size, but an observer can still see that some transfer happened, roughly when, and its size to 256 KiB segment-count granularity. Hiding the timing pattern would require constant-rate padding traffic, which is not implemented.
-- **Targeted ECDH key-grinding to make the 96-bit combined code match.** Rationale: the code length (96 bits) is fixed regardless of server load; a determined attacker willing to spend significant compute can in principle grind a colliding combined code, but the cost is significant and the length is held constant for that reason. (See the explanatory paragraph at Layer §4.)
+- **Online guessing of K during the 30 s key-confirm window.** Rationale: not a practical attack. K is 128 bits and each pairing attempt allows exactly one guess (a wrong confirm aborts the pairing), so there is nothing to grind offline or online; the old 96-bit code-grinding concern no longer applies.
 
 ### Trust assumptions
 
 - Both endpoint devices, their operating systems, and their browsers behave honestly. A compromised browser can defeat any in-page protection by definition.
-- The user actually compares the 24-hex verification code shown on the two screens and aborts on any mismatch. The four-list structure of this threat model exists precisely to make that requirement visible.
+- The QR code (and so K) is seen only by the intended sender device. The server never receives K (it lives in the URL fragment), so a malicious server cannot learn it. The four-list structure of this threat model exists precisely to make that requirement visible.
 - HTTPS is correctly terminated in front of the server (typically Caddy + Let's Encrypt) and the TLS stack is sound.
 - The vendored third-party libraries were honest at the time they were vendored. Subresource Integrity (§10) re-verifies the bytes at runtime, so a later swap is detected; a backdoor present at vendoring time is not.
 - `NODE_ENV` is not relied on for security posture: the custom error / 404 handlers (§34) make the server safe to deploy even when `NODE_ENV` is unset, which it is in the shipped Docker image.
@@ -745,20 +767,35 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
    matching role. Passed in URL hash
    fragment (never sent to server in HTTP requests). Constant-time comparison prevents
    timing attacks. Prevents room enumeration even if the short room ID is guessed.
-4. **Verification code**: Both parties see a single 24-hex-char (96-bit) SHA-256
-   code derived from BOTH public keys (the two raw keys are sorted into a canonical
-   order before hashing), grouped as `XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`. The same code is
-   shown on both devices, so users only confirm the two screens match instead of
-   cross-referencing two separate per-key fingerprints in swapped roles (which testers
-   found confusing). The length is fixed and must NOT be adapted to active-room count.
-   The relevant attack is a signaling-MITM grinding ECDH keys until the combined code
-   matches on both sides, a second-preimage search whose cost is independent of how
-   many rooms are live. 96 bits is used because this is a single comparison (the earlier
-   design compared two independent 64-bit per-key fingerprints), keeping the
-   single-comparison grind comfortably above the old scheme. An earlier "adaptive"
-   version (3-12 hex) was removed because at 3 hex chars the search is feasible in
-   sub-second time on a laptop. `getKeyFingerprint` (64-bit, per key) is retained only
-   for the reconnect peer-identity check and is not shown to the user.
+4. **QR secret + encrypted key-confirm (replaces the human verification code)**: the
+   receiver draws K = 16 random bytes (`WebSendCrypto.generateQrSecret`, base64url, 22
+   chars) and puts it in the QR URL fragment, `/send/<roomId>#<secret>:<K>`. The fragment
+   is never sent in HTTP requests, so the server and any relay never see K. Both sides
+   then derive (`deriveSessionKeys`, P-256 ECDH bits as IKM, receiverRaw / senderRaw are
+   the 65-byte uncompressed public keys):
+
+   ```
+   master  = HKDF-SHA256(ikm  = ECDH(privOurs, pubTheirs),
+                         salt = "WebSend-v2" || K,
+                         info = "WebSend-v2|master|" || receiverRaw || senderRaw)  -> 256 bits
+   confirm(dir) = HKDF(master, salt = "", info = "WebSend-v2|key-confirm|" + dir)  -> AES-GCM-256
+   fileKey      = HKDF(master, salt = fileSalt(16 B), info = "WebSend-v2|segment|sender-to-receiver")
+   ```
+
+   with `dir` in {`receiver-to-sender`, `sender-to-receiver`}. Each side sends
+   `{type:'key-confirm', ct}` where `ct = base64(IV(12 B) || AES-GCM(confirm(ourDir),
+   plaintext = "WebSend-v2|key-confirm|" + ourDir))`, and opens the peer's under
+   `confirm(peerDir)`. The session is *bound* only when the peer's confirm opens and the
+   plaintext matches; `Pairing.getSessionKeys()` returns null until then, so nothing can
+   be decrypted or sent. Concretely, with a correct K both sides compute the same 32-byte
+   master and the confirms open; with a wrong K (or a MITM that swapped either public key,
+   since both raw keys are in the info) the masters differ, AES-GCM authentication fails,
+   the pairing aborts with a "pairing failed" error and no file is accepted. A missing
+   confirm aborts after 30 s. Directions are domain-separated, so a peer cannot reflect
+   our own confirm back. Links without K (pre-v2 QRs) are refused by `QrParse` with an
+   "outdated link" message, and a `protocolVersion` other than 2 on a peer key yields a
+   "reload the page" error. The UI shows "Pairing confirmed" (status line + sidebar "verified" line) once
+   bound; there is no modal and no human comparison step.
 5. **Size obfuscation**: The exact file size lives only inside the encrypted metadata
    record; the final segment is padded with random bytes (to the nearest of 16 / 64 /
    256 KiB) so an observer learns the size only to segment-count granularity, which the
@@ -837,12 +874,13 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     past `Protocol.MAX_TOTAL_SESSION_BYTES` (8 GiB; sized as one 4 GiB max file plus
     overhead plus a fully rewound tail resend). On any of those, the data channel and
     peer connection are torn down immediately and the application is notified via
-    `onDisconnected`. Records from an unverified peer are parsed and dropped in
-    constant memory (decryption only happens behind the verification gate in
-    receive-flow.js), so a not-yet-verified peer cannot OOM the receiver tab while the
-    verification modal is up. The CLI shim (`src/cli/shim.js`) mirrors the same parser
-    bounds plus a verified-fingerprint gate on `file-start`/`file-end`/`batch-end` and
-    binary chunks, so the optional Node CLI receiver path enjoys the same protection
+    `onDisconnected`. Records from a peer whose pairing is not bound are parsed and
+    dropped in constant memory (decryption only happens behind the pairing gate in
+    receive-flow.js), so a not-yet-bound peer cannot OOM the receiver tab while the
+    key-confirm is pending. These caps apply before verification by design. The CLI
+    shim (`src/cli/shim.js`) mirrors the same parser bounds plus a pairing-bound gate
+    on `file-start`/`file-end`/`batch-end` and binary chunks (binary data from an
+    unbound peer aborts the connection), so the optional Node CLI receiver path enjoys the same protection
     as the browser path.
 18. **Transform-replay hardening (anti-DoS)**: `Protocol.isTransformArray` caps
     `transforms[]` length at `MAX_TRANSFORMS_PER_MSG` (32) and, for `op:'crop'`,
@@ -852,8 +890,8 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     multi-GiB `createImageData` allocation or freeze the main thread on the inverse
     mapping loop. Peer-mutating handlers in `receive.html` (`encrypted-file`,
     `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind
-    `weConfirmed && theyConfirmed` so an unverified peer cannot push files, replay
-    transforms, or rearrange the gallery while the verification modal is still up.
+    `pairing.isBound()` (`VERIFIED_GATED_HANDLERS`) so a peer whose key-confirm has
+    not opened cannot push files, replay transforms, or rearrange the gallery.
 19. **Long-poll waiter caps (anti-DoS)**: `GET /api/rooms/:id/answer?wait=true`
     is layered behind three independent caps so a peer holding a valid room
     secret cannot exhaust server memory or file descriptors by pipelining
@@ -930,30 +968,29 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     before returning 503, capping the worst-case allocation cost so a
     pathological state (huge live-room set, broken RNG) cannot peg the
     event loop.
-23. **Sender-side mutual-verification gate**: the sender refuses to
-    advance into capture mode (or transmit any photo) until BOTH sides
-    have actually confirmed the fingerprint. `handleReady` checks
-    `sharedKey && weConfirmed && theyConfirmed` and ignores premature
-    `ready` messages, so a hostile receiver cannot fast-forward the
-    sender UI by sending `ready` without ever sending
-    `fingerprint-confirmed`. `sender-send.sendOnePhoto` adds a second
-    independent gate via `SenderConnect.isVerified()` so a future code
-    path that reaches the queue without going through the fingerprint
-    flow still cannot leak plaintext. The two gates mirror the
+23. **Sender-side pairing gate**: the sender refuses to advance into
+    capture mode (or transmit any photo) until its Pairing is bound,
+    i.e. the receiver's key-confirm opened. A `ready` that arrives
+    before that is deferred (`pendingReady`) and only flushed on bind,
+    so a hostile receiver cannot fast-forward the sender UI by sending
+    `ready` without proving it holds K. `sender-send.sendOnePhoto`
+    adds a second independent gate via `SenderConnect.isVerified()`
+    (= pairing bound) and `getSessionKeys()` returns null until bound,
+    so a future code path that reaches the queue without going through
+    pairing still cannot leak plaintext. The gates mirror the
     receiver's `VERIFIED_GATED_HANDLERS`.
-24. **Sender-side re-key block**: once a shared key has been derived,
-    `handlePublicKey` refuses any further `public-key` messages from
-    the receiver. Accepting one would silently rotate the encryption
-    key to a peer-chosen value while `weConfirmed`/`theyConfirmed`
-    remain `true` from the original handshake (the user would think
-    they had verified the peer, but every subsequent photo would be
-    encrypted to the attacker's key). The legitimate re-key path goes
-    through `SenderConnect.reconnect()`, which clears `sharedKey`,
-    `weConfirmed`, and `theyConfirmed` synchronously before the new
-    handshake. The receiver side allows re-key but forces re-
-    verification synchronously before any await; the sender side
-    blocks outright because the sender never asks for a new key in
-    the protocol.
+24. **Re-key handling**: once the sender holds a receiver key,
+    `handlePublicKey` refuses a *different* `public-key` from the
+    receiver (toast `send.unexpectedRekey`); during the reconnect
+    window a changed key drops the pairing and returns to the scan
+    step instead of silently re-pairing. A duplicate of the same key
+    keeps the binding and re-sends `sender-public-key` + key-confirm.
+    The legitimate re-key path is `SenderConnect.reconnect()`, which
+    generates a fresh key pair and resets the Pairing synchronously
+    before the new handshake. On the receiver, `Pairing.acceptPeerKey`
+    drops the binding synchronously before its first await when a
+    different sender key arrives, so a mid-session public key always
+    forces a fresh key-confirm before any further file is accepted.
 25. **Service-worker scope hardening**: the SW intercepts ONLY same-
     origin GET requests, and only writes responses to the cache when
     `response.type === 'basic'` (200, same-origin, non-opaque). Cross-
@@ -964,7 +1001,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     rejects any tampered cached body at execution time; the SW filter
     is the belt-and-braces layer that avoids storing it in the first
     place. The cache version is bumped on releases that change cached
-    assets (`websend-v3` as of v4.6.0) so the activate handler evicts
+    assets (`websend-v5` as of the v2 QR-secret pairing protocol) so the activate handler evicts
     stale entries, including any cross-origin junk that pre-filter SW
     versions may have stored.
 26. **QR foreign-origin refusal**: the sender's scan / paste path runs
@@ -978,9 +1015,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     visible-URL signal is now enforced, not ornamental. Bare relative
     paths (manual entry) still work, and an oversized secret is
     rejected so a crafted QR cannot smuggle junk into the
-    `X-Room-Secret` header. Note: this is a defense-in-depth layer on
-    top of fingerprint verification, which remains the primary safeguard
-    against ending up in a hostile peer's room.
+    `X-Room-Secret` header. It also extracts the QR secret K from the fragment
+    and refuses a link without it (`outdated-link`, a pre-v2 QR) with a
+    clear message. Note: the foreign-origin check is a defense-in-depth
+    layer on top of the K-based key-confirm, which remains the primary
+    safeguard against ending up in a hostile peer's room.
 27. **Data-channel control-message size cap**: `webrtc.js handleMessage`
     refuses any JSON string whose byte size exceeds
     `Protocol.MAX_CONTROL_MSG_BYTES` (16 KiB) BEFORE calling
@@ -1051,15 +1090,17 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     writes for room data, and no cross-room caching.
 33. **Frozen security-critical globals**: `Object.freeze` is applied at
     export time to every namespace object that holds a cryptographic
-    primitive, a protocol builder, the verification gate, or the safe
+    primitive, a protocol builder, the pairing gate, or the safe
     blob-URL helper: `window.WebSendCrypto`, `window.Protocol` (and its
-    nested `build` sub-object), `window.QrParse`, `window.SenderConnect`,
-    `window.SenderSend`, `window.ReceiveCard`, and
-    `window.VerificationModal`. Without this, a hostile script reaching
-    the page (XSS via an inline-script CSP escape, a compromised browser
-    extension, a future tampered third-party load) could monkey-patch
-    `WebSendCrypto.deriveSharedKey` to return an attacker-known key,
-    swap `Protocol.build.fingerprintConfirmed` to spoof verification,
+    nested `build` sub-object), `window.QrParse`, `window.Pairing` (and
+    every pairing instance it creates), `window.SenderConnect`,
+    `window.SenderSend`, and `window.ReceiveCard`. Without this, a
+    hostile script reaching the page (XSS via an inline-script CSP
+    escape, a compromised browser extension, a future tampered
+    third-party load) could monkey-patch
+    `WebSendCrypto.deriveSessionKeys` to return an attacker-known key,
+    swap `Pairing.create` (or an instance's `isBound`) to report a
+    binding without a valid key-confirm,
     flip `SenderConnect.isVerified` to `() => true` to bypass the
     send-path gate, or rewrite `ReceiveCard.makeSafeBlobUrl` to emit
     `text/html` blob URLs and re-open the blob-XSS path that #20
@@ -1103,7 +1144,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     file. The receiver's `ReceiveFlow` keeps its in-flight
     SegmentReceiver (every record below `nextSeq` already verified). On
     reconnect, the receiver re-sends its public key (so the sender can
-    verify the cached fingerprint hasn't changed) and emits
+    check the receiver key hasn't changed) and emits
     `file-resume-offer {nextSeq}`. The sender rewinds its SegmentSender
     to that record — re-keying with a fresh salt, since a rewind must
     never reuse a (key, nonce) pair — answers `file-resume-ack
@@ -1111,9 +1152,11 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     `blob.slice()`, no ciphertext is ever cached. A resumed send skips
     `file-start` so the receiver's verified prefix is preserved, and
     the record parser is re-armed (`resetParser`) so a half-buffered
-    record from before the drop cannot poison the resumed stream. A
-    peer-fingerprint mismatch on reconnect is treated as a peer-swap
-    and forces a fresh verification ceremony.
+    record from before the drop cannot poison the resumed stream. The
+    same receiver key on reconnect keeps the binding and simply
+    re-sends the key-confirm; a different key is treated as a peer-swap
+    (the sender drops the pairing and returns to scan, the receiver
+    unbinds and requires a fresh key-confirm).
 36. **HTTP-relay fallback transport**: Corporate networks that block UDP
     and strip TURNS-over-TCP at the proxy used to leave WebSend with no
     working path. v3.7.0 adds an HTTPS-only fallback that runs over the
@@ -1127,7 +1170,7 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     joins the race using pure HTTPS POST/GET so the path is
     indistinguishable from regular web traffic. The relay forwards
     opaque ciphertext between the two paired peers; the existing ECDH +
-    AES-GCM + fingerprint stack is transport-agnostic, so the server
+    AES-GCM + key-confirm stack is transport-agnostic, so the server
     never sees plaintext. Anti-DoS caps mirror the WebRTC bounds:
     `MAX_TOTAL_SESSION_BYTES` (8 GiB) and `MAX_CONTROL_MSG_BYTES`
     (16 KiB) enforced server-side, plus a bounded per-slot queue
@@ -1183,8 +1226,8 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     can drop while the user picks a file. The sender no longer refuses
     the file in that window: `handleFileSelect` / `sendPhoto` in
     `send.html` always queue the blob, and the `js/sender-send.js`
-    drain loop pauses on the verification gate (queue intact, nothing
-    encrypted or sent) until the peer is verified again, then flushes.
+    drain loop pauses on the pairing gate (queue intact, nothing
+    encrypted or sent) until the pairing is bound again, then flushes.
     `batch-start` is deferred the same way (`markBatchStartPending`,
     consumed by the drain loop just before the first item) so a batch
     queued while offline still opens correctly. A full
@@ -1198,8 +1241,8 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     UI to the capture/choose step, and kicks the drain.
     Since v4.7.3 the drain loop also gates on transport connectivity
     (`RacingTransport.isConnected()`, delegating to the winning inner):
-    verification state survives a transient relay drop, so the
-    verification gate alone let files picked during the outage drain
+    the pairing binding survives a transient relay drop, so the
+    pairing gate alone let files picked during the outage drain
     into a closed socket and die on `finishHash`. The deferred
     `batch-start` / `batch-end` flags are only consumed when their
     `sendMessage` actually went out, and all three transports' `sendFile`
@@ -1314,16 +1357,16 @@ This feature was added with assistance from
 
 Three tiers, layered from fast/cheap to slow/realistic:
 
-- **Tier 1 — Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js`, `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed. `doc-detect-samples.test.mjs` runs the document-edge detector against real camera shots in `test/fixtures/doc-samples/`, warps the detected quad to the ground-truth dimensions in `test/fixtures/doc-target-result/` via `ImageTransforms.perspectiveTransform`, and asserts both mean luminance and mean Sobel edge density of the crop match the target within 1% of 0..255 (BW + math, no colour classifier). It also applies a per-corner **geometry guard** (`EXPECTED_CORNERS`, tolerance 0.06 normalized) because the content metrics stay green even when a corner collapses inward over a uniform page; the guard catches that class of failure. Skips automatically when the optional `canvas` devDep is not installed. `maintenance-banner.test.mjs` loads `sidebar.js` in JSDOM and asserts the DEV maintenance banner's 5-day age gate (shown under 5 days, suppressed over it, DEV badge unaffected, missing `serverStartedAt` fails open).
-- **Tier 2 — HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, client keying (`client-keying.test.mjs`: IPv6 /64 and IPv4-mapped addresses share a bucket, the WS upgrade honours `trust proxy`), live-room caps (`room-caps.test.mjs`: `ROOMS_MAX`, `ROOMS_MAX_PER_CLIENT`, release on expiry), room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits (and the JSON parser running only after the secret check: wrong secret plus oversized/malformed body is 401), per-role secrets (`rooms.test.mjs`: every signaling route refuses the other role's secret with the same 401), the HTTP relay (`relay-ws.test.mjs`, `relay-lp.test.mjs`: pairing, role-bound slots including mixed LP/WS, backpressure, frame caps including the WS `maxPayload`) and its relay-wide byte budget (`relay-queue-budget.test.mjs`: cross-room 429 with `Retry-After: 1`, WS send buffers counted, bytes returned when a slot or socket closes, WS feeder paused rather than dropped), the `/vendor` `/scribe` `/tessdata` static mounts, and the receiver-only-auth gate (`auth-scope.test.mjs`: `AUTH_SCOPE=receiver` refuses `POST /api/rooms` without the proxy identity header, honors a custom `AUTH_IDENTITY_HEADER`, surfaces `senderOrigin`, and aborts startup on the misconfiguration cases). A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
-- **Tier 3 — End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer. The receiver/sender pairing and fingerprint verification dance lives once in `src/test/e2e/helpers.js` (`pairAndVerify`), shared by every spec that needs a paired session. Two specs run the vendored scribe.js for real. `pdf-card-export.spec.js` sends a generated 2-page text PDF and drives both per-PDF card actions (ZIP of page images, OCR PDF), which exercises `ScribeHandle.renderPdfPages` (scribe's PDF renderer); it is also the regression test for a bug where those actions `fetch()`ed page data URLs, which the CSP (`connect-src 'self'`) blocks, so `renderPdfPages` now returns PNG Blobs. `ocr-export.spec.js` sends a 2400 px wide text image rendered in the browser (above the 2000 px OCR input cap) and exports a searchable PDF through both `generateOcrPdf` paths (cached background-OCR splice, and on-demand fallback forced by corrupting `receivedImages[0].ocrPageData`), then checks the text layer and word geometry with `pdftotext -bbox` (spec skipped when poppler-utils is missing). It is the regression net for scribe.js upgrades, since our code reaches into scribe's per-page OCR objects, page metrics and native image slots (confined to `js/scribe-handle.js` plus the splice code in `receive-export.js`).
+- **Tier 1: Unit** (`src/test/unit/`, run via `npm run test:unit`): pure-JS modules executed under the Node native test runner. Covers `crypto.js` (including the K-mixed HKDF and key-confirm: K changes the keys, swapped or MITM-substituted public keys fail, no reflection), `pairing.js` (`pairing.test.mjs`: confirm success / failure / timeout, buffered early confirm, re-key, version mismatch), `qr-parse.js` (K extraction, outdated links), the receive-flow and sender-connect pairing gates, the CLI shim gating (`cli-shim.test.mjs`), `image-transforms.js`, server helper functions, transfer stats, and `update-sri.js`. Browser modules are loaded via `test/support/load-browser-module.mjs` with a Web Crypto / canvas shim where needed. `doc-detect-samples.test.mjs` runs the document-edge detector against real camera shots in `test/fixtures/doc-samples/`, warps the detected quad to the ground-truth dimensions in `test/fixtures/doc-target-result/` via `ImageTransforms.perspectiveTransform`, and asserts both mean luminance and mean Sobel edge density of the crop match the target within 1% of 0..255 (BW + math, no colour classifier). It also applies a per-corner **geometry guard** (`EXPECTED_CORNERS`, tolerance 0.06 normalized) because the content metrics stay green even when a corner collapses inward over a uniform page; the guard catches that class of failure. Skips automatically when the optional `canvas` devDep is not installed. `maintenance-banner.test.mjs` loads `sidebar.js` in JSDOM and asserts the DEV maintenance banner's 5-day age gate (shown under 5 days, suppressed over it, DEV badge unaffected, missing `serverStartedAt` fails open).
+- **Tier 2: HTTP integration** (`src/test/http/`, run via `npm run test:http`): each test file spawns the real `server.js` as a child process on a random port (see `test/http/helpers.mjs`) and hits it over the loopback network. Covers `/api/config` (and env-var propagation including `ALLOWED_FILE_TYPES` and Umami injection), origin validation, rate limiting, client keying (`client-keying.test.mjs`: IPv6 /64 and IPv4-mapped addresses share a bucket, the WS upgrade honours `trust proxy`), live-room caps (`room-caps.test.mjs`: `ROOMS_MAX`, `ROOMS_MAX_PER_CLIENT`, release on expiry), room/SDP/ICE signaling endpoints, long-poll fast-path / mid-wait delivery / client abort, body size limits (and the JSON parser running only after the secret check: wrong secret plus oversized/malformed body is 401), per-role secrets (`rooms.test.mjs`: every signaling route refuses the other role's secret with the same 401), the HTTP relay (`relay-ws.test.mjs`, `relay-lp.test.mjs`: pairing, role-bound slots including mixed LP/WS, backpressure, frame caps including the WS `maxPayload`) and its relay-wide byte budget (`relay-queue-budget.test.mjs`: cross-room 429 with `Retry-After: 1`, WS send buffers counted, bytes returned when a slot or socket closes, WS feeder paused rather than dropped), the `/vendor` `/scribe` `/tessdata` static mounts, and the receiver-only-auth gate (`auth-scope.test.mjs`: `AUTH_SCOPE=receiver` refuses `POST /api/rooms` without the proxy identity header, honors a custom `AUTH_IDENTITY_HEADER`, surfaces `senderOrigin`, and aborts startup on the misconfiguration cases). A `TEST_DISABLE_RATE_LIMIT=1` escape hatch lets test files that create many rooms bypass the per-IP limiter.
+- **Tier 3: End-to-end** (`src/test/e2e/`, run via `npm run test:e2e`): Playwright drives two real browsers (sender + receiver) through a full round-trip transfer. The receiver/sender pairing (scan the QR with K, wait for "Pairing confirmed" on both sides) lives once in `src/test/e2e/helpers.js` (`pairAndVerify`), shared by every spec that needs a paired session. Two specs run the vendored scribe.js for real. `pdf-card-export.spec.js` sends a generated 2-page text PDF and drives both per-PDF card actions (ZIP of page images, OCR PDF), which exercises `ScribeHandle.renderPdfPages` (scribe's PDF renderer); it is also the regression test for a bug where those actions `fetch()`ed page data URLs, which the CSP (`connect-src 'self'`) blocks, so `renderPdfPages` now returns PNG Blobs. `ocr-export.spec.js` sends a 2400 px wide text image rendered in the browser (above the 2000 px OCR input cap) and exports a searchable PDF through both `generateOcrPdf` paths (cached background-OCR splice, and on-demand fallback forced by corrupting `receivedImages[0].ocrPageData`), then checks the text layer and word geometry with `pdftotext -bbox` (spec skipped when poppler-utils is missing). It is the regression net for scribe.js upgrades, since our code reaches into scribe's per-page OCR objects, page metrics and native image slots (confined to `js/scribe-handle.js` plus the splice code in `receive-export.js`).
 
 A pre-push git hook at `.githooks/pre-push` runs `npm test` (Tier 1+2) and aborts the push on failure. The hook is auto-wired by the `prepare` script in `src/package.json` (sets `core.hooksPath=.githooks` on `npm install`).
 
 **Not yet covered** (intentional gaps — documented so the picture is honest):
 - Frontend modules with no unit tests: `webrtc.js` (peer-connection state machine, chunked transfer, connection-type detection), `logger.js` — tightly coupled to real `RTCPeerConnection` / DOM, so the E2E tier exercises them instead. (`i18n.js` is covered by `test/unit/i18n.test.mjs`: brand substitution, en/fr key parity, referenced-key coverage, the window.i18n exposure, and the aria-label/alt attribute handlers.)
 - Receiver UI logic: the perspective-crop tool and the **transform-replay protocol** (`transform-image` messages for `rotateCW` / `flipH` / `bw` / `crop`); the receiver-side replay handler lives in `js/transform-replay.js` (`window.TransformReplay`) and dispatches into `js/image-transforms.js`. The export modal (PDF / ZIP / B&W Otsu / scribe.js OCR / per-PDF actions) lives in `js/receive-export.js`; the hand-crafted minimal PDF generator lives in `js/pdf-builder.js` and has unit tests covering xref offsets, trailer size, and multi-image structure.
-- Protocol edge paths: fingerprint **mismatch / abort**, `file-ack` integrity **mismatch or timeout → retry**, SRI-mismatch failure mode. E2E only drives the happy path. (The segment-nack/rewind retry and resume paths ARE unit-covered — `segment-stream.test.mjs`, `receive-flow.test.mjs`, `v2-retry-integration.test.mjs`, `webrtc-send-resume.test.mjs` — and room TTL expiry/refresh is HTTP-covered by `room-ttl.test.mjs`.)
+- Protocol edge paths: `file-ack` integrity **mismatch or timeout → retry**, SRI-mismatch failure mode. E2E only drives the happy path. (Key-confirm mismatch / abort IS unit-covered by `pairing.test.mjs`, `cli-shim.test.mjs` and `sender-connect.test.mjs`. The segment-nack/rewind retry and resume paths ARE unit-covered (`segment-stream.test.mjs`, `receive-flow.test.mjs`, `v2-retry-integration.test.mjs`, `webrtc-send-resume.test.mjs`), and room TTL expiry/refresh is HTTP-covered by `room-ttl.test.mjs`.)
 - PWA service-worker caching + `controllerchange` auto-reload.
 - `src/healthcheck.js` and the live oauth2-proxy/Keycloak integration (the app-side receiver-only-auth gate IS covered by `auth-scope.test.mjs`, but the proxy injecting the header and the open host's 403/header-strip are deployment config, not app code, so they are not unit/HTTP tested). The `TRUST_PROXY` env-var parsing in `server.js` is also uncovered (default `loopback` is exercised by the HTTP tier, but non-default values are not).
 - TURN time-based HMAC-SHA1 credential derivation (coturn itself is out of scope; `misc/check_turn.py` is the manual probe).

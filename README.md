@@ -56,7 +56,7 @@ This project was developed with AI assistance ([Claude Code](https://claude.ai/c
 1. **Receiver** (typically a computer) opens the app and clicks "Receive" -- generates encryption keys and displays a QR code
 2. **Sender** (typically a smartphone) scans the QR code -- either by clicking "Send" and using the in-browser camera, or by scanning directly with any barcode scanner app (the URL opens the browser directly in sender mode)
 3. A **direct peer-to-peer connection** is established via WebRTC
-4. Both parties **verify key fingerprints** by reading short codes aloud to each other
+4. The two devices **confirm the pairing automatically**: the QR code carries a one-time secret that both devices mix into their encryption keys, and each proves to the other that it derived the same keys. Both screens then show "Pairing confirmed". There is no code to read aloud
 5. **Sender** takes or selects photos, which are encrypted and sent directly
 6. **Receiver** decrypts, previews, optionally crops/rotates/binarizes, and downloads the photos -- individually, as a ZIP, or as a single PDF (plain or searchable via OCR). Photos are auto-grouped into "collections" (one per sender batch). The sender side also exposes a Genius-Scan-like gallery (rotate, flip, B&W, perspective crop, drag-and-drop reorder) before the photos are sent, and auto-crops captured documents when edge detection is on
 
@@ -68,15 +68,15 @@ The protections listed in [Security Features](#security-features) below address 
 - Passive network eavesdroppers on any link (local Wi-Fi, ISP, signaling traffic, TURN/TURNS relay traffic).
 - Active man-in-the-middle on the signaling channel, including a fully malicious WebSend server operator, a compromised reverse proxy, or anyone between the two peers and the server.
 - A compromised or curious TURN / TURNS relay operator.
-- A hostile peer **before** fingerprint verification (a stranger who manages to join the room and floods malformed messages before the user confirms).
-- A hostile peer **after** fingerprint verification (a phone whose user was socially engineered into pairing, then sends oversized files, malformed transforms, or peer-controlled filenames / MIME types).
+- A hostile peer **before** the pairing is confirmed (a stranger who manages to join the room without the QR secret and floods malformed messages).
+- A hostile peer **after** the pairing is confirmed (a phone whose user was socially engineered into scanning the QR, then sends oversized files, malformed transforms, or peer-controlled filenames / MIME types).
 - Compromised content delivery: a tampered WebSend server, a hostile CDN, or any attempt to swap in modified JS/CSS at runtime.
 - Phishing QR codes that encode an attacker-controlled origin instead of the legitimate WebSend host.
 
 **In scope (defended)**:
 - Confidentiality and integrity of every file payload, end-to-end, even when the signaling server and the TURN relay are both hostile.
-- Detection of a signaling-channel MITM through the spoken 16-hex-char fingerprint ceremony.
-- Resource-exhaustion DoS attempts from a peer (both before and after the fingerprint ceremony) against the receiver tab, the sender tab, and the server process.
+- Detection of a signaling-channel MITM without any human comparison step: the QR carries a 128-bit secret (in the URL fragment, never sent to the server) that is mixed into the key derivation together with both public keys, and each side must send an encrypted key-confirm that only opens if the other side derived the same keys. A MITM who swaps keys does not know the secret, so pairing fails with a clear error and no file is accepted.
+- Resource-exhaustion DoS attempts from a peer (both before and after the pairing is confirmed) against the receiver tab, the sender tab, and the server process.
 - Cross-origin and CSRF-style abuse of the signaling API.
 - XSS via peer-controlled filenames or peer-declared MIME types.
 - Silent tampering of static assets at the server or proxy (vendoring plus Subresource Integrity).
@@ -85,7 +85,7 @@ The protections listed in [Security Features](#security-features) below address 
 
 **Out of scope (explicitly NOT defended)**:
 - A fully compromised endpoint device (rooted phone, malware on the receiver computer, hostile browser, hostile browser extension). Any application-layer protection is bypassable by code running inside the same browser context.
-- A user who **skips** the spoken fingerprint comparison, or who confirms a mismatch by mistake. The verification ceremony is the security; bypassing it removes the guarantee against MITM.
+- An attacker who **sees the full QR code / link** (shoulder-surfing, a photo of the screen, the link pasted into a chat). The QR secret is the authenticator: whoever holds the full link first can pair in place of the intended phone. Show the QR only to the device you want to pair.
 - Targeted denial-of-service at the network / IP layer (we mitigate application-layer DoS, not packet floods).
 - Forensic recovery of decrypted bytes from device RAM after a transfer (references are dropped on shred, but unreferenced pages are not zeroed).
 - Compromise of the user's HTTPS certificate authority.
@@ -95,7 +95,7 @@ The protections listed in [Security Features](#security-features) below address 
 
 **Trust assumptions**:
 - Both endpoint devices, their operating systems, and their browsers behave honestly.
-- The user actually compares the 16-hex fingerprint aloud and aborts on any mismatch.
+- The QR code (and so its secret) is seen only by the intended sender device. The server never receives the secret because it lives in the URL fragment.
 - HTTPS is correctly terminated in front of the server (typically Caddy + Let's Encrypt) and the TLS stack is sound.
 - The vendored third-party libraries were honest at the time they were vendored. Subresource Integrity re-verifies the bytes at runtime, so a later swap is detected, but a backdoor present at vendoring time is not.
 
@@ -120,9 +120,12 @@ The protections listed in [Security Features](#security-features) below address 
 - **Planned**: as it matures, WebSend intends to adopt [WEBCAT](https://github.com/freedomofpress/webcat/) (Web-based Code Assurance and Transparency, from the Freedom of the Press Foundation) for even stronger guarantees. WEBCAT adds enforced code signing and a transparency log on top of SRI, so that a compatible browser refuses to run a WebSend frontend whose signed manifest does not appear in the public log, closing the gap where a backdoor present at vendoring/build time would otherwise go undetected
 
 ### Man-in-the-Middle Protection
-- **Key fingerprint verification**: after connection, both parties see a 16-hex-char (64-bit) SHA-256 fingerprint of each other's public keys, grouped as `XXXX-XXXX-XXXX-XXXX`, that they compare aloud to confirm no MITM key substitution occurred. The length is fixed at the recognised floor for verbal-comparison fingerprints (Signal uses 60 decimal digits, OTR 40 hex / 160 bits). It is deliberately NOT adapted to server load: a signaling-MITM grinds ECDH keys against any single session, so shortening the code under low load would not reduce attacker effort, just make the attack feasible in seconds on a laptop.
-- Both parties must **explicitly confirm** the fingerprints match before photo transfer begins
-- Either party can **abort** if fingerprints don't match
+- **QR secret**: the receiver draws a fresh 16-byte random secret K per pairing and puts it in the QR URL's hash fragment (`/send/<roomId>#<roomSecret>:<K>`), so it never reaches the server or a relay.
+- **Key derivation bound to K and both public keys**: `master = HKDF-SHA256(ECDH secret, salt = "WebSend-v2" || K, info = "WebSend-v2|master|" || receiverPublicKey || senderPublicKey)`. Every file key and both key-confirm keys are derived from that master with domain-separated labels.
+- **Encrypted key-confirm**: each side sends a short AES-GCM message sealed under its direction's confirm key. A session is only usable ("Pairing confirmed") once the other side's confirm opens. A wrong secret or a swapped public key makes it fail to open: pairing is aborted with a clear error and no file is accepted. A missing confirm aborts after 30 seconds.
+- **Clean protocol break**: peers running an older protocol version get a "reload the page" error, and old QR links without the secret are refused with an "outdated link" message.
+- A mid-session public-key change (re-key) is refused by the sender, and on the receiver it drops the pairing and requires a fresh key-confirm before any further file is accepted.
+- This design (a QR-carried secret plus key-confirm instead of a code read aloud) was implemented with [Claude Code](https://claude.ai/claude-code).
 
 ### Room Security
 - Room IDs are short (6 characters) for usability, but each room also has a **128-bit cryptographic secret** (generated with `crypto.randomBytes`)
@@ -146,12 +149,12 @@ The protections listed in [Security Features](#security-features) below address 
 
 ### Receiver Payload Bounding (Anti-DoS)
 - The binary plane is a streaming record parser that buffers at most one partial record, hard-bounds every record's declared ciphertext length, refuses a record sequence number that skips ahead (framing desync), and refuses bytes that would push the cumulative session total past 8 GiB (one 4 GiB max-size file plus protocol overhead plus a fully retried tail). On any of those, the data channel and peer connection are torn down immediately.
-- Decryption only happens after fingerprint verification; records from an unverified peer are parsed and dropped in constant memory, so a not-yet-verified peer cannot OOM the receiver tab while the verification modal is up.
+- Decryption only happens after the pairing is confirmed; records from a peer whose key-confirm has not opened are parsed and dropped in constant memory, so a not-yet-paired peer cannot OOM the receiver tab. These caps deliberately apply before verification.
 
 ### Transform-Replay Hardening (Anti-DoS)
 - The `transform-image` validator caps `transforms[]` length (32 ops max) and, for `op:'crop'`, requires four `{tl, tr, br, bl}` corners with normalized `{x, y}` in `[0, 1]`. Peer-supplied corners outside that range are rejected before any pixel work happens.
 - `cropPerspective` defensively clamps its output dimensions to `min(srcDim * 2, 8192)` so even a validator bypass cannot drive a multi-GiB `createImageData` allocation or freeze the main thread on the inverse-mapping loop.
-- Peer-mutating handlers (`encrypted-file`, `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind both-sides fingerprint confirmation, so an unverified peer cannot push files, replay transforms, or rearrange the gallery while the verification modal is still up.
+- Peer-mutating handlers (`encrypted-file`, `transform-image`, `replace-image`, `delete-image`, `batch-*`) are gated behind a confirmed pairing, so a peer whose key-confirm has not opened cannot push files, replay transforms, or rearrange the gallery.
 
 ### Sender Picker Bounding (Anti-OOM)
 - The send-page file picker (`#file-input` / `#dir-input`) refuses selections larger than 50 files in one go. EXIF stripping re-encodes every image to PNG, which inflates a typical phone photo from ~5 MB to ~30 MB; a "select all" against a full gallery would otherwise pile up hundreds of MB of stripped blobs before the first byte hit the wire and kill the renderer on Android Chrome.
@@ -229,7 +232,7 @@ The protections listed in [Security Features](#security-features) below address 
 ### HTTP-Relay Fallback (Corporate Networks)
 - On networks that block UDP and strip TURNS at the proxy, WebSend now falls back to a pure-HTTPS path that runs through the same `:443` reverse-proxy listener as the rest of the app. No separate container or port; the same Caddy reverse proxy upgrades the WebSocket and handles the long-poll endpoints to the Node process.
 - The client races three transports in parallel: WebRTC (preferred), WebSocket to `/api/rooms/:id/relay`, and an on-demand long-poll over `/api/rooms/:id/relay/{handshake,up,down,close}` (auto-spawned when the WS path is refused). A 10 s grace window lets WebRTC win when it can; afterwards the relay path wins.
-- The relay forwards opaque ciphertext between two paired peers. The existing ECDH + AES-GCM + fingerprint stack is transport-agnostic, so the server never sees plaintext on this path either.
+- The relay forwards opaque ciphertext between two paired peers. The existing ECDH + AES-GCM + key-confirm stack is transport-agnostic, so the server never sees plaintext on this path either.
 - Anti-DoS caps are mirrored server-side: 8 GiB `MAX_TOTAL_SESSION_BYTES`, 16 KiB `MAX_CONTROL_MSG_BYTES`, plus a 32-frame bounded queue and 60 s idle timeout on the long-poll slots. Long-poll slot tokens (128-bit random) are validated in constant time alongside the room secret. Relay slots are role-bound: the receiver's host secret always gets slot `a` and the sender's QR secret always gets slot `b` (WS, long-poll, or a mix), and a second connector for an occupied role gets 409.
 - The long-poll transport uses 300 KiB chunks (vs. 16 KiB on the WebSocket / WebRTC paths) because every chunk is a full HTTPS round-trip, paced at a 50 ms minimum gap (~6 MB/s) so an unfriendly corporate proxy in front of the server cannot trip us with its own rate limit. `Retry-After` is honoured on 429 so a saturated upstream bucket drains instead of looping.
 - Before sealing, each segment attempts `gzip` via `CompressionStream` and the compressed bytes are used only if they shrink the segment, flagged inside the sealed record. Highly compressible payloads (text, JSON, logs) shrink dramatically; already-compressed media (JPEG, PNG, MP4) fall through unchanged.
@@ -471,7 +474,7 @@ The project uses a three-tier test suite:
 
 Run `npm test` (= unit + HTTP) for the fast inner loop, or `npm run test:all` for everything. A pre-push git hook (in `.githooks/pre-push`, auto-wired by `npm install` via the `prepare` script) runs `npm test` before every push.
 
-Known testing gaps (frontend modules like `webrtc.js`/`logger.js`/`i18n.js`, the export modal, crop tool, transform-replay protocol, fingerprint-mismatch / integrity-retry paths, the service worker, healthcheck, and SSO) are listed in [ARCHITECTURE.md](ARCHITECTURE.md#testing).
+Known testing gaps (frontend modules like `webrtc.js`/`logger.js`/`i18n.js`, the export modal, crop tool, transform-replay protocol, integrity-retry paths, the service worker, healthcheck, and SSO) are listed in [ARCHITECTURE.md](ARCHITECTURE.md#testing).
 
 ### CLI receiver (advanced)
 
