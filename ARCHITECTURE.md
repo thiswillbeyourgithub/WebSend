@@ -1091,7 +1091,12 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     never sees plaintext. Anti-DoS caps mirror the WebRTC bounds:
     `MAX_TOTAL_SESSION_BYTES` (8 GiB) and `MAX_CONTROL_MSG_BYTES`
     (16 KiB) enforced server-side, plus a bounded per-slot queue
-    (32 frames) and idle timeout (60 s) on the long-poll path. The
+    (32 frames) and idle timeout (60 s) on the long-poll path. Single
+    frames are capped at 320 KiB on both transports: the `/relay/up`
+    body limit (`LP_FRAME_BODY_LIMIT`) doubles as the WS server's
+    `maxPayload`, so a WS frame over it closes the socket with 1009
+    before ws buffers it (the ws default would accept 100 MiB; real WS
+    frames are at most 16 KiB). The
     queue bound is enforced as backpressure, never as a silent drop:
     when the peer's queue is full (or a WS peer's socket buffer exceeds
     8 MiB), `/relay/up` answers 429 and the client retries the same

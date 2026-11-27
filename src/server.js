@@ -383,7 +383,8 @@ const LP_SLOT_TOKEN_BYTES = 16;             // 128-bit slot token
 // big file does not need thousands of round-trips on the long-poll
 // transport. MAX_TOTAL_SESSION_BYTES is the session-level ceiling on
 // top of this.
-const LP_FRAME_BODY_LIMIT = '320kb';
+// Also the WS maxPayload (see wss below). A number: express.raw takes bytes.
+const LP_FRAME_BODY_LIMIT = 320 * 1024;
 const LP_SLOT_IDLE_TIMEOUT_MS = 60_000;     // close LP slot after this idle
 // Backpressure cap on a WS peer's outbound socket buffer. When an LP (or WS)
 // sender pushes frames faster than the receiving WS drains them, ws buffers
@@ -1545,7 +1546,13 @@ app.use((err, req, res, next) => {
 // mirrored MAX_TOTAL_SESSION_BYTES / MAX_CONTROL_MSG_BYTES caps.
 
 const RELAY_PATH_RE = /^\/api\/rooms\/([A-Z0-9]{6})\/relay$/;
-const wss = new WebSocketServer({ noServer: true });
+// maxPayload: without it ws accepts single frames up to 100 MiB, all
+// buffered in relay memory before the message handler (and its 16 KiB
+// control cap) ever runs. Legit WS frames are at most 16 KiB (ws-transport
+// CHUNK_SIZE, MAX_CONTROL_MSG_BYTES); the cap reuses the LP per-frame limit
+// so both transports refuse the same sizes and a future WS chunk bump up to
+// the LP chunk size cannot break. Oversized frames close the socket (1009).
+const wss = new WebSocketServer({ noServer: true, maxPayload: LP_FRAME_BODY_LIMIT });
 // Track the relay rooms with at least one open socket so the heartbeat
 // interval (ping/pong) only walks live entries.
 const relayPings = new Set();

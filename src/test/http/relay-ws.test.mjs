@@ -8,6 +8,8 @@
  *   - missing room  -> 401 close (no enumeration oracle)
  *   - third peer    -> 409 close
  *   - oversized control message (>16 KiB) -> 4413 close
+ *   - frame over maxPayload (LP_FRAME_BODY_LIMIT, 320 KiB) -> 1009 close,
+ *     not forwarded to the peer
  *   - 4 GiB session byte cap (proxy by injecting a smaller cap is impractical
  *     in a black-box test; instead we assert that bytes ARE forwarded up to
  *     the cap and the close-code path is exercised by an integration check)
@@ -251,6 +253,33 @@ test('oversized control message (>16 KiB) closes connection with 4413', async ()
     assert.equal(r.code, 4413);
 
     b.close();
+});
+
+test('frame over maxPayload (320 KiB) closes the socket with 1009 and is not forwarded', async () => {
+    const { roomId, secret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, secret));
+    const b = await openWs(wsUrl(roomId, secret));
+
+    let bGotBinary = false;
+    b.on('message', (_d, isBinary) => { if (isBinary) bGotBinary = true; });
+    const closedA = nextClose(a);
+    const closedB = nextClose(b);
+    a.send(Buffer.alloc(320 * 1024 + 1, 0x42), { binary: true });
+    const r = await closedA;
+    assert.equal(r.code, 1009); // ws "Message Too Big"
+    await closedB; // the pair is torn down with its first half
+    assert.equal(bGotBinary, false);
+});
+
+test('frame exactly at maxPayload (320 KiB) is forwarded', async () => {
+    const { roomId, secret } = await newRoom();
+    const a = await openWs(wsUrl(roomId, secret));
+    const b = await openWs(wsUrl(roomId, secret));
+    const recvB = nextMessage(b);
+    a.send(Buffer.alloc(320 * 1024, 0x43), { binary: true });
+    const got = await recvB;
+    assert.equal(got.data.byteLength, 320 * 1024);
+    a.close(); b.close();
 });
 
 test('binary frames of legitimate size are NOT capped by control-msg cap', async () => {
