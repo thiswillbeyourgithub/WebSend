@@ -32,7 +32,7 @@ HTTP-relay fallback transport, default `true`), `RELAY_LP_ONLY` (long-poll-only
 transport: suppresses WebRTC ICE servers and disables the WS relay endpoint so only
 the long-poll path is exposed, default `false`), `RELAY_QUEUE_BUDGET_BYTES` (relay-wide
 budget for bytes held for receivers, LP queues plus unflushed WS send buffers across all
-rooms, default 64 MiB; past it senders are backpressured), `ROOMS_MAX` (instance-wide cap on live rooms, `POST /api/rooms` answers 503 past it, default `5000`), `ROOMS_MAX_PER_CLIENT` (cap on live rooms per creator client key, an IPv4 or an IPv6 /64, `POST /api/rooms` answers 429 with `Retry-After: 60` past it, default `100`), `WEBSEND_ROOM_TTL_MS` /
+rooms, default 32 MiB; past it senders are backpressured), `ROOMS_MAX` (instance-wide cap on live rooms, `POST /api/rooms` answers 503 past it, default `5000`), `ROOMS_MAX_PER_CLIENT` (cap on live rooms per creator client key, an IPv4 or an IPv6 /64, `POST /api/rooms` answers 429 with `Retry-After: 60` past it, default `100`), `WEBSEND_ROOM_TTL_MS` /
 `WEBSEND_ROOM_CLEANUP_INTERVAL_MS` (room TTL and cleanup-sweep interval in ms,
 defaults 10 min / 1 min; mainly a test escape hatch), `TEST_DISABLE_RATE_LIMIT`
 (test escape hatch), `BRANDING` (the instance display name shown on the landing
@@ -1126,7 +1126,8 @@ The 36 numbered entries in [Security Layers](#security-layers) below are individ
     8 MiB), `/relay/up` answers 429 and the client retries the same
     frame on a short gap (bounded at 30 s of solid 429s), so a slow
     receiver can never cause chunk loss mid-file. One process-wide
-    budget (`RELAY_QUEUE_BUDGET_BYTES`, default 64 MiB) also bounds the
+    budget (`RELAY_QUEUE_BUDGET_BYTES`, default 32 MiB, sized for the
+    128M container memory limit) also bounds the
     sum of what the relay holds for receivers across all rooms: LP
     queued bytes plus bytes handed to `ws.send` and not yet flushed
     (counted until the send callback, given back wholesale when a

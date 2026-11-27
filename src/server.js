@@ -435,9 +435,11 @@ const WS_PEER_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
 // and WS feeders have their socket paused. Nothing is dropped. Receivers that
 // hold budget without draining are reaped anyway (WS: no pong within the
 // heartbeat, since the ping queues behind the backlog; LP: slot idle timeout).
+// The 32 MiB default leaves room for the Node heap and everything else under
+// the 128M container memory limit set in docker/docker-compose.yml.
 const RELAY_QUEUE_BUDGET_BYTES = parseInt(process.env.RELAY_QUEUE_BUDGET_BYTES, 10) > 0
     ? parseInt(process.env.RELAY_QUEUE_BUDGET_BYTES, 10)
-    : 64 * 1024 * 1024;
+    : 32 * 1024 * 1024;
 let relayHeldBytes = 0; // only touched via lpEnqueue/lpDequeue/wsSendCounted/wsReleaseHeld
 
 // ============ Rate Limiting ============
