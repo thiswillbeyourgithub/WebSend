@@ -136,6 +136,7 @@ The protections listed in [Security Features](#security-features) below address 
 - **Origin header validation** blocks cross-origin API requests from unauthorized websites (CSRF-like protection)
 - **JSON bodies parsed only after authentication**: the 50 kB JSON parser is mounted per route, after origin and room-secret checks, and only on the routes that read a body (SDP offer/answer, ICE candidates), so unauthenticated requests are refused before any body is buffered or parsed
 - Express **trusts proxy headers only from loopback**, so `X-Forwarded-For` cannot be spoofed by external clients (designed to run behind [Caddy](https://caddyserver.com/))
+- **Live-room caps**: rooms stay in memory until they expire, so `POST /api/rooms` refuses with 503 once the instance holds `ROOMS_MAX` live rooms (default 5000) and with 429 (`Retry-After: 60`) once one client (IPv4 address or IPv6 /64) holds `ROOMS_MAX_PER_CLIENT` live rooms (default 100, generous because a hospital's desktops often share one NAT address).
 - **Long-poll waiter caps**: layered defense for `?wait=true`. A per-room cap (4 concurrent waiters) refuses extras with 429, and a process-wide ceiling (10000 in-flight waiters) refuses extras with 503, before any socket / closure / timer is allocated.
 
 ### Transport Security Headers
@@ -388,7 +389,9 @@ COMPOSE_PROFILES=auth-split       # receiver-only SSO (two hosts), external TURN
 | `AUTH_SCOPE` | `both` gates every peer behind SSO; `receiver` gates only the room creator and leaves the sender on an open host. See [Receiver-only authentication](#receiver-only-authentication) | `both` |
 | `SENDER_PUBLIC_ORIGIN` | Required when `AUTH_SCOPE=receiver`: the open sender host's origin (`scheme://host[:port]`) the receiver's QR/invite link targets. Must also be in `ALLOWED_ORIGINS` (server aborts at boot otherwise) | _(empty)_ |
 | `AUTH_IDENTITY_HEADER` | The proxy-injected identity header the room-creation gate checks when `AUTH_SCOPE=receiver` (oauth2-proxy injects this upstream via `pass-user-headers`) | `x-forwarded-user` |
-| `TEST_DISABLE_RATE_LIMIT` | Disable per-IP rate limiting (test escape hatch only) | _(unset)_ |
+| `ROOMS_MAX` | Instance-wide cap on live rooms; `POST /api/rooms` answers 503 past it | `5000` |
+| `ROOMS_MAX_PER_CLIENT` | Cap on live rooms per creator client (IPv4 address or IPv6 /64); `POST /api/rooms` answers 429 with `Retry-After: 60` past it | `100` |
+| `TEST_DISABLE_RATE_LIMIT` | Disable per-client rate limiting and the per-client live-room cap (test escape hatch only) | _(unset)_ |
 
 ## Firewall (UFW)
 
@@ -463,7 +466,7 @@ The project uses a three-tier test suite:
 | Tier | Command | What it covers | Speed |
 |------|---------|----------------|-------|
 | Unit | `npm run test:unit` | Pure JS modules: crypto, image transforms, server helpers, transfer stats, SRI updater, hand-rolled PDF builder, and a real-photo regression suite for the document-edge detector (`doc-detect-samples.test.mjs`, gated on the optional `canvas` devDep) | ~0.5s |
-| HTTP integration | `npm run test:http` | Real `server.js` spawned per file via child_process — config, origin validation, rate limiting and client keying, room/ICE/SDP signaling, long-poll edge cases, HTTP relay (WS + long-poll, including the relay-wide byte budget), static asset mounts, env-var propagation | ~2s |
+| HTTP integration | `npm run test:http` | Real `server.js` spawned per file via child_process — config, origin validation, rate limiting and client keying, live-room caps, room/ICE/SDP signaling, long-poll edge cases, HTTP relay (WS + long-poll, including the relay-wide byte budget), static asset mounts, env-var propagation | ~2s |
 | End-to-end | `npm run test:e2e` | Two real browsers via Playwright (sender + receiver round-trip, OCR searchable-PDF export; the OCR spec needs `pdftotext` from poppler-utils and is skipped without it) | ~30s |
 
 Run `npm test` (= unit + HTTP) for the fast inner loop, or `npm run test:all` for everything. A pre-push git hook (in `.githooks/pre-push`, auto-wired by `npm install` via the `prepare` script) runs `npm test` before every push.

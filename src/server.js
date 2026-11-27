@@ -353,6 +353,36 @@ const jsonBody = express.json({ limit: '50kb' });
 
 // In-memory room storage (in production, use Redis or similar)
 const rooms = new Map();
+
+// Live-room caps. Rooms only leave memory through the expiry sweep, so the
+// creation rate limit alone still lets one client park rooms for a whole
+// ROOM_TTL, and nothing bounded the instance total. ROOMS_MAX bounds the
+// instance (503 when full); ROOMS_MAX_PER_CLIENT bounds one client key (an
+// IPv4 or an IPv6 /64, see getClientIp; 429 when reached). It is generous
+// because a hospital's desktops can all share one NAT address.
+const ROOMS_MAX = parseInt(process.env.ROOMS_MAX, 10) > 0
+    ? parseInt(process.env.ROOMS_MAX, 10)
+    : 5000;
+const ROOMS_MAX_PER_CLIENT = parseInt(process.env.ROOMS_MAX_PER_CLIENT, 10) > 0
+    ? parseInt(process.env.ROOMS_MAX_PER_CLIENT, 10)
+    : 100;
+// creator key -> number of live rooms it created. Kept in step with `rooms`
+// by addRoom/deleteRoom, the only places that touch the map's membership.
+const liveRoomsByCreator = new Map();
+
+function addRoom(id, room) {
+    rooms.set(id, room);
+    liveRoomsByCreator.set(room.creator, (liveRoomsByCreator.get(room.creator) || 0) + 1);
+}
+
+function deleteRoom(id) {
+    const room = rooms.get(id);
+    if (!room) return;
+    rooms.delete(id);
+    const n = (liveRoomsByCreator.get(room.creator) || 1) - 1;
+    if (n > 0) liveRoomsByCreator.set(room.creator, n);
+    else liveRoomsByCreator.delete(room.creator);
+}
 // Idle TTL. Signaling-only rooms expire ROOM_TTL after creation
 // (anti-squatting); once a relay session exists, every relayed frame
 // refreshes room.lastActivity, so a long transfer (a multi-GiB file on
@@ -693,7 +723,7 @@ function cleanupRooms() {
                 }
                 room.relay = null;
             }
-            rooms.delete(id);
+            deleteRoom(id);
             console.log(`Room ${id} expired and removed`);
         }
     }
@@ -948,6 +978,19 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
             return res.status(401).json({ error: 'Authentication required to create a room' });
         }
     }
+    if (rooms.size >= ROOMS_MAX) {
+        console.warn(`Refusing room creation: instance-wide cap of ${ROOMS_MAX} live rooms reached`);
+        res.set('Retry-After', '60');
+        return res.status(503).json({ error: 'Too many rooms, try again in a minute' });
+    }
+    const creator = getClientIp(req);
+    // Bypassed with the other per-client limits by the test escape hatch:
+    // every HTTP test runs from loopback, so they would all share one budget.
+    if (!RATE_LIMIT_DISABLED && (liveRoomsByCreator.get(creator) || 0) >= ROOMS_MAX_PER_CLIENT) {
+        debugLog('ROOM', 'Room creation refused: per-client live-room cap reached', { clientIp: getClientAddress(req) });
+        res.set('Retry-After', '60');
+        return res.status(429).json({ error: 'Too many rooms for this client', retryAfter: 60 });
+    }
     let roomId;
     // Ensure unique room ID. Bounded by MAX_ROOM_ID_TRIES so a future
     // pathological state (huge live-room set, broken RNG, etc.) cannot
@@ -967,8 +1010,10 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
     // Generate cryptographic secret for room access authorization
     const secret = helpers.generateRoomSecret();
 
-    rooms.set(roomId, {
+    addRoom(roomId, {
         created: Date.now(),
+        // Client key of the creator, counted against ROOMS_MAX_PER_CLIENT.
+        creator,
         // Refreshed by every relayed frame (LP up, WS message, LP down
         // delivery). cleanupRooms expires relay rooms on inactivity but
         // signaling-only rooms strictly on `created`.
@@ -2005,6 +2050,8 @@ httpServer.listen(PORT, '0.0.0.0', () => {
         { name: 'RELAY_ENABLE',          value: process.env.RELAY_ENABLE,         used: String(RELAY_ENABLE) },
         { name: 'RELAY_LP_ONLY',         value: process.env.RELAY_LP_ONLY,        used: String(RELAY_LP_ONLY) },
         { name: 'RELAY_QUEUE_BUDGET_BYTES', value: process.env.RELAY_QUEUE_BUDGET_BYTES, used: String(RELAY_QUEUE_BUDGET_BYTES) },
+        { name: 'ROOMS_MAX',             value: process.env.ROOMS_MAX,            used: String(ROOMS_MAX) },
+        { name: 'ROOMS_MAX_PER_CLIENT',  value: process.env.ROOMS_MAX_PER_CLIENT, used: String(ROOMS_MAX_PER_CLIENT) },
         { name: 'DEV_FORCE_CONNECTION',  value: process.env.DEV_FORCE_CONNECTION, used: DEV_FORCE_CONNECTION },
         { name: 'UMAMI_URL',             value: process.env.UMAMI_URL,            used: UMAMI_URL || '(none)' },
         { name: 'UMAMI_WEBSITE_ID',      value: process.env.UMAMI_WEBSITE_ID,     used: UMAMI_WEBSITE_ID || '(none)' },
