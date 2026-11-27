@@ -8,28 +8,26 @@
  * Implementation note: the actual WebRTC + crypto flow runs inside a
  * Playwright-launched headless Chromium (already a project devDependency for
  * e2e tests), reusing src/public/js/crypto.js + src/public/js/protocol.js
- * verbatim. This avoids adding native node-webrtc bindings and keeps the wire
+ * verbatim (plus pairing.js for the QR-secret key-confirm). This avoids adding native node-webrtc bindings and keeps the wire
  * protocol in lockstep with the production browser path.
  *
  * Usage:
- *   node src/cli/receive.js <instance-url> [--out <dir>] [--auto-accept] [--verbose]
+ *   node src/cli/receive.js <instance-url> [--out <dir>] [--verbose]
  *
  * Built with the help of Claude Code (Opus 4.7).
  */
 
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
 
 // ============ args ============
 
 function parseArgs(argv) {
-    const opts = { url: null, out: null, autoAccept: false, verbose: false, help: false };
+    const opts = { url: null, out: null, verbose: false, help: false };
     const rest = [];
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--out') opts.out = argv[++i];
-        else if (a === '--auto-accept') opts.autoAccept = true;
         else if (a === '--verbose' || a === '-v') opts.verbose = true;
         else if (a === '--help' || a === '-h') opts.help = true;
         else if (a.startsWith('-')) { console.error(`unknown flag: ${a}`); process.exit(2); }
@@ -44,7 +42,6 @@ function usage() {
 
 Options:
   --out <dir>      Output directory (default: ./websend-received/<timestamp>)
-  --auto-accept    Auto-confirm fingerprint without y/n prompt
   -v, --verbose    Verbose protocol/crypto logging
   -h, --help       Show this help
 
@@ -90,13 +87,6 @@ function uniquePath(dir, name) {
         if (!fs.existsSync(p)) return p;
     }
     throw new Error('too many duplicates');
-}
-
-function promptYesNo(question) {
-    return new Promise((resolve) => {
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        rl.question(question, (ans) => { rl.close(); resolve(/^y(es)?$/i.test(ans.trim())); });
-    });
 }
 
 // ============ main ============
@@ -149,14 +139,6 @@ async function main() {
         console.log('');
     });
 
-    await page.exposeFunction('__nodePromptFp', async (code) => {
-        console.log('');
-        console.log(`  Verification code: ${code}`);
-        console.log('');
-        if (opts.autoAccept) return true;
-        return await promptYesNo('Does this code match the one shown on the other device? [y/N] ');
-    });
-
     const stats = { savedCount: 0, savedBytes: 0 };
     await page.exposeFunction('__nodeSaveFile', async (name, mime, b64) => {
         const safe = safeFilename(name);
@@ -189,11 +171,12 @@ async function main() {
         process.exit(1);
     }
 
-    // Inject the production crypto + protocol + segment-stream modules from
+    // Inject the production crypto + protocol + pairing + segment-stream modules from
     // the live server. Any change to those files automatically flows
     // through — zero drift.
     await page.addScriptTag({ url: '/js/crypto.js' });
     await page.addScriptTag({ url: '/js/protocol.js' });
+    await page.addScriptTag({ url: '/js/pairing.js' });
     await page.addScriptTag({ url: '/js/segment-stream.js' });
 
     // Inject our minimal driver from disk.
@@ -203,10 +186,7 @@ async function main() {
     // Kick off the receiver flow inside the page. Returns when start() resolves
     // (which it doesn't, normally — the in-page driver runs an open-ended loop
     // and the only exit signal is __nodeDone via dc.onclose).
-    page.evaluate((args) => window.__wsCli.start(args), {
-        baseUrl,
-        autoAccept: !!opts.autoAccept,
-    }).catch((e) => log.err(`driver error: ${e.message}`));
+    page.evaluate((args) => window.__wsCli.start(args), { baseUrl }).catch((e) => log.err(`driver error: ${e.message}`));
 
     // Wait for the data channel to close (done) or Ctrl-C.
     process.on('SIGINT', () => {

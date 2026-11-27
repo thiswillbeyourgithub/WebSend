@@ -3,26 +3,31 @@
  *
  * Loaded into a Playwright-launched Chromium page that has been navigated to
  * the WebSend instance origin (so fetch() carries the right Origin header and
- * crypto.js / protocol.js have already been added via addScriptTag).
+ * crypto.js / protocol.js / pairing.js / segment-stream.js have already been
+ * added via addScriptTag).
  *
- * Exposes window.__wsCli with start({ baseUrl, autoAccept }) → Promise<void>
- * that drives the entire receiver flow:
+ * Exposes window.__wsCli with start({ baseUrl }) -> Promise<void> that drives
+ * the entire receiver flow:
  *
- *   1. Generate ECDH keypair, POST /api/rooms, create RTCPeerConnection +
- *      data channel, post offer, trickle ICE, long-poll for answer.
- *   2. Once the data channel opens, send our public key, derive shared key
- *      from the sender's, and surface the fingerprints.
- *   3. Bridge file saves and the y/n fingerprint prompt back to Node via
- *      previously-exposed window.__nodeLog / __nodeSaveFile / __nodePromptFp.
+ *   1. Generate ECDH keypair and the QR secret K, POST /api/rooms, create
+ *      RTCPeerConnection + data channel, post offer, long-poll for answer.
+ *      The sender URL carries K in its fragment (#roomSecret:K), so the
+ *      server never sees it.
+ *   2. Once the data channel opens, send our public key; the Pairing state
+ *      machine derives the session keys (ECDH + K + both public keys) and
+ *      exchanges encrypted key-confirms. Files are accepted only once the
+ *      sender's confirm opened (no human comparison step).
+ *   3. Bridge logs, file saves and completion back to Node via the
+ *      previously-exposed window.__nodeLog / __nodeSaveFile / __nodeDone.
  *
- * Reuses src/public/js/crypto.js, protocol.js, and segment-stream.js
+ * Reuses src/public/js/crypto.js, protocol.js, pairing.js and segment-stream.js
  * verbatim — the wire protocol cannot drift because we load the same files
  * the production receiver loads. Receives the v2 chunked format (sealed
  * segment records); the in-connection segment-nack retry dance is NOT
  * implemented (WebRTC's ordered reliable channel makes record corruption
  * a non-event), so any verification failure nacks the whole file.
  *
- * Built with the help of Claude Code (Opus 4.7).
+ * Built with the help of Claude Code (Opus 4.7; key-confirm pairing by Opus 5.5).
  */
 (function () {
     const log = (lvl, msg) => { try { window.__nodeLog(lvl, msg); } catch (_) {} };
@@ -58,11 +63,224 @@
         return btoa(s);
     }
 
-    async function start({ baseUrl, autoAccept }) {
+    /**
+     * Receiver-side data-channel session: pairing (key-confirm gate), v2
+     * record parsing and file saving. Split from start() so the gate can be
+     * unit-tested without WebRTC (test/unit/cli-shim.test.mjs).
+     *
+     * @param {Object} deps
+     * @param {CryptoKeyPair} deps.keyPair - our ECDH pair (its public half is sent as public-key)
+     * @param {string} deps.qrSecret - K, also placed in the sender URL fragment
+     * @param {function(Object)} deps.send - send one control message
+     * @param {function()} deps.close - tear the connection down
+     * @param {function(Object)} deps.done - report final stats to Node
+     * @param {function(string, string, string): Promise<string>} deps.saveFile
+     */
+    function createSession({ keyPair, qrSecret, send, close, done, saveFile }) {
+        const P = window.Protocol;
+        const SS = window.SegmentStream;
+        // v2 receive state: the SegmentReceiver for the in-flight file plus
+        // the streaming record parser's partial-record buffer and the next
+        // record seq the wire may carry (mirrors transport-assembler.js).
+        let receiver = null;
+        let pending = null;      // Uint8Array, at most one partial record
+        let wireNextSeq = 0;
+        // Records funnel through one promise chain because accept() is
+        // async and records must verify strictly in order.
+        let recordChain = Promise.resolve();
+        // Key-confirm gate. Mirrors VERIFIED_GATED_HANDLERS in receive.html:
+        // state-mutating peer messages and binary chunks are dropped until
+        // the sender's encrypted key-confirm opened (proof it knows the QR
+        // secret K and derived the same keys).
+        const pairing = window.Pairing.create({
+            role: 'receiver',
+            keyPair,
+            qrSecret,
+            onBound: () => {
+                log('ok', 'Pairing confirmed (sender proved knowledge of the QR secret)');
+                send(P.build.ready());
+            },
+            onFailed: (reason) => {
+                log('err', `Pairing failed (${reason}): the sender does not know the QR secret; no files accepted`);
+                close();
+            },
+        });
+        // Cumulative bytes since dc opened, bounded by Protocol.MAX_TOTAL_SESSION_BYTES.
+        // Mirrors WebSendRTC._sessionTotalBytes (src/public/js/webrtc.js).
+        let sessionTotalBytes = 0;
+        // Latched once we tear down for protocol abuse so trailing chunks no-op.
+        let abusiveTeardown = false;
+        const state = { savedCount: 0, savedBytes: 0 };
+
+        // Tear down on detected protocol abuse. Same shape as
+        // WebSendRTC._abortAbusiveStream: latch, close channel + pc, surface
+        // the abort to the Node side via done() so receive.js can exit
+        // with a non-zero status instead of a confused stack trace.
+        const abortAbusive = (reason) => {
+            if (abusiveTeardown) return;
+            abusiveTeardown = true;
+            log('err', `Aborting peer connection: ${reason}`);
+            receiver = null; pending = null;
+            close();
+            done({ ...state, abusive: true, reason });
+        };
+
+        // Verify one framed record against the in-flight SegmentReceiver.
+        // No segment-nack retry here (see header comment): a failure nacks
+        // the whole file and the sender surfaces its retry toast.
+        const acceptRecord = async (seq, ct) => {
+            if (!receiver) return; // dropped transfer; ignore tail records
+            const res = await receiver.accept(seq, ct);
+            if (!res.ok) {
+                log('err', `record ${seq} rejected (${res.reason})`);
+                receiver = null;
+                send(P.build.fileNack('decrypt-failed'));
+            }
+        };
+
+        async function onMessage(d) {
+            try {
+                if (abusiveTeardown) return;
+                if (typeof d === 'string') {
+                    const msg = JSON.parse(d);
+                    const vr = P.validate(msg);
+                    if (!vr.ok) { log('warn', `drop: ${vr.error}`); return; }
+                    // Peer-controlled handlers that mutate state or run heavy
+                    // work on peer-supplied parameters: drop until the
+                    // pairing is bound. Mirrors
+                    // VERIFIED_GATED_HANDLERS in src/public/receive.html.
+                    const verifiedGated = (
+                        msg.type === 'file-start' ||
+                        msg.type === 'file-end' ||
+                        msg.type === 'batch-end'
+                    );
+                    if (verifiedGated && !pairing.isBound()) {
+                        log('warn', `Dropping ${msg.type} from unverified peer`);
+                        return;
+                    }
+                    if (msg.type === 'sender-public-key') {
+                        const res = await pairing.acceptPeerKey(msg);
+                        if (res.status === 'version-mismatch') {
+                            log('err', `Sender runs protocol v${msg.protocolVersion}, this CLI v${P.VERSION}: reload the sender page / update the CLI`);
+                            close();
+                        } else if (res.status === 'invalid-key') {
+                            log('warn', 'drop: invalid sender public key');
+                        } else if (res.confirmMsg) {
+                            if (res.rekey) log('warn', 'Sender key changed: a fresh key-confirm is required');
+                            send(res.confirmMsg);
+                        }
+                    } else if (msg.type === 'key-confirm') {
+                        await pairing.handleKeyConfirm(msg);
+                    } else if (msg.type === 'file-start') {
+                        if (msg.v !== 2) {
+                            log('err', `file-start with unsupported version (v=${msg.v}); nacking`);
+                            send(P.build.fileNack('unsupported-version'));
+                            return;
+                        }
+                        receiver = SS.createReceiver({
+                            sessionKeys: pairing.getSessionKeys(),
+                            saltB64: msg.salt,
+                            segCount: msg.segCount,
+                        });
+                        pending = null;
+                        wireNextSeq = 0;
+                        log('info', `Receiving file (${msg.segCount} segments)...`);
+                    } else if (msg.type === 'file-end') {
+                        recordChain = recordChain.then(async () => {
+                            if (!receiver) return;
+                            const r = receiver;
+                            receiver = null; pending = null;
+                            if (r.nextSeq !== r.segCount + 1) {
+                                log('err', `file-end after ${r.nextSeq}/${r.segCount + 1} records`);
+                                send(P.build.fileNack('incomplete'));
+                                return;
+                            }
+                            const { metadata, blob, compositeHashHex } = await r.finish();
+                            const b64 = arrayBufferToBase64(await blob.arrayBuffer());
+                            const path = await saveFile(
+                                (metadata && metadata.name) || 'unnamed',
+                                (metadata && metadata.mimeType) || '', b64);
+                            send(P.build.fileAck(compositeHashHex));
+                            state.savedCount += 1;
+                            state.savedBytes += blob.size;
+                            log('ok', `Saved ${path} (${blob.size} bytes)`);
+                        }).catch((e) => {
+                            send(P.build.fileNack('decrypt-failed'));
+                            log('err', `finalize failed: ${e.message}`);
+                        });
+                        await recordChain;
+                    } else if (msg.type === 'batch-end') {
+                        log('ok', 'Batch ended');
+                    } else {
+                        log('dbg', `(ignored) ${msg.type}`);
+                    }
+                } else {
+                    // Binary chunk (ArrayBuffer because dc.binaryType = 'arraybuffer').
+                    // Streaming v2 record parser with the same defense-in-depth
+                    // bounds as transport-assembler.js handleBinaryV2: at most
+                    // one partial record buffered, ctLen hard-bounded, seq may
+                    // never skip ahead, session bytes capped.
+                    if (!pairing.isBound()) {
+                        return abortAbusive('binary chunk from unconfirmed peer');
+                    }
+                    const len = d.byteLength | 0;
+                    if (sessionTotalBytes + len > P.MAX_TOTAL_SESSION_BYTES) {
+                        return abortAbusive(
+                            `session byte cap exceeded (${sessionTotalBytes + len} > ${P.MAX_TOTAL_SESSION_BYTES})`
+                        );
+                    }
+                    sessionTotalBytes += len;
+                    if (!receiver) return; // no transfer in flight: drop in O(1)
+
+                    const pendingLen = pending ? pending.length : 0;
+                    const merged = new Uint8Array(pendingLen + len);
+                    if (pendingLen) merged.set(pending, 0);
+                    merged.set(new Uint8Array(d), pendingLen);
+
+                    // Largest legal record ct: a full segment's plaintext
+                    // ([1B flags][4B dataLen] + SEG_SIZE) plus the GCM tag.
+                    const maxCt = P.SEG_SIZE + 21;
+                    let offset = 0;
+                    while (merged.length - offset >= 8) {
+                        const view = new DataView(merged.buffer, offset);
+                        const seq = view.getUint32(0, false);
+                        const ctLen = view.getUint32(4, false);
+                        if (ctLen < 16 || ctLen > maxCt) {
+                            return abortAbusive(`record ciphertext length ${ctLen} out of bounds`);
+                        }
+                        if (seq > wireNextSeq) {
+                            return abortAbusive(`record seq ${seq} skipped ahead of expected ${wireNextSeq}`);
+                        }
+                        if (merged.length - offset < 8 + ctLen) break; // partial record
+                        const ct = merged.slice(offset + 8, offset + 8 + ctLen);
+                        offset += 8 + ctLen;
+                        wireNextSeq = seq + 1;
+                        recordChain = recordChain
+                            .then(() => acceptRecord(seq, ct.buffer))
+                            .catch((e) => log('err', `record ${seq}: ${e.message}`));
+                    }
+                    pending = offset < merged.length ? merged.slice(offset) : null;
+                }
+            } catch (e) {
+                log('err', `handler: ${e.message}`);
+            }
+        }
+
+        return {
+            onMessage,
+            state,
+            isBound: () => pairing.isBound(),
+            dispose: () => pairing.reset(),
+        };
+    }
+
+    async function start({ baseUrl }) {
         const C = window.WebSendCrypto;
         const P = window.Protocol;
         const SS = window.SegmentStream;
-        if (!C || !P || !SS) throw new Error('crypto.js / protocol.js / segment-stream.js not loaded');
+        if (!C || !P || !SS || !window.Pairing) {
+            throw new Error('crypto.js / protocol.js / pairing.js / segment-stream.js not loaded');
+        }
         log('info', `Protocol v${P.VERSION}`);
 
         const config = await httpJson(`${baseUrl}/api/config`);
@@ -74,6 +292,9 @@
 
         const keyPair = await C.generateKeyPair();
         const myPubB64 = await C.exportPublicKey(keyPair.publicKey);
+        // K: proves to each side that the peer scanned this exact URL.
+        // Never logged; only the sender URL printed to the terminal has it.
+        const qrSecret = C.generateQrSecret();
 
         log('info', 'Creating room...');
         const room = await httpJson(`${baseUrl}/api/rooms`, {
@@ -140,7 +361,7 @@
             body: JSON.stringify({ type: 'offer', sdp: finalSdp }),
         });
 
-        const senderUrl = `${baseUrl}/send/${roomId}#${secret}`;
+        const senderUrl = `${baseUrl}/send/${roomId}#${secret}:${qrSecret}`;
         try { window.__nodeSenderUrl(senderUrl); } catch (_) {}
 
         // Long-poll for answer. The server returns 204 (null body) if no answer
@@ -185,199 +406,28 @@
         });
         log('ok', 'Data channel open');
 
-        let sessionKeys = null;
-        // v2 receive state: the SegmentReceiver for the in-flight file plus
-        // the streaming record parser's partial-record buffer and the next
-        // record seq the wire may carry (mirrors transport-assembler.js).
-        let receiver = null;
-        let pending = null;      // Uint8Array, at most one partial record
-        let wireNextSeq = 0;
-        // Records funnel through one promise chain because accept() is
-        // async and records must verify strictly in order.
-        let recordChain = Promise.resolve();
-        // Verified-fingerprint gate. Mirrors VERIFIED_GATED_HANDLERS in
-        // receive.html: state-mutating peer messages and binary chunks are
-        // dropped until both sides confirm the ECDH fingerprint.
-        let weConfirmed = false, theyConfirmed = false;
-        // Cumulative bytes since dc opened, bounded by Protocol.MAX_TOTAL_SESSION_BYTES.
-        // Mirrors WebSendRTC._sessionTotalBytes (src/public/js/webrtc.js).
-        let sessionTotalBytes = 0;
-        // Latched once we tear down for protocol abuse so trailing chunks no-op.
-        let abusiveTeardown = false;
-        const state = { savedCount: 0, savedBytes: 0 };
-
-        const send = (m) => dc.send(JSON.stringify(m));
-
-        // Tear down on detected protocol abuse. Same shape as
-        // WebSendRTC._abortAbusiveStream: latch, close channel + pc, surface
-        // the abort to the Node side via __nodeDone so receive.js can exit
-        // with a non-zero status instead of a confused stack trace.
-        const abortAbusive = (reason) => {
-            if (abusiveTeardown) return;
-            abusiveTeardown = true;
-            log('err', `Aborting peer connection: ${reason}`);
-            receiver = null; pending = null;
-            try { dc.close(); } catch (_) {}
-            try { pc.close(); } catch (_) {}
-            try { window.__nodeDone({ ...state, abusive: true, reason }); } catch (_) {}
-        };
-
-        // Verify one framed record against the in-flight SegmentReceiver.
-        // No segment-nack retry here (see header comment): a failure nacks
-        // the whole file and the sender surfaces its retry toast.
-        const acceptRecord = async (seq, ct) => {
-            if (!receiver) return; // dropped transfer; ignore tail records
-            const res = await receiver.accept(seq, ct);
-            if (!res.ok) {
-                log('err', `record ${seq} rejected (${res.reason})`);
-                receiver = null;
-                send(P.build.fileNack('decrypt-failed'));
-            }
-        };
-
-        dc.onmessage = async (ev) => {
-            try {
-                if (abusiveTeardown) return;
-                const d = ev.data;
-                if (typeof d === 'string') {
-                    const msg = JSON.parse(d);
-                    const vr = P.validate(msg);
-                    if (!vr.ok) { log('warn', `drop: ${vr.error}`); return; }
-                    // Peer-controlled handlers that mutate state or run heavy
-                    // work on peer-supplied parameters: drop until both sides
-                    // confirm the fingerprint. Mirrors
-                    // VERIFIED_GATED_HANDLERS in src/public/receive.html.
-                    const verifiedGated = (
-                        msg.type === 'file-start' ||
-                        msg.type === 'file-end' ||
-                        msg.type === 'batch-end'
-                    );
-                    if (verifiedGated && !(weConfirmed && theyConfirmed)) {
-                        log('warn', `Dropping ${msg.type} from unverified peer`);
-                        return;
-                    }
-                    if (msg.type === 'sender-public-key') {
-                        const theirPub = await C.importPublicKey(msg.key);
-                        sessionKeys = await C.deriveSessionKeys(keyPair.privateKey, theirPub);
-                        const code = await C.getCombinedFingerprint(keyPair.publicKey, theirPub);
-                        const ok = autoAccept ? true : await window.__nodePromptFp(code);
-                        if (ok) {
-                            weConfirmed = true;
-                            send(P.build.fingerprintConfirmed());
-                            log('ok', 'Fingerprint confirmed');
-                        }
-                        else { send(P.build.fingerprintDenied()); log('err', 'Denied'); try { dc.close(); } catch {} }
-                    } else if (msg.type === 'fingerprint-confirmed') {
-                        theyConfirmed = true;
-                        log('dbg', 'sender confirmed');
-                    } else if (msg.type === 'fingerprint-denied') {
-                        log('err', 'sender denied');
-                        try { dc.close(); } catch {}
-                    } else if (msg.type === 'file-start') {
-                        if (msg.v !== 2) {
-                            log('err', `file-start with unsupported version (v=${msg.v}); nacking`);
-                            send(P.build.fileNack('unsupported-version'));
-                            return;
-                        }
-                        if (!sessionKeys) { log('err', 'file-start before key derived'); return; }
-                        receiver = SS.createReceiver({
-                            sessionKeys,
-                            saltB64: msg.salt,
-                            segCount: msg.segCount,
-                        });
-                        pending = null;
-                        wireNextSeq = 0;
-                        log('info', `Receiving file (${msg.segCount} segments)...`);
-                    } else if (msg.type === 'file-end') {
-                        recordChain = recordChain.then(async () => {
-                            if (!receiver) return;
-                            const r = receiver;
-                            receiver = null; pending = null;
-                            if (r.nextSeq !== r.segCount + 1) {
-                                log('err', `file-end after ${r.nextSeq}/${r.segCount + 1} records`);
-                                send(P.build.fileNack('incomplete'));
-                                return;
-                            }
-                            const { metadata, blob, compositeHashHex } = await r.finish();
-                            const b64 = arrayBufferToBase64(await blob.arrayBuffer());
-                            const path = await window.__nodeSaveFile(
-                                (metadata && metadata.name) || 'unnamed',
-                                (metadata && metadata.mimeType) || '', b64);
-                            send(P.build.fileAck(compositeHashHex));
-                            state.savedCount += 1;
-                            state.savedBytes += blob.size;
-                            log('ok', `Saved ${path} (${blob.size} bytes)`);
-                        }).catch((e) => {
-                            send(P.build.fileNack('decrypt-failed'));
-                            log('err', `finalize failed: ${e.message}`);
-                        });
-                        await recordChain;
-                    } else if (msg.type === 'batch-end') {
-                        log('ok', 'Batch ended');
-                    } else {
-                        log('dbg', `(ignored) ${msg.type}`);
-                    }
-                } else {
-                    // Binary chunk (ArrayBuffer because dc.binaryType = 'arraybuffer').
-                    // Streaming v2 record parser with the same defense-in-depth
-                    // bounds as transport-assembler.js handleBinaryV2: at most
-                    // one partial record buffered, ctLen hard-bounded, seq may
-                    // never skip ahead, session bytes capped.
-                    if (!(weConfirmed && theyConfirmed)) {
-                        return abortAbusive('binary chunk from unverified peer');
-                    }
-                    const len = d.byteLength | 0;
-                    if (sessionTotalBytes + len > P.MAX_TOTAL_SESSION_BYTES) {
-                        return abortAbusive(
-                            `session byte cap exceeded (${sessionTotalBytes + len} > ${P.MAX_TOTAL_SESSION_BYTES})`
-                        );
-                    }
-                    sessionTotalBytes += len;
-                    if (!receiver) return; // no transfer in flight: drop in O(1)
-
-                    const pendingLen = pending ? pending.length : 0;
-                    const merged = new Uint8Array(pendingLen + len);
-                    if (pendingLen) merged.set(pending, 0);
-                    merged.set(new Uint8Array(d), pendingLen);
-
-                    // Largest legal record ct: a full segment's plaintext
-                    // ([1B flags][4B dataLen] + SEG_SIZE) plus the GCM tag.
-                    const maxCt = P.SEG_SIZE + 21;
-                    let offset = 0;
-                    while (merged.length - offset >= 8) {
-                        const view = new DataView(merged.buffer, offset);
-                        const seq = view.getUint32(0, false);
-                        const ctLen = view.getUint32(4, false);
-                        if (ctLen < 16 || ctLen > maxCt) {
-                            return abortAbusive(`record ciphertext length ${ctLen} out of bounds`);
-                        }
-                        if (seq > wireNextSeq) {
-                            return abortAbusive(`record seq ${seq} skipped ahead of expected ${wireNextSeq}`);
-                        }
-                        if (merged.length - offset < 8 + ctLen) break; // partial record
-                        const ct = merged.slice(offset + 8, offset + 8 + ctLen);
-                        offset += 8 + ctLen;
-                        wireNextSeq = seq + 1;
-                        recordChain = recordChain
-                            .then(() => acceptRecord(seq, ct.buffer))
-                            .catch((e) => log('err', `record ${seq}: ${e.message}`));
-                    }
-                    pending = offset < merged.length ? merged.slice(offset) : null;
-                }
-            } catch (e) {
-                log('err', `handler: ${e.message}`);
-            }
-        };
+        const done = (st) => { try { window.__nodeDone(st); } catch (_) {} };
+        const session = createSession({
+            keyPair,
+            qrSecret,
+            send: (m) => dc.send(JSON.stringify(m)),
+            close: () => { try { dc.close(); } catch (_) {} try { pc.close(); } catch (_) {} },
+            done,
+            saveFile: (name, mime, b64) => window.__nodeSaveFile(name, mime, b64),
+        });
+        dc.onmessage = (ev) => session.onMessage(ev.data);
 
         dc.onclose = () => {
             polling = false;
             log('info', 'Data channel closed');
-            try { window.__nodeDone(state); } catch (_) {}
+            session.dispose();
+            done(session.state);
         };
 
         // First wire message: our public key.
-        send(P.build.publicKey(myPubB64));
+        dc.send(JSON.stringify(P.build.publicKey(myPubB64)));
     }
 
-    window.__wsCli = { start };
+    // createSession is exposed for test/unit/cli-shim.test.mjs.
+    window.__wsCli = { start, createSession };
 })();
