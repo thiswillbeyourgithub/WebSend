@@ -18,6 +18,7 @@ import { readFileSync } from 'node:fs';
 import { createContext, runInContext } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { makeSessionPair } from '../support/session-keys.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const js = p => path.resolve(__dirname, '../../public/js', p);
@@ -72,12 +73,7 @@ async function makeHarness(win, content, { corrupt = () => {} } = {}) {
     const PA = win.PayloadAssembler;
     const RF = win.ReceiveFlow;
 
-    const A = await C.generateKeyPair();
-    const B = await C.generateKeyPair();
-    const pubA = await C.importPublicKey(await C.exportPublicKey(A.publicKey));
-    const pubB = await C.importPublicKey(await C.exportPublicKey(B.publicKey));
-    const senderKeys = await C.deriveSessionKeys(A.privateKey, pubB);
-    const receiverKeys = await C.deriveSessionKeys(B.privateKey, pubA);
+    const { senderKeys, receiverKeys } = await makeSessionPair(C);
 
     // ---- receiver endpoint ----
     const images = [];

@@ -21,8 +21,8 @@ const VALID_CROP_CORNERS = {
 
 // ---- VERSION ----
 
-test('Protocol.VERSION is 1', () => {
-    assert.equal(VERSION, 1);
+test('Protocol.VERSION is 2 (QR-secret pairing clean break)', () => {
+    assert.equal(VERSION, 2);
 });
 
 // ---- validate: good messages ----
@@ -35,12 +35,25 @@ test('validate: sender-public-key with string key is ok', () => {
     assert.equal(validate({ type: 'sender-public-key', key: 'abc' }).ok, true);
 });
 
-test('validate: fingerprint-confirmed (no fields) is ok', () => {
-    assert.equal(validate({ type: 'fingerprint-confirmed' }).ok, true);
+test('validate: removed fingerprint-* types are now unknown', () => {
+    assert.equal(validate({ type: 'fingerprint-confirmed' }).ok, false);
+    assert.equal(validate({ type: 'fingerprint-denied' }).ok, false);
 });
 
-test('validate: fingerprint-denied (no fields) is ok', () => {
-    assert.equal(validate({ type: 'fingerprint-denied' }).ok, true);
+test('validate: key-confirm requires a bounded base64 ct', () => {
+    assert.equal(validate({ type: 'key-confirm', ct: 'AAAA' }).ok, true);
+    assert.equal(validate({ type: 'key-confirm' }).ok, false);
+    assert.equal(validate({ type: 'key-confirm', ct: 'not base64!' }).ok, false);
+    assert.equal(validate({ type: 'key-confirm', ct: 'A'.repeat(204) }).ok, false);
+    assert.equal(validate({ type: 'key-confirm', ct: 42 }).ok, false);
+});
+
+test('isCompatibleVersion: only the current version passes', () => {
+    const { isCompatibleVersion } = win.Protocol;
+    assert.equal(isCompatibleVersion(build.publicKey('k')), true);
+    assert.equal(isCompatibleVersion({ type: 'public-key', key: 'k', protocolVersion: 1 }), false);
+    assert.equal(isCompatibleVersion({ type: 'public-key', key: 'k' }), false);
+    assert.equal(isCompatibleVersion(null), false);
 });
 
 test('validate: ready (no fields) is ok', () => {
@@ -243,20 +256,20 @@ test('build.publicKey produces valid stamped message', () => {
     const m = build.publicKey('mykey');
     assert.equal(m.type, 'public-key');
     assert.equal(m.key, 'mykey');
-    assert.equal(m.protocolVersion, 1);
+    assert.equal(m.protocolVersion, 2);
     assert.equal(validate(m).ok, true);
 });
 
 test('build.senderPublicKey produces valid stamped message', () => {
     const m = build.senderPublicKey('k');
     assert.equal(validate(m).ok, true);
-    assert.equal(m.protocolVersion, 1);
+    assert.equal(m.protocolVersion, 2);
 });
 
-test('build.fingerprintConfirmed produces valid message', () => {
-    const m = build.fingerprintConfirmed();
+test('build.keyConfirm produces valid message', () => {
+    const m = build.keyConfirm('AAAA');
     assert.equal(validate(m).ok, true);
-    assert.equal(m.protocolVersion, 1);
+    assert.equal(m.protocolVersion, 2);
 });
 
 test('build.fileAck produces valid message', () => {
@@ -415,7 +428,7 @@ test('build.fileStartV2 produces a valid stamped v2 message', () => {
     assert.equal(m.segSize, SEG_SIZE);
     assert.equal(m.segCount, 7);
     assert.equal(m.salt, VALID_SALT);
-    assert.equal(m.protocolVersion, 1);
+    assert.equal(m.protocolVersion, 2);
     assert.equal(validate(m).ok, true);
 });
 

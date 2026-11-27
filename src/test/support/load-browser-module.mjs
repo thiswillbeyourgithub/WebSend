@@ -20,7 +20,9 @@ const stubLogger = {
 };
 
 export async function loadBrowserModule(filePath, extraGlobals = {}) {
-    const code = readFileSync(filePath, 'utf8');
+    // An array loads several scripts into the same context, in order
+    // (like consecutive <script> tags), for modules that depend on others.
+    const paths = Array.isArray(filePath) ? filePath : [filePath];
 
     const win = { logger: stubLogger, ...extraGlobals };
 
@@ -34,7 +36,7 @@ export async function loadBrowserModule(filePath, extraGlobals = {}) {
         ...extraGlobals,
     });
 
-    runInContext(code, context);
+    for (const p of paths) runInContext(readFileSync(p, 'utf8'), context);
 
     // Merge anything the script attached to window back into context.window
     Object.assign(context.window, context.window);

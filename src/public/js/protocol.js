@@ -4,7 +4,11 @@
  * Built with Claude Code (Opus 4.7).
  */
 (function () {
-    const PROTOCOL_VERSION = 1;
+    // v2: QR-secret pairing (HKDF mixes K from the QR fragment, encrypted
+    // key-confirm replaces the human-compared code). Clean break: a peer
+    // whose public-key carries another version is refused with a
+    // "reload the page" error (see isCompatibleVersion / pairing.js).
+    const PROTOCOL_VERSION = 2;
 
     // Hard upper bound on a single file. Bounds MAX_SEG_COUNT below, so a
     // hostile or buggy peer cannot request an oversized record stream or
@@ -64,6 +68,10 @@
         // base64 of exactly 16 bytes: 22 significant chars + '==' padding
         return typeof v === 'string' && /^[A-Za-z0-9+/]{22}==$/.test(v);
     }
+    function isKeyConfirmCt(v) {
+        // base64(IV(12) || ciphertext+tag); the real one is ~92 chars
+        return typeof v === 'string' && v.length <= 200 && /^[A-Za-z0-9+/]+={0,2}$/.test(v);
+    }
     function isSeqInRange(v) {
         return isNonNegativeInt(v) && v <= MAX_SEG_COUNT;
     }
@@ -122,8 +130,7 @@
     const schemas = {
         'public-key':              { required: { key: 'string' } },
         'sender-public-key':       { required: { key: 'string' } },
-        'fingerprint-confirmed':   {},
-        'fingerprint-denied':      {},
+        'key-confirm':             { required: { ct: isKeyConfirmCt } },
         'ready':                   {},
         'file-start':              { check: isFileStartShape },
         'file-end':                {},
@@ -181,13 +188,17 @@
         return { ok: true };
     }
 
+    /** True when the peer message was stamped with our protocol version. */
+    function isCompatibleVersion(msg) {
+        return !!msg && msg.protocolVersion === PROTOCOL_VERSION;
+    }
+
     function stamp(msg) { return Object.assign({ protocolVersion: PROTOCOL_VERSION }, msg); }
 
     const build = {
         publicKey:             (key)                     => stamp({ type: 'public-key',              key }),
         senderPublicKey:       (key)                     => stamp({ type: 'sender-public-key',       key }),
-        fingerprintConfirmed:  ()                        => stamp({ type: 'fingerprint-confirmed' }),
-        fingerprintDenied:     ()                        => stamp({ type: 'fingerprint-denied' }),
+        keyConfirm:            (ct)                      => stamp({ type: 'key-confirm',             ct }),
         ready:                 ()                        => stamp({ type: 'ready' }),
         fileStartV2:           (segCount, salt)          => stamp({ type: 'file-start',              v: 2, segSize: SEG_SIZE, segCount, salt }),
         fileEnd:               ()                        => stamp({ type: 'file-end' }),
@@ -209,7 +220,7 @@
     };
 
     // Freeze the build sub-object so a hostile script cannot swap
-    // build.fingerprintConfirmed / build.transformNack with a tampering
+    // build.keyConfirm / build.transformNack with a tampering
     // variant after this module has been loaded.
     Object.freeze(build);
     window.Protocol = Object.freeze({
@@ -221,6 +232,7 @@
         MAX_TRANSFORMS_PER_MSG,
         MAX_CONTROL_MSG_BYTES,
         validate,
+        isCompatibleVersion,
         build,
         _schemas: schemas,
     });

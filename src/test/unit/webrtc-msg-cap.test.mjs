@@ -64,8 +64,8 @@ test('handleMessage accepts a normal control message under the cap', () => {
     let captured = null;
     rtc.onMessage = (m) => { captured = m; };
 
-    const small = JSON.stringify({ type: 'fingerprint-confirmed' });
+    const small = JSON.stringify({ type: 'ready' });
     rtc.handleMessage(small);
-    assert.ok(captured && captured.type === 'fingerprint-confirmed',
+    assert.ok(captured && captured.type === 'ready',
         `onMessage should receive the parsed message, got: ${JSON.stringify(captured)}`);
 });

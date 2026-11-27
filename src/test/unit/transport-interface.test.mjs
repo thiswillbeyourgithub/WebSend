@@ -3,8 +3,8 @@
  * expected factory surface, returns instances that satisfy the duck-
  * typed Transport interface that the receiver and sender flows rely on,
  * and is frozen so a hostile script cannot swap a factory to hand back
- * a tampered transport (e.g. one whose sendMessage drops fingerprint-
- * confirmed or whose isVerified always returns true).
+ * a tampered transport (e.g. one whose sendMessage drops key-
+ * confirm or whose isVerified always returns true).
  *
  * Generated with the help of Claude Code.
  */

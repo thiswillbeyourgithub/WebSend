@@ -6,6 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadBrowserModule } from '../support/load-browser-module.mjs';
+import { makeSessionPair } from '../support/session-keys.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -41,15 +42,8 @@ const SEG = Protocol.SEG_SIZE;
 const HDR = SS.RECORD_HEADER_BYTES;
 
 /** Real ECDH/HKDF session key handles for a sender/receiver pair. */
-async function makePeers() {
-    const A = await C.generateKeyPair();
-    const B = await C.generateKeyPair();
-    const pubA = await C.importPublicKey(await C.exportPublicKey(A.publicKey));
-    const pubB = await C.importPublicKey(await C.exportPublicKey(B.publicKey));
-    return {
-        senderKeys: await C.deriveSessionKeys(A.privateKey, pubB),
-        receiverKeys: await C.deriveSessionKeys(B.privateKey, pubA),
-    };
+function makePeers() {
+    return makeSessionPair(C);
 }
 
 function patternedBytes(size) {

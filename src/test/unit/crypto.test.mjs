@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadBrowserModule } from '../support/load-browser-module.mjs';
+import { makeSessionPair } from '../support/session-keys.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -48,63 +49,139 @@ test('sha256Hex: deterministic for same input', async () => {
     assert.equal(h1, h2);
 });
 
-// ---- deriveSharedKey symmetry ----
+// ---- public key validation ----
 
-test('deriveSharedKey is symmetric across two key pairs', async () => {
-    const kpA = await C.generateKeyPair();
-    const kpB = await C.generateKeyPair();
-
-    const pubA = await C.exportPublicKey(kpA.publicKey);
-    const pubB = await C.exportPublicKey(kpB.publicKey);
-
-    const importedPubA = await C.importPublicKey(pubA);
-    const importedPubB = await C.importPublicKey(pubB);
-
-    // B derives using A's public key
-    const keyByB = await C.deriveSharedKey(kpB.privateKey, importedPubA);
-    // A derives using B's public key
-    const keyByA = await C.deriveSharedKey(kpA.privateKey, importedPubB);
-
-    // The keys are non-extractable, so prove symmetry by encrypting with
-    // one and decrypting with the other (raw WebCrypto; the module no
-    // longer exposes a whole-buffer encrypt helper).
-    const iv = C.getRandomBytes(12);
-    const plaintext = new TextEncoder().encode('symmetry check');
-    const ct = await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, keyByA, plaintext);
-    const pt = await globalThis.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, keyByB, ct);
-    assert.deepEqual(new Uint8Array(pt), plaintext);
+test('importPublicKey: rejects malformed keys before WebCrypto', async () => {
+    const kp = await C.generateKeyPair();
+    const good = await C.exportPublicKey(kp.publicKey);
+    assert.equal(C.decodePublicKeyBytes(good).length, 65);
+    await assert.rejects(() => C.importPublicKey('not base64!'));
+    await assert.rejects(() => C.importPublicKey('A'.repeat(300)));
+    await assert.rejects(() => C.importPublicKey(12));
+    // 65 bytes but compressed-point prefix instead of 0x04
+    const bad = Buffer.from(Buffer.from(good, 'base64').map((b, i) => (i === 0 ? 0x02 : b))).toString('base64');
+    await assert.rejects(() => C.importPublicKey(bad));
+    // wrong length (33 bytes)
+    await assert.rejects(() => C.importPublicKey(Buffer.alloc(33, 4).toString('base64')));
 });
 
-// ---- getKeyFingerprint ----
-//
-// Fingerprint length is fixed at 16 hex chars (64 bits), matching the
-// recognised floor for verbal-comparison fingerprints. Any reintroduction
-// of an adaptive / shorter mode would weaken MITM protection, so these
-// tests pin the format.
+// ---- QR secret K ----
 
-test('getKeyFingerprint: deterministic for same key', async () => {
-    const kp = await C.generateKeyPair();
-    const fp1 = await C.getKeyFingerprint(kp.publicKey);
-    const fp2 = await C.getKeyFingerprint(kp.publicKey);
-    assert.equal(fp1, fp2);
+test('generateQrSecret: 22-char base64url decoding to 16 bytes', () => {
+    const k = C.generateQrSecret();
+    assert.match(k, /^[A-Za-z0-9_-]{22}$/);
+    assert.equal(C.isQrSecret(k), true);
+    assert.equal(C.decodeQrSecret(k).length, 16);
+    assert.notEqual(C.generateQrSecret(), k);
 });
 
-test('getKeyFingerprint: fixed at 16 hex chars (64 bits, MITM floor)', async () => {
-    const kp = await C.generateKeyPair();
-    const fp = await C.getKeyFingerprint(kp.publicKey);
-    const hexOnly = fp.replace(/-/g, '');
-    assert.equal(hexOnly.length, 16);
-    // Grouped as XXXX-XXXX-XXXX-XXXX
-    assert.match(fp, /^[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/);
+test('decodeQrSecret: round-trips known bytes and rejects bad input', () => {
+    // bytes 0xfb 0xff ... exercise the url-safe '-' / '_' mapping
+    const raw = Buffer.from([0xfb, 0xff, 0xbf, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    const k = raw.toString('base64url');
+    assert.equal(k.length, 22);
+    assert.deepEqual(Buffer.from(C.decodeQrSecret(k)), raw);
+    assert.equal(C.isQrSecret(k + 'A'), false);
+    assert.equal(C.isQrSecret(k.slice(0, 21) + '+'), false);
+    assert.equal(C.isQrSecret(null), false);
+    assert.throws(() => C.decodeQrSecret('short'));
 });
 
-test('getKeyFingerprint: ignores extra args (no adaptive shortening)', async () => {
+// ---- session derivation + key-confirm ----
+
+/** Receiver/sender session handles (see test/support/session-keys.mjs). */
+async function makePair(crypto_ = C, override = {}) {
+    const { receiverKeys: receiver, senderKeys: sender } = await makeSessionPair(crypto_, override);
+    return { receiver, sender };
+}
+
+test('key-confirm: matching bindings open in both directions', async () => {
+    const { receiver, sender } = await makePair();
+    const r2s = await receiver.sealKeyConfirm('receiver-to-sender');
+    const s2r = await sender.sealKeyConfirm('sender-to-receiver');
+    assert.equal(await sender.openKeyConfirm('receiver-to-sender', r2s), true);
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', s2r), true);
+});
+
+test('key-confirm: a confirm never opens as the other direction (no reflection)', async () => {
+    const { receiver, sender } = await makePair();
+    const r2s = await receiver.sealKeyConfirm('receiver-to-sender');
+    // An attacker reflecting the receiver's own confirm back to it
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', r2s), false);
+    assert.equal(await sender.openKeyConfirm('sender-to-receiver', r2s), false);
+});
+
+test('key-confirm: a different K on one side changes the keys (confirm fails)', async () => {
+    const { receiver, sender } = await makePair(C, { sender: { qrSecret: C.generateQrSecret() } });
+    const s2r = await sender.sealKeyConfirm('sender-to-receiver');
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', s2r), false);
+});
+
+test('key-confirm: swapped public-key order fails', async () => {
+    // Same ECDH secret and K, but the sender binds the keys in the wrong
+    // role order: the master key differs, so the confirm must not open.
+    const kpR = await C.generateKeyPair();
+    const kpS = await C.generateKeyPair();
+    const pubR = await C.exportPublicKey(kpR.publicKey);
+    const pubS = await C.exportPublicKey(kpS.publicKey);
+    const qrSecret = C.generateQrSecret();
+    const receiver = await C.deriveSessionKeys(kpR.privateKey, await C.importPublicKey(pubS),
+        { receiverPub: pubR, senderPub: pubS, qrSecret });
+    const sender = await C.deriveSessionKeys(kpS.privateKey, await C.importPublicKey(pubR),
+        { receiverPub: pubS, senderPub: pubR, qrSecret });
+    const s2r = await sender.sealKeyConfirm('sender-to-receiver');
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', s2r), false);
+});
+
+test('key-confirm: MITM-substituted public key fails even with the right K', async () => {
+    // The MITM relays its own key M to the receiver as "sender" and to the
+    // sender as "receiver". Even if M somehow knew K, each honest side binds
+    // the keys it saw, so the confirms cannot line up across the two halves.
+    const kpR = await C.generateKeyPair();
+    const kpS = await C.generateKeyPair();
+    const kpM = await C.generateKeyPair();
+    const [pubR, pubS, pubM] = await Promise.all([kpR, kpS, kpM].map(k => C.exportPublicKey(k.publicKey)));
+    const qrSecret = C.generateQrSecret();
+    const receiver = await C.deriveSessionKeys(kpR.privateKey, await C.importPublicKey(pubM),
+        { receiverPub: pubR, senderPub: pubM, qrSecret });
+    const sender = await C.deriveSessionKeys(kpS.privateKey, await C.importPublicKey(pubM),
+        { receiverPub: pubM, senderPub: pubS, qrSecret });
+    const s2r = await sender.sealKeyConfirm('sender-to-receiver');
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', s2r), false);
+});
+
+test('key-confirm: garbage and tampered ciphertexts are rejected', async () => {
+    const { receiver, sender } = await makePair();
+    const s2r = await sender.sealKeyConfirm('sender-to-receiver');
+    const bytes = Buffer.from(s2r, 'base64');
+    bytes[bytes.length - 1] ^= 1;
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', bytes.toString('base64')), false);
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', 'AAAA'), false);
+    assert.equal(await receiver.openKeyConfirm('sender-to-receiver', '!!!'), false);
+    await assert.rejects(() => receiver.openKeyConfirm('sideways', s2r));
+});
+
+test('deriveSessionKeys: refuses a missing or malformed binding', async () => {
     const kp = await C.generateKeyPair();
-    // Older call sites passed a length; the new API takes only the key. A
-    // stray second arg must NOT shorten the output, otherwise an attacker
-    // (or a regressed caller) could weaken the verification code.
-    const fp = await C.getKeyFingerprint(kp.publicKey, 3);
-    assert.equal(fp.replace(/-/g, '').length, 16);
+    const pub = await C.exportPublicKey(kp.publicKey);
+    const imported = await C.importPublicKey(pub);
+    await assert.rejects(() => C.deriveSessionKeys(kp.privateKey, imported));
+    await assert.rejects(() => C.deriveSessionKeys(kp.privateKey, imported,
+        { receiverPub: pub, senderPub: pub, qrSecret: 'tooshort' }));
+    await assert.rejects(() => C.deriveSessionKeys(kp.privateKey, imported,
+        { receiverPub: pub, senderPub: 'x', qrSecret: C.generateQrSecret() }));
+});
+
+test('deriveFileKey: K changes the file key', async () => {
+    const same = await makePair();
+    const diff = await makePair(C, { sender: { qrSecret: C.generateQrSecret() } });
+    const data = new Uint8Array([1, 2, 3]);
+    const ctSame = await C.sealSegment(await same.sender.deriveFileKey(new Uint8Array(16)), 0, true, data);
+    const out = await C.openSegment(await same.receiver.deriveFileKey(new Uint8Array(16)), 0, true, ctSame);
+    assert.deepEqual(new Uint8Array(out), data);
+    const ctDiff = await C.sealSegment(await diff.sender.deriveFileKey(new Uint8Array(16)), 0, true, data);
+    const wrongKey = await diff.receiver.deriveFileKey(new Uint8Array(16));
+    await assert.rejects(() => C.openSegment(wrongKey, 0, true, ctDiff));
 });
 
 // ---- v2 chunked AEAD segments (STREAM construction) ----
@@ -129,12 +206,7 @@ const CG = winGz.WebSendCrypto;
  * key from one salt, mirroring a real sender/receiver pair.
  */
 async function makeFileKeyPair(crypto_, salt) {
-    const kpA = await crypto_.generateKeyPair();
-    const kpB = await crypto_.generateKeyPair();
-    const pubA = await crypto_.importPublicKey(await crypto_.exportPublicKey(kpA.publicKey));
-    const pubB = await crypto_.importPublicKey(await crypto_.exportPublicKey(kpB.publicKey));
-    const keysA = await crypto_.deriveSessionKeys(kpA.privateKey, pubB);
-    const keysB = await crypto_.deriveSessionKeys(kpB.privateKey, pubA);
+    const { receiver: keysA, sender: keysB } = await makePair(crypto_);
     return {
         keysA,
         keysB,
@@ -164,25 +236,6 @@ test('buildSegmentNonce: rejects out-of-range seq', () => {
     assert.throws(() => C.buildSegmentNonce(-1, false));
     assert.throws(() => C.buildSegmentNonce(2 ** 32, false));
     assert.throws(() => C.buildSegmentNonce(1.5, false));
-});
-
-test('deriveSessionKeys: sharedKey matches deriveSharedKey and is symmetric', async () => {
-    const kpA = await C.generateKeyPair();
-    const kpB = await C.generateKeyPair();
-    const pubA = await C.importPublicKey(await C.exportPublicKey(kpA.publicKey));
-    const keysB = await C.deriveSessionKeys(kpB.privateKey, pubA);
-    const pubB = await C.importPublicKey(await C.exportPublicKey(kpB.publicKey));
-    const legacyA = await C.deriveSharedKey(kpA.privateKey, pubB);
-
-    // Both keys are non-extractable; parity is proven by a raw WebCrypto
-    // encrypt-with-one / decrypt-with-the-other round trip.
-    const iv = C.getRandomBytes(12);
-    const plaintext = new TextEncoder().encode('session key parity');
-    const ct = await globalThis.crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv }, keysB.sharedKey, plaintext);
-    const pt = await globalThis.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv }, legacyA, ct);
-    assert.deepEqual(new Uint8Array(pt), plaintext);
 });
 
 test('deriveFileKey: rejects bad salts', async () => {

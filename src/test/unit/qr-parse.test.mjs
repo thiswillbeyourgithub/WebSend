@@ -28,26 +28,29 @@ function load() {
 }
 
 const ORIGIN = 'https://websend.example.org';
-const VALID_SECRET = 'AbCdEfGhIjKlMnOpQrStUv'; // 22 base64url chars
+const VALID_SECRET = 'AbCdEfGhIjKlMnOpQrStUv'; // 22 base64url chars (room secret)
+const VALID_K = 'Zy9_-xWvUtSrQpOnMlKjIh'; // 22 base64url chars (QR secret K)
+const FRAG = `${VALID_SECRET}:${VALID_K}`;
 
 test('valid same-origin URL is accepted', () => {
     const { parseSendInvite } = load();
-    const r = parseSendInvite(`${ORIGIN}/send/ABC123#${VALID_SECRET}`, ORIGIN);
+    const r = parseSendInvite(`${ORIGIN}/send/ABC123#${FRAG}`, ORIGIN);
     assert.equal(r.ok, true);
     assert.equal(r.roomId, 'ABC123');
     assert.equal(r.secret, VALID_SECRET);
+    assert.equal(r.qrSecret, VALID_K);
 });
 
 test('valid same-origin URL is uppercased', () => {
     const { parseSendInvite } = load();
-    const r = parseSendInvite(`${ORIGIN}/send/abc123#${VALID_SECRET}`, ORIGIN);
+    const r = parseSendInvite(`${ORIGIN}/send/abc123#${FRAG}`, ORIGIN);
     assert.equal(r.ok, true);
     assert.equal(r.roomId, 'ABC123');
 });
 
 test('foreign-origin URL is refused even with valid room/secret shape', () => {
     const { parseSendInvite } = load();
-    const r = parseSendInvite(`https://attacker.example/send/ABC123#${VALID_SECRET}`, ORIGIN);
+    const r = parseSendInvite(`https://attacker.example/send/ABC123#${FRAG}`, ORIGIN);
     assert.equal(r.ok, false);
     assert.equal(r.reason, 'foreign-origin');
     assert.equal(r.foreignOrigin, 'https://attacker.example');
@@ -56,21 +59,21 @@ test('foreign-origin URL is refused even with valid room/secret shape', () => {
 test('foreign-origin with different port is refused', () => {
     const { parseSendInvite } = load();
     // Same host, different port still counts as different origin.
-    const r = parseSendInvite(`https://websend.example.org:8443/send/ABC123#${VALID_SECRET}`, ORIGIN);
+    const r = parseSendInvite(`https://websend.example.org:8443/send/ABC123#${FRAG}`, ORIGIN);
     assert.equal(r.ok, false);
     assert.equal(r.reason, 'foreign-origin');
 });
 
 test('http vs https on same host is refused as foreign origin', () => {
     const { parseSendInvite } = load();
-    const r = parseSendInvite(`http://websend.example.org/send/ABC123#${VALID_SECRET}`, ORIGIN);
+    const r = parseSendInvite(`http://websend.example.org/send/ABC123#${FRAG}`, ORIGIN);
     assert.equal(r.ok, false);
     assert.equal(r.reason, 'foreign-origin');
 });
 
 test('bare path with no scheme/host is allowed (manual entry)', () => {
     const { parseSendInvite } = load();
-    const r = parseSendInvite(`/send/ABC123#${VALID_SECRET}`, ORIGIN);
+    const r = parseSendInvite(`/send/ABC123#${FRAG}`, ORIGIN);
     assert.equal(r.ok, true);
     assert.equal(r.roomId, 'ABC123');
 });
@@ -109,6 +112,32 @@ test('javascript: pseudo-URL is treated as foreign and refused', () => {
     // URL("javascript:...") parses; origin is "null". Either way the
     // current-origin check must reject it so we never act on a scheme
     // unrelated to https.
-    const r = parseSendInvite('javascript:alert(1)/send/ABC123#' + VALID_SECRET, ORIGIN);
+    const r = parseSendInvite('javascript:alert(1)/send/ABC123#' + FRAG, ORIGIN);
     assert.equal(r.ok, false);
+});
+
+test('old invite without K refused as outdated-link', () => {
+    const { parseSendInvite } = load();
+    const r = parseSendInvite(`${ORIGIN}/send/ABC123#${VALID_SECRET}`, ORIGIN);
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'outdated-link');
+    assert.equal(r.roomId, 'ABC123');
+});
+
+test('K with wrong length or charset is not accepted', () => {
+    const { parseSendInvite } = load();
+    // 21 chars: too short
+    assert.equal(parseSendInvite(`${ORIGIN}/send/ABC123#${VALID_SECRET}:${VALID_K.slice(1)}`, ORIGIN).ok, false);
+    // 23 chars: too long
+    assert.equal(parseSendInvite(`${ORIGIN}/send/ABC123#${VALID_SECRET}:${VALID_K}A`, ORIGIN).ok, false);
+    // '+' is base64, not base64url
+    const plus = VALID_K.slice(0, 21) + '+';
+    assert.equal(parseSendInvite(`${ORIGIN}/send/ABC123#${VALID_SECRET}:${plus}`, ORIGIN).ok, false);
+});
+
+test('K case is preserved (it is key material, unlike the room id)', () => {
+    const { parseSendInvite } = load();
+    const r = parseSendInvite(`${ORIGIN}/send/abc123#${FRAG}`, ORIGIN);
+    assert.equal(r.roomId, 'ABC123');
+    assert.equal(r.qrSecret, VALID_K);
 });

@@ -208,7 +208,7 @@ test('buffers pre-winner messages and replays them in order when that inner wins
     // handshake hangs, verification modal never shows.
     ws._markConnected();
     ws.onMessage({ type: 'public-key', key: 'k1' });
-    ws.onMessage({ type: 'fingerprint-confirmed' });
+    ws.onMessage({ type: 'ready' });
     assert.deepEqual(received, [], 'nothing should be delivered before a winner is locked');
 
     // WebRTC fails -> WS wins immediately and replays its buffer in order.
@@ -216,7 +216,7 @@ test('buffers pre-winner messages and replays them in order when that inner wins
     assert.equal(t.winner, 'ws');
     assert.deepEqual(received, [
         { type: 'public-key', key: 'k1' },
-        { type: 'fingerprint-confirmed' },
+        { type: 'ready' },
     ], 'buffered messages must be replayed in arrival order on winner lock');
     t.close();
 });
