@@ -12,7 +12,7 @@
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/svg+xml" href="/icons/icon.svg">
     <link rel="apple-touch-icon" href="/icons/icon-192.png">
-    <link rel="stylesheet" href="/css/style.css" integrity="sha384-M6EfJEFSSiFcK43cAFF+il/uKGmAYB7DXuDC6YM2sTwxXhJ3bhuvsGbS99xEA7xh" crossorigin="anonymous">
+    <link rel="stylesheet" href="/css/style.css" integrity="sha384-I7DZdrsdkUGCnKQ3AMopi2Nb2dYcbq4OfhQc5bJrFJGgFi/sbWlhgaX9wam+NmXx" crossorigin="anonymous">
     <!-- QR Scanner library - lightweight (local copy to avoid CDN issues) -->
     <script src="/js/jsqr.min.js" integrity="sha384-9Q0jWoineiIq95JeIyBsNV90KKLfDsbkj29k/YFxf76a2JwkHDYkMuSbNGN6XJfV" crossorigin="anonymous"></script>
 </head>
@@ -64,34 +64,6 @@
         <div id="step-connecting" class="hidden">
             <div class="status status-info" id="connection-status" data-i18n="send.connecting">
                 Connecting to receiver...
-            </div>
-        </div>
-
-        <!-- Security verification modal (blocking) -->
-        <div id="verification-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
-            <div class="verify-card">
-                <h2 class="verify-title" data-i18n="verify.title">🔒 Verify Connection</h2>
-                <p class="verify-instruction" data-i18n="verify.instruction">
-                    Check that the code below is identical on both devices. Only confirm if they match.
-                </p>
-
-                <div class="verify-codes">
-                    <div class="verify-code-block">
-                        <span class="verify-code-label" data-i18n="verify.codeLabel">Verification code</span>
-                        <p id="verification-code" class="verify-fingerprint">----</p>
-                    </div>
-                </div>
-
-                <p class="verify-warning" data-i18n="verify.warning">
-                    ⚠️ If codes don't match, someone may be intercepting the connection!
-                </p>
-
-                <button id="confirm-match-btn" class="btn btn-action btn-success verify-confirm-btn" data-i18n="verify.confirm">
-                    ✓ Yes, codes match
-                </button>
-                <button id="deny-match-btn" class="btn btn-action btn-secondary verify-deny-btn" data-i18n="verify.deny">
-                    ✗ No, cancel connection
-                </button>
             </div>
         </div>
 
@@ -275,7 +247,7 @@
 
     <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-Y3Y5l6ruwQFGqsnnzpmwtM8FuWg7EE3KvCSERuYdqd5kqo3cw9AOr7ui82FZG/d+"></script>
+    <script src="/js/i18n.js" integrity="sha384-kA0MKYtUv1BsFRljRwCMP6CHchs3whz5MY6l3PvaEYi1c6KO/I6BpJnifXIFyyMB"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-NIAxgFpCiKxMztVPINLp4nIsI01Cm7Z5ICOsouZAgXMoIJKINRvUrg/SB9bggSpb"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>
@@ -292,7 +264,6 @@
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-OB4QY3CCpEJiptMsiTcPnBGnoDm2iqtD5/EoKp6OeKJD0VOsSHt4bV+9OGFGEDfI"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-y1MKLIIjfJYVE55Bz7HRv/AnOVpiNy8pMIJ4XjZkt9s4A6CK1Py6WqK8RNimoZ9g"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-LTPGF18+5jFBGR0I9E2w/S8qCTnPg31f9dtJwBFDrgGI1HalzQMpKf/9ZrcT9zM6"></script>
-    <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
     <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-kqKox21EzlwQNYvW5jjw+l8Vg0WYr12f9JW0Up/J1y0E6t8Bo6CttpgU8WFftyIR"></script>
     <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-fWNrlVLenmVn+56VjqDGgZNtOre79gJmLrF2Ihx193rjXDX4au5f/ikXI1XNlMA7"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-oNJ9NYzzBe1fjLdZ86HgaJlFl/dh/2c7Px4zR8tIRivB5wwO1g1BPGwuER0Kpzbg"></script>

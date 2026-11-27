@@ -58,13 +58,6 @@ test('window.Pairing is frozen', async () => {
     assert.equal(win.Pairing.create, original);
 });
 
-test('window.VerificationModal is frozen', async () => {
-    const code = readFileSync(path.join(pub, 'verification-modal.js'), 'utf8');
-    const dom = new JSDOM('<!doctype html><html><body><div id="verification-modal" class="hidden"></div></body></html>', { runScripts: 'outside-only' });
-    dom.window.eval(code);
-    assert.ok(Object.isFrozen(dom.window.VerificationModal), 'VerificationModal must be frozen');
-});
-
 test('window.SenderConnect is frozen', async () => {
     // sender-connect.js uses IIFE wrapper but only reads Protocol /
     // WebSendCrypto at call time, so loading it without those stubs is

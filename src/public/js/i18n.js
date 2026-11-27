@@ -251,15 +251,6 @@ const i18n = (function() {
             'crop.imageAlt': 'Image to crop',
 
             // Verification modal
-            'verify.title': '🔒 Verify Connection',
-            'verify.instruction': 'Check that the code below is identical on both devices. Only confirm if they match.',
-            'verify.codeLabel': 'Verification code',
-            'verify.warning': '⚠️ If the codes are different, someone may be intercepting the connection!',
-            'verify.confirm': '✓ Yes, codes match',
-            'verify.deny': '✗ No, cancel connection',
-            'verify.deniedBySender': 'Connection cancelled by sender - fingerprints did not match.\n\nThis could indicate a security issue. Please try again.',
-            'verify.deniedByReceiver': 'Connection cancelled by receiver - fingerprints did not match.\n\nThis could indicate a security issue. Please try again.',
-            'verify.selfDenied': 'Connection cancelled.\n\nIf the codes did not match, someone may have been intercepting the connection. Please try again in a secure environment.',
 
             // Connection types
             'connection.relay': '🔄 {details}',
@@ -555,15 +546,6 @@ const i18n = (function() {
             'crop.imageAlt': 'Image à recadrer',
 
             // Verification modal
-            'verify.title': '🔒 Vérifier la connexion',
-            'verify.instruction': 'Vérifiez que le code ci-dessous est identique sur les deux appareils. Ne confirmez que s\'ils correspondent.',
-            'verify.codeLabel': 'Code de vérification',
-            'verify.warning': '⚠️ Si les codes sont différents, quelqu\'un peut intercepter la connexion !',
-            'verify.confirm': '✓ Oui, les codes correspondent',
-            'verify.deny': '✗ Non, annuler la connexion',
-            'verify.deniedBySender': 'Connexion annulée par l\'expéditeur - les empreintes ne correspondaient pas.\n\nCela pourrait indiquer un problème de sécurité. Veuillez réessayer.',
-            'verify.deniedByReceiver': 'Connexion annulée par le destinataire - les empreintes ne correspondaient pas.\n\nCela pourrait indiquer un problème de sécurité. Veuillez réessayer.',
-            'verify.selfDenied': 'Connexion annulée.\n\nSi les codes ne correspondaient pas, quelqu\'un a peut-être intercepté la connexion. Veuillez réessayer dans un environnement sécurisé.',
 
             // Connection types
             'connection.relay': '🔄 {details}',
