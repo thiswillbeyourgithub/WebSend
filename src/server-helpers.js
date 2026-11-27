@@ -1,7 +1,7 @@
 /**
  * Pure helper functions extracted from server.js for unit-testability.
  * These functions have no side-effects beyond their return values and
- * depend only on Node's built-in `crypto` module.
+ * depend only on Node's built-in `crypto` and `net` modules.
  *
  * server.js requires this module and uses these functions directly — there is
  * no separate copy in server.js.
@@ -10,6 +10,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const net = require('net');
 
 const ROOM_ID_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No ambiguous chars (0,O,1,I,l)
 
@@ -72,6 +73,49 @@ function generateTurnCredentials(turnSecret, ttlSeconds, nowFn = Date.now) {
 }
 
 /**
+ * Expand an IPv6 address into its 8 hextets (numbers), or null when the
+ * input is not IPv6. Handles `::` compression, a zone id (`%eth0`) and a
+ * trailing dotted IPv4 (`::ffff:1.2.3.4`, which fills the last two hextets).
+ * @param {string} addr
+ * @returns {number[]|null}
+ */
+function ipv6Hextets(addr) {
+    if (!net.isIPv6(addr)) return null;
+    let s = addr.split('%')[0];
+    const dotted = s.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+    if (dotted) {
+        const o = dotted[2].split('.').map(Number);
+        s = `${dotted[1]}${((o[0] << 8) | o[1]).toString(16)}:${((o[2] << 8) | o[3]).toString(16)}`;
+    }
+    const [head, tail] = s.includes('::') ? s.split('::') : [s, null];
+    const left = head === '' ? [] : head.split(':');
+    const right = tail === null || tail === '' ? [] : tail.split(':');
+    const fill = tail === null ? [] : new Array(8 - left.length - right.length).fill('0');
+    return [...left, ...fill, ...right].map(h => parseInt(h, 16));
+}
+
+/**
+ * Key under which a client address is counted by per-client limits.
+ * IPv4 is kept as is; IPv4-mapped IPv6 (`::ffff:a.b.c.d`) collapses to
+ * `a.b.c.d`; any other IPv6 address becomes its /64 prefix, because one
+ * host (or one customer line) usually owns a whole /64 and can rotate
+ * through it freely. Missing input gives 'unknown', non-IP input is
+ * returned unchanged.
+ * @param {string|undefined} addr
+ * @returns {string} e.g. '2001:db8:1:2::/64'
+ */
+function clientIpKey(addr) {
+    if (typeof addr !== 'string' || addr.length === 0) return 'unknown';
+    if (net.isIPv4(addr)) return addr;
+    const h = ipv6Hextets(addr);
+    if (h === null) return addr;
+    if (h.slice(0, 5).every(x => x === 0) && h[5] === 0xffff) {
+        return [h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff].join('.');
+    }
+    return `${h.slice(0, 4).map(x => x.toString(16)).join(':')}::/64`;
+}
+
+/**
  * Check whether an origin is allowed.
  * Returns true if no origin (non-browser request) or if origin is in allowedOrigins.
  * @param {string|undefined} origin
@@ -89,5 +133,6 @@ module.exports = {
     secureCompare,
     generateTurnCredentials,
     isOriginAllowed,
+    clientIpKey,
     ROOM_ID_CHARS,
 };

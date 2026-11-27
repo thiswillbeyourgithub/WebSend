@@ -11,6 +11,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const { version: APP_VERSION } = require('./package.json');
 const helpers = require('./server-helpers');
+const proxyaddr = require('proxy-addr');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 8080;
@@ -458,14 +459,27 @@ const RATE_LIMIT_CONFIG = {
 };
 
 /**
- * Get client IP from Express request.
- * Uses req.ip which respects the 'trust proxy' setting - it will use
- * X-Forwarded-For only when the request comes from a trusted proxy (loopback).
- * @param {Request} req - Express request
- * @returns {string} Client IP address
+ * Real client address of a request, honouring the 'trust proxy' setting:
+ * X-Forwarded-For is only believed when the peer is a trusted proxy.
+ * Works on both Express requests and raw upgrade requests (which have no
+ * req.ip), using the same compiled trust function Express uses for req.ip.
+ * Use this for logs; use getClientIp() for keying limits.
+ * @param {http.IncomingMessage} req
+ * @returns {string|undefined}
+ */
+function getClientAddress(req) {
+    return proxyaddr(req, app.get('trust proxy fn'));
+}
+
+/**
+ * Key a client is counted under by per-client limits (rate limiter, live
+ * room cap). IPv6 clients count as their whole /64 and IPv4-mapped IPv6
+ * as the plain IPv4, see helpers.clientIpKey.
+ * @param {http.IncomingMessage} req
+ * @returns {string} e.g. '203.0.113.7' or '2001:db8:1:2::/64'
  */
 function getClientIp(req) {
-    return req.ip || 'unknown';
+    return helpers.clientIpKey(getClientAddress(req));
 }
 
 /**
@@ -974,7 +988,7 @@ app.post('/api/rooms', rateLimitMiddleware('roomCreation'), (req, res) => {
     });
 
     console.log(`Room ${roomId} created`);
-    debugLog('ROOM', `Room created`, { roomId, clientIp: getClientIp(req) });
+    debugLog('ROOM', `Room created`, { roomId, clientIp: getClientAddress(req) });
     // Return both roomId and secret; secret is included in QR code URL
     res.json({ roomId, secret });
 });
@@ -1924,8 +1938,10 @@ httpServer.on('upgrade', (req, socket, head) => {
     // Per-IP rate limit. Reuses the existing 'general' category (100/min)
     // so a hostile client cannot pin slots by reconnecting in a tight
     // loop. We can't go through the Express middleware on upgrade so we
-    // call checkRateLimit directly.
-    const ip = req.socket.remoteAddress || 'unknown';
+    // call checkRateLimit directly. Keyed like the HTTP routes (trust
+    // proxy honoured, IPv6 /64), so a WS upgrade and the LP fallback
+    // share one bucket and clients behind Caddy are not all 'loopback'.
+    const ip = getClientIp(req);
     if (!RATE_LIMIT_DISABLED) {
         const rl = checkRateLimit(ip, 'general');
         if (!rl.allowed) {
