@@ -2,7 +2,7 @@
  * Two-peer round-trip E2E test.
  *
  * Opens receive.html in context A, extracts the room URL from the page,
- * opens send.html in context B at that URL, accepts fingerprints on both sides,
+ * opens send.html in context B at that URL, waits for the key-confirm to bind,
  * sends a file, and verifies the receiver gets it.
  */
 

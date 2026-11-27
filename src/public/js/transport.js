@@ -60,7 +60,7 @@
 
     // Bound on how many pre-winner inbound messages we buffer per inner.
     // Only control messages flow before a winner is locked (public-key,
-    // and at most a fingerprint-confirmed / ready behind it), so this is
+    // and at most a key-confirm / ready behind it), so this is
     // comfortably above any legitimate need while denying a hostile relay
     // an unbounded queue.
     const MAX_PENDING_MSGS = 16;
@@ -578,7 +578,7 @@
 
     // Frozen so a hostile script cannot swap the factories with one that
     // returns a tampered transport (e.g. one whose sendMessage silently
-    // drops fingerprint-confirmed, or whose isVerified always returns
+    // drops key-confirm, or whose isVerified always returns
     // true). Matches the freeze of WebSendCrypto/Protocol/SenderConnect.
     window.Transport = Object.freeze({
         createForReceiver,

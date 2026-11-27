@@ -8,38 +8,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
-import { loadBrowserModule } from '../support/load-browser-module.mjs';
+import { loadPairingWindow, makePairingPeers } from '../support/pairing-peers.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const js = (f) => path.resolve(__dirname, '../../public/js', f);
-
-const win = await loadBrowserModule([js('crypto.js'), js('protocol.js'), js('pairing.js')], {
-    TextEncoder, TextDecoder,
-    btoa: globalThis.btoa, atob: globalThis.atob,
-    setTimeout, clearTimeout,
-});
+const win = await loadPairingWindow();
 const { WebSendCrypto: C, Protocol: P, Pairing } = win;
-
-/** Two Pairing instances plus their public-key messages. */
-async function makePeers({ senderK, receiverK, timeoutMs } = {}) {
-    const K = C.generateQrSecret();
-    const kpR = await C.generateKeyPair();
-    const kpS = await C.generateKeyPair();
-    const events = { receiver: [], sender: [] };
-    const mk = (role, keyPair, qrSecret) => Pairing.create({
-        role, keyPair, qrSecret,
-        confirmTimeoutMs: timeoutMs,
-        onBound: () => events[role].push('bound'),
-        onFailed: (reason) => events[role].push(`failed:${reason}`),
-    });
-    const receiver = mk('receiver', kpR, receiverK || K);
-    const sender = mk('sender', kpS, senderK || K);
-    const rPubMsg = P.build.publicKey(await C.exportPublicKey(kpR.publicKey));
-    const sPubMsg = P.build.senderPublicKey(await C.exportPublicKey(kpS.publicKey));
-    return { receiver, sender, rPubMsg, sPubMsg, events, K };
-}
+const makePeers = (opts) => makePairingPeers(win, opts);
 
 /** Run the full exchange: keys both ways, then confirms both ways. */
 async function exchange(p) {

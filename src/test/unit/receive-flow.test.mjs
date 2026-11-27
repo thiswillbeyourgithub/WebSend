@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
+import { loadPairingWindow, makePairingPeers } from '../support/pairing-peers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const modulePath = path.resolve(__dirname, '../../public/js/receive-flow.js');
@@ -304,6 +305,51 @@ test('v2 file-start without session keys is ignored; later segments are no-ops',
     await win.ReceiveFlow.handleFileSegment({ type: 'file-segment', seq: 0, ct: new ArrayBuffer(32) });
     assert.equal(fake.calls.length, 0);
     assert.equal(deps.sent.length, 0, 'no nack spam for gated/ignored transfers');
+});
+
+// receive.html wires getSessionKeys to pairing.getSessionKeys(), which is
+// null until the sender's key-confirm opened. Drive a real receiver/sender
+// Pairing pair (real crypto, real K) and check the decrypt pipeline only
+// opens once bound, and never for a sender holding a different K.
+async function makeRealPairings(opts) {
+    const pw = await loadPairingWindow();
+    const p = await makePairingPeers(pw, opts);
+    const s = await p.sender.acceptPeerKey(p.rPubMsg);
+    await p.receiver.acceptPeerKey(p.sPubMsg);
+    return { receiver: p.receiver, sender: p.sender, senderConfirm: s.confirmMsg };
+}
+
+test('pairing gate: file-start is ignored until the sender key-confirm opens', async () => {
+    const fake = makeFakeReceiver();
+    const pair = await makeRealPairings();
+    const { win, createdWith } = setupV2(fake, {
+        optsExtra: { getSessionKeys: () => pair.receiver.getSessionKeys() },
+    });
+    // Keys derived but not bound yet: nothing reaches the SegmentReceiver.
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    assert.equal(createdWith.length, 0, 'no decryption before key-confirm');
+
+    const res = await pair.receiver.handleKeyConfirm(pair.senderConfirm);
+    assert.equal(res.status, 'bound');
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    assert.equal(createdWith.length, 1, 'file-start accepted once bound');
+    assert.equal(createdWith[0].sessionKeys, pair.receiver.getSessionKeys());
+    pair.receiver.reset();
+    pair.sender.reset();
+});
+
+test('pairing gate: a sender with a different QR secret never unlocks decryption', async () => {
+    const fake = makeFakeReceiver();
+    const pair = await makeRealPairings({ senderK: 'x'.repeat(22) });
+    const { win, createdWith } = setupV2(fake, {
+        optsExtra: { getSessionKeys: () => pair.receiver.getSessionKeys() },
+    });
+    const res = await pair.receiver.handleKeyConfirm(pair.senderConfirm);
+    assert.equal(res.status, 'failed');
+    await win.ReceiveFlow.handleFileStart(V2_START);
+    assert.equal(createdWith.length, 0, 'failed pairing keeps the pipeline closed');
+    pair.receiver.reset();
+    pair.sender.reset();
 });
 
 test('v2 resume: getResumeState reports the missing seq, applyResumeAck rekeys', async () => {

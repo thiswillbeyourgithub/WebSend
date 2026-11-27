@@ -5,8 +5,8 @@
  * client-side race coordinator suppresses the WebRTC inner and lets
  * the WS relay win immediately on relay-hello. Verifies:
  *
- *   1. Both pages reach the verification modal (so signaling + key
- *      exchange completed over the relay, not via WebRTC SDP).
+ *   1. Both pages bind their pairing (so signaling, key exchange and
+ *      key-confirm completed over the relay, not via WebRTC SDP).
  *   2. Sidebar reads "Relayed via HTTP(S) fallback".
  *   3. A file transfer round-trips and lands in #received-images.
  *
@@ -18,6 +18,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const net = require('net');
+const { pairAndVerify } = require('./helpers');
 
 const FIXTURE_PNG = path.resolve(__dirname, '../fixtures/test-image.png');
 
@@ -110,37 +111,12 @@ test.beforeAll(ensureFixture);
 test('two-peer round-trip via HTTP-relay fallback', async ({ browser }) => {
     const server = await startRelayServer();
     try {
-        const ctxA = await browser.newContext({ baseURL: server.baseURL });
-        const pageA = await ctxA.newPage();
-        await pageA.goto(server.baseURL + '/receive.html');
-
-        await pageA.waitForSelector('#qr-url-input', { timeout: 12000 });
-        const senderUrl = await pageA.inputValue('#qr-url-input');
-
-        const ctxB = await browser.newContext({ baseURL: server.baseURL });
-        const pageB = await ctxB.newPage();
-        await pageB.goto(senderUrl);
-        await pageB.waitForLoadState('domcontentloaded');
-
-        // The relay path skips ICE entirely, so reaching the verification
-        // modal here proves the WS relay completed pairing + key exchange.
-        await pageA.waitForFunction(
-            () => {
-                const m = document.getElementById('verification-modal');
-                return m && !m.classList.contains('hidden');
-            },
-            { timeout: 25000 }
-        );
-        await pageA.click('#confirm-match-btn');
-
-        await pageB.waitForFunction(
-            () => {
-                const m = document.getElementById('verification-modal');
-                return m && !m.classList.contains('hidden');
-            },
-            { timeout: 15000 }
-        ).catch(() => null);
-        await pageB.$eval('#confirm-match-btn', b => b.click()).catch(() => null);
+        // The relay path skips ICE entirely, so binding here proves the
+        // WS relay completed pairing, key exchange and key-confirm.
+        const { ctxA, pageA, ctxB, pageB } = await pairAndVerify(browser, {
+            baseURL: server.baseURL,
+            timeout: 25000,
+        });
 
         // Sidebar should announce the HTTP relay path. Localhost test runs
         // over plain HTTP, so we expect the HTTP (not HTTPS) label.

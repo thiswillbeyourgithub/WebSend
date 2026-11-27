@@ -95,15 +95,6 @@
             </div>
         </div>
 
-        <!-- Waiting for receiver confirmation -->
-        <div id="step-waiting-confirmation" class="hidden">
-            <div class="send-confirm-banner">
-                <p class="send-confirm-msg" data-i18n="send.waitingConfirmation">
-                    ⏳ Waiting for receiver to confirm...
-                </p>
-            </div>
-        </div>
-
         <!-- Step 3: Connected, choose photo source -->
         <div id="step-choose" class="hidden">
             <div class="status status-connected" data-i18n="send.connectedSecure">
@@ -284,25 +275,26 @@
 
     <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-nD+uDnd0spKtjKImNdv8f/pDD68fWVdD+45+ncCME6aBc8sLTlzdFV5/At5o0WHf"></script>
+    <script src="/js/i18n.js" integrity="sha384-Y3Y5l6ruwQFGqsnnzpmwtM8FuWg7EE3KvCSERuYdqd5kqo3cw9AOr7ui82FZG/d+"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-NIAxgFpCiKxMztVPINLp4nIsI01Cm7Z5ICOsouZAgXMoIJKINRvUrg/SB9bggSpb"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-ePBcYILqOC2z/L5IMDVjalantEKdHyrdTsPzMYdQ942k2Lrhp2tXMqOfEgIzwP0c"></script>
     <script src="/js/protocol.js" integrity="sha384-BQQiXInpk1cUFt3gmfsADoTZfI+XlFyyhhYtv4PI1TqxzSDdCalfEuDp0ZcDfBgp"></script>
+    <script src="/js/pairing.js" crossorigin="anonymous" integrity="sha384-GGKjPIamg18AyuJ/6WUjVm3o84IwmH4AW4pE99YkszhjB1o4++PdZ8WFOmsUo6k/"></script>
     <script src="/js/webrtc.js" integrity="sha384-HJ/v/3mG/hyisilr1BxkrF0PsJDzaCr+6P/ScK179IqegdUGh063zv0TGyhBDZhh"></script>
     <script src="/js/transport-assembler.js" integrity="sha384-UCZoJWT8EYqihn3Wsw1PE/M5u+eXT5QMZY2Rvs2ezp2c6HeHXvQLhes/dsoslCIU"></script>
     <script src="/js/segment-stream.js" integrity="sha384-vYPirWIlAZuqrya8JHRylowxpn1RbvWAk0pe/MYpISoweEkzL21qRY+VXO29UVMk"></script>
-    <script src="/js/ws-transport.js" integrity="sha384-miuNrG+BxQYrrcCWC6mZJW9LxGtGo20YuczZ2lv1RDcNE5JvH7nbGSDGd6wi4EeJ"></script>
+    <script src="/js/ws-transport.js" integrity="sha384-H7HxKlRnaqe2hZc2viYROwITnrAPib1hwXV7+db73FawkRaSyUm0FhYzbnGF2QMm"></script>
     <script src="/js/lp-transport.js" integrity="sha384-OMvnHUPFdfzo1gMTyz63wLc5YbPsTY3XmZwUeuloaodOWMSTBGpE0ZjkK4hmywyG"></script>
-    <script src="/js/transport.js" integrity="sha384-oaQoZCZphIZc1aM+yiLXEQKPwgV99/7cViNCCqFIoeKoGrblZhPFonyw9yFb5lKR"></script>
+    <script src="/js/transport.js" integrity="sha384-WjxdhT5SLtb79N47enD3U7xndWMwFWHdCrTBIyeq8NiZ5uaHYFPQJZv+QxJv7uWg"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-OB4QY3CCpEJiptMsiTcPnBGnoDm2iqtD5/EoKp6OeKJD0VOsSHt4bV+9OGFGEDfI"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-y1MKLIIjfJYVE55Bz7HRv/AnOVpiNy8pMIJ4XjZkt9s4A6CK1Py6WqK8RNimoZ9g"></script>
     <script src="/js/peer-ui.js" crossorigin="anonymous" integrity="sha384-LTPGF18+5jFBGR0I9E2w/S8qCTnPg31f9dtJwBFDrgGI1HalzQMpKf/9ZrcT9zM6"></script>
     <script src="/js/verification-modal.js" crossorigin="anonymous" integrity="sha384-M2sDR/YWBqZcvU4QpxY8M0tYwbTC1I1VCt5aSw/RhSUvO/+8ZSKdjZ1ZZPjMYMbh"></script>
-    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-Rr/6sbjEoTjFkoegB/kXKlEtfHNx15uvLd4xM6FpgulYoKE+1ZeBxgitaFVgVS6T"></script>
-    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-t2qb24cJLGmFTtOJZ6FHRhI97MaHtyarrj4MqY8QOsymtWHrqChBsOvDm+apmhCF"></script>
+    <script src="/js/sender-send.js" crossorigin="anonymous" integrity="sha384-kqKox21EzlwQNYvW5jjw+l8Vg0WYr12f9JW0Up/J1y0E6t8Bo6CttpgU8WFftyIR"></script>
+    <script src="/js/sender-connect.js" crossorigin="anonymous" integrity="sha384-fWNrlVLenmVn+56VjqDGgZNtOre79gJmLrF2Ihx193rjXDX4au5f/ikXI1XNlMA7"></script>
     <script src="/js/sender-camera.js" crossorigin="anonymous" integrity="sha384-oNJ9NYzzBe1fjLdZ86HgaJlFl/dh/2c7Px4zR8tIRivB5wwO1g1BPGwuER0Kpzbg"></script>
     <script src="/js/qr-parse.js" crossorigin="anonymous" integrity="sha384-fiB91TJX6OuODX2AZR9Y4w+pUnvesBO10HNDZmLYiJCNQT1WAEncV/DAPQhU2dpd"></script>
     <script src="/js/sender-gallery.js" crossorigin="anonymous" integrity="sha384-m5ywzA1eqOBVDeFTFz1RIDkk3wkfRye+99uTcpxf7sZ9iTbJA906VHTpm7dmteEB"></script>
@@ -366,7 +358,7 @@
             // heavy re-pair immediately: webrtc.js defers its disconnect
             // teardown while the page is hidden and re-arms a short recovery
             // grace on resume. Give ICE that window to self-heal (which avoids
-            // a fresh handshake and the re-verification modal); only fall back
+            // a fresh handshake and key-confirm); only fall back
             // to a full reconnect if it is still down afterward.
             if (SenderConnect.connectionLost()) {
                 logger.info('Page visible again, connection lost; waiting for ICE self-heal before reconnect');
@@ -384,7 +376,6 @@
         // UI Elements
         const stepScan = document.getElementById('step-scan');
         const stepConnecting = document.getElementById('step-connecting');
-        const stepWaitingConfirmation = document.getElementById('step-waiting-confirmation');
         const stepChoose = document.getElementById('step-choose');
         const stepCamera = document.getElementById('step-camera');
         const stepPreview = document.getElementById('step-preview');
@@ -392,57 +383,60 @@
 
         /**
          * Show a specific step div and hide all others.
-         * The send page is a linear wizard: scan -> connecting -> verification -> choose -> camera/file -> preview -> sent.
+         * The send page is a linear wizard: scan -> connecting (key exchange + key-confirm) -> choose -> camera/file -> preview -> sent.
          * @param {HTMLElement} step - The step container element to display
          */
         function showStep(step) {
-            [stepScan, stepConnecting, stepWaitingConfirmation, stepChoose, stepCamera, stepPreview, stepSent].forEach(s => {
+            [stepScan, stepConnecting, stepChoose, stepCamera, stepPreview, stepSent].forEach(s => {
                 s.classList.add('hidden');
             });
             step.classList.remove('hidden');
         }
 
         /**
-         * Extract room ID from URL path (/send/ROOMID)
-         * @returns {string|null} Room ID or null if not found
+         * Map a failed QrParse.parseSendInvite result to a user-facing
+         * error. Shared by the page-URL path (opened from a camera app)
+         * and the in-page scanner so both refuse the same invites.
+         * @returns {string} i18n message
          */
-        function getRoomIdFromUrl() {
-            const path = window.location.pathname;
-            const match = path.match(/\/send\/([A-Z0-9]{6})/i);
-            return match ? match[1].toUpperCase() : null;
-        }
-
-        /**
-         * Extract room secret from URL hash fragment (#SECRET).
-         * The secret is a base64url-encoded 16-byte random value.
-         * @returns {string|null} Room secret or null if not found
-         */
-        function getRoomSecretFromUrl() {
-            const hash = window.location.hash;
-            if (hash && hash.length > 1) {
-                return hash.substring(1); // Remove the '#' prefix
+        function inviteErrorMessage(r) {
+            if (r.reason === 'foreign-origin') {
+                logger.error(`Refusing invite for foreign origin: ${r.foreignOrigin}`);
+                return i18n.t('send.invalidQR.foreignOrigin');
             }
-            return null;
+            if (r.reason === 'secret-missing') {
+                logger.error('Invalid invite - room secret missing');
+                return i18n.t('send.invalidQR.secretMissing');
+            }
+            if (r.reason === 'outdated-link') {
+                logger.error('Invite has no QR secret (link from an older WebSend version)');
+                return i18n.t('send.invalidQR.outdatedLink');
+            }
+            logger.error('Invalid invite - no room ID found');
+            return i18n.t('send.invalidQR.noRoom');
         }
 
         async function init() {
             logger.info('Initializing sender...');
 
             // Check URL immediately before any async work so the UI updates
-            // right away when opened from a camera QR scanner app
-            const roomId = getRoomIdFromUrl();
-            const secret = getRoomSecretFromUrl();
-            if (roomId && secret) {
-                logger.info(`Room ID from URL: ${roomId}`);
+            // right away when opened from a camera QR scanner app. The
+            // query string is dropped: invites are /send/ROOM#SECRET:K.
+            const invite = window.location.pathname.startsWith('/send/')
+                ? QrParse.parseSendInvite(
+                    window.location.origin + window.location.pathname + window.location.hash,
+                    window.location.origin)
+                : null;
+            if (invite && invite.ok) {
+                logger.info(`Room ID from URL: ${invite.roomId}`);
                 showStep(stepConnecting);
                 document.getElementById('connection-status').textContent = i18n.t('send.connecting');
                 document.getElementById('connection-status').className = 'status status-info';
-            } else if (roomId) {
-                logger.error('Room secret missing from URL');
-                document.getElementById('connection-status').textContent = i18n.t('send.invalidQR.secret');
+            } else if (invite && invite.reason !== 'no-room') {
+                document.getElementById('connection-status').textContent = inviteErrorMessage(invite);
                 document.getElementById('connection-status').className = 'status status-error';
                 showStep(stepConnecting);
-                return; // No point continuing without the secret
+                return; // No point continuing without a complete invite
             }
 
             // Fetch server config to check DEV mode and enable eruda asap if needed
@@ -480,15 +474,16 @@
                 logger.warn('Could not fetch server config: ' + e.message);
             }
 
-            // 1. Connect module owns rtc/keyPair/sharedKey
+            // 1. Connect module owns rtc/keyPair/pairing
             SenderConnect.attach({
                 i18n,
                 logger,
                 showToast,
                 onReadyToCapture: () => showStep(stepChoose),
-                onFingerprintReady: (code) => {
-                    document.getElementById('verification-code').textContent = code;
-                    showVerificationModal();
+                onPaired: () => {
+                    const statusEl = document.getElementById('connection-status');
+                    statusEl.textContent = i18n.t('pairing.confirmed');
+                    statusEl.className = 'status status-connected';
                 },
                 onShowConnecting: () => showStep(stepConnecting),
                 onScanRequested: () => showStep(stepScan),
@@ -596,9 +591,9 @@
             // (Pinch-zoom + detect-toggle wiring is done inside SenderCamera.attach.)
 
             // Join room after async initialization is complete
-            if (roomId && secret) {
+            if (invite && invite.ok) {
                 showStep(stepConnecting);
-                await SenderConnect.join(roomId, secret);
+                await SenderConnect.join(invite.roomId, invite.secret, invite.qrSecret);
             }
         }
 
@@ -610,28 +605,21 @@
          * Process scanned QR code - extract room ID and secret from URL
          */
         async function processScannedQR(data) {
-            logger.info('Processing scanned QR: ' + data);
+            // Never log the raw QR: its fragment carries the room secret
+            // and the QR secret K, and logs are visible in the debug panel.
             const r = QrParse.parseSendInvite(data, window.location.origin);
             if (r.ok) {
+                logger.info(`Scanned invite for room ${r.roomId}`);
                 showStep(stepConnecting);
-                await SenderConnect.join(r.roomId, r.secret);
+                await SenderConnect.join(r.roomId, r.secret, r.qrSecret);
                 return;
             }
-            if (r.reason === 'foreign-origin') {
-                logger.error(`Refusing scanned QR for foreign origin: ${r.foreignOrigin}`);
-                showToast(i18n.t('send.invalidQR.foreignOrigin'), { type: 'error' });
-            } else if (r.reason === 'secret-missing') {
-                logger.error('Invalid QR code - room secret missing');
-                showToast(i18n.t('send.invalidQR.secretMissing'));
-            } else {
-                logger.error('Invalid QR code - no room ID found');
-                showToast(i18n.t('send.invalidQR.noRoom'));
-            }
+            showToast(inviteErrorMessage(r), { type: 'error' });
             showStep(stepScan);
         }
 
-        // Connection lifecycle (WebRTC state, key exchange, fingerprint
-        // verification handshake, reconnect, transform-nack retry, message
+        // Connection lifecycle (WebRTC state, key exchange + key-confirm
+        // pairing, reconnect, transform-nack retry, message
         // dispatcher) lives in window.SenderConnect (sender-connect.js).
 
         /**
@@ -985,30 +973,6 @@
             SenderSend.markBatchStartPending();
             SenderSend.markBatchEndPending();
             SenderSend.drain();
-        }
-
-        // ============ Fingerprint Verification ============
-        // Mutual verification: both parties must confirm fingerprints match.
-        // Sender confirms first, then waits for receiver's 'ready' signal.
-
-        /** Display the blocking verification modal with key fingerprints */
-        function showVerificationModal() {
-            VerificationModal.show({ onConfirm: onConfirmMatch, onDeny: onDenyMatch });
-        }
-
-        /** User confirmed fingerprints match - notify receiver and wait for mutual confirmation */
-        function onConfirmMatch() {
-            logger.info('User confirmed fingerprints match');
-            VerificationModal.hide();
-            showStep(stepWaitingConfirmation);
-            SenderConnect.confirmFingerprint();
-        }
-
-        /** User denied fingerprints match - abort connection (possible MITM) */
-        function onDenyMatch() {
-            logger.error('User denied fingerprint match - aborting connection');
-            SenderConnect.denyFingerprint();
-            showToast(i18n.t('verify.selfDenied'), { duration: 5000 });
         }
 
         // ============ Document Cropping (perspective correction) ============

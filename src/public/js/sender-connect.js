@@ -2,8 +2,9 @@
  * sender-connect.js
  *
  * Owns the sender's connection lifecycle: room join, WebRTC state
- * callbacks, ECDH key exchange, fingerprint verification handshake,
- * reconnect-after-disconnect, and the inbound message dispatcher.
+ * callbacks, ECDH key exchange + encrypted key-confirm (via the shared
+ * Pairing module), reconnect-after-disconnect, and the inbound message
+ * dispatcher.
  *
  * Extracted from send.html as part of the modular refactor.
  *
@@ -16,31 +17,26 @@
     // -- Connection state --
     let rtc = null;
     let keyPair = null;
-    let sharedKey = null;
-    // Session key handles from deriveSessionKeys: sharedKey plus the
-    // deriveFileKey(salt) used by SegmentStream to derive per-file
-    // subkeys for v2 chunked transfers. Lifecycle mirrors sharedKey.
-    let sessionKeys = null;
-    let weConfirmed = false;
-    let theyConfirmed = false;
+    // Pairing state machine (window.Pairing) for the current keyPair + QR
+    // secret. Owns the session keys and the "bound" flag: session keys
+    // are only handed out once the receiver's key-confirm opened, which
+    // is the single gate for sending files.
+    let pairing = null;
+    let pairingKeyPair = null;
     let lastRoomId = null;
     let lastSecret = null;
-    // True when a 'ready' arrived before local verification state caught
-    // up (e.g. control messages reordered across a transport switch, or
-    // the user clicked Match a fraction of a second later than the
-    // receiver). Re-evaluated after weConfirmed / theyConfirmed flip
-    // so a dropped ready does not wedge the sender permanently.
+    // QR secret K from the invite fragment. Never sent to the server and
+    // never logged; kept only so a reconnect can re-derive.
+    let lastQrSecret = null;
+    // True when a 'ready' arrived before our pairing bound (e.g. the
+    // receiver's key-confirm and ready overtook our own derivation).
+    // Re-evaluated when the pairing binds so a dropped ready does not
+    // wedge the sender permanently.
     let pendingReady = false;
-    // Fingerprints cached after the original verification so we can
-    // recognise the SAME peer after a transport reconnect and skip the
-    // verification modal. A mismatch on reconnect = peer swap / MITM
-    // attempt; we force a fresh pairing in that case.
-    let cachedTheirFingerprint = null;
-    let cachedOurFingerprint = null;
-    // True between the transport firing onTransientDisconnect and the
-    // first successful re-handshake after onReconnected. handlePublicKey
-    // accepts a re-key in this window and validates it against the
-    // cached fingerprints.
+    // True between the transport firing onReconnecting and the first
+    // public-key after it. A public-key carrying a DIFFERENT receiver key
+    // in this window means the peer changed: we refuse it and force a
+    // fresh scan instead of silently re-pairing.
     let inReconnect = false;
 
     // -- Wired-in deps --
@@ -48,7 +44,7 @@
     let _logger = null;
     let _showToast = null;
     let _onReadyToCapture = null;
-    let _onFingerprintReady = null;
+    let _onPaired = null;
     let _onShowConnecting = null;
     let _onScanRequested = null;
 
@@ -57,14 +53,48 @@
         _logger = deps.logger;
         _showToast = deps.showToast;
         _onReadyToCapture = deps.onReadyToCapture;
-        _onFingerprintReady = deps.onFingerprintReady;
+        _onPaired = deps.onPaired;
         _onShowConnecting = deps.onShowConnecting;
         _onScanRequested = deps.onScanRequested;
     }
 
     // ============ Room Joining ============
 
-    async function join(roomId, secret) {
+    function isBound() {
+        return !!pairing && pairing.isBound();
+    }
+
+    /** (Re)create the Pairing when the keyPair or QR secret changed. */
+    function ensurePairing() {
+        if (pairing && pairingKeyPair === keyPair) return;
+        if (pairing) pairing.reset();
+        pairing = window.Pairing.create({
+            role: 'sender',
+            keyPair,
+            qrSecret: lastQrSecret,
+            onBound: onPairingBound,
+            onFailed: onPairingFailed,
+        });
+        pairingKeyPair = keyPair;
+    }
+
+    function dropPairing() {
+        if (pairing) pairing.reset();
+        pairing = null;
+        pairingKeyPair = null;
+    }
+
+    async function join(roomId, secret, qrSecret) {
+        if (!window.WebSendCrypto.isQrSecret(qrSecret)) {
+            // Callers parse the invite with QrParse, which already refuses
+            // links without K; this is the last line of defence.
+            _logger.error('Refusing to join: invite has no valid QR secret');
+            _showToast(_i18n.t('send.invalidQR.outdatedLink'), { type: 'error', duration: 0 });
+            if (_onScanRequested) _onScanRequested();
+            return;
+        }
+        // A different K for the same room means a fresh QR: start over.
+        if (lastQrSecret && lastQrSecret !== qrSecret) dropPairing();
         // If we're switching to a different roomId (i.e. a brand-new pairing,
         // not a same-room reconnect), shred any in-memory user data first.
         // Confirm with the user only when the gallery is non-empty so we don't
@@ -86,13 +116,8 @@
                 window.SenderSend.clear();
             }
             keyPair = null;
-            sharedKey = null;
-            sessionKeys = null;
-            weConfirmed = false;
-            theyConfirmed = false;
+            dropPairing();
             pendingReady = false;
-            cachedTheirFingerprint = null;
-            cachedOurFingerprint = null;
             inReconnect = false;
             if (rtc) {
                 try { rtc.close(); } catch (_) {}
@@ -102,6 +127,7 @@
 
         lastRoomId = roomId;
         lastSecret = secret;
+        lastQrSecret = qrSecret;
         const statusEl = document.getElementById('connection-status');
         statusEl.textContent = _i18n.t('send.connecting');
         statusEl.className = 'status status-info';
@@ -112,8 +138,11 @@
             await rtc.init();
             wireRtcCallbacks();
         }
+        ensurePairing();
 
         try {
+            // Only the room secret goes to the server (X-Room-Secret);
+            // the QR secret K never leaves this device.
             await rtc.joinRoom(roomId, secret);
         } catch (e) {
             _logger.error('Failed to join room: ' + e.message);
@@ -149,7 +178,7 @@
     function restoreSendUiAfterRecovery() {
         const retryBtn = document.getElementById('error-retry-btn');
         if (retryBtn) retryBtn.remove();
-        if (!sharedKey || !weConfirmed || !theyConfirmed) return;
+        if (!isBound()) return;
         const connecting = document.getElementById('step-connecting');
         if (connecting && !connecting.classList.contains('hidden')) {
             _logger.info('Connection recovered while stuck on the connecting step; restoring capture UI');
@@ -225,15 +254,15 @@
             statusEl.textContent = _i18n.t('send.connected');
             statusEl.className = 'status status-connected';
         }
-        // inReconnect stays true until handlePublicKey verifies the
-        // peer's fingerprint matches the cached one.
+        // inReconnect stays true until handlePublicKey sees the
+        // receiver's public key again and checks it is unchanged.
         restoreSendUiAfterRecovery();
     }
 
     // ============ Reconnect ============
 
     async function reconnect() {
-        if (!lastRoomId || !lastSecret) {
+        if (!lastRoomId || !lastSecret || !lastQrSecret) {
             _logger.warn('reconnect() called with no stored room — ignoring');
             return;
         }
@@ -251,13 +280,8 @@
         // keyed with the old sessionKeys) is dropped; drain() stays
         // paused until the new session is verified.
         keyPair = await window.WebSendCrypto.generateKeyPair();
-        sharedKey = null;
-        sessionKeys = null;
-        weConfirmed = false;
-        theyConfirmed = false;
+        dropPairing();
         pendingReady = false;
-        cachedTheirFingerprint = null;
-        cachedOurFingerprint = null;
         inReconnect = false;
         window.SenderSend.resetForReconnect();
 
@@ -265,144 +289,120 @@
         await rtc.init();
         wireRtcCallbacks();
 
-        await join(lastRoomId, lastSecret);
+        await join(lastRoomId, lastSecret, lastQrSecret);
     }
 
-    // ============ Key exchange + fingerprint verification ============
+    // ============ Key exchange + key-confirm ============
 
     async function handlePublicKey(msg) {
-        // Reconnect branch: a public-key arriving with sharedKey already
-        // set is allowed only when the RacingTransport announced a
-        // reconnect. We verify the peer's fingerprint hasn't changed
-        // (preserving the original anti-MITM gate), keep the existing
-        // sharedKey + weConfirmed/theyConfirmed state, and just answer
-        // with our public-key so the receiver can do its own check.
-        if (sharedKey) {
+        if (!pairing) {
+            _logger.warn('public-key received before a room was joined; ignoring');
+            return;
+        }
+        if (pairing.hasPeerKey() && !pairing.isSamePeerKey(msg.key)) {
             if (!inReconnect) {
-                // A duplicate public-key carrying the SAME key is not an
-                // attack: it means the receiver never got our
-                // sender-public-key reply (e.g. it was dropped before a race
-                // winner was locked, or the two peers locked different
-                // winners) and is re-sending. Treat it as idempotent and
-                // just re-send our reply so the handshake completes. Only a
-                // DIFFERENT key is a genuine unexpected mid-session re-key.
-                try {
-                    const incoming = await window.WebSendCrypto.importPublicKey(msg.key);
-                    const fp = await window.WebSendCrypto.getKeyFingerprint(incoming);
-                    if (fp === cachedTheirFingerprint) {
-                        const ourPublicKeyB64 = await window.WebSendCrypto.exportPublicKey(keyPair.publicKey);
-                        rtc.sendMessage(window.Protocol.build.senderPublicKey(ourPublicKeyB64));
-                        _logger.info('Re-sent sender-public-key for a duplicate receiver public-key (reply likely lost)');
-                        return;
-                    }
-                } catch (e) {
-                    _logger.warn('Failed to evaluate duplicate public-key: ' + e.message);
-                }
-                // A mid-session re-key with a DIFFERENT key would silently
-                // rotate the encryption key under fingerprint state the user
-                // has already confirmed.
+                // A mid-session re-key with a DIFFERENT key would rotate the
+                // session under a binding we already confirmed. Refuse it.
                 _logger.warn('Ignoring unexpected public-key after key exchange already completed');
                 _showToast(_i18n.t('send.unexpectedRekey'), { type: 'error', duration: 5000 });
                 return;
             }
-            try {
-                const receiverPublicKey = await window.WebSendCrypto.importPublicKey(msg.key);
-                const newTheirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey);
-                if (newTheirFingerprint !== cachedTheirFingerprint) {
-                    // The peer changed during the reconnect window. Could
-                    // be a peer-swap MITM. Refuse to silently auto-confirm
-                    // and force the user back to scan so they see a fresh
-                    // verification ceremony.
-                    _logger.error(`Peer fingerprint changed during reconnect: cached ${cachedTheirFingerprint} vs new ${newTheirFingerprint}`);
-                    _showToast(_i18n.t('send.peerChangedOnReconnect'), { type: 'error', duration: 0 });
-                    sharedKey = null;
-                    sessionKeys = null;
-                    weConfirmed = false;
-                    theyConfirmed = false;
-                    cachedTheirFingerprint = null;
-                    cachedOurFingerprint = null;
-                    inReconnect = false;
-                    if (_onScanRequested) _onScanRequested();
-                    return;
-                }
-                // Same peer. Re-send our public-key so the receiver can
-                // do its own fingerprint comparison. Crypto state is
-                // preserved verbatim so the in-flight encrypted file is
-                // still decryptable.
-                const ourPublicKeyB64 = await window.WebSendCrypto.exportPublicKey(keyPair.publicKey);
-                rtc.sendMessage(window.Protocol.build.senderPublicKey(ourPublicKeyB64));
-                _logger.success(`Reconnect rekey verified, peer fingerprint unchanged (${newTheirFingerprint})`);
+            // The peer changed during the reconnect window (peer swap /
+            // MITM attempt). Do not silently re-pair: drop the session and
+            // send the user back to scan a fresh QR.
+            _logger.error('Receiver public key changed during reconnect; refusing');
+            _showToast(_i18n.t('send.peerChangedOnReconnect'), { type: 'error', duration: 0 });
+            dropPairing();
+            inReconnect = false;
+            if (_onScanRequested) _onScanRequested();
+            return;
+        }
+
+        let res;
+        try {
+            res = await pairing.acceptPeerKey(msg);
+        } catch (e) {
+            _logger.error('Failed to complete key exchange: ' + e.message);
+            return;
+        }
+        if (res.status === 'version-mismatch') {
+            _logger.error(`Receiver runs protocol version ${msg.protocolVersion}, we run ${window.Protocol.VERSION}`);
+            _showToast(_i18n.t('pairing.versionMismatch'), { type: 'error', duration: 0 });
+            return;
+        }
+        if (res.status === 'invalid-key') {
+            _logger.warn('Ignoring public-key with an invalid key');
+            return;
+        }
+        if (res.status === 'stale') return;
+
+        // Answer with our public key, then our key-confirm (order matters
+        // only for latency: the receiver buffers an early confirm).
+        const ourPublicKeyB64 = await window.WebSendCrypto.exportPublicKey(keyPair.publicKey);
+        rtc.sendMessage(window.Protocol.build.senderPublicKey(ourPublicKeyB64));
+        await sendMessageWithRetry(res.confirmMsg, 'key-confirm');
+
+        if (res.status === 'same-key') {
+            // Duplicate public-key with the same key: the receiver missed
+            // our reply (dropped before a race winner was locked) or a
+            // relay reconnect re-announced it. The binding is kept, so the
+            // in-flight encrypted file stays decryptable.
+            _logger.info('Re-sent sender-public-key + key-confirm for a duplicate receiver public-key');
+            if (inReconnect) {
                 inReconnect = false;
-                // weConfirmed / theyConfirmed are kept from the original
-                // session so the sender stays past the verification gate.
+                _logger.success('Reconnect: receiver key unchanged, pairing kept');
                 restoreSendUiAfterRecovery();
-            } catch (e) {
-                _logger.error('Failed to verify peer on reconnect: ' + e.message);
             }
             return;
         }
-        _logger.info('Received receiver public key, performing key exchange...');
-        try {
-            const receiverPublicKey = await window.WebSendCrypto.importPublicKey(msg.key);
-            sessionKeys = await window.WebSendCrypto.deriveSessionKeys(keyPair.privateKey, receiverPublicKey);
-            sharedKey = sessionKeys.sharedKey;
-
-            // Per-key fingerprints are cached only for the reconnect
-            // peer-identity check below; the user-facing code is the
-            // single combined fingerprint computed next.
-            cachedOurFingerprint = await window.WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
-            cachedTheirFingerprint = await window.WebSendCrypto.getKeyFingerprint(receiverPublicKey);
-
-            const combinedFingerprint = await window.WebSendCrypto.getCombinedFingerprint(keyPair.publicKey, receiverPublicKey);
-            _logger.success(`Key exchange complete. Verification code: ${combinedFingerprint}`);
-
-            const ourPublicKeyB64 = await window.WebSendCrypto.exportPublicKey(keyPair.publicKey);
-            rtc.sendMessage(window.Protocol.build.senderPublicKey(ourPublicKeyB64));
-            _logger.info('Sent our public key to receiver');
-
-            if (_onFingerprintReady) {
-                _onFingerprintReady(combinedFingerprint);
-            }
-        } catch (e) {
-            _logger.error('Failed to complete key exchange: ' + e.message);
-        }
+        _logger.success('Key exchange complete; sent public key and key-confirm, awaiting the receiver key-confirm');
     }
 
-    function handleFingerprintConfirmed() {
-        _logger.info('Receiver confirmed fingerprint match');
-        theyConfirmed = true;
+    async function handleKeyConfirm(msg) {
+        if (!pairing) return;
+        await pairing.handleKeyConfirm(msg);
+    }
+
+    function onPairingBound() {
+        _logger.success('Pairing confirmed: the receiver proved it holds the same keys');
+        if (_onPaired) _onPaired();
         if (pendingReady) maybeFlushReady();
     }
 
-    function handleFingerprintDenied() {
-        _logger.error('Receiver denied fingerprint match - possible MITM attack!');
-        _showToast(_i18n.t('verify.deniedByReceiver'), { duration: 5000 });
+    function onPairingFailed(reason) {
+        // Wrong QR secret, a substituted public key, or a silent peer.
+        // Accept nothing from this session: tear it down and go back to
+        // scanning.
+        _logger.error(`Pairing failed (${reason}): key-confirm did not verify`);
+        _showToast(_i18n.t('pairing.failed'), { type: 'error', duration: 0 });
+        pendingReady = false;
+        dropPairing();
+        if (rtc) {
+            try { rtc.close(); } catch (_) {}
+            rtc = null;
+        }
+        if (_onScanRequested) _onScanRequested();
     }
 
     function handleReady() {
         // Defense in depth: a malicious receiver can send `ready` without
-        // ever sending `fingerprint-confirmed` (or before the user has
-        // clicked "match" locally), trying to fast-forward the sender UI
-        // past verification and into capture mode. Only honour `ready`
-        // when BOTH sides have explicitly confirmed and a shared key was
-        // actually derived.
-        if (!sharedKey || !weConfirmed || !theyConfirmed) {
-            _logger.warn(`Deferring 'ready' until verification completes (sharedKey=${!!sharedKey}, weConfirmed=${weConfirmed}, theyConfirmed=${theyConfirmed})`);
-            // Defer rather than drop: confirmFingerprint /
-            // handleFingerprintConfirmed will re-trigger maybeFlushReady
-            // once the local flags catch up. The security check still
-            // gates capture mode (capture only opens when all three
-            // conditions are simultaneously true), so deferring is safe.
+        // ever sending a valid key-confirm, trying to fast-forward the
+        // sender UI into capture mode. Only honour `ready` once our
+        // pairing is bound (the receiver's key-confirm opened).
+        if (!isBound()) {
+            _logger.warn("Deferring 'ready' until the receiver key-confirm verifies");
+            // Defer rather than drop: onPairingBound re-triggers
+            // maybeFlushReady. Capture mode still only opens when bound.
             pendingReady = true;
             return;
         }
         pendingReady = false;
-        _logger.success('Both parties verified, can now send photos');
+        _logger.success('Pairing confirmed on both sides, can now send photos');
         window.PeerUI.showVerifiedInSidebar();
         if (_onReadyToCapture) _onReadyToCapture();
         // Flush files queued while disconnected: drain() paused itself on
-        // the verification gate and needs a kick now that both sides
-        // confirmed (covers the full-reconnect path, where the queue
+        // the pairing gate and needs a kick now that both sides
+        // bound (covers the full-reconnect path, where the queue
         // survives via resetForReconnect).
         if (window.SenderSend && window.SenderSend.size() > 0) {
             window.SenderSend.drain();
@@ -411,8 +411,8 @@
 
     function maybeFlushReady() {
         if (!pendingReady) return;
-        if (!sharedKey || !weConfirmed || !theyConfirmed) return;
-        _logger.info('Verification state caught up; honoring previously-deferred ready');
+        if (!isBound()) return;
+        _logger.info('Pairing bound; honoring previously-deferred ready');
         handleReady();
     }
 
@@ -454,8 +454,7 @@
 
     const messageHandlers = {
         'public-key': handlePublicKey,
-        'fingerprint-confirmed': handleFingerprintConfirmed,
-        'fingerprint-denied': handleFingerprintDenied,
+        'key-confirm': handleKeyConfirm,
         'ready': handleReady,
         'transform-nack': handleTransformNack,
         // Relay-reconnect resume: receiver tells us what bytes of an
@@ -474,7 +473,7 @@
         await handler(msg);
     }
 
-    // ============ Fingerprint user actions ============
+    // ============ Sending helpers ============
 
     async function sendMessageWithRetry(message, label) {
         const delaysMs = [0, 50, 150, 300, 600, 1200];
@@ -489,17 +488,6 @@
         return false;
     }
 
-    async function confirmFingerprint() {
-        weConfirmed = true;
-        await sendMessageWithRetry(window.Protocol.build.fingerprintConfirmed(), 'fingerprint-confirmed');
-        // Honour a 'ready' that arrived before the user clicked Match.
-        if (pendingReady) maybeFlushReady();
-    }
-
-    async function denyFingerprint() {
-        await sendMessageWithRetry(window.Protocol.build.fingerprintDenied(), 'fingerprint-denied');
-    }
-
     // ============ Cleanup ============
 
     function cleanup() {
@@ -508,16 +496,12 @@
         }
         rtc = null;
         keyPair = null;
-        sharedKey = null;
-        sessionKeys = null;
-        weConfirmed = false;
-        theyConfirmed = false;
+        dropPairing();
         pendingReady = false;
-        cachedTheirFingerprint = null;
-        cachedOurFingerprint = null;
         inReconnect = false;
         lastRoomId = null;
         lastSecret = null;
+        lastQrSecret = null;
         if (window.Gallery && typeof window.Gallery.shredLocal === 'function') {
             try { window.Gallery.shredLocal(); } catch (_) {}
         }
@@ -526,7 +510,7 @@
         }
     }
 
-    /** Pre-room initialization so getRtc()/getSharedKey() are stable. */
+    /** Pre-room initialization so getRtc() is stable before join(). */
     async function init() {
         keyPair = await window.WebSendCrypto.generateKeyPair();
         rtc = window.Transport.createForSender();
@@ -534,24 +518,22 @@
         wireRtcCallbacks();
     }
 
-    // Frozen so a hostile script cannot swap isVerified / getSharedKey
-    // / confirmFingerprint to bypass the verification gate from outside.
+    // Frozen so a hostile script cannot swap isVerified / getSessionKeys
+    // to bypass the pairing gate from outside.
     window.SenderConnect = Object.freeze({
         attach,
         init,
         join,
         reconnect,
-        confirmFingerprint,
-        denyFingerprint,
         cleanup,
         getRtc: () => rtc,
-        getSharedKey: () => sharedKey,
-        getSessionKeys: () => sessionKeys,
-        // True only when key exchange completed AND both sides confirmed
-        // the fingerprint. Callers on the send path must consult this
-        // before encrypting/transmitting a photo, so a future code change
-        // that advances UI without verification cannot leak user data.
-        isVerified: () => !!sharedKey && weConfirmed && theyConfirmed,
+        // null until the pairing is bound (receiver key-confirm opened)
+        getSessionKeys: () => (pairing ? pairing.getSessionKeys() : null),
+        // True only when the receiver's key-confirm verified. Callers on
+        // the send path must consult this before encrypting/transmitting a
+        // photo, so a future code change that advances UI without pairing
+        // cannot leak user data.
+        isVerified: isBound,
         // For visibilitychange, quick state probe without exposing internals
         connectionLost: () => rtc && rtc.pc && (rtc.pc.connectionState === 'failed' || rtc.pc.connectionState === 'disconnected'),
     });

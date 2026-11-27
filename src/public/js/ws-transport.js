@@ -11,10 +11,10 @@
  * Security model (must stay aligned with webrtc.js):
  *   - All payloads remain ECDH+AES-GCM end-to-end encrypted; the relay
  *     forwards opaque bytes and never sees plaintext.
- *   - Fingerprint verification (window.SenderConnect.isVerified, the
+ *   - The key-confirm binding (window.SenderConnect.isVerified, the
  *     VERIFIED_GATED_HANDLERS map in receive.html) gates application
  *     messages independent of the transport, so a future code path that
- *     wins the race here still requires the same out-of-band ceremony.
+ *     wins the race here still requires the same QR-secret key-confirm.
  *   - Anti-DoS bounds are mirrored from webrtc.js handleMessage:
  *       Protocol.MAX_CONTROL_MSG_BYTES (16 KiB)
  *       Protocol.MAX_TOTAL_SESSION_BYTES (4 GiB)

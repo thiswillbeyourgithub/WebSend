@@ -1,12 +1,15 @@
 /**
- * Unit tests for js/sender-connect.js — covers the verification gate
- * around handleReady (premature `ready` ignored) and the mid-session
- * re-key block in handlePublicKey (second `public-key` rejected, no
- * second derive, no UI re-prompt). Together these guard the sender
- * against a hostile receiver that tries to short-circuit verification
- * or rotate keys after the user has confirmed.
+ * Unit tests for js/sender-connect.js. Loads the REAL crypto.js,
+ * protocol.js and pairing.js into the jsdom realm and drives the sender
+ * against a real receiver-side Pairing, so the key-confirm gate is
+ * exercised end to end: premature `ready` deferred until bound, a
+ * mid-session re-key refused, a duplicate same-key public-key answered
+ * idempotently, a wrong QR secret aborting the session, plus the
+ * transform-nack cap, recovery and reconnect queue behaviour.
+ *
+ * Built with Claude Code (Opus 5.5).
  */
-import { test } from 'node:test';
+import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -14,10 +17,18 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const modulePath = path.resolve(__dirname, '../../public/js/sender-connect.js');
-const moduleSource = readFileSync(modulePath, 'utf8');
+const jsDir = path.resolve(__dirname, '../../public/js');
+const sources = ['crypto.js', 'protocol.js', 'pairing.js', 'sender-connect.js']
+    .map((f) => readFileSync(path.join(jsDir, f), 'utf8'));
 
-function setup({ deriveSharedKeyCallback } = {}) {
+// Pairings arm a 30 s key-confirm timer; reset every pairing created by a
+// test so a pending timer never keeps the runner alive.
+const live = [];
+afterEach(() => {
+    while (live.length) live.pop()();
+});
+
+function setup() {
     const dom = new JSDOM(
         '<!doctype html><html><body>' +
         '<div id="connection-status"></div>' +
@@ -26,50 +37,23 @@ function setup({ deriveSharedKeyCallback } = {}) {
         { runScripts: 'outside-only', url: 'http://localhost/' }
     );
     const win = dom.window;
+    // jsdom has no SubtleCrypto: lend it Node's WebCrypto.
+    Object.defineProperty(win, 'crypto', { value: globalThis.crypto, configurable: true });
+    win.TextEncoder = globalThis.TextEncoder;
+    win.TextDecoder = globalThis.TextDecoder;
+    // crypto.js logs through the page-global logger.
+    win.logger = { info() {}, warn() {}, error() {}, success() {} };
 
-    let deriveCalls = 0;
-    win.WebSendCrypto = {
-        generateKeyPair: async () => ({ privateKey: 'priv', publicKey: 'pub' }),
-        importPublicKey: async (k) => ({ __imported: k }),
-        deriveSessionKeys: async () => {
-            deriveCalls++;
-            if (deriveSharedKeyCallback) deriveSharedKeyCallback();
-            return {
-                sharedKey: { __fake: 'shared' },
-                deriveFileKey: async () => ({ __fake: 'filekey' }),
-            };
-        },
-        exportPublicKey: async () => 'b64pubkey',
-        // Derive a distinct fingerprint per key so the tests can tell a
-        // genuine mid-session re-key (different key -> different fingerprint,
-        // must be blocked) from a duplicate re-send of the SAME key (same
-        // fingerprint -> idempotent reply). importPublicKey wraps the raw key
-        // as { __imported }, while the sender's own public key arrives as the
-        // bare 'pub' string from generateKeyPair.
-        getKeyFingerprint: async (k) =>
-            'FP-' + (k && k.__imported !== undefined ? k.__imported : k),
-        getCombinedFingerprint: async () => 'AAAA-BBBB-CCCC-DDDD',
-    };
     win.WebSendRTC = class {
-        constructor() { this.iceServers = []; this.sent = []; }
+        constructor() { this.iceServers = []; this.sent = []; this.closed = false; }
         async init() {}
         async joinRoom() {}
-        sendMessage(m) { this.sent.push(m); }
-        close() {}
+        sendMessage(m) { this.sent.push(m); return true; }
+        close() { this.closed = true; }
     };
-    // sender-connect.js now obtains its transport through window.Transport
-    // (commit 1 extraction) so we stub the factory to keep returning the
-    // existing WebSendRTC test double.
     win.Transport = {
         createForSender: () => new win.WebSendRTC(),
         createForReceiver: () => new win.WebSendRTC(),
-    };
-    win.Protocol = {
-        build: {
-            senderPublicKey: (k) => ({ type: 'sender-public-key', key: k }),
-            fingerprintConfirmed: () => ({ type: 'fingerprint-confirmed' }),
-            fingerprintDenied: () => ({ type: 'fingerprint-denied' }),
-        },
     };
     win.PeerUI = { onConnectionTypeDetected: () => {}, showVerifiedInSidebar: () => {}, hasTurn: () => true };
     win.wakeLockMgr = { desired: false, acquire: async () => {}, release: () => {} };
@@ -89,11 +73,11 @@ function setup({ deriveSharedKeyCallback } = {}) {
     const logs = { info: [], warn: [], error: [], success: [] };
     const toasts = [];
     let readyToCaptureCalled = 0;
-    let fingerprintReadyCalled = 0;
+    let pairedCalled = 0;
+    let scanRequested = 0;
 
-    // Load module into the jsdom realm
-    const script = new win.Function(moduleSource);
-    script.call(win);
+    for (const src of sources) new win.Function(src).call(win);
+    live.push(() => win.SenderConnect.cleanup());
 
     win.SenderConnect.attach({
         i18n: { t: (k) => k },
@@ -105,58 +89,132 @@ function setup({ deriveSharedKeyCallback } = {}) {
         },
         showToast: (m, opts) => toasts.push({ m, opts }),
         onReadyToCapture: () => { readyToCaptureCalled++; },
-        onFingerprintReady: () => { fingerprintReadyCalled++; },
+        onPaired: () => { pairedCalled++; },
         onShowConnecting: () => {},
-        onScanRequested: () => {},
+        onScanRequested: () => { scanRequested++; },
     });
 
     return {
         win,
         logs,
         toasts,
-        getDeriveCalls: () => deriveCalls,
         getReadyToCaptureCalled: () => readyToCaptureCalled,
-        getFingerprintReadyCalled: () => fingerprintReadyCalled,
+        getPairedCalled: () => pairedCalled,
+        getScanRequested: () => scanRequested,
     };
 }
 
-test('handleReady ignores premature ready (no fingerprint-confirmed received)', async () => {
+/**
+ * A receiver peer built on the real Pairing, as receive.html does it.
+ * `qrSecret` is what the receiver printed in its QR; pass a different
+ * one to the sender to model a MITM / wrong link.
+ */
+async function makeReceiver(win, qrSecret) {
+    const keyPair = await win.WebSendCrypto.generateKeyPair();
+    const pub = await win.WebSendCrypto.exportPublicKey(keyPair.publicKey);
+    const pairing = win.Pairing.create({ role: 'receiver', keyPair, qrSecret });
+    live.push(() => pairing.reset());
+    return { keyPair, pub, pairing, publicKeyMsg: win.Protocol.build.publicKey(pub) };
+}
+
+const lastOfType = (rtc, type) => [...rtc.sent].reverse().find((m) => m && m.type === type);
+
+/**
+ * Sender joins with `senderK`, receiver announces its key, both exchange
+ * key-confirms. Returns the pieces so tests can continue the dialogue.
+ */
+async function handshake(ctx, { receiverK, senderK } = {}) {
+    const { win } = ctx;
+    const K = receiverK || win.WebSendCrypto.generateQrSecret();
+    const receiver = await makeReceiver(win, K);
+    await win.SenderConnect.init();
+    await win.SenderConnect.join('ROOM01', 'secret', senderK || K);
+    const rtc = win.SenderConnect.getRtc();
+    await rtc.onMessage(receiver.publicKeyMsg);
+    const spk = lastOfType(rtc, 'sender-public-key');
+    assert.ok(spk, 'sender answers with sender-public-key');
+    assert.ok(lastOfType(rtc, 'key-confirm'), 'sender sends its key-confirm');
+    const accepted = await receiver.pairing.acceptPeerKey(spk);
+    assert.equal(accepted.status, 'derived');
+    const receiverSide = await receiver.pairing.handleKeyConfirm(lastOfType(rtc, 'key-confirm'));
+    return { rtc, receiver, receiverConfirm: accepted.confirmMsg, receiverSide };
+}
+
+test('join refuses an invite without a valid QR secret', async () => {
     const ctx = setup();
     await ctx.win.SenderConnect.init();
-    // Simulate just the user clicking match locally; the receiver never
-    // sends fingerprint-confirmed, then jumps straight to `ready`.
-    ctx.win.SenderConnect.confirmFingerprint();
-    // No theyConfirmed yet, but receiver pushes ready.
-    // Reach into the dispatcher via the public path: rtc.onMessage was
-    // wired in init(). Easier: derive the shared key first then call
-    // ready via init's onMessage path.
-    // We don't have direct access to onMessage; instead, drive it by
-    // first injecting a public-key, then ready.
-    // Drive ready through SenderConnect by invoking init's wired
-    // dispatcher. There is no public hook so we emulate by calling
-    // confirmFingerprint (we did) and observing that without a public
-    // key arriving, isVerified() is still false because sharedKey is
-    // null.
-    assert.equal(ctx.win.SenderConnect.isVerified(), false,
-        'isVerified must be false without sharedKey');
-    assert.equal(ctx.getReadyToCaptureCalled(), 0,
-        'onReadyToCapture must not have fired');
+    await ctx.win.SenderConnect.join('ROOM01', 'secret', undefined);
+    assert.ok(ctx.toasts.some((t) => t.m === 'send.invalidQR.outdatedLink'));
+    assert.equal(ctx.getScanRequested(), 1);
+    assert.equal(ctx.win.SenderConnect.getRtc().sent.length, 0, 'nothing sent for a refused invite');
 });
 
-test('handlePublicKey blocks mid-session re-key after sharedKey established', async () => {
+test('matching K: both sides bind, ready opens capture only after the confirm', async () => {
     const ctx = setup();
+    const { rtc, receiverConfirm, receiverSide } = await handshake(ctx);
+    assert.equal(receiverSide.status, 'bound', 'receiver opens the sender confirm');
+
+    // Premature ready (before the receiver confirm reached us): deferred.
+    await rtc.onMessage({ type: 'ready', protocolVersion: 2 });
+    assert.equal(ctx.win.SenderConnect.isVerified(), false);
+    assert.equal(ctx.win.SenderConnect.getSessionKeys(), null, 'no session keys before bound');
+    assert.equal(ctx.getReadyToCaptureCalled(), 0, 'ready must not open capture before bound');
+
+    await rtc.onMessage(receiverConfirm);
+    assert.equal(ctx.win.SenderConnect.isVerified(), true);
+    assert.equal(ctx.getPairedCalled(), 1, 'pairing-confirmed UI fires once');
+    assert.equal(ctx.getReadyToCaptureCalled(), 1, 'deferred ready is honoured once bound');
+    assert.ok(ctx.win.SenderConnect.getSessionKeys(), 'session keys available once bound');
+});
+
+test('ready alone (no key-confirm ever) never opens capture', async () => {
+    const ctx = setup();
+    const { rtc } = await handshake(ctx);
+    await rtc.onMessage({ type: 'ready', protocolVersion: 2 });
+    assert.equal(ctx.win.SenderConnect.isVerified(), false);
+    assert.equal(ctx.getReadyToCaptureCalled(), 0);
+});
+
+test('different K: receiver confirm fails, sender aborts and accepts nothing', async () => {
+    const ctx = setup();
+    const K1 = ctx.win.WebSendCrypto.generateQrSecret();
+    const K2 = ctx.win.WebSendCrypto.generateQrSecret();
+    const { rtc, receiverConfirm, receiverSide } = await handshake(ctx, { receiverK: K1, senderK: K2 });
+    assert.equal(receiverSide.status, 'failed', 'receiver rejects the sender confirm');
+
+    await rtc.onMessage(receiverConfirm);
+    assert.equal(ctx.win.SenderConnect.isVerified(), false);
+    assert.equal(ctx.win.SenderConnect.getSessionKeys(), null);
+    assert.ok(ctx.toasts.some((t) => t.m === 'pairing.failed'), 'clear error shown');
+    assert.ok(rtc.closed, 'connection closed on confirm failure');
+    assert.equal(ctx.getScanRequested(), 1, 'user sent back to scanning');
+    await rtc.onMessage({ type: 'ready', protocolVersion: 2 });
+    assert.equal(ctx.getReadyToCaptureCalled(), 0, 'ready after a failure opens nothing');
+});
+
+test('version mismatch on public-key shows the reload error and derives nothing', async () => {
+    const ctx = setup();
+    const receiver = await makeReceiver(ctx.win, ctx.win.WebSendCrypto.generateQrSecret());
     await ctx.win.SenderConnect.init();
-
-    // First public-key: legitimate
+    await ctx.win.SenderConnect.join('ROOM01', 'secret', ctx.win.WebSendCrypto.generateQrSecret());
     const rtc = ctx.win.SenderConnect.getRtc();
-    await rtc.onMessage({ type: 'public-key', key: 'aaaa' });
-    assert.equal(ctx.getDeriveCalls(), 1, 'first public-key derives shared key');
-    assert.equal(ctx.getFingerprintReadyCalled(), 1, 'fingerprint UI shown once');
+    await rtc.onMessage({ ...receiver.publicKeyMsg, protocolVersion: 1 });
+    assert.ok(ctx.toasts.some((t) => t.m === 'pairing.versionMismatch'));
+    assert.equal(lastOfType(rtc, 'key-confirm'), undefined, 'no confirm for an incompatible peer');
+});
 
-    // Second public-key: must be rejected
-    await rtc.onMessage({ type: 'public-key', key: 'bbbb' });
-    assert.equal(ctx.getDeriveCalls(), 1, 'second public-key must NOT derive a new key');
-    assert.equal(ctx.getFingerprintReadyCalled(), 1, 'fingerprint UI must not re-fire on blocked re-key');
+test('handlePublicKey blocks a mid-session re-key with a different key', async () => {
+    const ctx = setup();
+    const { rtc, receiverConfirm } = await handshake(ctx);
+    await rtc.onMessage(receiverConfirm);
+    assert.equal(ctx.win.SenderConnect.isVerified(), true);
+
+    const other = await makeReceiver(ctx.win, ctx.win.WebSendCrypto.generateQrSecret());
+    const sentBefore = rtc.sent.length;
+    await rtc.onMessage(other.publicKeyMsg);
+    assert.equal(rtc.sent.length, sentBefore, 'nothing sent in reply to a refused re-key');
+    assert.equal(ctx.win.SenderConnect.isVerified(), true, 'existing binding untouched');
+    assert.equal(ctx.getPairedCalled(), 1);
     assert.ok(
         ctx.logs.warn.some(m => /unexpected public-key|already completed/i.test(m)),
         `warn log should mention the blocked re-key, got: ${JSON.stringify(ctx.logs.warn)}`
@@ -169,34 +227,22 @@ test('handlePublicKey blocks mid-session re-key after sharedKey established', as
 
 test('handlePublicKey re-sends reply idempotently for a DUPLICATE same-key public-key', async () => {
     const ctx = setup();
-    await ctx.win.SenderConnect.init();
-
-    const rtc = ctx.win.SenderConnect.getRtc();
-    // First public-key: legitimate, derives + answers with sender-public-key.
-    await rtc.onMessage({ type: 'public-key', key: 'aaaa' });
-    assert.equal(ctx.getDeriveCalls(), 1, 'first public-key derives shared key');
-    assert.equal(ctx.getFingerprintReadyCalled(), 1, 'fingerprint UI shown once');
+    const { rtc, receiver, receiverConfirm } = await handshake(ctx);
+    await rtc.onMessage(receiverConfirm);
 
     // Second public-key carrying the SAME key: the receiver never got our
     // first reply (dropped before a race winner locked) and is re-sending.
-    // This is not an attack: re-send our public-key, do not derive again,
-    // do not re-prompt, do not warn or toast about a re-key.
+    // Not an attack: re-send our public-key + confirm, keep the binding,
+    // no re-key warning or toast.
     const sentBefore = rtc.sent.length;
-    await rtc.onMessage({ type: 'public-key', key: 'aaaa' });
-    assert.equal(ctx.getDeriveCalls(), 1, 'duplicate public-key must NOT derive again');
-    assert.equal(ctx.getFingerprintReadyCalled(), 1, 'fingerprint UI must not re-fire on a duplicate');
-    assert.ok(
-        rtc.sent.slice(sentBefore).some(m => m && m.type === 'sender-public-key'),
-        `sender must re-send its public-key for a duplicate, sent: ${JSON.stringify(rtc.sent)}`
-    );
-    assert.ok(
-        !ctx.logs.warn.some(m => /unexpected public-key|already completed/i.test(m)),
-        `no re-key warning should fire for a duplicate, got: ${JSON.stringify(ctx.logs.warn)}`
-    );
-    assert.ok(
-        !ctx.toasts.some(t => /rekey|re-key/i.test(t.m)),
-        `no re-key toast should fire for a duplicate, got: ${JSON.stringify(ctx.toasts)}`
-    );
+    await rtc.onMessage(receiver.publicKeyMsg);
+    const fresh = rtc.sent.slice(sentBefore);
+    assert.ok(fresh.some(m => m && m.type === 'sender-public-key'), 'sender-public-key re-sent');
+    assert.ok(fresh.some(m => m && m.type === 'key-confirm'), 'key-confirm re-sent');
+    assert.equal(ctx.win.SenderConnect.isVerified(), true, 'binding kept');
+    assert.equal(ctx.getPairedCalled(), 1, 'pairing UI must not re-fire on a duplicate');
+    assert.ok(!ctx.logs.warn.some(m => /unexpected public-key|already completed/i.test(m)));
+    assert.ok(!ctx.toasts.some(t => /rekey|re-key/i.test(t.m)));
 });
 
 test('handleTransformNack caps per-photo re-sends (anti-pin)', async () => {
@@ -240,7 +286,7 @@ test('handleTransformNack caps per-photo re-sends (anti-pin)', async () => {
 // Regression: a drop + recovery while the wizard sat on the connecting
 // step (classically: the connection died while the OS file picker was
 // open) used to dead-end the UI on a "Connected" status with only a
-// stale "Back to scan" button — no way to pick a file again.
+// stale "Back to scan" button, with no way to pick a file again.
 test('connection recovery removes the stale retry button and restores the capture step', async () => {
     const ctx = setup();
     const { win } = ctx;
@@ -251,15 +297,11 @@ test('connection recovery removes the stale retry button and restores the captur
         isActive: () => false,
         drain: () => { drains++; },
     };
-    await win.SenderConnect.init();
-    const rtc = win.SenderConnect.getRtc();
-
-    // Complete verification: public-key, local confirm, peer confirm, ready.
-    await rtc.onMessage({ type: 'public-key', key: 'aaaa' });
-    await win.SenderConnect.confirmFingerprint();
-    await rtc.onMessage({ type: 'fingerprint-confirmed' });
-    await rtc.onMessage({ type: 'ready' });
-    assert.equal(ctx.getReadyToCaptureCalled(), 1, 'verified session reaches the capture step');
+    // Complete pairing: public-key, key-confirms, ready.
+    const { rtc, receiverConfirm } = await handshake(ctx);
+    await rtc.onMessage(receiverConfirm);
+    await rtc.onMessage({ type: 'ready', protocolVersion: 2 });
+    assert.equal(ctx.getReadyToCaptureCalled(), 1, 'paired session reaches the capture step');
 
     // Transport failure dumps the user onto the connecting step with a
     // retry button.
@@ -289,7 +331,7 @@ test('reconnect() preserves the send queue via resetForReconnect instead of clea
         resetForReconnect: () => { resets++; },
     };
     await win.SenderConnect.init();
-    await win.SenderConnect.join('ROOM01', 'secret');
+    await win.SenderConnect.join('ROOM01', 'secret', win.WebSendCrypto.generateQrSecret());
     await win.SenderConnect.reconnect();
     assert.equal(resets, 1, 'resetForReconnect must run so queued blobs re-key with the new session');
     assert.equal(clears, 0, 'files picked while the transport was down must not be wiped');

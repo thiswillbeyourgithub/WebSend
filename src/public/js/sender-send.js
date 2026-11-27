@@ -332,8 +332,8 @@
      * the queue head instead of dropping the photo.
      */
     async function sendOnePhoto(item, resumeFromSeq) {
-        // Hard gate: refuse to encrypt/transmit unless both sides have
-        // confirmed the fingerprint and a shared key was derived. This
+        // Hard gate: refuse to encrypt/transmit unless the pairing is
+        // bound (the receiver's encrypted key-confirm opened). This
         // is independent of the UI gate in handleReady so a future bug
         // that advances the capture flow without verification cannot
         // leak user data over the wire.

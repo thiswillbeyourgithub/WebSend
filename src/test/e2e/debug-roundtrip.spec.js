@@ -22,25 +22,12 @@ test('debug full round-trip with file send', async ({ browser }) => {
     await pageB.goto(senderUrl);
     await pageB.waitForLoadState('domcontentloaded');
 
-    // Wait for key exchange
-    await pageA.waitForTimeout(3000);
-
-    // Check modal state
-    const modalAClass = await pageA.$eval('#verification-modal', el => el.className).catch(() => 'not found');
-    const modalBClass = await pageB.$eval('#verification-modal', el => el?.className || 'no modal').catch(() => 'not found');
-    console.log('Modal A class:', modalAClass);
-    console.log('Modal B class:', modalBClass);
-
-    // Click confirm on both
-    await pageA.click('#confirm-match-btn').catch(e => console.log('A confirm error:', e.message));
-    await pageB.click('#confirm-match-btn').catch(e => console.log('B confirm error:', e.message));
-
-    await pageA.waitForTimeout(2000);
-
-    const modalAClassAfter = await pageA.$eval('#verification-modal', el => el.className).catch(() => 'not found');
-    const modalBClassAfter = await pageB.$eval('#verification-modal', el => el?.className || 'no modal').catch(() => 'not found');
-    console.log('Modal A class after click:', modalAClassAfter);
-    console.log('Modal B class after click:', modalBClassAfter);
+    // Pairing is automatic (QR secret + key-confirm); just wait for it.
+    await pageB.waitForFunction(
+        () => window.SenderConnect && window.SenderConnect.isVerified(),
+        { timeout: 20000 }
+    ).catch(e => console.log('Sender never bound:', e.message));
+    console.log('Sender bound:', await pageB.evaluate(() => window.SenderConnect.isVerified()));
 
     // Send file
     await pageB.setInputFiles('#file-input', FIXTURE_PNG).catch(e => console.log('setInputFiles error:', e.message));

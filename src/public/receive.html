@@ -49,33 +49,7 @@
                 Connected! Waiting for photos...
             </div>
 
-            <!-- Security verification modal (blocking) -->
-            <div id="verification-modal" class="hidden" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;">
-                <div style="background: white; border-radius: 15px; padding: 25px; max-width: 350px; margin: 20px; text-align: center;">
-                    <h2 style="margin: 0 0 15px 0; color: #1565c0;" data-i18n="verify.title">🔒 Verify Connection</h2>
-                    <p style="margin: 0 0 20px 0; color: #555; font-size: 0.95rem;" data-i18n="verify.instruction">
-                        Check that the code below is identical on both devices. Only confirm if they match.
-                    </p>
-
-                    <div style="background: #f5f5f5; border-radius: 10px; padding: 15px; margin-bottom: 20px;">
-                        <span style="font-size: 0.85rem; color: #666;" data-i18n="verify.codeLabel">Verification code</span>
-                        <p id="verification-code" style="font-family: monospace; font-size: 1.5rem; font-weight: bold; color: #1565c0; margin: 5px 0; letter-spacing: 2px;">----</p>
-                    </div>
-
-                    <p style="margin: 0 0 20px 0; color: #d32f2f; font-size: 0.85rem;" data-i18n="verify.warning">
-                        ⚠️ If codes don't match, someone may be intercepting the connection!
-                    </p>
-
-                    <button id="confirm-match-btn" class="btn btn-action btn-success" style="width: 100%; margin-bottom: 20px; padding: 20px; font-size: 1.15rem;" data-i18n="verify.confirm">
-                        ✓ Yes, codes match
-                    </button>
-                    <button id="deny-match-btn" class="btn btn-action btn-secondary" style="width: 100%; padding: 20px; font-size: 1.15rem; background: #ffebee; color: #c62828; border: 1px solid #ef9a9a;" data-i18n="verify.deny">
-                        ✗ No, cancel connection
-                    </button>
-                </div>
-            </div>
-
-            <!-- Waiting for sender confirmation -->
+            <!-- Waiting for the sender's key-confirm -->
             <div id="waiting-confirmation" class="hidden" style="margin: 15px 0; padding: 20px; background: #e3f2fd; border-radius: 10px; border: 1px solid #90caf9; text-align: center;">
                 <p style="margin: 0; color: #1565c0; font-weight: bold;" data-i18n="receive.waitingConfirmation">
                     ⏳ Waiting for sender to confirm...
@@ -140,19 +114,20 @@
     </div>
 
     <script src="/js/eruda-loader.js" integrity="sha384-CHaksGu1LZDt+58WiqaLjZsk6aMivTSsYZ5N5UXzbyW6IyTLSQnWTJZxQvGp+T13"></script>
-    <script src="/js/i18n.js" integrity="sha384-nD+uDnd0spKtjKImNdv8f/pDD68fWVdD+45+ncCME6aBc8sLTlzdFV5/At5o0WHf"></script>
+    <script src="/js/i18n.js" integrity="sha384-Y3Y5l6ruwQFGqsnnzpmwtM8FuWg7EE3KvCSERuYdqd5kqo3cw9AOr7ui82FZG/d+"></script>
     <script src="/js/logger.js" integrity="sha384-On0d9/0CRbEtQ7SlNbgqhKHb8kBO/gbaDiUSLWn5UIVp4Rs+ioS05TSuPsi4cNUF"></script>
     <script src="/js/sidebar.js" integrity="sha384-NIAxgFpCiKxMztVPINLp4nIsI01Cm7Z5ICOsouZAgXMoIJKINRvUrg/SB9bggSpb"></script>
     <script src="/js/transfer-stats.js" integrity="sha384-lu/ExktJtW6HNhT7a3EcrFnLSTRgHsnmhSyokfXeb8ZfsBAeucSXRAMLoUWNWHXg"></script>
     <script src="/js/wake-lock.js" integrity="sha384-EFvkQ0W+iVPn5Kd7naYcp+EFfROXvsHeQU5LwMd8vGEKYm6Ajf2BWmFsFZWDJJa7"></script>
     <script src="/js/crypto.js" integrity="sha384-ePBcYILqOC2z/L5IMDVjalantEKdHyrdTsPzMYdQ942k2Lrhp2tXMqOfEgIzwP0c"></script>
     <script src="/js/protocol.js" integrity="sha384-BQQiXInpk1cUFt3gmfsADoTZfI+XlFyyhhYtv4PI1TqxzSDdCalfEuDp0ZcDfBgp"></script>
+    <script src="/js/pairing.js" crossorigin="anonymous" integrity="sha384-GGKjPIamg18AyuJ/6WUjVm3o84IwmH4AW4pE99YkszhjB1o4++PdZ8WFOmsUo6k/"></script>
     <script src="/js/webrtc.js" integrity="sha384-HJ/v/3mG/hyisilr1BxkrF0PsJDzaCr+6P/ScK179IqegdUGh063zv0TGyhBDZhh"></script>
     <script src="/js/transport-assembler.js" integrity="sha384-UCZoJWT8EYqihn3Wsw1PE/M5u+eXT5QMZY2Rvs2ezp2c6HeHXvQLhes/dsoslCIU"></script>
     <script src="/js/segment-stream.js" integrity="sha384-vYPirWIlAZuqrya8JHRylowxpn1RbvWAk0pe/MYpISoweEkzL21qRY+VXO29UVMk"></script>
-    <script src="/js/ws-transport.js" integrity="sha384-miuNrG+BxQYrrcCWC6mZJW9LxGtGo20YuczZ2lv1RDcNE5JvH7nbGSDGd6wi4EeJ"></script>
+    <script src="/js/ws-transport.js" integrity="sha384-H7HxKlRnaqe2hZc2viYROwITnrAPib1hwXV7+db73FawkRaSyUm0FhYzbnGF2QMm"></script>
     <script src="/js/lp-transport.js" integrity="sha384-OMvnHUPFdfzo1gMTyz63wLc5YbPsTY3XmZwUeuloaodOWMSTBGpE0ZjkK4hmywyG"></script>
-    <script src="/js/transport.js" integrity="sha384-oaQoZCZphIZc1aM+yiLXEQKPwgV99/7cViNCCqFIoeKoGrblZhPFonyw9yFb5lKR"></script>
+    <script src="/js/transport.js" integrity="sha384-WjxdhT5SLtb79N47enD3U7xndWMwFWHdCrTBIyeq8NiZ5uaHYFPQJZv+QxJv7uWg"></script>
     <script src="/js/image-transforms.js" crossorigin="anonymous" integrity="sha384-OB4QY3CCpEJiptMsiTcPnBGnoDm2iqtD5/EoKp6OeKJD0VOsSHt4bV+9OGFGEDfI"></script>
     <script src="/js/doc-detect.js" integrity="sha384-8bf1b0K4/JxyohAVh4L2YMH2YGQVwJB1o9CjR3IQ4tzMPxDtbUTGi3EQ+z/gisD6" crossorigin="anonymous"></script>
     <script src="/js/crop-modal.js" crossorigin="anonymous" integrity="sha384-y1MKLIIjfJYVE55Bz7HRv/AnOVpiNy8pMIJ4XjZkt9s4A6CK1Py6WqK8RNimoZ9g"></script>
@@ -183,14 +158,23 @@
          * 3. Create WebRTC offer and store on server
          * 4. Display QR code with room URL
          * 5. Wait for answer via server polling
-         * 6. Send public key to sender
-         * 7. Receive encrypted photos and decrypt them
+         * 6. Send public key to sender, derive session keys (ECDH + QR
+         *    secret K) and exchange encrypted key-confirms (js/pairing.js)
+         * 7. Receive encrypted photos and decrypt them once bound
          */
 
         let rtc = null;
         let keyPair = null;
-        let sharedKey = null; // AES key derived from ECDH, set after sender connects
-        let sessionKeys = null; // {sharedKey, deriveFileKey} handle for v2 chunked transfers
+        // Pairing state machine (js/pairing.js): derives the session keys
+        // and binds only once the sender's key-confirm opens. Its
+        // getSessionKeys() is null until bound, which is the gate for every
+        // peer-controlled handler below.
+        let pairing = null;
+        // QR secret K: 16 random bytes (base64url) printed after the room
+        // secret in the QR fragment. Never sent to the server, never logged.
+        // Kept across same-room reconnects (the QR stays valid), rotated by
+        // startNewPairing.
+        let qrSecret = '';
 
         // Transfer stats state
         let receiveXferStart = null;
@@ -206,17 +190,9 @@
         // The sender's room secret, printed in the QR URL fragment. Our own
         // credential (the host secret) lives in rtc.roomSecret.
         let senderSecret = '';
-        let weConfirmed = false;  // Track if we confirmed fingerprints
-        let theyConfirmed = false; // Track if sender confirmed fingerprints
-        // Cached after the original verification ceremony so a transport
-        // reconnect can recognise the SAME peer (matching sender public
-        // key fingerprint) and skip the modal. A mismatch is treated as
-        // a peer-swap and the modal is reshown with a warning.
-        let cachedSenderFingerprint = null;
-        let cachedOurFingerprint = null;
-        // Set true between RacingTransport's onReconnecting and a
-        // successful re-handshake; lets handleSenderPublicKey take the
-        // fingerprint-match branch.
+        // Set true between RacingTransport's onReconnecting and the
+        // sender's next sender-public-key, so a changed key can be reported
+        // as a peer swap during reconnect.
         let inReconnect = false;
         // Interval that re-sends our public-key until the sender's
         // sender-public-key reply arrives (see startPublicKeyResend).
@@ -248,7 +224,7 @@
             logger: logger,
             i18n: i18n,
             showToast: showToast,
-            getSessionKeys: () => sessionKeys,
+            getSessionKeys: () => (pairing ? pairing.getSessionKeys() : null),
             getPendingReplaceHash: () => pendingReplaceHash,
             setPendingReplaceHash: (h) => { pendingReplaceHash = h; },
             getConnectionTimestamp: () => connectionTimestamp,
@@ -301,7 +277,7 @@
             // restart immediately: webrtc.js defers its disconnect teardown
             // while hidden and re-arms a short recovery grace on resume. Give
             // ICE that window to self-heal before forcing a same-room
-            // reconnect (which re-pairs and re-runs the verification ceremony).
+            // reconnect (which re-pairs and re-runs the key-confirm).
             if (rtc && rtc.pc) {
                 const state = rtc.pc.connectionState;
                 if (state === 'failed' || state === 'disconnected') {
@@ -334,8 +310,10 @@
                 // Show DEV mode status and version in sidebar
                 updateDevBadge(config);
 
-                // Generate encryption key pair
+                // Generate encryption key pair and the QR secret K
                 keyPair = await WebSendCrypto.generateKeyPair();
+                qrSecret = WebSendCrypto.generateQrSecret();
+                newPairing();
 
                 // Initialize WebRTC
                 rtc = Transport.createForReceiver();
@@ -408,9 +386,12 @@
             // the default 'both' mode senderOrigin is null and we keep using our
             // own origin exactly as before.
             const inviteOrigin = (window.__wsConfig && window.__wsConfig.senderOrigin) || window.location.origin;
-            const url = `${inviteOrigin}/send/${rtc.roomId}#${senderSecret}`;
+            // Fragment = SECRET:K. K binds the key derivation, so a
+            // signaling MITM (who sees neither) cannot pass key-confirm.
+            const url = `${inviteOrigin}/send/${rtc.roomId}#${senderSecret}:${qrSecret}`;
 
-            logger.info(`QR code URL: ${url}`);
+            // Never log the fragment: logs are visible in the debug panel.
+            logger.info(`QR code URL: ${inviteOrigin}/send/${rtc.roomId}#<redacted>`);
 
             try {
                 const canvas = document.createElement('canvas');
@@ -562,7 +543,7 @@
                     // public-key is lost (e.g. the two peers locked different
                     // race winners and it reached a transport the sender had
                     // already closed) the handshake would hang and the
-                    // verification modal would never appear.
+                    // key-confirm would never happen.
                     startPublicKeyResend(publicKeyB64);
                 } else {
                     const errEl = document.querySelector('#step-connected .status');
@@ -584,15 +565,14 @@
         // Re-send our public-key on an interval until the sender replies
         // with sender-public-key (which clears the timer in
         // handleSenderPublicKey). Bounded so we never spin forever against a
-        // genuinely dead peer; the in-flight handshake also stops it via the
-        // sharedKey guard once the reply is processed.
+        // genuinely dead peer; it also stops once the pairing holds a peer key.
         const PUBLIC_KEY_RESEND_INTERVAL_MS = 2000;
         const PUBLIC_KEY_MAX_RESENDS = 5;
         function startPublicKeyResend(publicKeyB64) {
             stopPublicKeyResend();
             let attempts = 0;
             publicKeyResendTimer = setInterval(() => {
-                if (sharedKey || attempts >= PUBLIC_KEY_MAX_RESENDS) {
+                if ((pairing && pairing.hasPeerKey()) || attempts >= PUBLIC_KEY_MAX_RESENDS) {
                     stopPublicKeyResend();
                     return;
                 }
@@ -686,11 +666,11 @@
                 statusEl.textContent = i18n.t('receive.connected');
                 statusEl.className = 'status status-connected';
             }
-            // Re-emit our public key so the sender can verify our
-            // fingerprint hasn't changed. The sender's handlePublicKey
-            // takes the rekey-on-reconnect branch (compares to its cached
-            // fingerprint) and replies with sender-public-key, which our
-            // handleSenderPublicKey verifies against cachedSenderFingerprint.
+            // Re-emit our public key so the sender can check it is
+            // unchanged. The sender replies with sender-public-key and a
+            // fresh key-confirm; the same key keeps the bound session, a
+            // different one forces a fresh key-confirm (see
+            // handleSenderPublicKey).
             try {
                 if (keyPair && rtc) {
                     const publicKeyB64 = await WebSendCrypto.exportPublicKey(keyPair.publicKey);
@@ -819,13 +799,8 @@
             // Reset per-pairing crypto state. User data (receivedImages, OCR,
             // preBWData, collections) is intentionally preserved.
             stopPublicKeyResend();
+            dropPairing();
             keyPair = null;
-            sharedKey = null;
-            sessionKeys = null;
-            weConfirmed = false;
-            theyConfirmed = false;
-            cachedSenderFingerprint = null;
-            cachedOurFingerprint = null;
             inReconnect = false;
             pendingReplaceHash = null;
 
@@ -838,6 +813,7 @@
 
             try {
                 keyPair = await WebSendCrypto.generateKeyPair();
+                newPairing();
                 rtc = Transport.createForReceiver();
                 await rtc.init();
                 rtc.onConnected = onConnected;
@@ -918,6 +894,8 @@
 
             try {
                 keyPair = await WebSendCrypto.generateKeyPair();
+                qrSecret = WebSendCrypto.generateQrSecret();
+                newPairing();
                 rtc = Transport.createForReceiver();
                 await rtc.init();
                 rtc.onConnected = onConnected;
@@ -999,13 +977,9 @@
                 rtc.close();
             }
             // Clear crypto + per-pairing state
+            dropPairing();
             keyPair = null;
-            sharedKey = null;
-            sessionKeys = null;
-            weConfirmed = false;
-            theyConfirmed = false;
-            cachedSenderFingerprint = null;
-            cachedOurFingerprint = null;
+            qrSecret = '';
             inReconnect = false;
             pendingReplaceHash = null;
             photoCount = 0;
@@ -1027,108 +1001,100 @@
         window.addEventListener('pagehide', (e) => { if (!e.persisted) cleanupAllData(); });
 
 
+        /** (Re)create the Pairing for the current keyPair and qrSecret. */
+        function newPairing() {
+            dropPairing();
+            const p = Pairing.create({
+                role: 'receiver',
+                keyPair,
+                qrSecret,
+                // Callbacks of a replaced pairing must not touch the UI.
+                onBound: () => { if (p === pairing) onPairingBound(); },
+                onFailed: (reason) => { if (p === pairing) onPairingFailed(reason); },
+            });
+            pairing = p;
+        }
+
+        function dropPairing() {
+            if (pairing) pairing.reset();
+            pairing = null;
+        }
+
         async function handleSenderPublicKey(msg) {
             // The sender replied, so stop re-sending our public-key.
             stopPublicKeyResend();
-            // Sender sent their ECDH public key - derive shared secret.
-            //
-            // Defense-in-depth: a fresh sender-public-key always closes the
-            // verified-fingerprint gate SYNCHRONOUSLY before any await, so a
-            // hostile already-verified peer cannot rotate keys and slip files
-            // through under the new shared key before the user reacts to the
-            // re-shown modal. Any file-transfer / transform / batch message
-            // that arrives between this point and the user's confirm click
-            // is blocked by VERIFIED_GATED_HANDLERS. Clearing sharedKey here
-            // also means decryption would fail even if the gate were bypassed.
-            const isRekey = sharedKey !== null;
-
-            // Idempotent duplicate: a sender-public-key carrying the SAME key
-            // (outside a reconnect) means our reply crossed with the sender's
-            // re-send of its public-key, or our public-key resend prompted a
-            // second reply. Ignore it rather than tearing down the already-
-            // verified session and reshowing the modal. A DIFFERENT key falls
-            // through to the full rekey path below.
-            if (isRekey && !inReconnect && cachedSenderFingerprint) {
-                try {
-                    const dupKey = await WebSendCrypto.importPublicKey(msg.key);
-                    const dupFp = await WebSendCrypto.getKeyFingerprint(dupKey);
-                    if (dupFp === cachedSenderFingerprint) {
-                        logger.info('Ignoring duplicate sender-public-key (same key, reply crossed with a re-send)');
-                        return;
-                    }
-                } catch (e) {
-                    logger.warn('Duplicate sender-public-key check failed: ' + e.message + '; treating as fresh');
-                }
-            }
-
-            // Reconnect branch: a rekey arriving while inReconnect was set
-            // is verified against the cached fingerprints. If the
-            // sender's public-key fingerprint matches the cached one, we
-            // keep the existing sharedKey / weConfirmed / theyConfirmed
-            // so the in-flight partial buffer remains decryptable and
-            // the user is not prompted to verify again.
-            if (isRekey && inReconnect && cachedSenderFingerprint) {
-                try {
-                    const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);
-                    const fp = await WebSendCrypto.getKeyFingerprint(senderPublicKey);
-                    if (fp === cachedSenderFingerprint) {
-                        logger.success(`Reconnect rekey verified, sender fingerprint unchanged (${fp})`);
-                        inReconnect = false;
-                        // sharedKey / weConfirmed / theyConfirmed kept as-is.
-                        return;
-                    }
-                    logger.error(`Sender fingerprint changed during reconnect: cached ${cachedSenderFingerprint} vs new ${fp}; forcing re-verification`);
+            const p = pairing;
+            if (!p) return;
+            // A different key than the one we already hold unbinds the
+            // session synchronously inside acceptPeerKey (before any await),
+            // so a hostile already-paired peer cannot rotate keys and slip
+            // files through: VERIFIED_GATED_HANDLERS drop everything until a
+            // fresh key-confirm opens under the new keys.
+            if (p.hasPeerKey() && !p.isSamePeerKey(msg.key)) {
+                if (inReconnect) {
+                    logger.error('Sender key changed during reconnect; a fresh key-confirm is required');
                     showToast(i18n.t('receive.peerChangedOnReconnect'), { type: 'error', duration: 0 });
-                    // Fall through into the normal rekey path which
-                    // tears down verification state and reshows the modal.
-                } catch (e) {
-                    logger.error('Reconnect rekey check failed: ' + e.message + '; falling back to fresh verification');
+                } else {
+                    logger.warn('Sender re-keyed mid-session; a fresh key-confirm is required before further files');
                 }
-                inReconnect = false;
             }
-
-            if (isRekey) {
-                logger.warn('Sender re-keyed mid-session; re-verification required before further files');
+            inReconnect = false;
+            const res = await p.acceptPeerKey(msg);
+            if (p !== pairing) return;
+            if (res.status === 'version-mismatch') {
+                logger.error(`Sender runs protocol version ${msg.protocolVersion}, we run ${Protocol.VERSION}`);
+                showToast(i18n.t('pairing.versionMismatch'), { type: 'error', duration: 0 });
+                return;
             }
-            weConfirmed = false;
-            theyConfirmed = false;
-            sharedKey = null;
-            sessionKeys = null;
-            logger.info('Received sender public key, deriving shared secret...');
-            try {
-                const senderPublicKey = await WebSendCrypto.importPublicKey(msg.key);
-                sessionKeys = await WebSendCrypto.deriveSessionKeys(keyPair.privateKey, senderPublicKey);
-                sharedKey = sessionKeys.sharedKey;
+            if (res.status === 'invalid-key') {
+                logger.error('Ignoring sender-public-key with an invalid key');
+                return;
+            }
+            if (res.status === 'stale') return;
+            if (res.status === 'same-key') {
+                logger.info('Same sender key again (reply crossed with a re-send or reconnect); re-sending key-confirm');
+            } else {
+                logger.info('Session keys derived; sending key-confirm');
+                if (!p.isBound()) document.getElementById('waiting-confirmation').classList.remove('hidden');
+            }
+            await sendMessageWithRetry(res.confirmMsg, 'key-confirm');
+        }
 
-                // Per-key fingerprints are cached only for the
-                // rekey-on-reconnect peer-identity check above.
-                cachedSenderFingerprint = await WebSendCrypto.getKeyFingerprint(senderPublicKey);
-                cachedOurFingerprint = await WebSendCrypto.getKeyFingerprint(keyPair.publicKey);
-
-                // Single combined code, identical on both devices, shown in
-                // the verification modal so users just check the two screens match.
-                const combinedFingerprint = await WebSendCrypto.getCombinedFingerprint(keyPair.publicKey, senderPublicKey);
-                document.getElementById('verification-code').textContent = combinedFingerprint;
-                logger.success(`Key exchange complete. Verification code: ${combinedFingerprint}`);
-
-                // Show blocking verification modal
-                showVerificationModal();
-            } catch (e) {
-                logger.error('Failed to derive shared key: ' + e.message);
+        async function handleKeyConfirm(msg) {
+            if (!pairing) return;
+            const res = await pairing.handleKeyConfirm(msg);
+            if (res.status === 'ignored') {
+                logger.warn('Ignoring a key-confirm that does not open on the already bound session');
             }
         }
 
-        function handleFingerprintConfirmed(msg) {
-            // Sender confirmed the fingerprints match
-            logger.info('Sender confirmed fingerprint match');
-            theyConfirmed = true;
-            checkBothConfirmed();
+        /**
+         * The sender's key-confirm opened: it derived the same keys, so it
+         * knows K and holds the private key for the public key we bound.
+         * Show the confirmed state and let the sender start sending.
+         */
+        function onPairingBound() {
+            logger.success('Key-confirm verified: pairing confirmed');
+            document.getElementById('waiting-confirmation').classList.add('hidden');
+            const statusEl = document.querySelector('#step-connected .status');
+            if (statusEl) {
+                statusEl.textContent = i18n.t('pairing.confirmed');
+                statusEl.className = 'status status-connected';
+            }
+            PeerUI.showVerifiedInSidebar();
+            sendMessageWithRetry(Protocol.build.ready(), 'ready');
         }
 
-        function handleFingerprintDenied(msg) {
-            // Sender denied - abort connection
-            logger.error('Sender denied fingerprint match - possible MITM attack!');
-            showToast(i18n.t('verify.deniedBySender'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
+        /**
+         * Key-confirm failed or never came: the peer does not know K (a
+         * signaling MITM or a stale link). Accept nothing from it, drop the
+         * connection and re-arm the same QR for the legitimate sender.
+         */
+        function onPairingFailed(reason) {
+            logger.error(`Pairing failed (${reason}): the sender did not prove knowledge of the QR secret; no files accepted`);
+            document.getElementById('waiting-confirmation').classList.add('hidden');
+            showToast(i18n.t('pairing.failed'), { type: 'error', duration: 0 });
+            reconnectReceiverSameRoom();
         }
 
         function handleProgress(msg) {
@@ -1241,8 +1207,7 @@
         // _fileAckResolve / _fileAckReject) and never reach onMessage.
         const messageHandlers = {
             'sender-public-key': handleSenderPublicKey,
-            'fingerprint-confirmed': handleFingerprintConfirmed,
-            'fingerprint-denied': handleFingerprintDenied,
+            'key-confirm': handleKeyConfirm,
             'progress': handleProgress,
             'delete-image': handleDeleteImage,
             'transform-image': handleTransformImageMsg,
@@ -1252,7 +1217,7 @@
             'batch-end': handleBatchEnd,
             // Chunked transfers: the assembler forwards the file-start,
             // framed 'file-segment' records, and file-end up here so they
-            // pass the verification gate before any decrypt/verify work
+            // pass the key-confirm gate before any decrypt/verify work
             // happens (ReceiveFlow owns the SegmentReceiver).
             'file-start': (msg) => ReceiveFlow.handleFileStart(msg),
             'file-segment': (msg) => ReceiveFlow.handleFileSegment(msg),
@@ -1267,13 +1232,12 @@
         };
 
         // Peer-controlled handlers that mutate state or run heavy work on
-        // peer-supplied parameters. Until BOTH sides have confirmed the
-        // fingerprint, an unverified peer cannot push files, replay
+        // peer-supplied parameters. Until the sender's key-confirm opened
+        // (pairing bound), an unpaired peer cannot push files, replay
         // transforms, delete, or reorder our gallery. The handshake-only
-        // messages (sender-public-key, fingerprint-confirmed,
-        // fingerprint-denied) and the local synthetic 'progress' event
-        // intentionally bypass this gate so verification itself can complete
-        // and the user gets a live transfer indicator.
+        // messages (sender-public-key, key-confirm) and the local synthetic
+        // 'progress' event intentionally bypass this gate so pairing itself
+        // can complete and the user gets a live transfer indicator.
         const VERIFIED_GATED_HANDLERS = new Set([
             'delete-image',
             'transform-image',
@@ -1292,7 +1256,7 @@
             'segment-rewind',
             // file-resume-ack can discard our partial transfer (when
             // nextSeq=0). Gating it keeps an unverified peer from
-            // disturbing receive state during the verification window.
+            // disturbing receive state before key-confirm.
             'file-resume-ack',
         ]);
 
@@ -1302,8 +1266,8 @@
                 logger.warn(`Unknown message type: ${msg.type}`);
                 return;
             }
-            if (VERIFIED_GATED_HANDLERS.has(msg.type) && !(weConfirmed && theyConfirmed)) {
-                logger.warn(`Dropping ${msg.type} from unverified peer (fingerprint not yet confirmed)`);
+            if (VERIFIED_GATED_HANDLERS.has(msg.type) && !(pairing && pairing.isBound())) {
+                logger.warn(`Dropping ${msg.type} from unpaired peer (key-confirm not verified)`);
                 return;
             }
             await handler(msg);
@@ -1465,62 +1429,6 @@
             card.remove();
             updateExportButton();
             logger.success(`Image ${imageIndex} discarded`);
-        }
-
-        // ============ Fingerprint Verification ============
-        // Both sender and receiver must confirm fingerprints match before any
-        // photos can be sent. This prevents MITM attacks where an attacker
-        // substitutes their own keys during the ECDH exchange.
-
-        /**
-         * Display the blocking verification modal with key fingerprints.
-         * User must confirm or deny before any photo transfer can begin.
-         */
-        function showVerificationModal() {
-            VerificationModal.show({ onConfirm: onConfirmMatch, onDeny: onDenyMatch });
-        }
-
-        /** User confirmed fingerprints match - notify the sender and wait for mutual confirmation */
-        async function onConfirmMatch() {
-            logger.info('User confirmed fingerprints match');
-            weConfirmed = true;
-
-            // Hide modal, show waiting message
-            VerificationModal.hide();
-            document.getElementById('waiting-confirmation').classList.remove('hidden');
-
-            // Tell sender we confirmed
-            await sendMessageWithRetry(Protocol.build.fingerprintConfirmed(), 'fingerprint-confirmed');
-
-            checkBothConfirmed();
-        }
-
-        /** User denied fingerprints match - abort the connection (possible MITM) */
-        function onDenyMatch() {
-            logger.error('User denied fingerprint match - aborting connection');
-
-            // Tell sender we denied
-            rtc.sendMessage(Protocol.build.fingerprintDenied());
-
-            showToast(i18n.t('verify.selfDenied'), { duration: 4000, onDismiss: () => { window.location.href = '/'; } });
-        }
-
-        /**
-         * Check if both parties confirmed fingerprints.
-         * When both confirm, show the verified badge and signal to the sender
-         * that they can start sending photos.
-         */
-        function checkBothConfirmed() {
-            if (weConfirmed && theyConfirmed) {
-                logger.success('Both parties confirmed - connection verified!');
-
-                // Hide waiting, show verified badge
-                document.getElementById('waiting-confirmation').classList.add('hidden');
-                PeerUI.showVerifiedInSidebar();
-
-                // Tell sender both parties verified, so they can show the photo send UI
-                sendMessageWithRetry(Protocol.build.ready(), 'ready');
-            }
         }
 
         // ============ PDF Generation (no external dependencies) ============
