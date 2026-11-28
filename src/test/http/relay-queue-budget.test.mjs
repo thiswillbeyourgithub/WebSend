@@ -128,7 +128,15 @@ test('WS send buffers count in the budget; a closed socket gives its bytes back'
 
     const closed = new Promise(res => sender.once('close', res));
     receiver.terminate();
-    await closed; // the pair is torn down with its receiver
+    // The pair is torn down with its receiver. The sender is still paused
+    // by backpressure here; the relay must resume it so the close
+    // handshake completes promptly, instead of hanging on ws's 30 s close
+    // timeout (or forever).
+    let timer;
+    const tooSlow = new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error('paused sender never finished closing')), 5_000);
+    });
+    try { await Promise.race([closed, tooSlow]); } finally { clearTimeout(timer); }
     await probeUntil(probeRoom, 204);
 });
 

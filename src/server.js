@@ -1769,7 +1769,11 @@ function maybePauseWsFeeder(ws, room, slot) {
         if (ws.readyState === ws.OPEN && !peerBacklogLow(peerNow())) return;
         clearInterval(ws._backpressureTimer);
         ws._backpressureTimer = null;
-        if (ws.readyState === ws.OPEN) {
+        // Resume a CLOSING socket too: the peer's teardown closes this
+        // feeder while it is still paused, and the close handshake needs
+        // us to read the client's close frame. Left paused, it only ended
+        // when ws's 30 s close timeout destroyed the socket.
+        if (ws.readyState === ws.OPEN || ws.readyState === ws.CLOSING) {
             try { sock.resume(); } catch (_) {}
         }
     }, WS_FEEDER_RESUME_POLL_MS);
