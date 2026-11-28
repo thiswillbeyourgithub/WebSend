@@ -37,6 +37,7 @@ const vendored = {
   'eruda': { readme: 'eruda', version: () => read('public/vendor/eruda/eruda.js').match(/\/\*! eruda v(\S+) /)?.[1] },
   'jsqr': { readme: 'jsQR', version: () => read('public/js/jsqr.min.js').match(/\/npm\/jsqr@([^/]+)\//)?.[1] },
   'qrcode': { readme: 'qrcode.js', version: () => read('public/js/qrcode.min.js').match(/\/npm\/qrcode@([^/]+)\//)?.[1] },
+  '@fontsource-variable/atkinson-hyperlegible-next': { readme: 'Atkinson Hyperlegible Next', version: () => JSON.parse(read('public/vendor/atkinson-hyperlegible-next/package.json')).version },
   'scribe.js-ocr': { readme: 'scribe.js-ocr', version: () => JSON.parse(read('public/vendor/scribe.js-ocr/package.json')).version },
 };
 

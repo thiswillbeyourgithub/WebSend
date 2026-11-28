@@ -492,6 +492,7 @@ All client-side libraries are vendored directly in the repository (no CDN at run
 | [scribe.js-ocr](https://github.com/scribeocr/scribe.js) | 0.17.0 | AGPL-3.0 | OCR engine (preloaded in background; bundles Tesseract WASM and its own PDF renderer) |
 | [Tesseract trained data](https://github.com/tesseract-ocr/tessdata) | — | Apache-2.0 | `eng` + `fra` language models, served locally |
 | [eruda](https://github.com/liriliri/eruda) | 3.4.3 | MIT | Mobile devtools console (on-demand) |
+| [Atkinson Hyperlegible Next](https://github.com/googlefonts/atkinson-hyperlegible-next) | 5.3.0 | OFL-1.1 | UI font (variable woff2, Latin + Latin Extended, via `@fontsource-variable`) |
 | [Express.js](https://expressjs.com) | ^5.0.0 | MIT | Server-side HTTP framework |
 
 ## License

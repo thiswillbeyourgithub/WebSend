@@ -124,7 +124,8 @@ WebSend/
         │
         ├── css/
         │   └── style.css   # All styles: dark theme, large touch targets for accessibility,
-        │                   #   responsive layout, crop modal, logs panel
+        │                   #   responsive layout, crop modal, logs panel; @font-face
+        │                   #   for the vendored Atkinson Hyperlegible Next UI font
         │
         ├── js/
         │   ├── collections.js # Receive page "collections" (one per sender batch,
@@ -492,6 +493,8 @@ WebSend/
         │   │                   #   docs/, examples/, mcp/, scribe-ui/, the demo index.html),
         │   │                   #   so those are not served under /scribe/. scrollview-web/
         │   │                   #   must stay: recognizeConvert.js imports it lazily
+        │   ├── atkinson-hyperlegible-next/ # UI font (OFL-1.1, @fontsource-variable):
+        │   │                   #   variable-weight woff2, Latin + Latin Extended only
         │   ├── tessdata/       # Tesseract language models (eng + fra .traineddata),
         │   │                   #   served locally to avoid CDN dependency
         │   └── eruda/          # Mobile devtools console (loaded in DEV mode, via
